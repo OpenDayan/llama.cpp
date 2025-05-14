@@ -1314,6 +1314,11 @@ void ggml_compute_forward_add(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_E5M2  :
+        case GGML_TYPE_E4M3  :
+        case GGML_TYPE_E4M3_Q:
+        case GGML_TYPE_E3M4_Q:
+
             {
                 ggml_compute_forward_add_q_f32(params, dst);
             } break;
@@ -1691,6 +1696,10 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_E5M2  :
+        case GGML_TYPE_E4M3  :
+        case GGML_TYPE_E4M3_Q:
+        case GGML_TYPE_E3M4_Q:
             {
                 ggml_compute_forward_add1_q_f32(params, dst);
             } break;
@@ -1818,6 +1827,10 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_E5M2  :
+        case GGML_TYPE_E4M3  :
+        case GGML_TYPE_E4M3_Q:
+        case GGML_TYPE_E3M4_Q:
         default:
             {
                 GGML_ABORT("fatal error");
@@ -4065,6 +4078,10 @@ void ggml_compute_forward_set(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_E5M2  :
+        case GGML_TYPE_E4M3  :
+        case GGML_TYPE_E4M3_Q:
+        case GGML_TYPE_E3M4_Q:
         default:
             {
                 GGML_ABORT("fatal error");
@@ -4326,6 +4343,11 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_E5M2  :
+        case GGML_TYPE_E4M3  :
+        case GGML_TYPE_E4M3_Q:
+        case GGML_TYPE_E3M4_Q:
+
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -4965,6 +4987,10 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
         case GGML_TYPE_F64:
+        case GGML_TYPE_E5M2:
+        case GGML_TYPE_E4M3:
+        case GGML_TYPE_E4M3_Q:
+        case GGML_TYPE_E3M4_Q:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

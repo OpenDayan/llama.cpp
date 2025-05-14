@@ -170,6 +170,12 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_E4M3_Q) {
+                new_type = GGML_TYPE_E4M3_Q;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_E3M4_Q) {
+                new_type = GGML_TYPE_E3M4_Q;
+            }
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
@@ -191,6 +197,10 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0) {
                 new_type = GGML_TYPE_Q4_K;
             }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_E4M3_Q || ftype == LLAMA_FTYPE_MOSTLY_E3M4_Q) {
+                new_type = tensor->type;
+            }
+
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
                ftype == LLAMA_FTYPE_MOSTLY_IQ2_S || ftype == LLAMA_FTYPE_MOSTLY_IQ2_M    || ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
@@ -404,6 +414,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             case GGML_TYPE_Q4_K:   new_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:   new_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_E4M3_Q:
+            case GGML_TYPE_E3M4_Q: new_type = tensor->type;   break;
             default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
         }
         if (tensor->ne[0] % ggml_blck_size(new_type) != 0) {
@@ -509,6 +521,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  default_type = GGML_TYPE_IQ4_XS;  break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:   default_type = GGML_TYPE_IQ3_S;   break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   default_type = GGML_TYPE_IQ3_S;   break;
+
+        // FP8
+        case LLAMA_FTYPE_MOSTLY_E5M2:   default_type = GGML_TYPE_E5M2;   break;
+        case LLAMA_FTYPE_MOSTLY_E4M3:   default_type = GGML_TYPE_E4M3;   break;
+        case LLAMA_FTYPE_MOSTLY_E4M3_Q: default_type = GGML_TYPE_E4M3_Q; break;
+        case LLAMA_FTYPE_MOSTLY_E3M4_Q: default_type = GGML_TYPE_E3M4_Q; break;
 
         default: throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
