@@ -128,6 +128,7 @@ endif()
 option(GGML_LASX             "ggml: enable lasx"             ON)
 option(GGML_LSX              "ggml: enable lsx"              ON)
 option(GGML_RVV              "ggml: enable rvv"              ON)
+option(GGML_RV_NPU           "ggml: enable rv-npu"           OFF)
 option(GGML_RV_ZFH           "ggml: enable riscv zfh"        OFF)
 option(GGML_VXE              "ggml: enable vxe"              ON)
 
