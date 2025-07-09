@@ -1,36 +1,78 @@
 #include "ggml-rnpu.h"
 #include <mutex>
+
+#include "../ggml-impl.h"
 #include "../ggml-backend-impl.h"
 
 #include "./common.hpp"
+#include "ggml.h"
 
 extern const ggml_backend_device_i ggml_backend_rnpu_device_interface;
 
 
 // -----------------------------------------------------------------------------------
-// ------------------- NPU backend registery external interface ----------------------
+// ----------------------- NPU backend registery interface ---------------------------
 // -----------------------------------------------------------------------------------
 
+/**
+ * @brief Retrieve the name of a given registery.
+ *
+ * This function always returns GGML_RNPU_NAME.
+ *
+ * @param reg The given registery. (Unused)
+ * @return Pointer to C-style string name.
+ */
+static const char * ggml_backend_rnpu_reg_get_name(ggml_backend_reg_t reg) {
+    GGML_UNUSED(reg);
+    return GGML_RNPU_NAME;
+}
 
+/**
+ * @brief Get the number of registered NPU devices in a given registery.
+ *
+ * @param reg The given registery.
+ * @return The number of NPU devices in the registery
+ */
+static size_t ggml_backend_rnpu_reg_get_device_count(ggml_backend_reg_t reg) {
+    ggml_backend_rnpu_reg_context * ctx = (ggml_backend_rnpu_reg_context *)reg->context;
+    return ctx->devices.size();
+}
 
+/**
+ * @brief Retrieve a specified NPU device in a given registery.
+ *
+ * @param reg The given registery.
+ * @param index The NPU device index to be retrieved.
+ * @return Pointer to retrieved NPU device
+ */
+static ggml_backend_dev_t ggml_backend_rnpu_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    ggml_backend_rnpu_reg_context * ctx = (ggml_backend_rnpu_reg_context *)reg->context;
+    GGML_ASSERT(index < ctx->devices.size());
+    return ctx->devices[index];
+}
 
-
-
-
-
-
-
-
-
+/**
+ * @brief Reflects a R-NPU function based on a given name.
+ *
+ * This function is reserved for future use.
+ *
+ * @param reg The given registery. (Unused)
+ * @param name The name of specified GGML backend function name. (Unused)
+ * @return {text}
+ */
+static void * ggml_backend_rnpu_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    GGML_UNUSED(name);
+    return nullptr;
+}
 
 static const ggml_backend_reg_i ggml_backend_rnpu_reg_interface = {
-    NULL
-    // TODO:
-    // /* .get_name          = */ ggml_backend_rnpu_reg_get_name,
-    // /* .get_device_count  = */ ggml_backend_rnpu_reg_get_device_count,
-    // /* .get_device        = */ ggml_backend_rnpu_reg_get_device,
-    // /* .get_proc_address  = */ ggml_backend_rnpu_reg_get_proc_address,
+    /* .get_name          = */ ggml_backend_rnpu_reg_get_name,
+    /* .get_device_count  = */ ggml_backend_rnpu_reg_get_device_count,
+    /* .get_device        = */ ggml_backend_rnpu_reg_get_device,
+    /* .get_proc_address  = */ ggml_backend_rnpu_reg_get_proc_address,
 };
+
 
 
 // --------------------------------------------------------------------------------
