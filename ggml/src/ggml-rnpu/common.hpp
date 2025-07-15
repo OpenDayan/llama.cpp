@@ -10,6 +10,8 @@
 #define GGML_RNPU_MAX_STREAMS 1
 #define GGML_RNPU_NAME "RNPU"
 
+#define MATRIX_ROW_PADDING 512
+
 #define NPU_CHECK_GEN(err, success, error_fn)                                      \
      do {                                                                           \
         auto err_ = (err);                                                          \
@@ -175,6 +177,9 @@ void ggml_rnpu_set_device(int32_t device);
 int32_t ggml_rnpu_get_device();
 
 const ggml_rnpu_device_info& ggml_rnpu_info();
+
+// rnpu-buf-type.cpp
+bool ggml_backend_buft_is_rnpu(ggml_backend_buffer_type_t buft);
 
 
 #ifdef  __cplusplus

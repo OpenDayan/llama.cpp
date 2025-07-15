@@ -41,7 +41,7 @@
  * @return The current device ID
  */
 int32_t ggml_rnpu_get_device() {
-    int32_t id;
+    int32_t id = 0;
     // TODO: get device API
     // NPU_CHECK(npurtGetDevice(&id));
     return id;
@@ -53,6 +53,9 @@ int32_t ggml_rnpu_get_device() {
  * @param device The device ID to set.
  */
 void ggml_rnpu_set_device(const int32_t device) {
+    // FIXME: delete in the future (if support multi-device)
+    GGML_UNUSED(device);
+
     // TODO: set device API
     // NPU_CHECK(npurtSetDevice(device))
 }
@@ -75,6 +78,10 @@ static ggml_rnpu_device_info ggml_rnpu_init() {
     //                     __func__, npuGetErrorString());
     //     return info;
     // }
+
+    // FIXME: delete in the futre (if support multi-device)
+    info.device_count = 1;
+    info.devices[0].cc = 0;
 
     GGML_ASSERT(info.device_count <= GGML_RNPU_MAX_DEVICES);
 

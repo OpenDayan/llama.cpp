@@ -20,7 +20,7 @@
 
 
 
-static const ggml_backend_buffer_i ggml_backend_rnpu_buffer_interface = {
+const ggml_backend_buffer_i ggml_backend_rnpu_buffer_interface = {
     NULL
     // /* .free_buffer     = */ ggml_backend_rnpu_buffer_free_buffer,
     // /* .get_base        = */ ggml_backend_rnpu_buffer_get_base,
