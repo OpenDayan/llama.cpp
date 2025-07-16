@@ -204,3 +204,17 @@ const ggml_backend_buffer_i ggml_backend_rnpu_buffer_interface = {
     /* .clear           = */ ggml_backend_rnpu_buffer_clear,
     /* .reset           = */ NULL,
 };
+
+// -----------------------------------------------------------------------------------
+// --------------------------- NPU buffer external API -------------------------------
+// -----------------------------------------------------------------------------------
+
+/**
+ * @brief Check whether backend buffer is a R-NPU buffer.
+ *
+ * @param buft Pointer to backend buffer to be checked.
+ * @return Return 'true' if buffer is a R-NPU buffer type.
+ */
+bool ggml_backend_buffer_is_rnpu(ggml_backend_buffer_t buffer) {
+    return ggml_backend_buft_is_rnpu(buffer->buft);
+}

@@ -101,3 +101,21 @@ const ggml_rnpu_device_info& ggml_rnpu_info() {
     static ggml_rnpu_device_info info = ggml_rnpu_init();
     return info;
 }
+
+/**
+ * @brief Computes the forward operation for a given tensor using R-NPU
+ * operations.
+ *
+ * This function selects the appropriate CANN operation based on the type of
+ * operation specified in the tensor and performs the computation.
+ *
+ * @param ctx The R-NPU context containing necessary resources and
+ * configurations.
+ * @param dst The destination tensor where the result of the computation will be
+ * stored.
+ * @return true if the computation was successful; false otherwise.
+ */
+bool ggml_rnpu_compute_forward(ggml_backend_rnpu_context& ctx,
+                               struct ggml_tensor* dst) {
+    // TODO: impl
+}

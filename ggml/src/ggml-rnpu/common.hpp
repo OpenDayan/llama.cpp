@@ -178,9 +178,14 @@ int32_t ggml_rnpu_get_device();
 
 const ggml_rnpu_device_info& ggml_rnpu_info();
 
+bool ggml_rnpu_compute_forward(ggml_backend_rnpu_context& ctx,
+                               struct ggml_tensor* dst);
+
 // rnpu-buf-type.cpp
 bool ggml_backend_buft_is_rnpu(ggml_backend_buffer_type_t buft);
 
+// rnpu-buf.cpp
+bool ggml_backend_buffer_is_rnpu(ggml_backend_buffer_t buffer);
 
 #ifdef  __cplusplus
 }
