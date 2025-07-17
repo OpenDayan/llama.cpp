@@ -7,6 +7,7 @@
 #include "../ggml-impl.h"
 #include "../ggml-backend-impl.h"
 #include "./common.hpp"
+#include "./ops.hpp"
 #include "ggml.h"
 
 // --------------------------------------------------------------------------------
@@ -117,5 +118,60 @@ const ggml_rnpu_device_info& ggml_rnpu_info() {
  */
 bool ggml_rnpu_compute_forward(ggml_backend_rnpu_context& ctx,
                                struct ggml_tensor* dst) {
-    // TODO: impl
+    switch (dst->op) {
+        case GGML_OP_GET_ROWS:
+            ggml_rnpu_get_rows(ctx, dst);
+            break;
+        case GGML_OP_ADD:
+            ggml_rnpu_op_add(ctx, dst);
+            break;
+        case GGML_OP_MUL:
+            ggml_rnpu_op_mul(ctx, dst);
+            break;
+        case GGML_OP_UNARY:
+            switch (ggml_get_unary_op(dst)) {
+                case GGML_UNARY_OP_SILU:
+                    ggml_rnpu_silu(ctx, dst);
+                    break;
+                // support remaining unary op
+                default:
+                    return false;
+            }
+            break;
+        case GGML_OP_MUL_MAT:
+            ggml_rnpu_mul_mat(ctx, dst);
+            break;
+        case GGML_OP_ROPE:
+            ggml_rnpu_rope(ctx, dst);
+            break;
+        case GGML_OP_CPY:
+            ggml_rnpu_cpy(ctx, dst);
+            break;
+        case GGML_OP_CONT:
+            ggml_rnpu_cont(ctx, dst);
+            break;
+        case GGML_OP_RESHAPE:
+            ggml_rnpu_reshape(ctx, dst);
+            break;
+        case GGML_OP_VIEW:
+            ggml_rnpu_view(ctx, dst);
+            break;
+        case GGML_OP_PERMUTE:
+            ggml_rnpu_permute(ctx, dst);
+            break;
+        case GGML_OP_TRANSPOSE:
+            ggml_rnpu_transpose(ctx, dst);
+            break;
+        case GGML_OP_RMS_NORM:
+            ggml_rnpu_rms_norm(ctx, dst);
+            break;
+        case GGML_OP_SOFT_MAX:
+            ggml_rnpu_softmax(ctx, dst);
+            break;
+        // TODO: support remainig op
+        default:
+            return false;
+    }
+
+    return true;
 }
