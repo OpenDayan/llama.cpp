@@ -192,7 +192,7 @@ struct ggml_backend_registry {
         register_backend(ggml_backend_kompute_reg());
 #endif
 #ifdef GGML_USE_RNPU
-        register_backend(ggml_backend_rnpu_reg())
+        register_backend(ggml_backend_rnpu_reg());
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());

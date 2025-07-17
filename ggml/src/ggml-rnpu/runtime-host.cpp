@@ -86,6 +86,22 @@ npuErr_t npuMemset(void * ptr, int value, size_t size) {
     return npuSuccess;
 }
 
+npuErr_t npuMemcpy(void * dst, const void * src, size_t size, npuMemcpy_t kind) {
+    void * res = nullptr;
+
+    if (kind == npuMemcpyHostToDevice ||
+        kind == npuMemcpyDeviceToDevice ||
+        kind == npuMemcpyDeviceToHost) {
+        void * res = memcpy(dst, src, size);
+    }
+
+    if (res != dst) {
+        return npuError;
+    }
+
+    return npuSuccess;
+}
+
 npuErr_t npuMemGetInfo(size_t * free, size_t * total) {
     *free = 1024L * 1024 * 1024; // FIXME: always have 1GB free memory
     *total = 16 * 1024L * 1024L * 1024L; // 16GB total memory

@@ -12,7 +12,6 @@
 #include "./common.hpp"
 #include "ggml.h"
 
-extern const ggml_backend_buffer_i ggml_backend_rnpu_buffer_interface;
 
 // --------------------------------------------------------------------------------------
 // ----------------------------- NPU buffer type interface ------------------------------

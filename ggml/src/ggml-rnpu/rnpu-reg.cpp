@@ -9,7 +9,6 @@
 #include "./common.hpp"
 #include "ggml.h"
 
-extern const ggml_backend_device_i ggml_backend_rnpu_device_interface;
 
 
 // -----------------------------------------------------------------------------------

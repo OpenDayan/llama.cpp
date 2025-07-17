@@ -12,6 +12,7 @@
 #include "../ggml-impl.h"
 
 #include "./common.hpp"
+#include "ggml.h"
 
 // ------------------------------------------------------------------------------
 // ---------------------------- NPU backend interface ---------------------------
@@ -64,6 +65,9 @@ static void ggml_backend_rnpu_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     // TODO: MemcpyAsync API
     // NPU_CHECK(rnpuMemcpyAsync((char *)tensor->data + offset, data, size, rnpuMemcpyHostToDevice, rnpu_ctx->stream()));
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
     GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
 }
 
@@ -84,6 +88,9 @@ static void ggml_backend_rnpu_get_tensor_async(ggml_backend_t backend, const ggm
 
     // TODO: MemcpyAsync API
     // NPU_CHECK(rnpuMemcpyAsync(data, (const char *)tensor->data + offset, size, rnpuMemcpyDeviceToHost, rnpu_ctx->stream()));
+    GGML_UNUSED(data);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(size);
     GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
 }
 
@@ -127,11 +134,13 @@ static bool ggml_backend_rnpu_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (rnpu_ctx_src->device == rnpu_ctx_dst->device) {
             // TODO: MemcpyAsync API
             // NPU_CHECK(rnpuMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), rnpuMemcpyDeviceToDevice, rnpu_ctx_src->stream()));
+            GGML_LOG_ERROR("[ERROR] R-NPU does not support memcpy between different NPU devices\n");
             GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
         } else {
             // TODO: MemcpyPeerAsync API
             // NPU_CHECK(rnpuMemcpyPeerAsync(dst->data, rnpu_ctx_dst->device, src->data, rnpu_ctx_src->device,
             //                                ggml_nbytes(dst), rnpu_ctx_src->stream()));
+            GGML_LOG_ERROR("[ERROR] R-NPU does not support peer access\n");
             GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
         }
     } else {
@@ -156,6 +165,7 @@ static void ggml_backend_rnpu_synchronize(ggml_backend_t backend) {
 
     // TODO: Stream support
     // NPU_CHECK(rnpuStreamSynchronize(rnpu_ctx->stream()));
+    GGML_UNUSED(rnpu_ctx);
     GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
 
     GGML_UNUSED(backend);
@@ -212,6 +222,8 @@ static void ggml_backend_rnpu_synchronize(ggml_backend_t backend) {
         (ggml_backend_rnpu_context*)backend->context;
     // TODO: Event API
     // NPU_CHECK(npuRecordEvent((npuEvent)event->context, rnpu_ctx->stream()));
+    GGML_UNUSED(rnpu_ctx);
+    GGML_UNUSED(event);
     GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
 }
 
@@ -231,6 +243,8 @@ static void ggml_backend_rnpu_synchronize(ggml_backend_t backend) {
     if (ggml_backend_is_rnpu(backend)) {
         // TODO: Event API
         // NPU_CHECK(npuStreamWaitEvent(rnpu_ctx->stream(), (npuEvent)event->context));
+        GGML_UNUSED(rnpu_ctx);
+        GGML_UNUSED(event);
         GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
     } else {
         GGML_ABORT("fatal error");

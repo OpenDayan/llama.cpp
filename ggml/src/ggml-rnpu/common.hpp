@@ -189,6 +189,11 @@ bool ggml_backend_buft_is_rnpu(ggml_backend_buffer_type_t buft);
 // rnpu-buf.cpp
 bool ggml_backend_buffer_is_rnpu(ggml_backend_buffer_t buffer);
 
+// Used by rnpu-reg.cpp
+extern const ggml_backend_device_i ggml_backend_rnpu_device_interface;
+// Used by rnpu-buf-type.cpp
+extern const ggml_backend_buffer_i ggml_backend_rnpu_buffer_interface;
+
 #ifdef  __cplusplus
 }
 #endif
