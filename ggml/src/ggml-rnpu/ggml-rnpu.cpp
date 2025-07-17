@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include "./runtime-host.hpp"
+
 #include "ggml-backend.h"
 #include "../ggml-impl.h"
 #include "../ggml-backend-impl.h"
@@ -25,8 +27,7 @@
  */
 [[noreturn]] void ggml_npu_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int32_t id = -1;
-    // TODO: get device API
-    // npurtGetDevice(&id);
+    npuGetDevice(&id);
 
     GGML_LOG_ERROR("R-NPU error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func,
@@ -43,8 +44,7 @@
  */
 int32_t ggml_rnpu_get_device() {
     int32_t id = 0;
-    // TODO: get device API
-    // NPU_CHECK(npurtGetDevice(&id));
+    npuGetDevice(&id);
     return id;
 }
 
@@ -54,11 +54,7 @@ int32_t ggml_rnpu_get_device() {
  * @param device The device ID to set.
  */
 void ggml_rnpu_set_device(const int32_t device) {
-    // FIXME: delete in the future (if support multi-device)
-    GGML_UNUSED(device);
-
-    // TODO: set device API
-    // NPU_CHECK(npurtSetDevice(device))
+    npuSetDevice(device);
 }
 
 /**
@@ -72,16 +68,15 @@ void ggml_rnpu_set_device(const int32_t device) {
 static ggml_rnpu_device_info ggml_rnpu_init() {
     ggml_rnpu_device_info info = {};
 
-    // TODO: device count API
-    // npuError err = npurtGetDeviceCount((uint32_t *)&info.device_count);
-    // if (err != NPU_SUCCESS) {
-    //     GGML_LOG_ERROR("%s: failed to initialize R-NPU: %s\n",
-    //                     __func__, npuGetErrorString());
-    //     return info;
-    // }
+    npuErr_t err = npurtGetDeviceCount((uint32_t *)&info.device_count);
+    if (err != npuSuccess) {
+        GGML_LOG_ERROR("%s: failed to initialize R-NPU: %s\n",
+                        __func__, npuGetErrorString(err));
+        return info;
+    }
 
     // FIXME: delete in the futre (if support multi-device)
-    info.device_count = 1;
+    GGML_ASSERT(info.device_count == 1);
     info.devices[0].cc = 0;
 
     GGML_ASSERT(info.device_count <= GGML_RNPU_MAX_DEVICES);

@@ -4,7 +4,10 @@
 #include <cstdint>
 #include <mutex>
 
+#include "./runtime-host.hpp"
+
 #include "../ggml-backend-impl.h"
+#include "../ggml-impl.h"
 
 #include "./common.hpp"
 #include "ggml.h"
@@ -45,22 +48,21 @@ ggml_backend_rnpu_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
     ggml_rnpu_set_device(buft_ctx->device);
 
     // TODO: Confirm if alloc alignment is needed.
-    // const size_t alignment = 128;
-    // size = GGML_PAD(size, alignment);
-    // if (size == 0) {
-    //     size = alignment;
-    // }
+    const size_t alignment = 128;
+    size = GGML_PAD(size, alignment);
+    if (size == 0) {
+        size = alignment;
+    }
 
     void * dev_ptr = NULL;
-    // TODO: Malloc API
-    // npuError_t err = npuMalloc(&dev_ptr, size);
-    // if (err != npuSuccess) {
-    //     // clear the error
-    //     (void)npuGetLastError();
-    //     GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: npuMalloc failed: %s\n",
-    //             __func__, size / 1024.0 / 1024.0, buft_ctx->device, npuGetErrorString(err));
-    //     return nullptr;
-    // }
+    npuErr_t err = npuMalloc(&dev_ptr, size);
+    if (err != npuSuccess) {
+        // clear the error
+        (void)npuGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: npuMalloc failed: %s\n",
+                __func__, size / 1024.0 / 1024.0, buft_ctx->device, npuGetErrorString(err));
+        return nullptr;
+    }
 
     ggml_backend_rnpu_buffer_context * ctx =
         new ggml_backend_rnpu_buffer_context(buft_ctx->device, dev_ptr);

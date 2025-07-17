@@ -2,7 +2,10 @@
 #include "ggml-backend.h"
 #include "ggml-rnpu.h"
 
+#include "./runtime-host.hpp"
+
 #include "../ggml-backend-impl.h"
+#include "../ggml-impl.h"
 #include "./common.hpp"
 #include "ggml.h"
 
@@ -29,8 +32,8 @@ static const char * ggml_backend_rnpu_host_buffer_type_name(
  * @param buffer Pointer to the host buffer
  */
 static void ggml_backend_rnpu_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    // TODO: free host API
-    // NPU_CHECK(npuFreeHost(buffer->context))
+    // TODO: buffer->context->host_prt ???
+    NPU_CHECK(npuFreeHost(buffer->context));
 }
 
 /**
@@ -52,13 +55,12 @@ static void * ggml_rnpu_host_malloc(size_t size) {
     }
 
     void * hostPtr = nullptr;
-    // TODO: malloc host API
-    // npuError err = npurtMallocHost((void **) &hostPtr, size);
-    // if (err != NPU_SUCCESS) {
-    //     GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__,
-    //                        size / 1024.0 / 1024.0, npuGetErrorString());
-    //     return nullptr;
-    // }
+    npuErr_t err = npuMallocHost((void **) &hostPtr, size);
+    if (err != npuSuccess) {
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s\n", __func__,
+                           size / 1024.0 / 1024.0, npuGetErrorString(err));
+        return nullptr;
+    }
     return hostPtr;
 }
 

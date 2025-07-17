@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "./runtime-host.hpp"
+
 #include "../ggml-backend-impl.h"
 
 #define GGML_RNPU_MAX_DEVICES 1
@@ -28,6 +30,10 @@
 #ifdef  __cplusplus
 extern "C" {
 #endif
+
+[[noreturn]] void ggml_npu_error(
+                    const char * stmt, const char * func,
+                    const char * file, int line, const char * msg);
 
 // -------------------------------------------------------------------
 // ------------------------- NPU device info -------------------------
@@ -158,7 +164,7 @@ struct ggml_backend_rnpu_buffer_context {
 
     ~ggml_backend_rnpu_buffer_context() {
         // TODO: runtime free API
-        // NPU_CHECK(cudartFree(dev_ptr))
+        NPU_CHECK(npuFree(dev_ptr));
     }
 };
 
@@ -167,10 +173,6 @@ struct ggml_backend_rnpu_buffer_context {
 // -------------------------------------------------------------------
 // --------------------- NPU common internal API ---------------------
 // -------------------------------------------------------------------
-
-[[noreturn]] void ggml_npu_error(
-                    const char * stmt, const char * func,
-                    const char * file, int line, const char * msg);
 
 void ggml_rnpu_set_device(int32_t device);
 

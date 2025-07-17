@@ -2,7 +2,10 @@
 #include "ggml-rnpu.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <string>
+
+#include "./runtime-host.hpp"
 
 #include "ggml-backend.h"
 #include "../ggml-backend-impl.h"
@@ -308,10 +311,10 @@ int32_t  ggml_backend_rnpu_get_device_count() {
 void ggml_backend_rnpu_get_device_description(
     int device, char * description, size_t description_size) {
     ggml_rnpu_set_device(device);
-    // TODO: NPU property API
-    // npuDeivceProp prop;
-    // NPU_CHECK(npuGetDeviceProperties(&prop, i))
-    // snprintf(description, description_size, "%s", prop.name);
+
+    npuDeviceProp prop;
+    NPU_CHECK(npuGetDeviceProperties(&prop, device));
+    snprintf(description, description_size, "%s", prop.name);
 }
 
 /**
@@ -325,8 +328,7 @@ void ggml_backend_rnpu_get_device_memory(
     int device, size_t * free, size_t * total) {
     ggml_rnpu_set_device(device);
 
-    // TODO: mem info API
-    // NPU_CHECK(npuMemGetInfo(free, total))
+    NPU_CHECK(npuMemGetInfo(free, total));
 }
 
 /**

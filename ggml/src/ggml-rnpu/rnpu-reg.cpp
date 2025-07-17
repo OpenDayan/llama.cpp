@@ -1,6 +1,8 @@
 #include "ggml-rnpu.h"
 #include <mutex>
 
+#include "./runtime-host.hpp"
+
 #include "../ggml-impl.h"
 #include "../ggml-backend-impl.h"
 
@@ -99,11 +101,10 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
                 dev_ctx->device = i;
                 dev_ctx->name = GGML_RNPU_NAME + std::to_string(i);
 
-                // TODO: NPU property API
-                // ggml_rnpu_set_device(i);
-                // npuDeivceProp prop;
-                // NPU_CHECK(npuGetDeviceProperties(&prop, i))
-                // dev_ctx->description = prop.name;
+                ggml_rnpu_set_device(i);
+                npuDeviceProp prop;
+                NPU_CHECK(npuGetDeviceProperties(&prop, i));
+                dev_ctx->description = prop.name;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_rnpu_device_interface,

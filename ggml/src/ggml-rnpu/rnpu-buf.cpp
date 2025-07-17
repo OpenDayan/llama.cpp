@@ -1,6 +1,8 @@
 #include "ggml-rnpu.h"
 #include <cstdint>
 
+#include "./runtime-host.hpp"
+
 #include "../ggml-backend-impl.h"
 
 #include "./common.hpp"
@@ -62,8 +64,8 @@ static enum ggml_status ggml_backend_rnpu_buffer_init_tensor(
 
         if (padded_size > original_size) {
             ggml_rnpu_set_device(ctx->device);
-            // TODO: Memset API
-            //NPU_CHECK(npuMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            // TODO: Use npuMemsetAsync with npuStream to optimize
+            NPU_CHECK(npuMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -86,8 +88,7 @@ static void ggml_backend_rnpu_buffer_memset_tensor(
 
     ggml_rnpu_set_device(ctx->device);
     // TODO: Use npuMemsetAsync with npuStream to optimize
-    // TODO: Memset API
-    // NPU_CHECK(npuMemset((char *)tensor->data + offset, value, size));
+    NPU_CHECK(npuMemset((char *)tensor->data + offset, value, size));
 }
 
 /**
@@ -107,8 +108,7 @@ static void ggml_backend_rnpu_buffer_set_tensor(
 
     ggml_rnpu_set_device(ctx->device);
     // TODO: Use npuMemcpyAsync with npuStream to optimize
-    // TODO: Memcpy API
-    // NPU_CHECK(npuMemcpy((char *)tensor->data + offset, data, size, npuMemcpyHostToDevice));
+    NPU_CHECK(npuMemcpy((char *)tensor->data + offset, data, size, npuMemcpyHostToDevice));
 }
 
 /**
@@ -128,8 +128,7 @@ static void ggml_backend_rnpu_buffer_get_tensor(
 
     ggml_rnpu_set_device(ctx->device);
     // TODO: Use npuMemcpyAsync with npuStream to optimize
-    // TODO: Memcpy API
-    // NPU_CHECK(npuMemcpy(data, (char *)tensor->data + offset, size, npuMemcpyDeviceToHost));
+    NPU_CHECK(npuMemcpy(data, (char *)tensor->data + offset, size, npuMemcpyDeviceToHost));
 }
 
 /**
@@ -153,19 +152,18 @@ static bool ggml_backend_rnpu_buffer_cpy_tensor(
 
         if (src_ctx->device == dst_ctx->device) {
             // TODO: Use npuMemcpyAsync with npuStream to optimize
-            // TODO: Memcpy API
-            // NPU_CHECK(npuMemcpy((char *)dst->data, memcpy_size,
-            //                     (const char *)src->data, memcpy_size, npuMemcpyDeviceToDevice))
+            NPU_CHECK(npuMemcpy((char *)dst->data, (const char *)src->data,
+                                memcpy_size, npuMemcpyDeviceToDevice));
         } else {
             // TODO: support different device access by peer
             // TODO: peer API
-            // int32_t canAccessPeer = 0;
-            // NPU_CHECK(npuDeviceCanAccessPeer(&canAccessPeer, src_ctx->device,
-            //                                  dst_ctx->device));
+            int32_t canAccessPeer = 0;
+            NPU_CHECK(npuDeviceCanAccessPeer(&canAccessPeer, src_ctx->device,
+                                             dst_ctx->device));
             // if (canAccessPeer) {
             //     ggml_rnpu_set_device(src_ctx->device);
             //     NPU_CHECK(npuDeviceEnablePeerAccess(dst_ctx->device, 0));
-            //     NPU_CHECK(npuMemcpy((char *)dst->data, memcpy_size,
+            //     NPU_CHECK(npuMemcpyPeer((char *)dst->data, memcpy_size,
             //                         (const char *)src->data, memcpy_size,
             //                         npuMemcpyDeviceToDevice))
             //     return true;
@@ -187,10 +185,9 @@ static void ggml_backend_rnpu_buffer_clear(
         (ggml_backend_rnpu_buffer_context*)buffer->context;
 
     ggml_rnpu_set_device(ctx->device);
-    // TODO: Memset API
-    // NPU_CHECK(npuDeviceSynchronize())
-    // NPU_CHECK(npuMemset(ctx->dev_ptr, buffer->size, value, buffer->size));
-    // NPU_CHECK(npuDeviceSynchronize())
+    NPU_CHECK(npuDeviceSynchronize());
+    NPU_CHECK(npuMemset(ctx->dev_ptr, value, buffer->size));
+    NPU_CHECK(npuDeviceSynchronize());
 }
 
 const ggml_backend_buffer_i ggml_backend_rnpu_buffer_interface = {

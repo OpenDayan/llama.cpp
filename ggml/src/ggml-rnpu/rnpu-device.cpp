@@ -2,6 +2,7 @@
 #include "ggml-rnpu.h"
 // #include "ggml-backend.h"
 #include "../ggml-backend-impl.h"
+#include "../ggml-impl.h"
 
 #include "./common.hpp"
 #include "ggml.h"
@@ -74,14 +75,12 @@ static void ggml_backend_rnpu_device_get_props(
     ggml_backend_rnpu_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
     bool host_buffer = getenv("GGML_RNPU_NO_PINNED") == nullptr;
-    // TODO: confirm whether R-NPU support event properties.
-    bool events = false;
 
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ false, // TODO: support async op in the future
         /* .host_buffer           = */ host_buffer,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ events,
+        /* .events                = */ false, // TODO: support evnets in the future
     };
 }
 
@@ -305,6 +304,7 @@ static ggml_backend_event_t ggml_backend_rnpu_device_event_new(
                                 ggml_backend_dev_t dev) {
     // TODO: support NPU Event in the future
     GGML_UNUSED(dev);
+    GGML_LOG_ERROR("[ERROR] R-NPU device interface %s is not supported!\n", __func__);
     return nullptr;
 }
 
@@ -313,6 +313,7 @@ static void ggml_backend_rnpu_device_event_free(
     // TODO: support NPU Event in the future
     GGML_UNUSED(dev);
     GGML_UNUSED(event);
+    GGML_LOG_ERROR("[ERROR] R-NPU device interface %s is not supported!\n", __func__);
 }
 
 static void ggml_backend_rnpu_device_event_synchronize(
@@ -320,6 +321,7 @@ static void ggml_backend_rnpu_device_event_synchronize(
     // TODO: support NPU Event in the future
     GGML_UNUSED(dev);
     GGML_UNUSED(event);
+    GGML_LOG_ERROR("[ERROR] R-NPU device interface %s is not supported!\n", __func__);
 }
 
 /**
@@ -330,7 +332,6 @@ static void ggml_backend_rnpu_device_event_synchronize(
  * acquisition of the buffer type, device support test, and event management.
  */
 const ggml_backend_device_i ggml_backend_rnpu_device_interface = {
-    // TODO:
     /* .get_name                = */ ggml_backend_rnpu_device_get_name,
     /* .get_description         = */ ggml_backend_rnpu_device_get_description,
     /* .get_memory              = */ ggml_backend_rnpu_device_get_memory,
