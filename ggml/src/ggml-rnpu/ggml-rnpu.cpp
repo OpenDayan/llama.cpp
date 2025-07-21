@@ -163,6 +163,8 @@ bool ggml_rnpu_compute_forward(ggml_backend_rnpu_context& ctx,
         case GGML_OP_SOFT_MAX:
             ggml_rnpu_softmax(ctx, dst);
             break;
+        case GGML_OP_NONE:
+            break;
         // TODO: support remainig op
         default:
             return false;

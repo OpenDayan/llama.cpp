@@ -220,6 +220,7 @@ static bool ggml_backend_rnpu_device_supports_op(
         // TODO: support implicit DUP op (CPY and CONT already use DUP)
         case GGML_OP_DUP:
             return false;
+        case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
@@ -234,7 +235,6 @@ static bool ggml_backend_rnpu_device_supports_op(
         // case GGML_OP_IM2COL:
         // case GGML_OP_CONCAT:
         // case GGML_OP_REPEAT:
-        // case GGML_OP_NONE:
         // case GGML_OP_NORM:
         // case GGML_OP_ADD1:
         // case GGML_OP_SUB:
