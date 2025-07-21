@@ -2,9 +2,11 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <iostream>
 #include <cstdlib>
 #include <cstdint>
 
+#include "ggml-impl.h"
 #include "runtime-host.hpp"
 
 const char * npuGetErrorString(npuErr_t error) {
@@ -17,6 +19,7 @@ const char * npuGetLastError() {
 npuErr_t npuGetDeviceProperties(npuDeviceProp * prop, int device){
     (void)(device);
     prop->name = "RNPU-0";
+    return npuSuccess;
 }
 
 void npuSetDevice(int device) {
@@ -45,12 +48,25 @@ npuErr_t npuDeviceSynchronize() {
     return npuSuccess;
 }
 
-npuErr_t npuMalloc(void ** ptr, size_t size) {
-    void * res = malloc(size);
-    *ptr = res;
 
-    if (res == nullptr)
+#define DEVICE_MALIGNMENT 128
+#define HOST_MALIGNMENT 128
+npuErr_t npuMalloc(void ** ptr, size_t size) {
+    if (size == 0) {
+        *ptr = nullptr;
+        return npuSuccess;
+    }
+
+    const int alignment = 128;
+    void * alloc_ptr = nullptr;
+    int result = posix_memalign(&alloc_ptr, alignment, size);
+
+    if (result != 0) {
+        *ptr = nullptr;
         return npuError;
+    }
+
+    *ptr = alloc_ptr;
 
     return npuSuccess;
 }
@@ -62,11 +78,21 @@ npuErr_t npuFree(void * ptr) {
 }
 
 npuErr_t npuMallocHost(void ** ptr, size_t size) {
-    void * res = malloc(size);
-    *ptr = res;
+    if (size == 0) {
+        *ptr = nullptr;
+        return npuSuccess;
+    }
 
-    if (res == nullptr)
+    const int alignment = 128;
+    void * alloc_ptr = nullptr;
+    int result = posix_memalign(&alloc_ptr, alignment, size);
+
+    if (result != 0) {
+        *ptr = nullptr;
         return npuError;
+    }
+
+    *ptr = alloc_ptr;
 
     return npuSuccess;
 }
@@ -92,7 +118,7 @@ npuErr_t npuMemcpy(void * dst, const void * src, size_t size, npuMemcpy_t kind) 
     if (kind == npuMemcpyHostToDevice ||
         kind == npuMemcpyDeviceToDevice ||
         kind == npuMemcpyDeviceToHost) {
-        void * res = memcpy(dst, src, size);
+        res = memcpy(dst, src, size);
     }
 
     if (res != dst) {
@@ -103,7 +129,7 @@ npuErr_t npuMemcpy(void * dst, const void * src, size_t size, npuMemcpy_t kind) 
 }
 
 npuErr_t npuMemGetInfo(size_t * free, size_t * total) {
-    *free = 1024L * 1024 * 1024; // FIXME: always have 1GB free memory
+    *free = 16 * 1024L * 1024L * 1024L; // FIXME: always have 1GB free memory
     *total = 16 * 1024L * 1024L * 1024L; // 16GB total memory
     return npuSuccess;
 }
