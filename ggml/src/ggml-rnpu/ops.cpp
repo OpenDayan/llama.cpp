@@ -608,9 +608,223 @@ void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
 }
 
-void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+
+static const int QK = 256;
+
+struct block_e4m3_q{
+    float scale;
+    uint8_t data[QK];
+};
+
+static uint16_t fp32_to_bf16(float f) {
+    uint16_t res;
+    union {
+        float value;
+        uint32_t bits;
+    } fp32;
+    fp32.value = f;
+    if ((fp32.bits & 0x7fffffff) > 0x7f800000) { /* nan */
+        res = (fp32.bits >> 16) | 64; /* force to quiet */
+        return res;
+    }
+    res = (fp32.bits + (0x7fff + ((fp32.bits >> 16) & 1))) >> 16;
+    return res;
+}
+
+static float bf16_to_fp32(uint16_t h) {
+    union {
+        float value;
+        uint32_t bits;
+    } fp32;
+    fp32.bits = (static_cast<uint32_t>(h) << 16);
+    return fp32.value;
+}
+
+static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+    int h0 = src0->ne[2];
+
+    int rbs = bs / src0->ne[3];
+    int rj = h / src0->ne[2];
+    assert(bs >= src0->ne[3]);
+    assert(h >= src0->ne[2]);
+
+    int n = src0->ne[1];
+    int m = src1->ne[1];
+    int k = src1->ne[0];
+    assert(src1->ne[0] == src0->ne[0]);
+
+    uint16_t * a = (uint16_t *) src0->data;
+    float * b = (float *) src1->data;
+    float * res = (float *) dst->data;
+    for (int i = 0; i < bs; ++i) {
+        for (int j = 0; j < h; ++j) {
+            // broadcast in dim(0)
+            int i0 = i / rbs;
+            // broadcase in dim(1)
+            int j0 = j / rj;
+
+            // b[i][j][:][:] * a[i0][j0][:][:]^T
+            for (int p = 0; p < m; ++p) {
+                for (int l = 0; l < n; ++l) {
+                    double val = 0.0;
+                    // res[i][j][p][l] = b[i][j][p][:] * a[i0][j0][l][:]^T
+                    for (int x = 0; x < k; ++x) {
+                        uint16_t ea = a[(i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1] + x*src0->nb[0]) / sizeof(uint16_t)];
+                        float eb = b[(i*src1->nb[3] + j*src1->nb[2] + p*src1->nb[1] + x*src1->nb[0]) / sizeof(float)];
+                        // b[...] is converted to bf16 then converted to fp32
+                        val += (double)(bf16_to_fp32(ea) * bf16_to_fp32(fp32_to_bf16(eb)));
+                    }
+                    // double to float cast
+                    res[i*h*m*n + j*m*n + p*n + l] = val;
+                }
+            }
+        }
+    }
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+}
+
+union fp32_int32 {
+    float f;
+    uint32_t bits;
+};
+
+// (2 - std::exp2(-M + 1)) * std::exp2(std::exp2(E - 1)) = (2 - 2**(-2)) *(2**(2**(3))) = (2 - 2**(-2)) * 2**(8)
+static const float e4m3q_max = (2 - std::exp2(-2)) * (std::exp2(8));
+
+// (std::exp2(-M)) * (std::exp2(2 - std::exp2(E - 1))) = (2**(-3)) * (2**(2 - 2**3)) = 2**(-9)
+static const float e4m3q_min = std::exp2(-3) * std::exp2(-6);
+static uint8_t float_to_e4m3q(float h) {
+    uint8_t out;
+    fp32_int32 in = {h};
+    out = (in.bits >> 24) & 0x80;
+    in.bits &= 0x7fffffff;
+    if (in.f >= e4m3q_max) {
+        out |= 0x7E;
+    } else if (in.f < e4m3q_min) { // => 0.
+    } else {
+        in.f *= std::exp2(7 - 127); // E==4 in e4m3q, so E_BIAS = 2^(E-1) - 1 = 7
+        uint32_t eps = (0x3fffff>>3) + ((in.bits >> (23-3)) & 0x1);
+        in.bits += eps;
+        out |= (in.bits >> (23-3)) & 0x7F;
+    }
+    return out;
+}
+
+static float e4m3q_to_float(uint8_t h) {
+    fp32_int32 out = {0};
+    out.bits = h & 0x80;
+    out.bits <<= 24;
+    uint32_t h_bits = h & 0x7F;
+    h_bits <<= (23 - 3); // 23 - FP8::M (M==3 in e4m3q)
+    out.bits |= h_bits;
+    // 2^(127 - FP8::E_BIAS)
+    out.f *= std::pow(2, 127 - 7); // E==4 in e4m3q, so E_BIAS = 2^(E-1) - 1 = 7
+    return out.f;
+}
+
+static void block_float_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8) {
+    float m = 0;
+    for (int i = 0; i < QK; ++i) {
+        m = std::max(std::abs(b_f32[i]),m);
+    }
+
+    const float D = e4m3q_max / m;
+
+    // set dequantize scale
+    b_fp8->scale = m / e4m3q_max;
+
+    for (int i = 0; i < QK; ++i) {
+        b_fp8->data[i] = float_to_e4m3q(b_f32[i] * D);
+    }
+}
+
+static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+
+    assert(src1->ne[3] == src0->ne[3]);
+    assert(src1->ne[2] == src0->ne[2]);
+
+    int n = src0->ne[1];
+    int m = src1->ne[1];
+    int k = src1->ne[0];
+    assert(src1->ne[0] == src0->ne[0]);
+    assert(k % QK == 0);
+    // rowsize = sizeof block scales + sizeof block data
+    int row_size = (k/QK)*sizeof(float) + k;
+
+    uint8_t * a = (uint8_t *) src0->data;
+    float * b = (float *) src1->data;
+    float * res = (float *) dst->data;
+    for (int i = 0; i < bs; ++i) {
+        for (int j = 0; j < h; ++j) {
+            for (int p = 0; p < m; ++p) {
+                for (int l = 0; l < n; ++l) {
+                    float dot_sum = 0.0; // DOT SUM
+
+                    // vector-dot loop
+                    for (int ib = 0; ib < k/QK; ++ib) {
+                        float block_sum = 0.0f; // BLOCK_SUM
+
+                        // get A block (fp8)
+                        block_e4m3_q * a_block_fp8 = (block_e4m3_q *)(a + i*h*n*row_size + j*n*row_size + l*row_size + ib*sizeof(block_e4m3_q));
+
+                        // get B block (fp32)
+                        float * b_block_f32 = b + i*h*m*k + j*m*k + p*k + (ib*QK);
+
+                        // transfer B block (to fp8)
+                        static struct block_e4m3_q b_block_fp8;
+                        block_float_to_e4m3q(b_block_f32, &b_block_fp8);
+
+                        // in-block loop
+                        for (int x = 0; x < QK; ++x) {
+                            float ea = e4m3q_to_float(a_block_fp8->data[x]);
+                            float eb = e4m3q_to_float(b_block_fp8.data[x]);
+                            block_sum += ea * eb;
+                        }
+
+                        // add block sum to dot sum (with scaling)
+                        float scale_a = a_block_fp8->scale;
+                        float scale_b = b_block_fp8.scale;
+                        dot_sum += scale_a * scale_b * block_sum;
+                    }
+
+                    // vector-dot result
+                    res[i*h*m*n + j*m*n + p*n + l] = dot_sum;
+                }
+            }
+        }
+    }
+    GGML_UNUSED(ctx);
+}
+
+void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_BF16:
+            ggml_rnpu_matmul_bf16(ctx, dst);
+            break;
+        case GGML_TYPE_E4M3_Q:
+            ggml_rnpu_matmul_e4m3q(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
 }
