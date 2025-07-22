@@ -1,3 +1,6 @@
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "../ggml-impl.h"
@@ -5,102 +8,604 @@
 #include "./ops.hpp"
 #include "ggml.h"
 
-void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_get_rows_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    // source tensor
+    int bs0 = src0->ne[3];
+    int h0 = src0->ne[2];
+    int n0 = src0->ne[1];
+    int m0 = src0->ne[0];
+
+    // index tensor
+    int bs1 = src1->ne[3];
+    int h1 = src1->ne[2];
+    int n1 = src1->ne[1];
+    int m1 = src1->ne[0];
+
+    assert((bs0 == h1) && (h0 == n1));
+    assert(bs1 == 1);
+
+    uint16_t * a = (uint16_t *)src0->data;
+    int * b = (int *)src1->data;
+    float * res = (float *)dst->data;
+    for (int j = 0; j < h1; ++j)
+        for (int k = 0; k < n1; ++k)
+            for (int p = 0; p < m1; ++p) {
+                // row_idx = b[0][j][k][p]
+                int row_idx = b[j*n1*m1 + k*m1 + p];
+                if (row_idx < 0 || row_idx > n0) {
+                    GGML_ABORT( "[ERROR] invalid row_idx value: %d\n", row_idx);
+                    return;
+                }
+                // res[j][k][p][:] = a[j][k][row_idx][:]
+                for (int l = 0; l < m0; l++) {
+                    uint32_t val_u32 = (uint32_t)a[j*h0*n0*m0 + k*n0*m0 + row_idx*m0 + l];
+                    val_u32 <<= 16;
+                    float val_f32;
+                    std::memcpy(&val_f32, &val_u32, sizeof(float));
+                    res[j*n1*m1*m0 + k*n1*m1 + p*m0 + l] = val_f32;
+                }
+
+            }
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+}
+
+static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    // source tensor
+    int bs0 = src0->ne[3];
+    int h0 = src0->ne[2];
+    int n0 = src0->ne[1];
+    int m0 = src0->ne[0];
+
+    // index tensor
+    int bs1 = src1->ne[3];
+    int h1 = src1->ne[2];
+    int n1 = src1->ne[1];
+    int m1 = src1->ne[0];
+
+    assert((bs0 == h1) && (h0 == n1));
+    assert(bs1 == 1);
+
+    uint16_t * a = (uint16_t *)src0->data;
+    int * b = (int *)src1->data;
+    float * res = (float *)dst->data;
+    for (int j = 0; j < h1; ++j)
+        for (int k = 0; k < n1; ++k)
+            for (int p = 0; p < m1; ++p) {
+                // row_idx = b[0][j][k][p]
+                int row_idx = b[j*n1*m1 + k*m1 + p];
+                if (row_idx < 0 || row_idx > n0) {
+                    GGML_ABORT("[ERROR] invalid row_idx value: %d\n", row_idx);
+                    return;
+                }
+                // res[j][k][p][:] = a[j][k][row_idx][:]
+                for (int l = 0; l < m0; l++) {
+                    res[j*n1*m1*m0 + k*n1*m1 + p*m0 + l] = a[j*h0*n0*m0 + k*n0*m0 + row_idx*m0 + l];
+                }
+            }
+    GGML_UNUSED(ctx);
+}
+
+void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_BF16:
+            ggml_rnpu_get_rows_bf16(ctx, dst);
+            break;
+        case GGML_TYPE_F32:
+            ggml_rnpu_get_rows_f32(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op GET_ROWS in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
 }
 
 void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // TODO: Only support f32 add
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ABORT("FATAL ERROR: type %s not supported for op ADD in R-NPU\n",
+                    ggml_type_name(src0->type));
+    }
+
+    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // src0 and src1 must be contiguous
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    for (int i = 0; i < bs; ++i) {
+        int i1 = src1->ne[3] == 1 ? 0 : i;
+        for (int j = 0; j < h; ++j) {
+            int j1 = src1->ne[2] == 1 ? 0 : i;
+            for (int k = 0; k < n; ++k) {
+                int k1 = src1->ne[1] == 1 ? 0 : k;
+                for (int p = 0; p < m; ++p) {
+                    int p1 = src1->ne[0] == 1 ? 0 : p;
+                    ((float *)dst->data)[i * h * n * m + j * n * m + k * m + p] =
+                        ((float *)src0->data)[i * h * n * m + j * n * m + k * m + p] +
+                        ((float* )src1->data)[i1* h * n * m + j1 * n * m + k1 * m + p1];
+                }
+            }
+        }
+    }
+
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
 }
 
 void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // TODO: Only support f32 mul
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ABORT("FATAL ERROR: type %s not supported for op MUL in R-NPU\n",
+                    ggml_type_name(src0->type));
+    }
+
+    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // src0 and src1 must be contiguous
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    for (int i = 0; i < bs; ++i) {
+        int i1 = src1->ne[3] == 1 ? 0 : i;
+        for (int j = 0; j < h; ++j) {
+            int j1 = src1->ne[2] == 1 ? 0 : i;
+            for (int k = 0; k < n; ++k) {
+                int k1 = src1->ne[1] == 1 ? 0 : k;
+                for (int p = 0; p < m; ++p) {
+                    int p1 = src1->ne[0] == 1 ? 0 : p;
+                    ((float *)dst->data)[i * h * n * m + j * n * m + k * m + p] =
+                        ((float *)src0->data)[i * h * n * m + j * n * m + k * m + p] *
+                        ((float* )src1->data)[i1* h * n * m + j1 * n * m + k1 * m + p1];
+                }
+            }
+        }
+    }
+
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+}
+
+static void rope_cache_init(std::vector<float>& cache,
+                     float theta_base, float theta_scale,
+                     float freq_scale,
+                     int m,
+                     //  float * corr_dims = NULL, // useless in qwen2
+                     //  float * freq_factor = NULL, // freq_factor is always NULL in qwen2
+                     //  float ext_factor = 0.0f, // // ext_factor is always 0.0f in qwen2
+                     float mscale = 1.0f, // mscale == attn_factor is always 1.0f in qwen2
+                     float sin_sign = 1.0f // sin_sign is always 1.0f in forward computing
+                     ) {
+    float theta = theta_base;
+    for (size_t i = 0; i < (size_t)m; i += 2) {
+        // const float ff = freq_factors ? freq_factors[i/2] : 1.0f;
+        const float ff = 1.0f;
+
+        // YaRN
+        // float theta_extrap = theta / ff;
+        float theta_interp = freq_scale * (theta / ff);
+        // if (ext_factor != 0.0f) ...
+        cache[i] = std::cos(theta_interp) * mscale;
+        cache[i + 1] = std::sin(theta_interp) * mscale;
+
+        cache[i + 1] *= sin_sign;
+        theta *= theta_scale;
+    }
 }
 
 void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // TODO: Only support f32 rope
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ABORT("FATAL ERROR: type %s not supported for op RoPE in R-NPU\n",
+                    ggml_type_name(src0->type));
+    }
+
+    int sections[4];
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+
+    //const int n_past     = ((int32_t *) dst->op_params)[0];
+    const int n_dims     = ((int32_t *) dst->op_params)[1];
+    const int mode       = ((int32_t *) dst->op_params)[2];
+    //const int n_ctx      = ((int32_t *) dst->op_params)[3];
+    const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+    memcpy(&sections,    (int32_t *) dst->op_params + 11, sizeof(int)*4);
+
+    // TODO: Only support specified params
+    GGML_ASSERT(mode == GGML_ROPE_TYPE_NEOX);
+    GGML_ASSERT(attn_factor == 1.0f);
+    GGML_ASSERT(ext_factor == 0.0f);
+    GGML_UNUSED(n_ctx_orig);
+    GGML_UNUSED(sections);
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
+
+    std::vector<float> cache;
+    cache.resize(src0->ne[0]);
+
+    for (int i = 0; i < bs; ++i) { // batch
+        for (int j = 0; j < h; ++j) { // seq-len
+            int64_t p = ((int32_t *)src1->data)[j];
+            rope_cache_init(cache, p, theta_scale,
+                            static_cast<float>(freq_scale), dst->ne[0]);
+            for (int k = 0; k < n; ++k) { // attn-heads
+                // fill res[i][j][k][:prope.n_dims]
+                for (int p = 0; p < n_dims; p += 2) {
+                    const int64_t ic = p / 2;
+                    const float cos_theta = cache[p];
+                    const float sin_theta = cache[p + 1];
+
+                    const float x0 = ((float *)src0->data)[i*h*n*m + j*n*m + k*m + ic];
+                    const float x1 = ((float *)src0->data)[i*h*n*m + j*n*m + k*m + ic + n_dims / 2];
+
+                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + ic] =
+                                                    (x0*cos_theta) - (x1*sin_theta);
+                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + ic + n_dims / 2] =
+                                                    (x0*sin_theta) + (x1*cos_theta);
+                }
+
+                // fill remain res[i][j][k][prope.n_dims:]
+                for (size_t p = n_dims; p < (size_t)m; p += 2) {
+                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + p] =
+                            ((float *)src0->data)[i*h*n*m + j*n*m + k*m + p];
+                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + p + 1] =
+                            ((float *)src0->data)[i*h*n*m + j*n*m + k*m + p + 1];
+                }
+            }
+        }
+    }
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+}
+
+static uint16_t f32_to_bf16(float h) {
+    uint16_t res;
+    union {
+        float value;
+        uint32_t bits;
+    } fp32;
+    fp32.value = h;
+    if ((fp32.bits & 0x7fffffff) > 0x7f800000) { /* nan */
+        res = (fp32.bits >> 16) | 64; /* force to quiet */
+        return res;
+    }
+    res = (fp32.bits + (0x7fff + ((fp32.bits >> 16) & 1))) >> 16;
+    return res;
+}
+
+static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+
+    if (ggml_is_contiguous(src0)) {
+        if (ggml_is_contiguous(dst)) {
+            // dup_cont_f32_cont_bf16
+            for (int i = 0; i < bs; ++i)
+                for (int j = 0; j < h; ++j)
+                    for (int k = 0; k < n; ++k)
+                        for (int p = 0; p < m; ++p)
+                            ((uint16_t *)dst->data)[i*h*n*m + j*n*m + k*m + p] =
+                                f32_to_bf16(((float *)src0->data)[i*h*n*m + j*n*m + k*m + p]);
+        } else {
+            // dup_cont_f32_no_cont_bf16
+            for (int i = 0; i < bs; ++i)
+                for (int j = 0; j < h; ++j)
+                    for (int k = 0; k < n; ++k)
+                        for (int p = 0; p < m; ++p)
+                            ((uint16_t *)dst->data)[i*dst->nb[3]/sizeof(uint16_t) +
+                                                    j*dst->nb[2]/sizeof(uint16_t) +
+                                                    k*dst->nb[1]/sizeof(uint16_t) +
+                                                    p*dst->nb[0]/sizeof(uint16_t)] =
+                                    f32_to_bf16(((float *)src0->data)[i*h*n*m + j*n*m + k*m + p]);
+        }
+    } else {
+        // TODO: Not support dup_no_cont_f32_cont_bf16
+        if (ggml_is_contiguous(dst)) {
+            GGML_ABORT("FATAL ERROR: Non-Contiguous BF16 destination is not supported for"
+                       "op DUP in R-NPU\n");
+        } else {
+            // dup_no_cont_f32_no_cont_bf16
+            for (int i = 0; i < bs; ++i)
+                for (int j = 0; j < h; ++j)
+                    for (int k = 0; k < n; ++k)
+                        for (int p = 0; p < m; ++p)
+                            ((uint16_t *)dst->data)[i*dst->nb[3]/sizeof(uint16_t) +
+                                                    j*dst->nb[2]/sizeof(uint16_t) +
+                                                    k*dst->nb[1]/sizeof(uint16_t) +
+                                                    p*dst->nb[0]/sizeof(uint16_t)] =
+                                    f32_to_bf16(((float *)src0->data)[i*src0->nb[3]/sizeof(float) +
+                                                                        j*src0->nb[2]/sizeof(float) +
+                                                                        k*src0->nb[1]/sizeof(float) +
+                                                                        p*src0->nb[0]/sizeof(float)]);
+        }
+    }
+
+    GGML_UNUSED(ctx);
+}
+
+static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
+    GGML_TENSOR_UNARY_OP_LOCALS;
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    for (int i = 0; i < bs; ++i) {
+        for (int j = 0; j < h; ++j) {
+            for (int k = 0; k < n; ++k) {
+                for (int p = 0; p < m; ++p) {
+                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + p] =
+                        ((float *)src0->data)[i*h*n*m + j*n*m + k*m + p];
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(ctx);
 }
 
 void ggml_rnpu_dup(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+    const ggml_tensor * src0 = dst->src[0];
+    // TODO: Only support copy from fp32 tensor.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+
+    switch (dst->type) {
+        case GGML_TYPE_BF16:
+            ggml_rnpu_dup_f32_bf16(ctx, dst);
+            break;
+        case GGML_TYPE_F32:
+            ggml_rnpu_dup_f32_f32(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op DUP in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
 }
 
 void ggml_rnpu_cpy(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+    ggml_rnpu_dup(ctx, dst);
 }
 
 void ggml_rnpu_cont(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    ggml_rnpu_dup(ctx, dst);
 }
 
 void ggml_rnpu_reshape(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+    // Empty op
 }
 
 void ggml_rnpu_view(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+    // Empty op
 }
 
 void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int axis0 = ((int32_t *) dst->op_params)[0];
+    const int axis1 = ((int32_t *) dst->op_params)[1];
+    const int axis2 = ((int32_t *) dst->op_params)[2];
+    const int axis3 = ((int32_t *) dst->op_params)[3];
+
+    // TODO: Only support fp32 permute
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    // TODO: Only support permute(1,2)
+    GGML_ASSERT(axis0 == 0 && axis1 == 2 && axis2 == 1 && axis3 == 3);
+
+    int bs = src0->ne[3];
+    int n = src0->ne[2];
+    int h = src0->ne[1];
+    int w = src0->ne[0];
+
+    int row_size = w * sizeof(float);
+
+    char * a = (char *) src0->data;
+    char * res = (char *) dst->data;
+    for (int i = 0; i < bs; ++i) {
+        for (int j = 0; j < n; ++j) {
+            for (int k = 0; k < h; ++k) {
+                // Copy a[i][j][k][:] to res[i][k][j][:]
+                const char * a_ptr = (char *)a + k*src0->nb[1] + j*src0->nb[2] + i*src0->nb[3];
+                size_t id = (k*n + j) * row_size;
+                std::memcpy((char *)res + id, a_ptr, row_size);
+            }
+        }
+    }
+
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
 }
 
 void ggml_rnpu_transpose(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
+    // Empty op
 }
 
 void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    // TODO: Only support fp32 RMS_NORM
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+
+    int b = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    float * res = (float *)dst->data;
+    float * a = (float *)src0->data;
+
+    for (int i = 0; i < (b * h * n); ++i) {
+        double sum = 0.0;
+        for (int j = 0; j < m; ++j) {
+            sum += (double)(a[i * m + j] * a[i * m + j]);
+        }
+        float mean = (float)(sum / m);
+        for (int j = 0; j < m; ++j) {
+            res[i * m + j] = a[i * m + j];
+            res[i * m + j] *= 1.0f/std::sqrt(mean + eps);
+        }
+    }
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
 }
 
 void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // TODO: Only support fp32 Softmax
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
+
+    const int bs          = src0->ne[3];
+    const uint32_t h      = src0->ne[2];
+    const int n           = src0->ne[1];
+    const int m           = src0->ne[0];
+    const uint32_t h_log2 = 1u << (uint32_t) floor(log2(h));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / h_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / h_log2);
+
+    float * a = (float *)src0->data;
+    float * b = (float *)src1->data;
+    float * res = (float *)dst->data;
+    for (int i = 0; i < bs; ++i) { // batch
+        for (int j = 0; j < (h * n); ++j) { // attn-heads * seq_len
+            const uint32_t hidx = (j / n); // current head idx
+            // const float slope = (max_bias > 0.0f) ? h < h_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - h_log2) + 1) : 1.0f;
+            const float slope = 1.0f; // only support max_bias == 0.0f in qwen2
+
+            // scale
+            // a[i][j][k][:] *= scale
+            for (int p = 0; p < m; ++p) {
+                a[i*h*n*m + j*m + p] = double(a[i*h*n*m + j*m + p]) * double(scale);
+            }
+
+            // mask
+            // a[i][j][k][:] += slope * b[i][0][k][:]
+            for (int p = 0; p < m; ++p) {
+                a[i*h*n*m + j*m + p] += slope * b[i*h*n*m + (j%n)*m + p];
+            }
+
+            // get max value for dim[-1]
+            // maxval = max(x(i))
+            float maxval = -INFINITY;
+
+            for (int p = 0; p < m; ++p) {
+                if (a[i*h*n*m + j*m + p] > maxval)
+                    maxval = a[i*h*n*m + j*m + p];
+            }
+
+            // a[i][j][k][:] -= max
+            // x(i) = e^(x(i) - max)
+            // sum = 1 / (sum of e^(x(i) - max))
+            double sum = 0.0f;
+            for (int p = 0; p < m; ++p) {
+                float val = std::exp(a[i*h*n*m + j*m + p] - maxval);
+                sum += (double)val;
+                res[i*h*n*m + j*m + p] = val;
+            }
+            sum = 1.0 / sum;
+
+            // res[i][j][k][:] *= 1/sum
+            // x(i) = e^(x(i) - max) / (sum of e^(x(i) - max))
+            for (int p = 0; p < m; ++p) {
+                res[i*h*n*m + j*m + p] *= (float)sum;
+            }
+        }
+    }
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
 }
 
 void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    // TODO: Only support fp32 SiLU
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(ggml_is_contiguous_1(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    size_t src0_size = ggml_nelements(src0);
+
+    for (size_t i = 0; i < src0_size; ++i) {
+        float x = ((float *)src0->data)[i];
+        ((float *)dst->data)[i] = x / (1.0f + std::exp(-x));;
+    }
+
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
-    GGML_LOG_ERROR("[ERROR] R-NPU ops %s is not implemented!\n", __func__);
-    // TODO: impl
 }
 
 void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
