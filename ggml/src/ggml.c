@@ -3244,6 +3244,51 @@ struct ggml_tensor * ggml_view_4d(
 
 // ggml_permute
 
+// FIXME: We need real data movement in permute(2,1) fp32, so we need allocate
+//        new tensor with no inplace mode.
+static struct ggml_tensor * ggml_permute_2_1_f32(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * a,
+    int                   axis0,
+    int                   axis1,
+    int                   axis2,
+    int                   axis3
+) {
+    int64_t ne[GGML_MAX_DIMS];
+    int nb[GGML_MAX_DIMS];
+
+    ne[axis0] = a->ne[0];
+    ne[axis1] = a->ne[1];
+    ne[axis2] = a->ne[2];
+    ne[axis3] = a->ne[3];
+
+    nb[0] = a->nb[0];
+    nb[1] = nb[0] * ne[0];
+    nb[2] = nb[1] * ne[1];
+    nb[3] = nb[2] * ne[2];
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, 4, ne);
+    ggml_format_name(result, "%s (permuted)", a->name);
+
+    result->ne[0] = ne[0];
+    result->ne[1] = ne[1];
+    result->ne[2] = ne[2];
+    result->ne[3] = ne[3];
+
+    result->nb[0] = nb[0];
+    result->nb[1] = nb[1];
+    result->nb[2] = nb[2];
+    result->nb[3] = nb[3];
+
+    result->op     = GGML_OP_PERMUTE;
+    result->src[0] = a;
+
+    int32_t params[] = { axis0, axis1, axis2, axis3 };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    return result;
+}
+
 struct ggml_tensor * ggml_permute(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3262,6 +3307,11 @@ struct ggml_tensor * ggml_permute(
     GGML_ASSERT(axis1 != axis2);
     GGML_ASSERT(axis1 != axis3);
     GGML_ASSERT(axis2 != axis3);
+
+    if ((axis3 == 3) && (axis0 == 0) && (axis1 == 2) && (axis2 == 1) &&
+        (a->type == GGML_TYPE_F32)) {
+        return ggml_permute_2_1_f32(ctx, a, axis0, axis1, axis2, axis3);
+    }
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
     ggml_format_name(result, "%s (permuted)", a->name);
