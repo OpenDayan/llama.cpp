@@ -165,10 +165,11 @@ static void ggml_backend_rnpu_synchronize(ggml_backend_t backend) {
 
     // TODO: Stream support
     // NPU_CHECK(rnpuStreamSynchronize(rnpu_ctx->stream()));
+    NPU_CHECK(npuDeviceSynchronize());
     GGML_UNUSED(rnpu_ctx);
-    GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
+    // GGML_LOG_ERROR("[ERROR] R-NPU backend interface %s is not supported!\n", __func__);
 
-    GGML_UNUSED(backend);
+    // GGML_UNUSED(backend);
 }
 
 /**
@@ -262,17 +263,19 @@ static void ggml_backend_rnpu_synchronize(ggml_backend_t backend) {
 static const ggml_backend_i ggml_backend_rnpu_interface = {
     /* .get_name                = */ ggml_backend_rnpu_get_name,
     /* .free                    = */ ggml_backend_rnpu_free,
-    /* .set_tensor_async        = */ ggml_backend_rnpu_set_tensor_async,
-    /* .get_tensor_async        = */ ggml_backend_rnpu_get_tensor_async,
-    /* .cpy_tensor_async        = */ ggml_backend_rnpu_cpy_tensor_async,
+    // TODO: asynchronous tensor operations
+    /* .set_tensor_async        = */ NULL,
+    /* .get_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ NULL,
     /* .synchronize             = */ ggml_backend_rnpu_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rnpu_graph_compute,
-    /* .event_record            = */ ggml_backend_rnpu_event_record,
-    /* .event_wait              = */ ggml_backend_rnpu_event_wait,
+    // TODO: event interface
+    /* .event_record            = */ NULL,
+    /* .event_wait              = */ NULL,
 };
 
 
