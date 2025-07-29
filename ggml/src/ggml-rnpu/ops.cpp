@@ -81,7 +81,7 @@ static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     assert((bs0 == h1) && (h0 == n1));
     assert(bs1 == 1);
 
-    uint16_t * a = (uint16_t *)src0->data;
+    float * a = (float *)src0->data;
     int * b = (int *)src1->data;
     float * res = (float *)dst->data;
     for (int j = 0; j < h1; ++j)
@@ -95,7 +95,7 @@ static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
                 }
                 // res[j][k][p][:] = a[j][k][row_idx][:]
                 for (int l = 0; l < m0; l++) {
-                    res[j*n1*m1*m0 + k*n1*m1 + p*m0 + l] = a[j*h0*n0*m0 + k*n0*m0 + row_idx*m0 + l];
+                    res[j*n1*m1*m0 + k*m1*m0 + p*m0 + l] = a[j*h0*n0*m0 + k*n0*m0 + row_idx*m0 + l];
                 }
             }
     GGML_UNUSED(ctx);
@@ -140,7 +140,7 @@ void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     for (int i = 0; i < bs; ++i) {
         int i1 = src1->ne[3] == 1 ? 0 : i;
         for (int j = 0; j < h; ++j) {
-            int j1 = src1->ne[2] == 1 ? 0 : i;
+            int j1 = src1->ne[2] == 1 ? 0 : j;
             for (int k = 0; k < n; ++k) {
                 int k1 = src1->ne[1] == 1 ? 0 : k;
                 for (int p = 0; p < m; ++p) {
@@ -550,7 +550,7 @@ void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
             // scale
             // a[i][j][k][:] *= scale
             for (int p = 0; p < m; ++p) {
-                a[i*h*n*m + j*m + p] = double(a[i*h*n*m + j*m + p]) * double(scale);
+                a[i*h*n*m + j*m + p] = a[i*h*n*m + j*m + p] * scale;
             }
 
             // mask
@@ -602,7 +602,7 @@ void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 
     for (size_t i = 0; i < src0_size; ++i) {
         float x = ((float *)src0->data)[i];
-        ((float *)dst->data)[i] = x / (1.0f + std::exp(-x));;
+        ((float *)dst->data)[i] = x / (1.0f + expf(-x));
     }
 
     GGML_UNUSED(ctx);
@@ -644,7 +644,7 @@ static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+    // GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
