@@ -8,6 +8,11 @@
 #include "./ops.hpp"
 #include "ggml.h"
 
+#include "NPUDriver.h"
+#include "NPURuntime.h"
+static struct NPURuntimeState runtime;
+extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
+
 static void ggml_rnpu_get_rows_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -747,7 +752,7 @@ static void block_float_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8) {
     }
 }
 
-static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -811,6 +816,188 @@ static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* 
             }
         }
     }
+    GGML_UNUSED(ctx);
+}
+
+template<int N>
+constexpr int exp_i2() {
+    return 1 << N;
+}
+
+template<int N>
+constexpr float exp_f2() {
+    if constexpr (N>0) return exp_f2<N-1>()*2;
+    if constexpr (N<0) return exp_f2<N+1>()/2;
+    if constexpr (N==0) return 1.;
+}
+
+template<int _E> //, int M=7-E>  1.7 bits!
+struct FP8 {
+    uint8_t bits;
+    using type = FP8<_E>;
+    static constexpr int E      = _E;
+    static constexpr int M      = (7-_E);
+    static constexpr int E_BIAS = exp_i2<E-1>()-1;
+    static constexpr float MAX  = (2-exp_f2<-M+1>())*exp_f2<exp_i2<E-1>()>();
+    static constexpr float MIN  = exp_f2<-M>()*exp_f2<2-exp_i2<E-1>()>();
+};
+
+template <int E>
+struct bloc_fp8 {
+    float d;
+    FP8<E> qs[QK];
+};
+
+template<int E>
+inline FP8<E> float_to_fp8(float value) {
+    FP8<E> out;
+    fp32_int32 in = {value};
+    // the sign
+    out.bits = (in.bits >> 24) & 0x80;
+    // value without sign
+    in.bits &= 0x7fffffff;
+    //GGML_ASSERT(in.bits < 0x7f800000); // +/- infinity or NAN
+    if (in.f >= FP8<E>::MAX) {
+        out.bits |= 0x7E;
+    } else if (in.f < FP8<E>::MIN) { // => 0.
+        // OK: S.0000000
+    } else {
+        in.f *= exp_f2<FP8<E>::E_BIAS-127>();
+        // - trunc
+        //uint32_t eps = 0;
+        // - rounding half away from zero
+        //uint32_t eps = 0x400000>>FP8<E>::M;
+        // - rounding half toward zero
+        //uint32_t eps = 0x3fffff>>FP8<E>::M;
+        // - rounding to nearest even
+        uint32_t eps = (0x3fffff>>FP8<E>::M) + ((in.bits >> (23-FP8<E>::M)) & 0x1);
+        // shift mantissa.
+        in.bits += eps;
+        out.bits |= (in.bits >> (23-FP8<E>::M)) & 0x7F;
+    }
+    return out;
+}
+
+template <int E>
+static inline void float_to_e4m3q(const float* x, bloc_fp8<E>* y, int64_t size) {
+    const auto qk_size = size / QK;
+    for (int64_t q=0; q<qk_size; ++q) {
+        float m = 0;
+        for (int64_t i=0; i<QK; i++) {
+            m = std::max(std::abs(x[q*QK+i]),m);
+        }
+        const float D = FP8<E>::MAX/m;
+        y[q].d = m/FP8<E>::MAX;
+        for (int64_t i=0; i<QK; i++) {
+            y[q].qs[i] = float_to_fp8<E>(x[q*QK+i]*D);
+        }
+    }
+}
+
+static int gmma_e4m3q_fp32_AT_QK256(
+                        void *a, void *b, void *c,
+                        int m, int n, int k,
+                        int lda, int ldb, int ldc) {
+    static struct NPUKernelDesc *gmma_e4m3q_fp32_AT_QK256_desc = NULL;
+    if (gmma_e4m3q_fp32_AT_QK256_desc == NULL)
+    {
+        ssize_t err = 0;
+        err = npu_runtime_init(&runtime);
+        if (err != NPU_SUCCESS) {
+          printf("[ERROR] %s: Failed to initialize Runtime: err=%d\n", __func__, err);
+          exit(-1);
+        }
+        err = npu_runtime_load_kernelset(&runtime, &__general_entry_fpga);
+        if (err != NPU_SUCCESS) {
+          printf("[ERROR] %s: Failed to load kernel set: err=%d\n", __func__, err);
+          npu_runtime_deinit(&runtime);
+          exit(-1);
+        }
+        err = npu_runtime_get_kernel_desc(&runtime, "gmma_e4m3q_fp32_AT_QK256", &gmma_e4m3q_fp32_AT_QK256_desc);
+        if (err != NPU_SUCCESS) {
+          printf("[ERROR] %s: Failed to get kernel description: err=%d\n", __func__, err);
+          npu_runtime_deinit(&runtime);
+          exit(-1);
+        }
+        printf("[INFO] Loaded gmma_e4m3q_fp32_AT_QK256 kernel desc successfully.\n");
+    }
+    // static address allocation
+    uint64_t a_dev = 0x81000000;
+    uint64_t b_dev = 0x83000000;
+    uint64_t c_dev = 0x85000000;
+    // Copy data to device
+    ssize_t ret = 0;
+    ret = npu_memcpy_to_dev(&runtime.dev_state, a_dev, a, m * lda * sizeof(uint8_t)); // a
+    if (ret < 0)
+        printf("[ERROR] Failed to write a to device at 0x%lx: err=%d\n", a_dev, ret);
+    ret = npu_memcpy_to_dev(&runtime.dev_state, b_dev, b, n * ldb * sizeof(uint8_t)); // b
+    if (ret < 0)
+        printf("[ERROR] Failed to write b to device at 0x%lx: err=%d\n", b_dev, ret);
+    ret = npu_memcpy_to_dev(&runtime.dev_state, c_dev, c, n * ldc * sizeof(float));   // c
+    if (ret < 0)
+        printf("[ERROR] Failed to write c to device at 0x%lx: err=%d\n", c_dev, ret);
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, gmma_e4m3q_fp32_AT_QK256_desc, &kernel_ret, 9,
+                             a_dev, b_dev, c_dev,
+                             (uint64_t)m, (uint64_t)n, (uint64_t)k,
+                             (uint64_t)lda, (uint64_t)ldb, (uint64_t)ldc);
+    npu_memcpy_from_dev(&runtime.dev_state, c, c_dev, n * ldc * sizeof(float)); // c
+    return kernel_ret;
+}
+
+static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+    int h0 = src0->ne[2];
+
+    // dim(0) and dim(1) only broadcast from src0 to src1
+    int rbs = bs / src0->ne[3];
+    int rj = h / src0->ne[2];
+    assert(bs >= src0->ne[3]);
+    assert(h >= src0->ne[2]);
+    assert(bs == 1);
+    assert(h == 1);
+
+    assert(dst->nb[0] == sizeof(float));
+
+    // src0 shape: (bs0, h0, m, k)
+    // src1 shape: (bs, h, n, k)
+    // dst shape: (bs, h, n, m)
+    int m = src0->ne[1];
+    int n = src1->ne[1];
+    int k = src1->ne[0];
+    assert(src1->ne[0] == src0->ne[0]);
+    // Convert src1 to e4m3q
+    float * b = (float *)(src1->data);
+    std::vector<uint8_t> b_e4m3q(bs * h * m * k * (QK + sizeof(float)) / QK);
+    for (int64_t i13 = 0; i13 < bs; ++i13) {
+        for (int64_t i12 = 0; i12 < h; ++i12) {
+            for (int64_t i11 = 0; i11 < n; ++i11) {
+                float_to_e4m3q(b + (
+                                i13 * src1->nb[3]
+                              + i12 * src1->nb[2]
+                              + i11 * src1->nb[1]
+                            )/sizeof(float),
+                            (bloc_fp8<4>*)(b_e4m3q.data() + (
+                                i13 * (src1->nb[3] / sizeof(float)) * (QK + sizeof(float)) / QK
+                              + i12 * (src1->nb[2] / sizeof(float)) * (QK + sizeof(float)) / QK
+                              + i11 * (src1->nb[1] / sizeof(float)) * (QK + sizeof(float)) / QK
+                            )/sizeof(uint8_t)),
+                            k);
+            }
+        }
+    }
+
+    // Call Kernel
+    gmma_e4m3q_fp32_AT_QK256(
+        src0->data, b_e4m3q.data(), dst->data,
+        m, n, k,
+        src1->ne[0] * (QK + sizeof(float)) / QK, src0->ne[0] * (QK + sizeof(float)) / QK, dst->nb[1] / sizeof(float)
+    );
+
     GGML_UNUSED(ctx);
 }
 

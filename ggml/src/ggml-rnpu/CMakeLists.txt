@@ -6,10 +6,13 @@ else()
 endif()
 
 set(RNPU_INCLUDE_DIRS
-    ${RNPU_RT_PATH}/include
+    ${RNPU_RT_PATH}/include,
+    /workspace/llama.cpp/ggml/src/ggml-rnpu
 )
 
-file(GLOB GGML_SOURCES_RNPU "*.cpp")
+file(GLOB  GGML_SOURCES_RNPU "*.cpp")
+file(GLOB  SRCS "*.c")
+list(APPEND GGML_SOURCES_RNPU ${SRCS})
 ggml_add_backend_library(ggml-rnpu ${GGML_SOURCES_RNPU})
 
 target_include_directories(ggml-rnpu PRIVATE ${RNPU_INCLUDE_DIRS})
