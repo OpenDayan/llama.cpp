@@ -13,7 +13,7 @@
 static struct NPURuntimeState runtime;
 extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
 
-static void ggml_rnpu_get_rows_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -62,7 +62,7 @@ static void ggml_rnpu_get_rows_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor*
     GGML_UNUSED(ctx);
 }
 
-static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -106,14 +106,20 @@ static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     GGML_UNUSED(ctx);
 }
 
+static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
 void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_get_rows_bf16(ctx, dst);
+            ggml_rnpu_get_rows_bf16_cpu(ctx, dst);
             break;
         case GGML_TYPE_F32:
-            ggml_rnpu_get_rows_f32(ctx, dst);
+            ggml_rnpu_get_rows_f32_cpu(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op GET_ROWS in R-NPU\n",
@@ -121,7 +127,7 @@ void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     }
 }
 
-void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -161,7 +167,25 @@ void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);
 }
 
-void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_op_add_f32_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op ADD in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
+
+static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -201,6 +225,24 @@ void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     GGML_UNUSED(ctx);
 }
 
+static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_op_mul_f32_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op MUL in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
+
 static void rope_cache_init(std::vector<float>& cache,
                      float theta_base, float theta_scale,
                      float freq_scale,
@@ -228,7 +270,7 @@ static void rope_cache_init(std::vector<float>& cache,
     }
 }
 
-void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -312,6 +354,24 @@ void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
 }
 
+static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_rope_f32_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op RoPE in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
+
 static uint16_t f32_to_bf16(float h) {
     uint16_t res;
     union {
@@ -327,7 +387,7 @@ static uint16_t f32_to_bf16(float h) {
     return res;
 }
 
-static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
 
@@ -384,7 +444,7 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     GGML_UNUSED(ctx);
 }
 
-static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
@@ -408,6 +468,18 @@ static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     GGML_UNUSED(ctx);
 }
 
+static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
 void ggml_rnpu_dup(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     // TODO: Only support copy from fp32 tensor.
@@ -415,10 +487,10 @@ void ggml_rnpu_dup(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 
     switch (dst->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_dup_f32_bf16(ctx, dst);
+            ggml_rnpu_dup_f32_bf16_cpu(ctx, dst);
             break;
         case GGML_TYPE_F32:
-            ggml_rnpu_dup_f32_f32(ctx, dst);
+            ggml_rnpu_dup_f32_f32_cpu(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op DUP in R-NPU\n",
@@ -447,7 +519,7 @@ void ggml_rnpu_view(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // Empty op
 }
 
-void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     const int axis0 = ((int32_t *) dst->op_params)[0];
     const int axis1 = ((int32_t *) dst->op_params)[1];
@@ -482,13 +554,31 @@ void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
 }
 
+static void ggml_rnpu_permute_f32_2_1(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_permute_f32_2_1_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op PERMUTE in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
+
 void ggml_rnpu_transpose(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
     // Empty op
 }
 
-void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_rms_norm_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
 
     // TODO: Only support fp32 RMS_NORM
@@ -519,7 +609,25 @@ void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
 }
 
-void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_rms_norm_f32_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op RMS_NORM in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
+
+static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -594,7 +702,25 @@ void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
 }
 
-void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_softmax_f32_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op SOFTMAX in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
+
+static void ggml_rnpu_silu_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
 
     // TODO: Only support fp32 SiLU
@@ -613,6 +739,23 @@ void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     GGML_UNUSED(ctx);
 }
 
+static void ggml_rnpu_silu_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    // TODO: LAUNCH YOUR KERNEL HERE
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+}
+
+void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            ggml_rnpu_silu_f32_cpu(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: type %s not supported for op SiLU in R-NPU\n",
+                       ggml_type_name(src0->type));
+    }
+}
 
 static const int QK = 256;
 
@@ -645,7 +788,7 @@ static float bf16_to_fp32(uint16_t h) {
     return fp32.value;
 }
 
-static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -1005,10 +1148,10 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_matmul_bf16(ctx, dst);
+            ggml_rnpu_matmul_bf16_cpu(ctx, dst);
             break;
         case GGML_TYPE_E4M3_Q:
-            ggml_rnpu_matmul_e4m3q(ctx, dst);
+            ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",
