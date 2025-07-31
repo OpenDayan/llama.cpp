@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "./runtime-host.hpp"
+#include "./runtime-wrapper.hpp"
 
 #include "../ggml-backend-impl.h"
 

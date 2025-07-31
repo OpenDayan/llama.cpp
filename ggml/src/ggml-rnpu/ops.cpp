@@ -10,8 +10,57 @@
 
 #include "NPUDriver.h"
 #include "NPURuntime.h"
-static struct NPURuntimeState runtime;
+struct NPURuntimeState runtime;
 extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
+
+static void copy_binary_op_data_from_dev_to_cpu(
+                    ggml_tensor * dst, void ** src0_data_cpu,
+                    void ** src1_data_cpu, void ** dst_data_cpu) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    size_t src0_size = ggml_nbytes(src0);
+    size_t src1_size = ggml_nbytes(src1);
+    size_t dst_size = ggml_nbytes(dst);
+    npuMallocHost(src0_data_cpu, src0_size);
+    npuMallocHost(src1_data_cpu, src1_size);
+    npuMallocHost(dst_data_cpu, dst_size);
+    npuMemcpy(*src0_data_cpu, src0->data, src0_size, npuMemcpyDeviceToHost);
+    npuMemcpy(*src1_data_cpu, src1->data, src1_size, npuMemcpyDeviceToHost);
+}
+
+static void copy_binary_op_data_from_cpu_to_dev(
+                    ggml_tensor * dst, void * src0_data_cpu,
+                    void * src1_data_cpu, void * dst_data_cpu) {
+    npuMemcpy(dst->data, dst_data_cpu, ggml_nbytes(dst), npuMemcpyHostToDevice);
+    npuFreeHost(src0_data_cpu);
+    npuFreeHost(src1_data_cpu);
+    npuFreeHost(dst_data_cpu);
+}
+
+static void copy_unary_op_data_from_dev_to_cpu(
+                ggml_tensor * dst, void ** src0_data_cpu, void ** dst_data_cpu) {
+    const ggml_tensor * src0 = dst->src[0];
+    size_t src0_size = ggml_nbytes(src0);
+    size_t dst_size = ggml_nbytes(dst);
+    npuMallocHost(src0_data_cpu, src0_size);
+    if (dst->view_src != src0) {
+        npuMallocHost(dst_data_cpu, dst_size);
+        npuMemcpy(*dst_data_cpu, dst->data, dst_size, npuMemcpyDeviceToHost);
+    } else {
+        dst_data_cpu = src0_data_cpu;
+    }
+    npuMemcpy(*src0_data_cpu, src0->data, src0_size, npuMemcpyDeviceToHost);
+}
+
+static void copy_unary_op_data_from_cpu_to_dev(
+                ggml_tensor * dst, void * src0_data_cpu, void * dst_data_cpu) {
+    const ggml_tensor * src0 = dst->src[0];
+    npuMemcpy(dst->data, dst_data_cpu, ggml_nbytes(dst), npuMemcpyHostToDevice);
+    npuFreeHost(src0_data_cpu);
+    if (dst->view_src != src0) {
+        npuFreeHost(dst_data_cpu);
+    }
+}
 
 static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -19,6 +68,12 @@ static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_ten
 
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
+
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -37,9 +92,9 @@ static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_ten
     assert((bs0 == h1) && (h0 == n1));
     assert(bs1 == 1);
 
-    uint16_t * a = (uint16_t *)src0->data;
-    int * b = (int *)src1->data;
-    float * res = (float *)dst->data;
+    uint16_t * a = (uint16_t *)src0_data_cpu;
+    int * b = (int *)src1_data_cpu;
+    float * res = (float *)dst_data_cpu;
     for (int j = 0; j < h1; ++j)
         for (int k = 0; k < n1; ++k)
             for (int p = 0; p < m1; ++p) {
@@ -60,6 +115,9 @@ static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_ten
 
             }
     GGML_UNUSED(ctx);
+
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -68,6 +126,12 @@ static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
 
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
+
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -86,9 +150,9 @@ static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     assert((bs0 == h1) && (h0 == n1));
     assert(bs1 == 1);
 
-    float * a = (float *)src0->data;
-    int * b = (int *)src1->data;
-    float * res = (float *)dst->data;
+    float * a = (float *)src0_data_cpu;
+    int * b = (int *)src1_data_cpu;
+    float * res = (float *)dst_data_cpu;
     for (int j = 0; j < h1; ++j)
         for (int k = 0; k < n1; ++k)
             for (int p = 0; p < m1; ++p) {
@@ -104,6 +168,8 @@ static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
                 }
             }
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -144,6 +210,12 @@ static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
     // src0 and src1 must be contiguous
     GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
     int bs = src0->ne[3];
     int h = src0->ne[2];
     int n = src0->ne[1];
@@ -156,15 +228,17 @@ static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
                 int k1 = src1->ne[1] == 1 ? 0 : k;
                 for (int p = 0; p < m; ++p) {
                     int p1 = src1->ne[0] == 1 ? 0 : p;
-                    ((float *)dst->data)[i * h * n * m + j * n * m + k * m + p] =
-                        ((float *)src0->data)[i * h * n * m + j * n * m + k * m + p] +
-                        ((float* )src1->data)[i1* h * n * m + j1 * n * m + k1 * m + p1];
+                    ((float *)dst_data_cpu)[i * h * n * m + j * n * m + k * m + p] =
+                        ((float *)src0_data_cpu)[i * h * n * m + j * n * m + k * m + p] +
+                        ((float* )src1_data_cpu)[i1* h * n * m + j1 * n * m + k1 * m + p1];
                 }
             }
         }
     }
 
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -202,6 +276,12 @@ static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
     // src0 and src1 must be contiguous
     GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
     int bs = src0->ne[3];
     int h = src0->ne[2];
     int n = src0->ne[1];
@@ -214,15 +294,17 @@ static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
                 int k1 = src1->ne[1] == 1 ? 0 : k;
                 for (int p = 0; p < m; ++p) {
                     int p1 = src1->ne[0] == 1 ? 0 : p;
-                    ((float *)dst->data)[i * h * n * m + j * n * m + k * m + p] =
-                        ((float *)src0->data)[i * h * n * m + j * n * m + k * m + p] *
-                        ((float* )src1->data)[i1* h * n * m + j1 * n * m + k1 * m + p1];
+                    ((float *)dst_data_cpu)[i * h * n * m + j * n * m + k * m + p] =
+                        ((float *)src0_data_cpu)[i * h * n * m + j * n * m + k * m + p] *
+                        ((float* )src1_data_cpu)[i1* h * n * m + j1 * n * m + k1 * m + p1];
                 }
             }
         }
     }
 
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -309,6 +391,12 @@ static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     GGML_UNUSED(n_ctx_orig);
     GGML_UNUSED(sections);
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
     GGML_TENSOR_UNARY_OP_LOCALS
 
     int bs = src0->ne[3];
@@ -322,7 +410,7 @@ static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
 
     for (int i = 0; i < bs; ++i) { // batch
         for (int j = 0; j < h; ++j) { // seq-len
-            int64_t p = ((int32_t *)src1->data)[j];
+            int64_t p = ((int32_t *)src1_data_cpu)[j];
             rope_cache_init(cache, p, theta_scale,
                             static_cast<float>(freq_scale), dst->ne[0]);
             for (int k = 0; k < n; ++k) { // attn-heads
@@ -332,26 +420,28 @@ static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
                     const float cos_theta = cache[p];
                     const float sin_theta = cache[p + 1];
 
-                    const float x0 = ((float *)src0->data)[i*h*n*m + j*n*m + k*m + ic];
-                    const float x1 = ((float *)src0->data)[i*h*n*m + j*n*m + k*m + ic + n_dims / 2];
+                    const float x0 = ((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + ic];
+                    const float x1 = ((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + ic + n_dims / 2];
 
-                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + ic] =
+                    ((float *)dst_data_cpu)[i*h*n*m + j*n*m + k*m + ic] =
                                                     (x0*cos_theta) - (x1*sin_theta);
-                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + ic + n_dims / 2] =
+                    ((float *)dst_data_cpu)[i*h*n*m + j*n*m + k*m + ic + n_dims / 2] =
                                                     (x0*sin_theta) + (x1*cos_theta);
                 }
 
                 // fill remain res[i][j][k][prope.n_dims:]
                 for (size_t p = n_dims; p < (size_t)m; p += 2) {
-                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + p] =
-                            ((float *)src0->data)[i*h*n*m + j*n*m + k*m + p];
-                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + p + 1] =
-                            ((float *)src0->data)[i*h*n*m + j*n*m + k*m + p + 1];
+                    ((float *)dst_data_cpu)[i*h*n*m + j*n*m + k*m + p] =
+                            ((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + p];
+                    ((float *)dst_data_cpu)[i*h*n*m + j*n*m + k*m + p + 1] =
+                            ((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + p + 1];
                 }
             }
         }
     }
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -393,6 +483,11 @@ static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
 
     GGML_TENSOR_UNARY_OP_LOCALS;
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu = src0->data;
+    void * dst_data_cpu = dst->data;
+    copy_unary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &dst_data_cpu);
+
     int bs = src0->ne[3];
     int h = src0->ne[2];
     int n = src0->ne[1];
@@ -405,19 +500,19 @@ static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
                 for (int j = 0; j < h; ++j)
                     for (int k = 0; k < n; ++k)
                         for (int p = 0; p < m; ++p)
-                            ((uint16_t *)dst->data)[i*h*n*m + j*n*m + k*m + p] =
-                                f32_to_bf16(((float *)src0->data)[i*h*n*m + j*n*m + k*m + p]);
+                            ((uint16_t *)dst_data_cpu)[i*h*n*m + j*n*m + k*m + p] =
+                                f32_to_bf16(((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + p]);
         } else {
             // dup_cont_f32_no_cont_bf16
             for (int i = 0; i < bs; ++i)
                 for (int j = 0; j < h; ++j)
                     for (int k = 0; k < n; ++k)
                         for (int p = 0; p < m; ++p)
-                            ((uint16_t *)dst->data)[i*dst->nb[3]/sizeof(uint16_t) +
+                            ((uint16_t *)dst_data_cpu)[i*dst->nb[3]/sizeof(uint16_t) +
                                                     j*dst->nb[2]/sizeof(uint16_t) +
                                                     k*dst->nb[1]/sizeof(uint16_t) +
                                                     p*dst->nb[0]/sizeof(uint16_t)] =
-                                    f32_to_bf16(((float *)src0->data)[i*h*n*m + j*n*m + k*m + p]);
+                                    f32_to_bf16(((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + p]);
         }
     } else {
         // TODO: Not support dup_no_cont_f32_cont_bf16
@@ -430,11 +525,11 @@ static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
                 for (int j = 0; j < h; ++j)
                     for (int k = 0; k < n; ++k)
                         for (int p = 0; p < m; ++p)
-                            ((uint16_t *)dst->data)[i*dst->nb[3]/sizeof(uint16_t) +
+                            ((uint16_t *)dst_data_cpu)[i*dst->nb[3]/sizeof(uint16_t) +
                                                     j*dst->nb[2]/sizeof(uint16_t) +
                                                     k*dst->nb[1]/sizeof(uint16_t) +
                                                     p*dst->nb[0]/sizeof(uint16_t)] =
-                                    f32_to_bf16(((float *)src0->data)[i*src0->nb[3]/sizeof(float) +
+                                    f32_to_bf16(((float *)src0_data_cpu)[i*src0->nb[3]/sizeof(float) +
                                                                         j*src0->nb[2]/sizeof(float) +
                                                                         k*src0->nb[1]/sizeof(float) +
                                                                         p*src0->nb[0]/sizeof(float)]);
@@ -442,6 +537,8 @@ static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     }
 
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -449,6 +546,11 @@ static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
     GGML_TENSOR_UNARY_OP_LOCALS;
+
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * dst_data_cpu;
+    copy_unary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &dst_data_cpu);
 
     int bs = src0->ne[3];
     int h = src0->ne[2];
@@ -458,14 +560,16 @@ static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
         for (int j = 0; j < h; ++j) {
             for (int k = 0; k < n; ++k) {
                 for (int p = 0; p < m; ++p) {
-                    ((float *)dst->data)[i*h*n*m + j*n*m + k*m + p] =
-                        ((float *)src0->data)[i*h*n*m + j*n*m + k*m + p];
+                    ((float *)dst_data_cpu)[i*h*n*m + j*n*m + k*m + p] =
+                        ((float *)src0_data_cpu)[i*h*n*m + j*n*m + k*m + p];
                 }
             }
         }
     }
 
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -531,6 +635,11 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
     // TODO: Only support permute(1,2)
     GGML_ASSERT(axis0 == 0 && axis1 == 2 && axis2 == 1 && axis3 == 3);
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * dst_data_cpu;
+    copy_unary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &dst_data_cpu);
+
     int bs = src0->ne[3];
     int n = src0->ne[2];
     int h = src0->ne[1];
@@ -538,8 +647,8 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
 
     int row_size = w * sizeof(float);
 
-    char * a = (char *) src0->data;
-    char * res = (char *) dst->data;
+    char * a = (char *) src0_data_cpu;
+    char * res = (char *) dst_data_cpu;
     for (int i = 0; i < bs; ++i) {
         for (int j = 0; j < n; ++j) {
             for (int k = 0; k < h; ++k) {
@@ -552,19 +661,40 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
     }
 
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_permute_f32_2_1(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    // TODO: LAUNCH YOUR KERNEL HERE
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    const ggml_tensor * src0 = dst->src[0];
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+
+    // Kernel lazy load
+    static struct NPUKernelDesc* permute_f32_2_1 = NULL;
+    if (permute_f32_2_1 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "permute_f32_2_1", &permute_f32_2_1);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded permute_f32_2_1 kernel desc successfully.\n");
+    }
+
+    // Launch kernel
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, permute_f32_2_1, &kernel_ret, 6,
+                            src0->data, dst->data, bs, h, n, m);
 }
 
 void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_permute_f32_2_1_cpu(ctx, dst);
+            ggml_rnpu_permute_f32_2_1(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op PERMUTE in R-NPU\n",
@@ -588,12 +718,17 @@ static void ggml_rnpu_rms_norm_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * dst_data_cpu;
+    copy_unary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &dst_data_cpu);
+
     int b = src0->ne[3];
     int h = src0->ne[2];
     int n = src0->ne[1];
     int m = src0->ne[0];
-    float * res = (float *)dst->data;
-    float * a = (float *)src0->data;
+    float * res = (float *)dst_data_cpu;
+    float * a = (float *)src0_data_cpu;
 
     for (int i = 0; i < (b * h * n); ++i) {
         double sum = 0.0;
@@ -607,6 +742,8 @@ static void ggml_rnpu_rms_norm_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
         }
     }
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -637,6 +774,12 @@ static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     GGML_ASSERT(ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
     float scale    = 1.0f;
     float max_bias = 0.0f;
     memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
@@ -651,9 +794,9 @@ static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     const float m0 = powf(2.0f, -(max_bias       ) / h_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / h_log2);
 
-    float * a = (float *)src0->data;
-    float * b = (float *)src1->data;
-    float * res = (float *)dst->data;
+    float * a = (float *)src0_data_cpu;
+    float * b = (float *)src1_data_cpu;
+    float * res = (float *)dst_data_cpu;
     for (int i = 0; i < bs; ++i) { // batch
         for (int j = 0; j < (h * n); ++j) { // attn-heads * seq_len
             const uint32_t hidx = (j / n); // current head idx
@@ -700,6 +843,8 @@ static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
         }
     }
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -729,14 +874,21 @@ static void ggml_rnpu_silu_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     GGML_ASSERT(ggml_is_contiguous_1(dst));
     GGML_ASSERT(ggml_are_same_shape(src0, dst));
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * dst_data_cpu;
+    copy_unary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &dst_data_cpu);
+
     size_t src0_size = ggml_nelements(src0);
 
     for (size_t i = 0; i < src0_size; ++i) {
-        float x = ((float *)src0->data)[i];
-        ((float *)dst->data)[i] = x / (1.0f + expf(-x));
+        float x = ((float *)src0_data_cpu)[i];
+        ((float *)dst_data_cpu)[i] = x / (1.0f + expf(-x));
     }
 
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
 }
 
 static void ggml_rnpu_silu_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -796,6 +948,12 @@ static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
     int bs = src1->ne[3];
     int h = src1->ne[2];
     int h0 = src0->ne[2];
@@ -810,9 +968,9 @@ static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     int k = src1->ne[0];
     assert(src1->ne[0] == src0->ne[0]);
 
-    uint16_t * a = (uint16_t *) src0->data;
-    float * b = (float *) src1->data;
-    float * res = (float *) dst->data;
+    uint16_t * a = (uint16_t *) src0_data_cpu;
+    float * b = (float *) src1_data_cpu;
+    float * res = (float *) dst_data_cpu;
     for (int i = 0; i < bs; ++i) {
         for (int j = 0; j < h; ++j) {
             // broadcast in dim(0)
@@ -838,6 +996,8 @@ static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
         }
     }
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 union fp32_int32 {
@@ -901,6 +1061,12 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
 
     GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
 
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     int bs = src1->ne[3];
@@ -917,9 +1083,9 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     // rowsize = sizeof block scales + sizeof block data
     int row_size = (k/QK)*sizeof(float) + k;
 
-    uint8_t * a = (uint8_t *) src0->data;
-    float * b = (float *) src1->data;
-    float * res = (float *) dst->data;
+    uint8_t * a = (uint8_t *) src0_data_cpu;
+    float * b = (float *) src1_data_cpu;
+    float * res = (float *) dst_data_cpu;
     for (int i = 0; i < bs; ++i) {
         for (int j = 0; j < h; ++j) {
             for (int p = 0; p < m; ++p) {
@@ -960,6 +1126,8 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
         }
     }
     GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
 }
 
 template<int N>
@@ -1044,19 +1212,7 @@ static int gmma_e4m3q_fp32_AT_QK256(
     static struct NPUKernelDesc *gmma_e4m3q_fp32_AT_QK256_desc = NULL;
     if (gmma_e4m3q_fp32_AT_QK256_desc == NULL)
     {
-        ssize_t err = 0;
-        err = npu_runtime_init(&runtime);
-        if (err != NPU_SUCCESS) {
-          printf("[ERROR] %s: Failed to initialize Runtime: err=%d\n", __func__, err);
-          exit(-1);
-        }
-        err = npu_runtime_load_kernelset(&runtime, &__general_entry_fpga);
-        if (err != NPU_SUCCESS) {
-          printf("[ERROR] %s: Failed to load kernel set: err=%d\n", __func__, err);
-          npu_runtime_deinit(&runtime);
-          exit(-1);
-        }
-        err = npu_runtime_get_kernel_desc(&runtime, "gmma_e4m3q_fp32_AT_QK256", &gmma_e4m3q_fp32_AT_QK256_desc);
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "gmma_e4m3q_fp32_AT_QK256", &gmma_e4m3q_fp32_AT_QK256_desc);
         if (err != NPU_SUCCESS) {
           printf("[ERROR] %s: Failed to get kernel description: err=%d\n", __func__, err);
           npu_runtime_deinit(&runtime);
@@ -1064,27 +1220,11 @@ static int gmma_e4m3q_fp32_AT_QK256(
         }
         printf("[INFO] Loaded gmma_e4m3q_fp32_AT_QK256 kernel desc successfully.\n");
     }
-    // static address allocation
-    uint64_t a_dev = 0x81000000;
-    uint64_t b_dev = 0x83000000;
-    uint64_t c_dev = 0x85000000;
-    // Copy data to device
-    ssize_t ret = 0;
-    ret = npu_memcpy_to_dev(&runtime.dev_state, a_dev, a, m * lda * sizeof(uint8_t)); // a
-    if (ret < 0)
-        printf("[ERROR] Failed to write a to device at 0x%lx: err=%d\n", a_dev, ret);
-    ret = npu_memcpy_to_dev(&runtime.dev_state, b_dev, b, n * ldb * sizeof(uint8_t)); // b
-    if (ret < 0)
-        printf("[ERROR] Failed to write b to device at 0x%lx: err=%d\n", b_dev, ret);
-    ret = npu_memcpy_to_dev(&runtime.dev_state, c_dev, c, n * ldc * sizeof(float));   // c
-    if (ret < 0)
-        printf("[ERROR] Failed to write c to device at 0x%lx: err=%d\n", c_dev, ret);
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, gmma_e4m3q_fp32_AT_QK256_desc, &kernel_ret, 9,
-                             a_dev, b_dev, c_dev,
+                             a, b, c,
                              (uint64_t)m, (uint64_t)n, (uint64_t)k,
                              (uint64_t)lda, (uint64_t)ldb, (uint64_t)ldc);
-    npu_memcpy_from_dev(&runtime.dev_state, c, c_dev, n * ldc * sizeof(float)); // c
     return kernel_ret;
 }
 

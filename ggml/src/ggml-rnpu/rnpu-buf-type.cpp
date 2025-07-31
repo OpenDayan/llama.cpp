@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <mutex>
 
-#include "./runtime-host.hpp"
+#include "./runtime-wrapper.hpp"
 
 #include "../ggml-backend-impl.h"
 #include "../ggml-impl.h"

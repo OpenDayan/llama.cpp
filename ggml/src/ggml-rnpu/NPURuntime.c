@@ -1,1 +1,0 @@
-/workspace/npu-runtime/src/NPURuntime.c

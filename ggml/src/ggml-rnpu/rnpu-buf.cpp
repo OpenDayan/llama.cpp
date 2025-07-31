@@ -1,7 +1,7 @@
 #include "ggml-rnpu.h"
 #include <cstdint>
 
-#include "./runtime-host.hpp"
+#include "./runtime-wrapper.hpp"
 
 #include "../ggml-backend-impl.h"
 

@@ -1,7 +1,7 @@
 #include "ggml-rnpu.h"
 #include <mutex>
 
-#include "./runtime-host.hpp"
+#include "./runtime-wrapper.hpp"
 
 #include "../ggml-impl.h"
 #include "../ggml-backend-impl.h"
@@ -9,7 +9,8 @@
 #include "./common.hpp"
 #include "ggml.h"
 
-
+#include "NPURuntime.h"
+#include "NPUDriver.h"
 
 // -----------------------------------------------------------------------------------
 // ----------------------- NPU backend registery interface ---------------------------
@@ -80,6 +81,9 @@ static const ggml_backend_reg_i ggml_backend_rnpu_reg_interface = {
 // ---------------------- NPU backend registery external API ----------------------
 // --------------------------------------------------------------------------------
 
+extern struct NPURuntimeState runtime;
+extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
+
 /**
  * @brief R-NPU backend registery, initialize registry when first called.
  *
@@ -94,6 +98,26 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
         std::lock_guard<std::mutex> lock(mutex);
 
         if(!initialized) {
+
+            // ======= NPU Runtime Init =======
+            // FIXME: NPU runtime initialize
+            printf("[INFO] backend init runtime\n");
+            ssize_t err;
+            err = npu_runtime_init(&runtime);
+            if (err != NPU_SUCCESS) {
+                GGML_ABORT("Failed to initialize Runtime: %ld\n", err);
+            }
+            GGML_LOG_INFO("Runtime initialized successfully.\n");
+
+            // FIXME: NPU load kernel sets
+            printf("[INFO] backend load kernelset\n");
+            err = npu_runtime_load_kernelset(&runtime, &__general_entry_fpga);
+            if (err != NPU_SUCCESS) {
+                npu_runtime_deinit(&runtime);
+                GGML_ABORT("Failed to load kernel set: %ld\n", err);
+            }
+            GGML_LOG_INFO("Kernel set loaded successfully.\n");
+
             ggml_backend_rnpu_reg_context * ctx = new ggml_backend_rnpu_reg_context;
             for (int i = 0; i < ggml_rnpu_info().device_count; ++i) {
                 ggml_backend_rnpu_device_context * dev_ctx = new ggml_backend_rnpu_device_context;
