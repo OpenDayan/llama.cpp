@@ -175,17 +175,47 @@ static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
 static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // TODO: LAUNCH YOUR KERNEL HERE
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    // GGML_UNUSED(dst);
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    int bs0 = src0->ne[3];
+    int h0 = src0->ne[2];
+    int n0 = src0->ne[1];
+    int m0 = src0->ne[0];
+
+    int bs1 = src1->ne[3];
+    int h1 = src1->ne[2];
+    int n1 = src1->ne[1];
+    int m1 = src1->ne[0];
+
+    GGML_ASSERT((bs0 == h1) && (h0 == n1));
+    GGML_ASSERT(bs1 == 1);
+
+    static struct NPUKernelDesc* get_rows_f32 = NULL;
+    if (get_rows_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "get_rows_f32_i32_f32", &get_rows_f32);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded get_rows_f32_i32_f32 kernel desc successfully.\n");
+    }
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, get_rows_f32, &kernel_ret, 8,
+                             src0->data, src1->data, dst->data,
+                             (uint64_t)h1, (uint64_t)n1, (uint64_t)m1, (uint64_t)m0, (uint64_t)n0);
 }
 
 void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_get_rows_bf16_cpu(ctx, dst);
+            // ggml_rnpu_get_rows_bf16_cpu(ctx, dst);
             break;
         case GGML_TYPE_F32:
-            ggml_rnpu_get_rows_f32_cpu(ctx, dst);
+            // ggml_rnpu_get_rows_f32_cpu(ctx, dst);
+            ggml_rnpu_get_rows_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op GET_ROWS in R-NPU\n",
@@ -575,13 +605,123 @@ static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
 static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // TODO: LAUNCH YOUR KERNEL HERE
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    // GGML_UNUSED(dst);
+
+    const ggml_tensor * src0 = dst->src[0];
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+
+    int src0_bs = src0->ne[3];
+    int src0_h = src0->ne[2];
+    int src0_n = src0->ne[1];
+    int src0_m = src0->ne[0];
+
+    int dst_bs = dst->ne[3];
+    int dst_h = dst->ne[2];
+    int dst_n = dst->ne[1];
+    int dst_m = dst->ne[0];
+
+    int src0_nb3 = src0->nb[3];
+    int src0_nb2 = src0->nb[2];
+    int src0_nb1 = src0->nb[1];
+    int src0_nb0 = src0->nb[0];
+
+    int dst_nb3 = dst->nb[3];
+    int dst_nb2 = dst->nb[2];
+    int dst_nb1 = dst->nb[1];
+    int dst_nb0 = dst->nb[0];
+
+    static struct NPUKernelDesc* dup_cont_f32_cont_bf16 = NULL;
+    static struct NPUKernelDesc* dup_cont_f32_no_cont_bf16 = NULL;
+    static struct NPUKernelDesc* dup_no_cont_f32_no_cont_bf16 = NULL;
+    if (ggml_is_contiguous(src0)) {
+        if (ggml_is_contiguous(dst)) {
+            // dup_cont_f32_cont_bf16
+            if (dup_cont_f32_cont_bf16 == NULL) {
+                ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_cont_f32_cont_bf16", &dup_cont_f32_cont_bf16);
+                if (err != NPU_SUCCESS) {
+                    printf("Failed to get kernel description: err=%ld\n", err);
+                    npu_runtime_deinit(&runtime);
+                    exit(-1);
+                }
+                printf("[INFO] Loaded dup_cont_f32_cont_bf16 kernel desc successfully.\n");
+            }
+            int kernel_ret;
+            npu_runtime_kernel_start(&runtime, dup_cont_f32_cont_bf16, &kernel_ret, 10,
+                                    src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
+        } else {
+            // dup_cont_f32_no_cont_bf16
+            if (dup_cont_f32_no_cont_bf16 == NULL) {
+                ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_cont_f32_no_cont_bf16", &dup_cont_f32_no_cont_bf16);
+                if (err != NPU_SUCCESS) {
+                    printf("Failed to get kernel description: err=%ld\n", err);
+                    npu_runtime_deinit(&runtime);
+                    exit(-1);
+                }
+                printf("[INFO] Loaded dup_cont_f32_no_cont_bf16 kernel desc successfully.\n");
+            }
+            int kernel_ret;
+            npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 10,
+                                    src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
+
+            npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 18,
+                                src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m,
+                                src0_nb3, src0_nb2, src0_nb1, src0_nb0, dst_nb3, dst_nb2, dst_nb1, dst_nb0);
+        }
+    } else {
+        // TODO: Not support dup_no_cont_f32_cont_bf16
+        if (ggml_is_contiguous(dst)) {
+            GGML_ABORT("FATAL ERROR: Non-Contiguous BF16 destination is not supported for"
+                       "op DUP in R-NPU\n");
+        } else {
+            // dup_no_cont_f32_no_cont_bf16
+            if (dup_no_cont_f32_no_cont_bf16 == NULL) {
+                ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_no_cont_f32_no_cont_bf16", &dup_no_cont_f32_no_cont_bf16);
+                if (err != NPU_SUCCESS) {
+                    printf("Failed to get kernel description: err=%ld\n", err);
+                    npu_runtime_deinit(&runtime);
+                    exit(-1);
+                }
+                printf("[INFO] Loaded dup_no_cont_f32_no_cont_bf16 kernel desc successfully.\n");
+            }
+            int kernel_ret;
+            npu_runtime_kernel_start(&runtime, dup_no_cont_f32_no_cont_bf16, &kernel_ret, 18,
+                                src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m,
+                                src0_nb3, src0_nb2, src0_nb1, src0_nb0, dst_nb3, dst_nb2, dst_nb1, dst_nb0);
+        }
+    }
+
 }
 
 static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // TODO: LAUNCH YOUR KERNEL HERE
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    // GGML_UNUSED(dst);
+    const ggml_tensor * src0 = dst->src[0];
+    int src0_bs = src0->ne[3];
+    int src0_h = src0->ne[2];
+    int src0_n = src0->ne[1];
+    int src0_m = src0->ne[0];
+
+    int dst_bs = dst->ne[3];
+    int dst_h = dst->ne[2];
+    int dst_n = dst->ne[1];
+    int dst_m = dst->ne[0];                         
+
+    GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
+
+    static struct NPUKernelDesc* dup_cont_f32_cont_f32 = NULL;
+    if (dup_cont_f32_cont_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_cont_f32_cont_f32", &dup_cont_f32_cont_f32);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded dup_cont_f32_cont_f32 kernel desc successfully.\n");
+    }
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, dup_cont_f32_cont_f32, &kernel_ret, 10,
+                            src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
 }
 
 void ggml_rnpu_dup(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -591,10 +731,12 @@ void ggml_rnpu_dup(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 
     switch (dst->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_dup_f32_bf16_cpu(ctx, dst);
+            // ggml_rnpu_dup_f32_bf16_cpu(ctx, dst);
+            ggml_rnpu_dup_f32_bf16(ctx, dst);
             break;
         case GGML_TYPE_F32:
-            ggml_rnpu_dup_f32_f32_cpu(ctx, dst);
+            // ggml_rnpu_dup_f32_f32_cpu(ctx, dst);
+            ggml_rnpu_dup_f32_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op DUP in R-NPU\n",
