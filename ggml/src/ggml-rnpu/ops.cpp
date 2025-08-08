@@ -889,16 +889,38 @@ static void ggml_rnpu_rms_norm_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
 }
 
 static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    // TODO: LAUNCH YOUR KERNEL HERE
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    const ggml_tensor * src0 = dst->src[0];
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+
+    float eps;
+    memcpy(&eps, dst->op_params, sizeof(float));
+    
+    // Kernel lazy load
+    static struct NPUKernelDesc* rms_norm_f32 = NULL;
+    if (rms_norm_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "rms_norm_f32", &rms_norm_f32);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded rms_norm_f32 kernel desc successfully.\n");
+    }
+
+    // Launch kernel
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, rms_norm_f32, &kernel_ret, 7,
+                            src0->data, dst->data, bs, h, n, m, eps);
 }
 
 void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_rms_norm_f32_cpu(ctx, dst);
+            ggml_rnpu_rms_norm_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op RMS_NORM in R-NPU\n",
@@ -1034,16 +1056,35 @@ static void ggml_rnpu_silu_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
 }
 
 static void ggml_rnpu_silu_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    // TODO: LAUNCH YOUR KERNEL HERE
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    const ggml_tensor * src0 = dst->src[0];
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+
+    // Kernel lazy load
+    static struct NPUKernelDesc* silu_f32 = NULL;
+    if (silu_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "silu_f32", &silu_f32);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded silu_f32 kernel desc successfully.\n");
+    }
+
+    // Launch kernel
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, silu_f32, &kernel_ret, 6,
+                            src0->data, dst->data, bs, h, n, m);
 }
 
 void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_silu_f32_cpu(ctx, dst);
+            ggml_rnpu_silu_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op SiLU in R-NPU\n",
