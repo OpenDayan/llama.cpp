@@ -273,15 +273,36 @@ static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
 
 static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // TODO: LAUNCH YOUR KERNEL HERE
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+
+    static struct NPUKernelDesc* kernel_add_fp32_desc = NULL;
+    if (kernel_add_fp32_desc == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_add_fp32_desc", &kernel_add_fp32_desc);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded kernel_add_fp32_desc kernel desc successfully.\n");
+    }
+
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, kernel_add_fp32_desc, &kernel_ret, 11,
+                            src0->data, src1->data, dst->data, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    // GGML_UNUSED(dst);
 }
 
 void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_op_add_f32_cpu(ctx, dst);
+            // ggml_rnpu_op_add_f32_cpu(ctx, dst);
+            ggml_rnpu_op_add_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op ADD in R-NPU\n",
@@ -319,7 +340,7 @@ static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
     for (int i = 0; i < bs; ++i) {
         int i1 = src1->ne[3] == 1 ? 0 : i;
         for (int j = 0; j < h; ++j) {
-            int j1 = src1->ne[2] == 1 ? 0 : i;
+            int j1 = src1->ne[2] == 1 ? 0 : j;
             for (int k = 0; k < n; ++k) {
                 int k1 = src1->ne[1] == 1 ? 0 : k;
                 for (int p = 0; p < m; ++p) {
@@ -339,15 +360,36 @@ static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
 
 static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // TODO: LAUNCH YOUR KERNEL HERE
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    
+    static struct NPUKernelDesc* kernel_mul_fp32_desc = NULL;
+    if (kernel_mul_fp32_desc == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_mul_fp32_desc", &kernel_mul_fp32_desc);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded kernel_mul_fp32_desc kernel desc successfully.\n");
+    }
+
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, kernel_mul_fp32_desc, &kernel_ret, 11,
+                            src0->data, src1->data, dst->data, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
+
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
+    // GGML_UNUSED(dst);
 }
 
 void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_op_mul_f32_cpu(ctx, dst);
+            // ggml_rnpu_op_mul_f32_cpu(ctx, dst);
+            ggml_rnpu_op_mul_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MUL in R-NPU\n",
