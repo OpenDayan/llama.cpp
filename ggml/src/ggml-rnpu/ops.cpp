@@ -517,7 +517,67 @@ static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
 }
 
 static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    // TODO: LAUNCH YOUR KERNEL HERE
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // TODO: Only support f32 rope
+    if (src0->type != GGML_TYPE_F32) {
+        GGML_ABORT("FATAL ERROR: type %s not supported for op RoPE in R-NPU\n",
+                    ggml_type_name(src0->type));
+    }
+
+    int sections[4];
+    float freq_base;
+    float freq_scale;
+    float ext_factor;
+    float attn_factor;
+    float beta_fast;
+    float beta_slow;
+
+    //const int n_past     = ((int32_t *) dst->op_params)[0];
+    const int n_dims     = ((int32_t *) dst->op_params)[1];
+    const int mode       = ((int32_t *) dst->op_params)[2];
+    //const int n_ctx      = ((int32_t *) dst->op_params)[3];
+    const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
+
+    memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (int32_t *) dst->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) dst->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (int32_t *) dst->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (int32_t *) dst->op_params + 10, sizeof(float));
+    memcpy(&sections,    (int32_t *) dst->op_params + 11, sizeof(int)*4);
+
+    // TODO: Only support specified params
+    GGML_ASSERT(mode == GGML_ROPE_TYPE_NEOX);
+    GGML_ASSERT(attn_factor == 1.0f);
+    GGML_ASSERT(ext_factor == 0.0f);
+    GGML_UNUSED(n_ctx_orig);
+    GGML_UNUSED(sections);
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
+    int mdst = dst->ne[0];
+
+    static struct NPUKernelDesc* rope_f32_i32_f32 = NULL;
+    if (rope_f32_i32_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "rope_f32_i32_f32", &rope_f32_i32_f32);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded rope_f32_i32_f32 kernel desc successfully.\n");
+    }
+
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, rope_f32_i32_f32, &kernel_ret, 11,
+                             src0->data, src1->data, dst->data,
+                             (uint64_t)bs, (uint64_t)h, (uint64_t)n, (uint64_t)m, (uint64_t)n_dims,
+                             theta_scale, freq_scale, mdst);
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
 }
@@ -1054,7 +1114,43 @@ static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
 }
 
 static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    // TODO: LAUNCH YOUR KERNEL HERE
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    // TODO: Only support fp32 Softmax
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    float scale    = 1.0f;
+    float max_bias = 0.0f;
+    memcpy(&scale,    (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias, (float *) dst->op_params + 1, sizeof(float));
+
+    int bs = src0->ne[3];
+    int h = src0->ne[2];
+    int n = src0->ne[1];
+    int m = src0->ne[0];
+    const uint32_t h_log2 = 1u << (uint32_t) floor(log2(h));
+
+    const float m0 = powf(2.0f, -(max_bias       ) / h_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / h_log2);
+    static struct NPUKernelDesc* softmax_f32_f32_f32 = NULL;
+    if (softmax_f32_f32_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "softmax_f32_f32_f32", &softmax_f32_f32_f32);
+        if (err != NPU_SUCCESS) {
+            printf("Failed to get kernel description: err=%ld\n", err);
+            npu_runtime_deinit(&runtime);
+            exit(-1);
+        }
+        printf("[INFO] Loaded softmax_f32_f32_f32 kernel desc successfully.\n");
+    }
+
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, softmax_f32_f32_f32, &kernel_ret, 8,
+                             src0->data, src1->data, dst->data, scale,
+                             bs, h, n, m);
     GGML_UNUSED(ctx);
     GGML_UNUSED(dst);
 }
