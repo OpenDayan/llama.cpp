@@ -279,7 +279,7 @@ static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
 
     static struct NPUKernelDesc* kernel_add_fp32_desc = NULL;
     if (kernel_add_fp32_desc == NULL) {
-        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_add_fp32_desc", &kernel_add_fp32_desc);
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_add_fp32", &kernel_add_fp32_desc);
         if (err != NPU_SUCCESS) {
             printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
@@ -366,7 +366,7 @@ static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
     
     static struct NPUKernelDesc* kernel_mul_fp32_desc = NULL;
     if (kernel_mul_fp32_desc == NULL) {
-        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_mul_fp32_desc", &kernel_mul_fp32_desc);
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_mul_fp32", &kernel_mul_fp32_desc);
         if (err != NPU_SUCCESS) {
             printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
