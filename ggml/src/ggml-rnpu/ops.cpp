@@ -1157,7 +1157,7 @@ void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_softmax_f32_cpu(ctx, dst);
+            ggml_rnpu_softmax_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op SOFTMAX in R-NPU\n",
