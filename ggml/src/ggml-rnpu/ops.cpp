@@ -577,16 +577,15 @@ static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst)
     npu_runtime_kernel_start(&runtime, rope_f32_i32_f32, &kernel_ret, 11,
                              src0->data, src1->data, dst->data,
                              (uint64_t)bs, (uint64_t)h, (uint64_t)n, (uint64_t)m, (uint64_t)n_dims,
-                             theta_scale, freq_scale, mdst);
+                             float_as_u32(theta_scale), float_as_u32(freq_scale), mdst);
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
 }
 
 void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_rope_f32_cpu(ctx, dst);
+            ggml_rnpu_rope_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op RoPE in R-NPU\n",
@@ -1149,10 +1148,9 @@ static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
 
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, softmax_f32_f32_f32, &kernel_ret, 8,
-                             src0->data, src1->data, dst->data, scale,
-                             bs, h, n, m);
+                             src0->data, src1->data, dst->data, float_as_u32(scale),
+                             (uint64_t)bs, (uint64_t)h, (uint64_t)n, (uint64_t)m);
     GGML_UNUSED(ctx);
-    GGML_UNUSED(dst);
 }
 
 void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
