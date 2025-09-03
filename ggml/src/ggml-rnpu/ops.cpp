@@ -6,6 +6,7 @@
 #include "../ggml-impl.h"
 #include "./common.hpp"
 #include "./ops.hpp"
+#include "./utils.hpp"
 #include "ggml.h"
 
 #include "NPUDriver.h"
@@ -13,6 +14,8 @@
 struct NPURuntimeState runtime;
 extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
 
+static int matmul_cnt = 0;
+static int stage = 0;
 static void copy_binary_op_data_from_dev_to_cpu(
                     ggml_tensor * dst, void ** src0_data_cpu,
                     void ** src1_data_cpu, void ** dst_data_cpu) {
@@ -63,6 +66,7 @@ static void copy_unary_op_data_from_cpu_to_dev(
 }
 
 static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -118,9 +122,11 @@ static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_ten
 
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_get_rows_bf16_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -170,6 +176,7 @@ static void ggml_rnpu_get_rows_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_get_rows_f32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -201,10 +208,12 @@ static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
         }
         printf("[INFO] Loaded get_rows_f32_i32_f32 kernel desc successfully.\n");
     }
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, get_rows_f32, &kernel_ret, 8,
                              src0->data, src1->data, dst->data,
                              (uint64_t)h1, (uint64_t)n1, (uint64_t)m1, (uint64_t)m0, (uint64_t)n0);
+    RECORD_OP_END("get_rows_f32_i32_f32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -224,6 +233,7 @@ void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 }
 
 static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -269,6 +279,7 @@ static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_op_add_f32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -285,9 +296,10 @@ static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
             npu_runtime_deinit(&runtime);
             exit(-1);
         }
-        printf("[INFO] Loaded kernel_add_fp32_desc kernel desc successfully.\n");
+        printf("[INFO] Loaded kernel_add_fp32 kernel desc successfully.\n");
     }
 
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, kernel_add_fp32_desc, &kernel_ret, 11,
                             src0->data, src1->data, dst->data, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
@@ -295,6 +307,7 @@ static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
 
     GGML_UNUSED(ctx);
     // GGML_UNUSED(dst);
+    RECORD_OP_END("kernel_add_fp32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
@@ -311,6 +324,7 @@ void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
 }
 
 static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -356,6 +370,7 @@ static void ggml_rnpu_op_mul_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tenso
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_op_mul_f32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -363,7 +378,7 @@ static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    
+
     static struct NPUKernelDesc* kernel_mul_fp32_desc = NULL;
     if (kernel_mul_fp32_desc == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_mul_fp32", &kernel_mul_fp32_desc);
@@ -372,9 +387,10 @@ static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
             npu_runtime_deinit(&runtime);
             exit(-1);
         }
-        printf("[INFO] Loaded kernel_mul_fp32_desc kernel desc successfully.\n");
+        printf("[INFO] Loaded kernel_mul_fp32 kernel desc successfully.\n");
     }
 
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, kernel_mul_fp32_desc, &kernel_ret, 11,
                             src0->data, src1->data, dst->data, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
@@ -382,14 +398,15 @@ static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
 
     GGML_UNUSED(ctx);
     // GGML_UNUSED(dst);
+    RECORD_OP_END("kernel_mul_fp32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            // ggml_rnpu_op_mul_f32_cpu(ctx, dst);
-            ggml_rnpu_op_mul_f32(ctx, dst);
+            ggml_rnpu_op_mul_f32_cpu(ctx, dst);
+            // ggml_rnpu_op_mul_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MUL in R-NPU\n",
@@ -425,6 +442,7 @@ static void rope_cache_init(std::vector<float>& cache,
 }
 
 static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -514,6 +532,7 @@ static void ggml_rnpu_rope_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_rope_f32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -573,12 +592,14 @@ static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst)
         printf("[INFO] Loaded rope_f32_i32_f32 kernel desc successfully.\n");
     }
 
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, rope_f32_i32_f32, &kernel_ret, 11,
                              src0->data, src1->data, dst->data,
                              (uint64_t)bs, (uint64_t)h, (uint64_t)n, (uint64_t)m, (uint64_t)n_dims,
                              float_as_u32(theta_scale), float_as_u32(freq_scale), mdst);
     GGML_UNUSED(ctx);
+    RECORD_OP_END("rope_f32_i32_f32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -609,6 +630,7 @@ static uint16_t f32_to_bf16(float h) {
 }
 
 static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
 
@@ -670,9 +692,11 @@ static void ggml_rnpu_dup_f32_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_dup_f32_bf16_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(src0));
@@ -701,6 +725,7 @@ static void ggml_rnpu_dup_f32_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_dup_f32_f32_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -746,9 +771,11 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
                 }
                 printf("[INFO] Loaded dup_cont_f32_cont_bf16 kernel desc successfully.\n");
             }
+            int64_t start_time = RECORD_OP_START();
             int kernel_ret;
             npu_runtime_kernel_start(&runtime, dup_cont_f32_cont_bf16, &kernel_ret, 10,
                                     src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
+            RECORD_OP_END("dup_cont_f32_cont_bf16", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
         } else {
             // dup_cont_f32_no_cont_bf16
             if (dup_cont_f32_no_cont_bf16 == NULL) {
@@ -760,6 +787,7 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
                 }
                 printf("[INFO] Loaded dup_cont_f32_no_cont_bf16 kernel desc successfully.\n");
             }
+            int64_t start_time = RECORD_OP_START();
             int kernel_ret;
             npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 10,
                                     src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
@@ -767,6 +795,7 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
             npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 18,
                                 src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m,
                                 src0_nb3, src0_nb2, src0_nb1, src0_nb0, dst_nb3, dst_nb2, dst_nb1, dst_nb0);
+            RECORD_OP_END("dup_cont_f32_no_cont_bf16", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
         }
     } else {
         // TODO: Not support dup_no_cont_f32_cont_bf16
@@ -784,10 +813,12 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
                 }
                 printf("[INFO] Loaded dup_no_cont_f32_no_cont_bf16 kernel desc successfully.\n");
             }
+            int64_t start_time = RECORD_OP_START();
             int kernel_ret;
             npu_runtime_kernel_start(&runtime, dup_no_cont_f32_no_cont_bf16, &kernel_ret, 18,
                                 src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m,
                                 src0_nb3, src0_nb2, src0_nb1, src0_nb0, dst_nb3, dst_nb2, dst_nb1, dst_nb0);
+            RECORD_OP_END("dup_no_cont_f32_no_cont_bf16", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
         }
     }
 
@@ -806,7 +837,7 @@ static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     int dst_bs = dst->ne[3];
     int dst_h = dst->ne[2];
     int dst_n = dst->ne[1];
-    int dst_m = dst->ne[0];                         
+    int dst_m = dst->ne[0];
 
     GGML_ASSERT(ggml_nelements(dst) == ggml_nelements(src0));
 
@@ -820,9 +851,11 @@ static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
         }
         printf("[INFO] Loaded dup_cont_f32_cont_f32 kernel desc successfully.\n");
     }
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, dup_cont_f32_cont_f32, &kernel_ret, 10,
                             src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
+    RECORD_OP_END("dup_cont_f32_cont_f32", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_dup(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -867,6 +900,7 @@ void ggml_rnpu_view(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 }
 
 static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const int axis0 = ((int32_t *) dst->op_params)[0];
     const int axis1 = ((int32_t *) dst->op_params)[1];
@@ -906,6 +940,7 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_permute_f32_2_1_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_permute_f32_2_1(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -928,9 +963,12 @@ static void ggml_rnpu_permute_f32_2_1(ggml_backend_rnpu_context& ctx, ggml_tenso
     }
 
     // Launch kernel
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, permute_f32_2_1, &kernel_ret, 6,
                             src0->data, dst->data, bs, h, n, m);
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("permute_f32_2_1", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -952,6 +990,7 @@ void ggml_rnpu_transpose(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 }
 
 static void ggml_rnpu_rms_norm_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
 
     // TODO: Only support fp32 RMS_NORM
@@ -987,6 +1026,7 @@ static void ggml_rnpu_rms_norm_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_rms_norm_f32_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -998,7 +1038,7 @@ static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
 
     float eps;
     memcpy(&eps, dst->op_params, sizeof(float));
-    
+
     // Kernel lazy load
     static struct NPUKernelDesc* rms_norm_f32 = NULL;
     if (rms_norm_f32 == NULL) {
@@ -1012,9 +1052,12 @@ static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     }
 
     // Launch kernel
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, rms_norm_f32, &kernel_ret, 7,
                             src0->data, dst->data, bs, h, n, m, eps);
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("rms_norm_f32", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -1030,6 +1073,7 @@ void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 }
 
 static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -1110,6 +1154,7 @@ static void ggml_rnpu_softmax_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_softmax_f32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -1146,18 +1191,20 @@ static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
         printf("[INFO] Loaded softmax_f32_f32_f32 kernel desc successfully.\n");
     }
 
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, softmax_f32_f32_f32, &kernel_ret, 8,
                              src0->data, src1->data, dst->data, float_as_u32(scale),
                              (uint64_t)bs, (uint64_t)h, (uint64_t)n, (uint64_t)m);
     GGML_UNUSED(ctx);
+    RECORD_OP_END("softmax_f32_f32_f32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_softmax_f32(ctx, dst);
+            ggml_rnpu_softmax_f32_cpu(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op SOFTMAX in R-NPU\n",
@@ -1166,6 +1213,7 @@ void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
 }
 
 static void ggml_rnpu_silu_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
 
     // TODO: Only support fp32 SiLU
@@ -1189,6 +1237,7 @@ static void ggml_rnpu_silu_f32_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_silu_f32_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_silu_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -1211,9 +1260,12 @@ static void ggml_rnpu_silu_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst)
     }
 
     // Launch kernel
+    int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, silu_f32, &kernel_ret, 6,
                             src0->data, dst->data, bs, h, n, m);
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("silu_f32", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -1260,6 +1312,7 @@ static float bf16_to_fp32(uint16_t h) {
 }
 
 static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -1317,6 +1370,7 @@ static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tenso
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_matmul_bf16_fp32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 union fp32_int32 {
@@ -1358,9 +1412,9 @@ static float e4m3q_to_float(uint8_t h) {
     return out.f;
 }
 
-static void block_float_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8) {
+void block_fp32_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8, int block_size) {
     float m = 0;
-    for (int i = 0; i < QK; ++i) {
+    for (int i = 0; i < block_size; ++i) {
         m = std::max(std::abs(b_f32[i]),m);
     }
 
@@ -1369,12 +1423,37 @@ static void block_float_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8) {
     // set dequantize scale
     b_fp8->scale = m / e4m3q_max;
 
-    for (int i = 0; i < QK; ++i) {
+    for (int i = 0; i < block_size; ++i) {
         b_fp8->data[i] = float_to_e4m3q(b_f32[i] * D);
     }
 }
 
+void block_bf16_to_e4m3q(uint16_t * b_bf16, int byte_stride, block_e4m3_q * b_fp8, int block_size) {
+    float m = 0;
+    for (int i = 0; i < block_size; ++i) {
+        uint16_t elem = *(b_bf16 + (i * byte_stride) / sizeof(uint16_t));
+        fp32_int32 temp;
+        temp.bits = (((uint32_t)elem) << 16) & 0xffff0000;
+        m = std::max(std::abs(temp.f),m);
+    }
+
+    const float D = e4m3q_max / m;
+
+    // set dequantize scale
+    b_fp8->scale = m / e4m3q_max;
+
+    for (int i = 0; i < block_size; ++i) {
+        fp32_int32 temp;
+        uint16_t elem = *(b_bf16 + (i * byte_stride) / sizeof(uint16_t));
+        temp.bits = (((uint32_t)elem) << 16) & 0xffff0000;
+        temp.f *= D;
+        temp.bits &= 0xffff0000;
+        b_fp8->data[i] = float_to_e4m3q(temp.f);
+    }
+}
+
 static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -1423,7 +1502,7 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
 
                         // transfer B block (to fp8)
                         static struct block_e4m3_q b_block_fp8;
-                        block_float_to_e4m3q(b_block_f32, &b_block_fp8);
+                        block_fp32_to_e4m3q(b_block_f32, &b_block_fp8, QK);
 
                         // in-block loop
                         for (int x = 0; x < QK; ++x) {
@@ -1447,6 +1526,90 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_matmul_e4m3q_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
+}
+
+void matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+    int h0 = src0->ne[2];
+
+    // dim(0) and dim(1) only broadcast from src0 to src1
+    int rbs = bs / src0->ne[3];
+    int rj = h / src0->ne[2];
+    assert(bs >= src0->ne[3]);
+    assert(h >= src0->ne[2]);
+
+    // FIXME: Copy from device to cpu memory
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
+    // src0 shape: (bs0, h0, n, k)
+    // src1 shape: (bs, h, m, k)
+    // dst shape: (bs, h, m, n)
+    int n = src0->ne[1];
+    int m = src1->ne[1];
+    int k = src1->ne[0];
+    assert(src1->ne[0] == src0->ne[0]);
+
+    uint16_t * a = (uint16_t *)src0_data_cpu;
+    float * b = (float *)src1_data_cpu;
+    float * res = (float *)dst_data_cpu;
+    for (int i = 0; i < bs; ++i)
+        for (int j = 0; j < h; ++j) {
+            // broadcast in dim(0)
+            int i0 = i / rbs;
+            // broadcase in dim(1)
+            int j0 = j / rj;
+            for (int p = 0; p < m; ++p) {
+                for (int l = 0; l < n; ++l) {
+                    float dot_sum = 0.0; // DOT SUM
+                    for (int x = 0; x < k; x += QK) {
+                        int block_size = std::min(k - x, QK);
+                        // quant A block
+                        // printf("reach quant a block m=%d n=%d\n", p, l);
+                        // printf("nb={%ld, %ld, %ld, %ld}\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+                        // printf("start at src->data[%ld]\n", ((i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1]) / sizeof(uint16_t)) + x);
+                        uint16_t * a_bf16 = a + ((i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1]) / sizeof(uint16_t)) + x;
+                        static struct block_e4m3_q a_block_fp8;
+                        block_bf16_to_e4m3q(a_bf16, src0->nb[0], &a_block_fp8, block_size);
+
+                        // quant B block
+                        // printf("reach quant a block m=%d n=%d\n", p, l);
+                        float * b_fp32 = b + ((i*src1->nb[3] + j*src1->nb[2] + p*src1->nb[1]) / sizeof(float)) + x;
+                        static struct block_e4m3_q b_block_fp8;
+                        block_fp32_to_e4m3q(b_fp32, &b_block_fp8, block_size);
+
+                        // in-block loop
+                        // printf("reach block_sum m=%d n=%d\n", p, l);
+                        float block_sum = 0.0f; // BLOCK_SUM
+                        for (int idx = 0; idx < block_size; ++idx) {
+                            float ea = e4m3q_to_float(a_block_fp8.data[idx]);
+                            float eb = e4m3q_to_float(b_block_fp8.data[idx]);
+                            block_sum += ea * eb;
+                        }
+
+                        // add block sum to dot sum (with scaling)
+                        float scale_a = a_block_fp8.scale;
+                        float scale_b = b_block_fp8.scale;
+                        dot_sum += (scale_a * scale_b) * block_sum;
+                    }
+                    // double to float cast
+                    // printf("reach dot sum m=%d n=%d\n", p, l);
+                    res[i*h*m*n + j*m*n + p*n + l] = dot_sum;
+                } // n loop
+            } // m loop
+        } // h loop
+    GGML_UNUSED(ctx);
+    // FIXME: Copy result to device memory
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 template<int N>
@@ -1607,7 +1770,12 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_matmul_bf16_cpu(ctx, dst);
+            // if (bf16_matmul_cnt % 2 == 1)
+            //     ggml_rnpu_matmul_bf16_cpu(ctx, dst);
+            // else
+                matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ctx, dst);
+            // bf16_matmul_cnt++;
+            // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
             break;
         case GGML_TYPE_E4M3_Q:
             ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);

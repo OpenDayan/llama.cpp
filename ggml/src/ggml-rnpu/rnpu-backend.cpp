@@ -12,6 +12,7 @@
 #include "../ggml-impl.h"
 
 #include "./common.hpp"
+#include "./utils.hpp"
 #include "ggml.h"
 
 // ------------------------------------------------------------------------------
@@ -42,6 +43,9 @@ static const char * ggml_backend_rnpu_get_name(ggml_backend_t backend) {
  * @param backend Pointer to the R-NPU backend structure to be freed.
  */
 static void ggml_backend_rnpu_free(ggml_backend_t backend) {
+    // Statistics information for RNPU operators
+    OperatorStatsManager::getInstance().saveReportToFile("operator_stats.json");
+
     ggml_backend_rnpu_context * rnpu_ctx = (ggml_backend_rnpu_context *)backend->context;
 
     delete rnpu_ctx;
