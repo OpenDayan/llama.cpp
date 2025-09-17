@@ -314,8 +314,8 @@ void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            // ggml_rnpu_op_add_f32_cpu(ctx, dst);
-            ggml_rnpu_op_add_f32(ctx, dst);
+            ggml_rnpu_op_add_f32_cpu(ctx, dst);
+            // ggml_rnpu_op_add_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op ADD in R-NPU\n",
@@ -1711,6 +1711,7 @@ static int gmma_e4m3q_fp32_AT_QK256(
 }
 
 static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -1735,35 +1736,16 @@ static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     int n = src1->ne[1];
     int k = src1->ne[0];
     assert(src1->ne[0] == src0->ne[0]);
-    // Convert src1 to e4m3q
-    float * b = (float *)(src1->data);
-    std::vector<uint8_t> b_e4m3q(bs * h * m * k * (QK + sizeof(float)) / QK);
-    for (int64_t i13 = 0; i13 < bs; ++i13) {
-        for (int64_t i12 = 0; i12 < h; ++i12) {
-            for (int64_t i11 = 0; i11 < n; ++i11) {
-                float_to_e4m3q(b + (
-                                i13 * src1->nb[3]
-                              + i12 * src1->nb[2]
-                              + i11 * src1->nb[1]
-                            )/sizeof(float),
-                            (bloc_fp8<4>*)(b_e4m3q.data() + (
-                                i13 * (src1->nb[3] / sizeof(float)) * (QK + sizeof(float)) / QK
-                              + i12 * (src1->nb[2] / sizeof(float)) * (QK + sizeof(float)) / QK
-                              + i11 * (src1->nb[1] / sizeof(float)) * (QK + sizeof(float)) / QK
-                            )/sizeof(uint8_t)),
-                            k);
-            }
-        }
-    }
 
     // Call Kernel
     gmma_e4m3q_fp32_AT_QK256(
-        src0->data, b_e4m3q.data(), dst->data,
+        src0->data, src1->data, dst->data,
         m, n, k,
-        src1->ne[0] * (QK + sizeof(float)) / QK, src0->ne[0] * (QK + sizeof(float)) / QK, dst->nb[1] / sizeof(float)
+        src1->ne[0] * (QK + sizeof(float)) / QK, src1->ne[0], dst->nb[1] / sizeof(float)
     );
 
     GGML_UNUSED(ctx);
+    RECORD_OP_END("ggml_rnpu_matmul_e4m3q", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
 void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -1778,10 +1760,12 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
             // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
             break;
         case GGML_TYPE_E4M3_Q:
-            ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
+            // ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
+            ggml_rnpu_matmul_e4m3q(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",
                        ggml_type_name(src0->type));
     }
 }
+
