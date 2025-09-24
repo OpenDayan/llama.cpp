@@ -98,6 +98,21 @@ npuErr_t npuFreeHost(void * ptr) {
 }
 
 npuErr_t npuMemset(void * ptr, int value, size_t size) {
+    if (size > 4096) {
+        void * copy_buf = malloc(4096);
+        memset(copy_buf, value, 4096);
+        while (size >= 4096) {
+            npuMemcpy(ptr, copy_buf, 4096, npuMemcpyHostToDevice);
+            ptr = (void *)((char * )ptr + 4096);
+            size -= 4096;
+        }
+
+        free(copy_buf);
+
+        if (size == 0) {
+            return npuSuccess;
+        }
+    }
     npu_runtime_memset(&runtime, (uint64_t)ptr, value, size);
     // memset(ptr, value, size);
     return npuSuccess;
