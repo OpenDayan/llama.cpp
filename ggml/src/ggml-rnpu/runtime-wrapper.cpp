@@ -134,8 +134,7 @@ npuErr_t npuMemcpy(void * dst, const void * src, size_t size, npuMemcpy_t kind) 
 }
 
 npuErr_t npuMemGetInfo(size_t * free, size_t * total) {
-    *free = 16 * 1024L * 1024L * 1024L; // FIXME: always have 1GB free memory
-    *total = 16 * 1024L * 1024L * 1024L; // 16GB total memory
+    npu_runtime_get_meminfo(&runtime, free, total);
     return npuSuccess;
 }
 
