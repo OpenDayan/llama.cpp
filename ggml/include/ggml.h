@@ -641,6 +641,7 @@ extern "C" {
     GGML_API int64_t ggml_cycles_per_ms(void);
 
     // accepts a UTF-8 path, even on Windows
+    GGML_API void    ggml_print_shape(const struct ggml_tensor * tensor);
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
@@ -1322,6 +1323,17 @@ extern "C" {
             int64_t               ne0,
             int64_t               ne1,
             int64_t               ne2,
+            size_t                nb1, // row   stride in bytes
+            size_t                nb2, // slice stride in bytes
+            size_t                offset);
+
+    GGML_API struct ggml_tensor * ggml_view_3d_uncont(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int64_t               ne0,
+            int64_t               ne1,
+            int64_t               ne2,
+            size_t                nb0,
             size_t                nb1, // row   stride in bytes
             size_t                nb2, // slice stride in bytes
             size_t                offset);

@@ -1112,6 +1112,11 @@ static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size 
 
 ////////////////////////////////////////////////////////////////////////////////
 
+void ggml_print_shape(const struct ggml_tensor * tensor) {
+    printf("ne:[%ld, %ld, %ld, %ld]\n", tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+    printf("nb:[%ld, %ld, %ld, %ld]\n", tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3]);
+}
+
 void ggml_print_object(const struct ggml_object * obj) {
     GGML_LOG_INFO(" - ggml_object: type = %d, offset = %zu, size = %zu, next = %p\n",
             obj->type, obj->offs, obj->size, (const void *) obj->next);
@@ -2741,7 +2746,7 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
-    GGML_ASSERT(!ggml_is_transposed(a));
+    // GGML_ASSERT(!ggml_is_transposed(a));
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3211,6 +3216,28 @@ struct ggml_tensor * ggml_view_3d(
 
     struct ggml_tensor * result = ggml_view_impl(ctx, a, 3, ne, offset);
 
+    result->nb[1] = nb1;
+    result->nb[2] = nb2;
+    result->nb[3] = result->nb[2]*ne2;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_view_3d_uncont(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * a,
+    int64_t               ne0,
+    int64_t               ne1,
+    int64_t               ne2,
+    size_t                nb0,
+    size_t                nb1,
+    size_t                nb2,
+    size_t                offset) {
+    const int64_t ne[3] = { ne0, ne1, ne2 };
+
+    struct ggml_tensor * result = ggml_view_impl(ctx, a, 3, ne, offset);
+
+    result->nb[0] = nb0;
     result->nb[1] = nb1;
     result->nb[2] = nb2;
     result->nb[3] = result->nb[2]*ne2;
