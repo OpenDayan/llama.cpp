@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -1612,81 +1613,6 @@ void matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ggml_backend_rnpu_context
     RECORD_OP_END("matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
-template<int N>
-constexpr int exp_i2() {
-    return 1 << N;
-}
-
-template<int N>
-constexpr float exp_f2() {
-    if constexpr (N>0) return exp_f2<N-1>()*2;
-    if constexpr (N<0) return exp_f2<N+1>()/2;
-    if constexpr (N==0) return 1.;
-}
-
-template<int _E> //, int M=7-E>  1.7 bits!
-struct FP8 {
-    uint8_t bits;
-    using type = FP8<_E>;
-    static constexpr int E      = _E;
-    static constexpr int M      = (7-_E);
-    static constexpr int E_BIAS = exp_i2<E-1>()-1;
-    static constexpr float MAX  = (2-exp_f2<-M+1>())*exp_f2<exp_i2<E-1>()>();
-    static constexpr float MIN  = exp_f2<-M>()*exp_f2<2-exp_i2<E-1>()>();
-};
-
-template <int E>
-struct bloc_fp8 {
-    float d;
-    FP8<E> qs[QK];
-};
-
-template<int E>
-inline FP8<E> float_to_fp8(float value) {
-    FP8<E> out;
-    fp32_int32 in = {value};
-    // the sign
-    out.bits = (in.bits >> 24) & 0x80;
-    // value without sign
-    in.bits &= 0x7fffffff;
-    //GGML_ASSERT(in.bits < 0x7f800000); // +/- infinity or NAN
-    if (in.f >= FP8<E>::MAX) {
-        out.bits |= 0x7E;
-    } else if (in.f < FP8<E>::MIN) { // => 0.
-        // OK: S.0000000
-    } else {
-        in.f *= exp_f2<FP8<E>::E_BIAS-127>();
-        // - trunc
-        //uint32_t eps = 0;
-        // - rounding half away from zero
-        //uint32_t eps = 0x400000>>FP8<E>::M;
-        // - rounding half toward zero
-        //uint32_t eps = 0x3fffff>>FP8<E>::M;
-        // - rounding to nearest even
-        uint32_t eps = (0x3fffff>>FP8<E>::M) + ((in.bits >> (23-FP8<E>::M)) & 0x1);
-        // shift mantissa.
-        in.bits += eps;
-        out.bits |= (in.bits >> (23-FP8<E>::M)) & 0x7F;
-    }
-    return out;
-}
-
-template <int E>
-static inline void float_to_e4m3q(const float* x, bloc_fp8<E>* y, int64_t size) {
-    const auto qk_size = size / QK;
-    for (int64_t q=0; q<qk_size; ++q) {
-        float m = 0;
-        for (int64_t i=0; i<QK; i++) {
-            m = std::max(std::abs(x[q*QK+i]),m);
-        }
-        const float D = FP8<E>::MAX/m;
-        y[q].d = m/FP8<E>::MAX;
-        for (int64_t i=0; i<QK; i++) {
-            y[q].qs[i] = float_to_fp8<E>(x[q*QK+i]*D);
-        }
-    }
-}
-
 static int gmma_e4m3q_fp32_AT_QK256(
                         void *a, void *b, void *c,
                         int m, int n, int k,
@@ -1748,20 +1674,96 @@ static void ggml_rnpu_matmul_e4m3q(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     RECORD_OP_END("ggml_rnpu_matmul_e4m3q", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
 
+static int gmma_bf16_fp32_AT_QK256(
+    void *a, void *b, void *c,
+    int m, int n, int k,
+    int lda, int ldb, int ldc,
+    int g, int h,
+    int stride_g, int stride_h, int a_is_transposed)
+{
+    printf("\nm:%d, n:%d, k:%d, g:%d, h:%d\n", m, n, k, g, h);
+    printf("lda:%d, ldb:%d, ldc:%d, stride_g:%d, stride_h:%d\n", lda, ldb, ldc, stride_g, stride_h);
+    static struct NPUKernelDesc *gmma_bf16_fp32_AT_QK256_desc = NULL;
+    if (gmma_bf16_fp32_AT_QK256_desc == NULL)
+    {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "gmma_bf16_fp32_AT_QK256", &gmma_bf16_fp32_AT_QK256_desc);
+        if (err != NPU_SUCCESS) {
+          printf("Failed to get kernel description: err=%d\n", err);
+          npu_runtime_deinit(&runtime);
+          exit(-1);
+        }
+        printf("[INFO] Loaded gmma_bf16_fp32_AT_QK256 kernel desc successfully.\n");
+    }
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, gmma_bf16_fp32_AT_QK256_desc, &kernel_ret, 14,
+                             a, b, c,
+                             (uint64_t)m, (uint64_t)n, (uint64_t)k,
+                             (uint64_t)lda, (uint64_t)ldb, (uint64_t)ldc,
+                             (uint64_t)g, (uint64_t)h,
+                             (uint64_t)stride_g, (uint64_t)stride_h, (uint64_t)a_is_transposed);
+    return kernel_ret;
+}
+
+static int count_matmul_bf16 = 0;
+void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+    int h0 = src0->ne[2];
+
+    assert(bs >= src0->ne[3]);
+    assert(h >= src0->ne[2]);
+    assert(src1->ne[0] == src0->ne[0]);
+
+    // src0 shape: (bs0, h0, m, k)
+    // src1 shape: (bs, h, n, k)
+    // dst shape: (bs, h, n, m)
+    int m = src0->ne[1];
+    int n = src1->ne[1];
+    int k = src1->ne[0];
+    assert(src1->ne[0] == src0->ne[0]);
+
+    int a_is_transposed = (src0->nb[0] > src0->nb[1]);
+    // Call Kernel
+    gmma_bf16_fp32_AT_QK256(
+        src0->data, src1->data, dst->data,
+        m, n, k,
+        (a_is_transposed ? src0->nb[0] : src0->nb[1]) / sizeof(uint16_t),
+        src1->nb[1] / sizeof(float),
+        dst->nb[1] / sizeof(float),
+        src0->ne[2], src1->ne[2],
+        src0->nb[2] / sizeof(uint16_t), src1->nb[2] / sizeof(float),
+        a_is_transposed
+    );
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("ggml_rnpu_matmul_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+
 void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            // if (bf16_matmul_cnt % 2 == 1)
-            //     ggml_rnpu_matmul_bf16_cpu(ctx, dst);
-            // else
-                matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ctx, dst);
-            // bf16_matmul_cnt++;
             // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
+
+            // if(count_matmul_bf16 % 2 == 1) {
+            //     matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ctx, dst);
+            // } else {
+            //     ggml_rnpu_matmul_bf16(ctx, dst);
+            // }
+
+            // matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ctx, dst);
+
+            ggml_rnpu_matmul_bf16(ctx, dst);
+
+            count_matmul_bf16++;
             break;
         case GGML_TYPE_E4M3_Q:
-            // ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
-            ggml_rnpu_matmul_e4m3q(ctx, dst);
+            ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
+            // ggml_rnpu_matmul_e4m3q(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",
