@@ -1154,6 +1154,14 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
         }
     }
 
+    if (!ggml_is_contiguous(tensor)) {
+        size_t max_nbytes = 0;
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            max_nbytes = max_nbytes > (tensor->ne[i] * tensor->nb[i]) ? max_nbytes : (tensor->ne[i] * tensor->nb[i]);
+        }
+        return max_nbytes;
+    }
+
     size_t nbytes;
     const size_t blck_size = ggml_blck_size(tensor->type);
     if (blck_size == 1) {
