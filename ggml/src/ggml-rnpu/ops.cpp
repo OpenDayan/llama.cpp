@@ -15,8 +15,10 @@
 struct NPURuntimeState runtime;
 extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
 
-static int matmul_cnt = 0;
-static int stage = 0;
+// reserve 128MB for cpu buffer
+static char src0_cpu_buffer[1024L * 1024L * 128];
+static char src1_cpu_buffer[1024L * 1024L * 128];
+static char dst_cpu_buffer[1024L * 1024L * 128];
 static void copy_binary_op_data_from_dev_to_cpu(
                     ggml_tensor * dst, void ** src0_data_cpu,
                     void ** src1_data_cpu, void ** dst_data_cpu) {
@@ -25,20 +27,27 @@ static void copy_binary_op_data_from_dev_to_cpu(
     size_t src0_size = ggml_nbytes(src0);
     size_t src1_size = ggml_nbytes(src1);
     size_t dst_size = ggml_nbytes(dst);
-    npuMallocHost(src0_data_cpu, src0_size);
-    npuMallocHost(src1_data_cpu, src1_size);
-    npuMallocHost(dst_data_cpu, dst_size);
-    npuMemcpy(*src0_data_cpu, src0->data, src0_size, npuMemcpyDeviceToHost);
-    npuMemcpy(*src1_data_cpu, src1->data, src1_size, npuMemcpyDeviceToHost);
+    npuMemcpy(src0_cpu_buffer, src0->data, src0_size, npuMemcpyDeviceToHost);
+    npuMemcpy(src1_cpu_buffer, src1->data, src1_size, npuMemcpyDeviceToHost);
+    if(dst->view_src == src0) {
+        *dst_data_cpu = (void *)src0_cpu_buffer;
+    } else if(dst->view_src == src1) {
+        *dst_data_cpu = (void *)src1_cpu_buffer;
+    } else {
+        *dst_data_cpu = (void *)dst_cpu_buffer;
+        npuMemcpy(dst_cpu_buffer, dst->data, dst_size, npuMemcpyDeviceToHost);
+    }
+    *src0_data_cpu = (void *)src0_cpu_buffer;
+    *src1_data_cpu = (void *)src1_cpu_buffer;
+
 }
 
 static void copy_binary_op_data_from_cpu_to_dev(
                     ggml_tensor * dst, void * src0_data_cpu,
                     void * src1_data_cpu, void * dst_data_cpu) {
+    GGML_UNUSED(src0_data_cpu);
+    GGML_UNUSED(src1_data_cpu);
     npuMemcpy(dst->data, dst_data_cpu, ggml_nbytes(dst), npuMemcpyHostToDevice);
-    npuFreeHost(src0_data_cpu);
-    npuFreeHost(src1_data_cpu);
-    npuFreeHost(dst_data_cpu);
 }
 
 static void copy_unary_op_data_from_dev_to_cpu(
@@ -46,24 +55,20 @@ static void copy_unary_op_data_from_dev_to_cpu(
     const ggml_tensor * src0 = dst->src[0];
     size_t src0_size = ggml_nbytes(src0);
     size_t dst_size = ggml_nbytes(dst);
-    npuMallocHost(src0_data_cpu, src0_size);
-    if (dst->view_src != src0) {
-        npuMallocHost(dst_data_cpu, dst_size);
-        npuMemcpy(*dst_data_cpu, dst->data, dst_size, npuMemcpyDeviceToHost);
+    if (dst->view_src == src0) {
+        *dst_data_cpu = (void *)src0_cpu_buffer;
     } else {
-        dst_data_cpu = src0_data_cpu;
+        *dst_data_cpu = (void *)dst_cpu_buffer;
+        npuMemcpy(dst_cpu_buffer, dst->data, dst_size, npuMemcpyDeviceToHost);
     }
-    npuMemcpy(*src0_data_cpu, src0->data, src0_size, npuMemcpyDeviceToHost);
+    npuMemcpy(src0_cpu_buffer, src0->data, src0_size, npuMemcpyDeviceToHost);
+    *src0_data_cpu = (void *)src0_cpu_buffer;
 }
 
 static void copy_unary_op_data_from_cpu_to_dev(
                 ggml_tensor * dst, void * src0_data_cpu, void * dst_data_cpu) {
-    const ggml_tensor * src0 = dst->src[0];
+    GGML_UNUSED(src0_data_cpu);
     npuMemcpy(dst->data, dst_data_cpu, ggml_nbytes(dst), npuMemcpyHostToDevice);
-    npuFreeHost(src0_data_cpu);
-    if (dst->view_src != src0) {
-        npuFreeHost(dst_data_cpu);
-    }
 }
 
 static void ggml_rnpu_get_rows_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -222,6 +227,7 @@ void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     switch (src0->type) {
         case GGML_TYPE_BF16:
             // ggml_rnpu_get_rows_bf16_cpu(ctx, dst);
+            GGML_ABORT("get_rows_bf16_cpu should not be called in R-NPU backend (always in CPU)\n");
             break;
         case GGML_TYPE_F32:
             // ggml_rnpu_get_rows_f32_cpu(ctx, dst);
@@ -315,8 +321,8 @@ void ggml_rnpu_op_add(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_op_add_f32_cpu(ctx, dst);
-            // ggml_rnpu_op_add_f32(ctx, dst);
+            // ggml_rnpu_op_add_f32_cpu(ctx, dst);
+            ggml_rnpu_op_add_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op ADD in R-NPU\n",
@@ -406,8 +412,8 @@ void ggml_rnpu_op_mul(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_op_mul_f32_cpu(ctx, dst);
-            // ggml_rnpu_op_mul_f32(ctx, dst);
+            // ggml_rnpu_op_mul_f32_cpu(ctx, dst);
+            ggml_rnpu_op_mul_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MUL in R-NPU\n",
@@ -607,7 +613,8 @@ void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_rope_f32(ctx, dst);
+            ggml_rnpu_rope_f32_cpu(ctx, dst);
+            // ggml_rnpu_rope_f32(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op RoPE in R-NPU\n",
@@ -976,6 +983,7 @@ void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
+            // ggml_rnpu_permute_f32_2_1_cpu(ctx, dst);
             ggml_rnpu_permute_f32_2_1(ctx, dst);
             break;
         default:
@@ -1065,6 +1073,7 @@ void ggml_rnpu_rms_norm(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
+            // ggml_rnpu_rms_norm_f32_cpu(ctx, dst);
             ggml_rnpu_rms_norm_f32(ctx, dst);
             break;
         default:
@@ -1205,6 +1214,7 @@ void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
+            // ggml_rnpu_softmax_f32(ctx, dst);
             ggml_rnpu_softmax_f32_cpu(ctx, dst);
             break;
         default:
@@ -1273,6 +1283,7 @@ void ggml_rnpu_silu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
+            // ggml_rnpu_silu_f32_cpu(ctx, dst);
             ggml_rnpu_silu_f32(ctx, dst);
             break;
         default:
@@ -1312,66 +1323,73 @@ static float bf16_to_fp32(uint16_t h) {
     return fp32.value;
 }
 
-static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    int64_t start_time = RECORD_OP_START();
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
+static uint8_t fp32_to_fp8_e4m3_round(float f) {
+    uint32_t x = 0;
+    memcpy(&x, &f, sizeof(float));
+    uint8_t sign = (x >> 31) & 0x1;
+    int32_t exponent = ((x >> 23) & 0xFF) - 127;
+    uint32_t mantissa = x & 0x007FFFFF;
 
-    // GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
-
-    GGML_TENSOR_BINARY_OP_LOCALS;
-
-    // FIXME: Copy from device to cpu memory
-    void * src0_data_cpu;
-    void * src1_data_cpu;
-    void * dst_data_cpu;
-    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
-
-    int bs = src1->ne[3];
-    int h = src1->ne[2];
-    int h0 = src0->ne[2];
-
-    int rbs = bs / src0->ne[3];
-    int rj = h / src0->ne[2];
-    assert(bs >= src0->ne[3]);
-    assert(h >= src0->ne[2]);
-
-    int n = src0->ne[1];
-    int m = src1->ne[1];
-    int k = src1->ne[0];
-    assert(src1->ne[0] == src0->ne[0]);
-
-    uint16_t * a = (uint16_t *) src0_data_cpu;
-    float * b = (float *) src1_data_cpu;
-    float * res = (float *) dst_data_cpu;
-    for (int i = 0; i < bs; ++i) {
-        for (int j = 0; j < h; ++j) {
-            // broadcast in dim(0)
-            int i0 = i / rbs;
-            // broadcase in dim(1)
-            int j0 = j / rj;
-
-            // b[i][j][:][:] * a[i0][j0][:][:]^T
-            for (int p = 0; p < m; ++p) {
-                for (int l = 0; l < n; ++l) {
-                    double val = 0.0;
-                    // res[i][j][p][l] = b[i][j][p][:] * a[i0][j0][l][:]^T
-                    for (int x = 0; x < k; ++x) {
-                        uint16_t ea = a[(i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1] + x*src0->nb[0]) / sizeof(uint16_t)];
-                        float eb = b[(i*src1->nb[3] + j*src1->nb[2] + p*src1->nb[1] + x*src1->nb[0]) / sizeof(float)];
-                        // b[...] is converted to bf16 then converted to fp32
-                        val += (double)(bf16_to_fp32(ea) * bf16_to_fp32(fp32_to_bf16(eb)));
-                    }
-                    // double to float cast
-                    res[i*h*m*n + j*m*n + p*n + l] = val;
-                }
-            }
-        }
+    if ((x & 0x7F800000) == 0x7F800000) {
+      return sign ? 0xFF : 0x7F;
     }
-    GGML_UNUSED(ctx);
-    // FIXME: Copy result to device memory
-    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
-    RECORD_OP_END("ggml_rnpu_matmul_bf16_fp32_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
+    if (exponent < -127) {
+      return sign << 7;
+    }
+
+    int32_t e4m3_exponent = exponent + 7;
+    uint8_t e4m3_mantissa = (mantissa >> 20) & 0x7;
+
+    if (e4m3_exponent <= 0) {
+      return sign << 7;
+    }
+
+    if (e4m3_exponent >= 15) {
+      return (sign << 7) | 0x7F;
+    }
+
+    uint32_t round_bit = (mantissa >> 19) & 0x1;
+    uint32_t sticky_bits = (mantissa & 0x0007FFFF) ? 1 : 0;
+
+    uint8_t result = (sign << 7) | (e4m3_exponent << 3) | e4m3_mantissa;
+
+    if (round_bit && (sticky_bits || (e4m3_mantissa & 1))) {
+        result += 1;
+    }
+
+    if ((result & 0x7F) == 0x7F) {
+      result = (sign << 7) | 0x7F;
+    }
+
+    return result;
+}
+
+static float fp8_e4m3_to_fp32(uint8_t x) {
+    int sign = (x & 0x80) ? -1 : 1;
+    int exponent = (x >> 3) & 0x0F;
+    float mantissa = (x & 0x07) / 8.0f;
+    if (exponent == 0) {
+      if (mantissa == 0.0f) {
+        return 0.0f * sign;
+      }
+      return sign * mantissa * 0.015625f;
+    }
+
+    mantissa += 1.0f;
+    float exp_value = 1.0f;
+    int exp = exponent - 7;
+
+    if (exp > 0) {
+      for (int i = 0; i < exp; i++) {
+        exp_value *= 2.0f;
+      }
+    } else {
+      for (int i = 0; i < -exp; i++) {
+        exp_value /= 2.0f;
+      }
+    }
+
+    return sign * mantissa * exp_value;
 }
 
 union fp32_int32 {
@@ -1413,7 +1431,7 @@ static float e4m3q_to_float(uint8_t h) {
     return out.f;
 }
 
-void block_fp32_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8, int block_size) {
+static void block_fp32_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8, int block_size) {
     float m = 0;
     for (int i = 0; i < block_size; ++i) {
         m = std::max(std::abs(b_f32[i]),m);
@@ -1425,31 +1443,8 @@ void block_fp32_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8, int block_size) {
     b_fp8->scale = m / e4m3q_max;
 
     for (int i = 0; i < block_size; ++i) {
+        // b_fp8->data[i] = fp32_to_fp8_e4m3_round(b_f32[i] * D);
         b_fp8->data[i] = float_to_e4m3q(b_f32[i] * D);
-    }
-}
-
-void block_bf16_to_e4m3q(uint16_t * b_bf16, int byte_stride, block_e4m3_q * b_fp8, int block_size) {
-    float m = 0;
-    for (int i = 0; i < block_size; ++i) {
-        uint16_t elem = *(b_bf16 + (i * byte_stride) / sizeof(uint16_t));
-        fp32_int32 temp;
-        temp.bits = (((uint32_t)elem) << 16) & 0xffff0000;
-        m = std::max(std::abs(temp.f),m);
-    }
-
-    const float D = e4m3q_max / m;
-
-    // set dequantize scale
-    b_fp8->scale = m / e4m3q_max;
-
-    for (int i = 0; i < block_size; ++i) {
-        fp32_int32 temp;
-        uint16_t elem = *(b_bf16 + (i * byte_stride) / sizeof(uint16_t));
-        temp.bits = (((uint32_t)elem) << 16) & 0xffff0000;
-        temp.f *= D;
-        temp.bits &= 0xffff0000;
-        b_fp8->data[i] = float_to_e4m3q(temp.f);
     }
 }
 
@@ -1509,6 +1504,8 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
                         for (int x = 0; x < QK; ++x) {
                             float ea = e4m3q_to_float(a_block_fp8->data[x]);
                             float eb = e4m3q_to_float(b_block_fp8.data[x]);
+                            // float ea = fp8_e4m3_to_fp32(a_block_fp8->data[x]);
+                            // float eb = fp8_e4m3_to_fp32(b_block_fp8.data[x]);
                             block_sum += ea * eb;
                         }
 
@@ -1530,20 +1527,12 @@ static void ggml_rnpu_matmul_e4m3q_cpu(ggml_backend_rnpu_context& ctx, ggml_tens
     RECORD_OP_END("ggml_rnpu_matmul_e4m3q_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
-void matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_matmul_bf16_cpu(ggml_backend_rnpu_context& ctx, struct ggml_tensor * dst) {
     int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
-    int bs = src1->ne[3];
-    int h = src1->ne[2];
-    int h0 = src0->ne[2];
-
-    // dim(0) and dim(1) only broadcast from src0 to src1
-    int rbs = bs / src0->ne[3];
-    int rj = h / src0->ne[2];
-    assert(bs >= src0->ne[3]);
-    assert(h >= src0->ne[2]);
+    // GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
 
     // FIXME: Copy from device to cpu memory
     void * src0_data_cpu;
@@ -1551,66 +1540,50 @@ void matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ggml_backend_rnpu_context
     void * dst_data_cpu;
     copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
 
-    // src0 shape: (bs0, h0, n, k)
-    // src1 shape: (bs, h, m, k)
-    // dst shape: (bs, h, m, n)
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+
+    int rbs = bs / src0->ne[3];
+    int rj = h / src0->ne[2];
+    assert(bs >= src0->ne[3]);
+    assert(h >= src0->ne[2]);
+
     int n = src0->ne[1];
     int m = src1->ne[1];
     int k = src1->ne[0];
     assert(src1->ne[0] == src0->ne[0]);
 
-    uint16_t * a = (uint16_t *)src0_data_cpu;
-    float * b = (float *)src1_data_cpu;
-    float * res = (float *)dst_data_cpu;
-    for (int i = 0; i < bs; ++i)
+    uint16_t * a = (uint16_t *) src0_data_cpu;
+    float * b = (float *) src1_data_cpu;
+    float * res = (float *) dst_data_cpu;
+    for (int i = 0; i < bs; ++i) {
         for (int j = 0; j < h; ++j) {
             // broadcast in dim(0)
             int i0 = i / rbs;
             // broadcase in dim(1)
             int j0 = j / rj;
+
+            // b[i][j][:][:] * a[i0][j0][:][:]^T
             for (int p = 0; p < m; ++p) {
                 for (int l = 0; l < n; ++l) {
-                    float dot_sum = 0.0; // DOT SUM
-                    for (int x = 0; x < k; x += QK) {
-                        int block_size = std::min(k - x, QK);
-                        // quant A block
-                        // printf("reach quant a block m=%d n=%d\n", p, l);
-                        // printf("nb={%ld, %ld, %ld, %ld}\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
-                        // printf("start at src->data[%ld]\n", ((i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1]) / sizeof(uint16_t)) + x);
-                        uint16_t * a_bf16 = a + ((i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1]) / sizeof(uint16_t)) + x;
-                        static struct block_e4m3_q a_block_fp8;
-                        block_bf16_to_e4m3q(a_bf16, src0->nb[0], &a_block_fp8, block_size);
-
-                        // quant B block
-                        // printf("reach quant a block m=%d n=%d\n", p, l);
-                        float * b_fp32 = b + ((i*src1->nb[3] + j*src1->nb[2] + p*src1->nb[1]) / sizeof(float)) + x;
-                        static struct block_e4m3_q b_block_fp8;
-                        block_fp32_to_e4m3q(b_fp32, &b_block_fp8, block_size);
-
-                        // in-block loop
-                        // printf("reach block_sum m=%d n=%d\n", p, l);
-                        float block_sum = 0.0f; // BLOCK_SUM
-                        for (int idx = 0; idx < block_size; ++idx) {
-                            float ea = e4m3q_to_float(a_block_fp8.data[idx]);
-                            float eb = e4m3q_to_float(b_block_fp8.data[idx]);
-                            block_sum += ea * eb;
-                        }
-
-                        // add block sum to dot sum (with scaling)
-                        float scale_a = a_block_fp8.scale;
-                        float scale_b = b_block_fp8.scale;
-                        dot_sum += (scale_a * scale_b) * block_sum;
+                    float val = 0.0;
+                    // res[i][j][p][l] = b[i][j][p][:] * a[i0][j0][l][:]^T
+                    for (int x = 0; x < k; ++x) {
+                        uint16_t ea = a[(i0*src0->nb[3] + j0*src0->nb[2] + l*src0->nb[1] + x*src0->nb[0]) / sizeof(uint16_t)];
+                        float eb = b[(i*src1->nb[3] + j*src1->nb[2] + p*src1->nb[1] + x*src1->nb[0]) / sizeof(float)];
+                        val += bf16_to_fp32(ea) * bf16_to_fp32(fp32_to_bf16(eb));
                     }
-                    // double to float cast
-                    // printf("reach dot sum m=%d n=%d\n", p, l);
-                    res[i*h*m*n + j*m*n + p*n + l] = dot_sum;
-                } // n loop
-            } // m loop
-        } // h loop
-    GGML_UNUSED(ctx);
+                    res[i*h*m*n + j*m*n + p*n + l] = val;
+                }
+            }
+        }
+    }
     // FIXME: Copy result to device memory
     copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
-    RECORD_OP_END("matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token", src0->ne, src1->ne, dst->ne, start_time, "CPU");
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("ggml_rnpu_matmul_bf16_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
 static int gmma_e4m3q_fp32_AT_QK256(
@@ -1681,8 +1654,8 @@ static int gmma_bf16_fp32_AT_QK256(
     int g, int h,
     int stride_g, int stride_h, int a_is_transposed)
 {
-    printf("\nm:%d, n:%d, k:%d, g:%d, h:%d\n", m, n, k, g, h);
-    printf("lda:%d, ldb:%d, ldc:%d, stride_g:%d, stride_h:%d\n", lda, ldb, ldc, stride_g, stride_h);
+    // printf("\nm:%d, n:%d, k:%d, g:%d, h:%d\n", m, n, k, g, h);
+    // printf("lda:%d, ldb:%d, ldc:%d, stride_g:%d, stride_h:%d\n", lda, ldb, ldc, stride_g, stride_h);
     static struct NPUKernelDesc *gmma_bf16_fp32_AT_QK256_desc = NULL;
     if (gmma_bf16_fp32_AT_QK256_desc == NULL)
     {
@@ -1704,8 +1677,7 @@ static int gmma_bf16_fp32_AT_QK256(
     return kernel_ret;
 }
 
-static int count_matmul_bf16 = 0;
-void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1724,6 +1696,7 @@ void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     int n = src1->ne[1];
     int k = src1->ne[0];
     assert(src1->ne[0] == src0->ne[0]);
+    // printf("name=%s, src0->data: 0x%p, src1->data: 0x%p, dst->data: 0x%p\n", dst->name, src0->data, src1->data, dst->data);
 
     int a_is_transposed = (src0->nb[0] > src0->nb[1]);
     // Call Kernel
@@ -1737,7 +1710,6 @@ void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
         src0->nb[2] / sizeof(uint16_t), src1->nb[2] / sizeof(float),
         a_is_transposed
     );
-
     GGML_UNUSED(ctx);
     RECORD_OP_END("ggml_rnpu_matmul_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 }
@@ -1748,18 +1720,7 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     switch (src0->type) {
         case GGML_TYPE_BF16:
             // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
-
-            // if(count_matmul_bf16 % 2 == 1) {
-            //     matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ctx, dst);
-            // } else {
-            //     ggml_rnpu_matmul_bf16(ctx, dst);
-            // }
-
-            // matmul_bf16_f32_f32_dynamic_quant_e4m3q_per_token(ctx, dst);
-
             ggml_rnpu_matmul_bf16(ctx, dst);
-
-            count_matmul_bf16++;
             break;
         case GGML_TYPE_E4M3_Q:
             ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
