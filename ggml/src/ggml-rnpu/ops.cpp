@@ -16,9 +16,9 @@ struct NPURuntimeState runtime;
 extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
 
 // reserve 128MB for cpu buffer
-static char src0_cpu_buffer[1024L * 1024L * 128];
-static char src1_cpu_buffer[1024L * 1024L * 128];
-static char dst_cpu_buffer[1024L * 1024L * 128];
+static char src0_cpu_buffer[1024L * 1024L * 256];
+static char src1_cpu_buffer[1024L * 1024L * 256];
+static char dst_cpu_buffer[1024L * 1024L * 256];
 static void copy_binary_op_data_from_dev_to_cpu(
                     ggml_tensor * dst, void ** src0_data_cpu,
                     void ** src1_data_cpu, void ** dst_data_cpu) {
@@ -613,8 +613,8 @@ void ggml_rnpu_rope(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            ggml_rnpu_rope_f32_cpu(ctx, dst);
-            // ggml_rnpu_rope_f32(ctx, dst);
+            ggml_rnpu_rope_f32(ctx, dst);
+            // ggml_rnpu_rope_f32_cpu(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op RoPE in R-NPU\n",
@@ -1214,8 +1214,8 @@ void ggml_rnpu_softmax(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            // ggml_rnpu_softmax_f32(ctx, dst);
-            ggml_rnpu_softmax_f32_cpu(ctx, dst);
+            ggml_rnpu_softmax_f32(ctx, dst);
+            // ggml_rnpu_softmax_f32_cpu(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op SOFTMAX in R-NPU\n",
@@ -1419,6 +1419,29 @@ static uint8_t float_to_e4m3q(float h) {
     return out;
 }
 
+static uint8_t float_to_e4m3q_nemu(float h) {
+    uint8_t out;
+    fp32_int32 in = {h};
+    int32_t exponent = ((in.bits >> 23) & 0xFF) - 127;
+    uint32_t mantissa = in.bits & 0x007FFFFF;
+
+    out = (in.bits >> 24) & 0x80;
+
+    in.bits &= 0x7fffffff;
+
+    if ((exponent > 8) || ((exponent == 8) && (mantissa >= 0x600000))) {
+        out |= 0x7E;
+    } else if (exponent < -7) { // => 0.
+        // out |= 0x1;
+    } else {
+        in.bits = (in.bits & 0x807fffff) | (((exponent + 7) & 0xff) << 23);
+        uint32_t eps = (0x3fffff>>3) + ((in.bits >> (23-3)) & 0x1);
+        in.bits += eps;
+        out |= (in.bits >> (23-3)) & 0x7F ;
+    }
+    return out;
+}
+
 static float e4m3q_to_float(uint8_t h) {
     fp32_int32 out = {0};
     out.bits = h & 0x80;
@@ -1444,7 +1467,8 @@ static void block_fp32_to_e4m3q(float * b_f32, block_e4m3_q * b_fp8, int block_s
 
     for (int i = 0; i < block_size; ++i) {
         // b_fp8->data[i] = fp32_to_fp8_e4m3_round(b_f32[i] * D);
-        b_fp8->data[i] = float_to_e4m3q(b_f32[i] * D);
+        // b_fp8->data[i] = float_to_e4m3q(b_f32[i] * D);
+        b_fp8->data[i] = float_to_e4m3q_nemu(b_f32[i] * D);
     }
 }
 
@@ -1723,8 +1747,8 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
             ggml_rnpu_matmul_bf16(ctx, dst);
             break;
         case GGML_TYPE_E4M3_Q:
-            ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
-            // ggml_rnpu_matmul_e4m3q(ctx, dst);
+            // ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
+            ggml_rnpu_matmul_e4m3q(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",
