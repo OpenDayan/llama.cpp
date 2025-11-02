@@ -16,6 +16,8 @@ set(RNPU_INCLUDE_DIRS
     ${RNPU_RT_PATH}/include
 )
 
+option(USE_FPGA "Enable FPGA mode" OFF)
+
 file(GLOB  GGML_SOURCES_RNPU "*.cpp")
 
 file(GLOB  RT_C_SRCS "${RNPU_RT_PATH}/src/*.c")
@@ -31,5 +33,10 @@ list(APPEND GGML_SOURCES_RNPU ${KERNEL_SRCS})
 ggml_add_backend_library(ggml-rnpu ${GGML_SOURCES_RNPU})
 
 target_include_directories(ggml-rnpu PRIVATE ${RNPU_INCLUDE_DIRS})
+
+if(USE_FPGA)
+    target_compile_definitions(ggml-rnpu PRIVATE USE_FPGA)
+    message(STATUS "Using FPGA mode")
+endif()
 
 message(STATUS "R-NPU: RNPU_INCLUDE_DIRS = ${RNPU_INCLUDE_DIRS}")
