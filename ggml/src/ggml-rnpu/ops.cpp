@@ -1064,7 +1064,7 @@ static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     int64_t start_time = RECORD_OP_START();
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, rms_norm_f32, &kernel_ret, 7,
-                            src0->data, dst->data, bs, h, n, m, eps);
+                            src0->data, dst->data, bs, h, n, m, float_as_u32(eps));
     GGML_UNUSED(ctx);
     RECORD_OP_END("rms_norm_f32", src0->ne, nullptr, dst->ne, start_time, "R-NPU");
 }
