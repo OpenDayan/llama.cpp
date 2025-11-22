@@ -797,8 +797,8 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
             }
             int64_t start_time = RECORD_OP_START();
             int kernel_ret;
-            npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 10,
-                                    src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
+            // npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 10,
+            //                         src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m);
 
             npu_runtime_kernel_start(&runtime, dup_cont_f32_no_cont_bf16, &kernel_ret, 18,
                                 src0->data, dst->data, src0_bs, src0_h, src0_n, src0_m, dst_bs, dst_h, dst_n, dst_m,
