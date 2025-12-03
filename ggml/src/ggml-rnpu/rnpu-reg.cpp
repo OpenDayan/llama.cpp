@@ -101,7 +101,7 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
 
             // ======= NPU Runtime Init =======
             // FIXME: NPU runtime initialize
-            printf("[INFO] backend init runtime\n");
+            GGML_LOG_INFO("[INFO] backend init runtime\n");
             ssize_t err;
             err = npu_runtime_init(&runtime);
             if (err != NPU_SUCCESS) {
@@ -110,7 +110,7 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
             GGML_LOG_INFO("Runtime initialized successfully.\n");
 
             // FIXME: NPU load kernel sets
-            printf("[INFO] backend load kernelset\n");
+            GGML_LOG_INFO("[INFO] backend load kernelset\n");
             err = npu_runtime_load_kernelset(&runtime, &__general_entry_fpga);
             if (err != NPU_SUCCESS) {
                 npu_runtime_deinit(&runtime);

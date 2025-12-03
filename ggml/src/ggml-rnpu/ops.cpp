@@ -208,11 +208,10 @@ static void ggml_rnpu_get_rows_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     if (get_rows_f32 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "get_rows_f32_i32_f32", &get_rows_f32);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
         }
-        printf("[INFO] Loaded get_rows_f32_i32_f32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded get_rows_f32_i32_f32 kernel desc successfully.\n");
     }
     int64_t start_time = RECORD_OP_START();
     int kernel_ret;
@@ -230,8 +229,11 @@ void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
             GGML_ABORT("get_rows_bf16_cpu should not be called in R-NPU backend (always in CPU)\n");
             break;
         case GGML_TYPE_F32:
-            // ggml_rnpu_get_rows_f32_cpu(ctx, dst);
+#if (defined GET_ROWS_CPU)
+            ggml_rnpu_get_rows_f32_cpu(ctx, dst);
+#else
             ggml_rnpu_get_rows_f32(ctx, dst);
+#endif
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op GET_ROWS in R-NPU\n",
@@ -299,11 +301,10 @@ static void ggml_rnpu_op_add_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
     if (kernel_add_fp32_desc == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_add_fp32", &kernel_add_fp32_desc);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
         }
-        printf("[INFO] Loaded kernel_add_fp32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded kernel_add_fp32 kernel desc successfully.\n");
     }
 
     int64_t start_time = RECORD_OP_START();
@@ -390,11 +391,10 @@ static void ggml_rnpu_op_mul_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* ds
     if (kernel_mul_fp32_desc == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "kernel_mul_fp32", &kernel_mul_fp32_desc);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
         }
-        printf("[INFO] Loaded kernel_mul_fp32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded kernel_mul_fp32 kernel desc successfully.\n");
     }
 
     int64_t start_time = RECORD_OP_START();
@@ -592,11 +592,10 @@ static void ggml_rnpu_rope_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst)
     if (rope_f32_i32_f32 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "rope_f32_i32_f32", &rope_f32_i32_f32);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded rope_f32_i32_f32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded rope_f32_i32_f32 kernel desc successfully.\n");
     }
 
     int64_t start_time = RECORD_OP_START();
@@ -773,11 +772,10 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
             if (dup_cont_f32_cont_bf16 == NULL) {
                 ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_cont_f32_cont_bf16", &dup_cont_f32_cont_bf16);
                 if (err != NPU_SUCCESS) {
-                    printf("Failed to get kernel description: err=%ld\n", err);
                     npu_runtime_deinit(&runtime);
-                    exit(-1);
+                    GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
                 }
-                printf("[INFO] Loaded dup_cont_f32_cont_bf16 kernel desc successfully.\n");
+                GGML_LOG_INFO("[INFO] Loaded dup_cont_f32_cont_bf16 kernel desc successfully.\n");
             }
             int64_t start_time = RECORD_OP_START();
             int kernel_ret;
@@ -789,11 +787,10 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
             if (dup_cont_f32_no_cont_bf16 == NULL) {
                 ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_cont_f32_no_cont_bf16", &dup_cont_f32_no_cont_bf16);
                 if (err != NPU_SUCCESS) {
-                    printf("Failed to get kernel description: err=%ld\n", err);
                     npu_runtime_deinit(&runtime);
-                    exit(-1);
+                    GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
                 }
-                printf("[INFO] Loaded dup_cont_f32_no_cont_bf16 kernel desc successfully.\n");
+                GGML_LOG_INFO("[INFO] Loaded dup_cont_f32_no_cont_bf16 kernel desc successfully.\n");
             }
             int64_t start_time = RECORD_OP_START();
             int kernel_ret;
@@ -815,11 +812,10 @@ static void ggml_rnpu_dup_f32_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* 
             if (dup_no_cont_f32_no_cont_bf16 == NULL) {
                 ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_no_cont_f32_no_cont_bf16", &dup_no_cont_f32_no_cont_bf16);
                 if (err != NPU_SUCCESS) {
-                    printf("Failed to get kernel description: err=%ld\n", err);
                     npu_runtime_deinit(&runtime);
-                    exit(-1);
+                    GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
                 }
-                printf("[INFO] Loaded dup_no_cont_f32_no_cont_bf16 kernel desc successfully.\n");
+                GGML_LOG_INFO("[INFO] Loaded dup_no_cont_f32_no_cont_bf16 kernel desc successfully.\n");
             }
             int64_t start_time = RECORD_OP_START();
             int kernel_ret;
@@ -853,11 +849,10 @@ static void ggml_rnpu_dup_f32_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     if (dup_cont_f32_cont_f32 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "dup_cont_f32_cont_f32", &dup_cont_f32_cont_f32);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded dup_cont_f32_cont_f32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded dup_cont_f32_cont_f32 kernel desc successfully.\n");
     }
     int64_t start_time = RECORD_OP_START();
     int kernel_ret;
@@ -963,11 +958,10 @@ static void ggml_rnpu_permute_f32_2_1(ggml_backend_rnpu_context& ctx, ggml_tenso
     if (permute_f32_2_1 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "permute_f32_2_1", &permute_f32_2_1);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded permute_f32_2_1 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded permute_f32_2_1 kernel desc successfully.\n");
     }
 
     // Launch kernel
@@ -1053,11 +1047,10 @@ static void ggml_rnpu_rms_norm_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* 
     if (rms_norm_f32 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "rms_norm_f32", &rms_norm_f32);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded rms_norm_f32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded rms_norm_f32 kernel desc successfully.\n");
     }
 
     // Launch kernel
@@ -1194,11 +1187,10 @@ static void ggml_rnpu_softmax_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     if (softmax_f32_f32_f32 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "softmax_f32_f32_f32", &softmax_f32_f32_f32);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded softmax_f32_f32_f32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded softmax_f32_f32_f32 kernel desc successfully.\n");
     }
 
     int64_t start_time = RECORD_OP_START();
@@ -1263,16 +1255,16 @@ static void ggml_rnpu_silu_f32(ggml_backend_rnpu_context& ctx, ggml_tensor* dst)
     if (silu_f32 == NULL) {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "silu_f32", &silu_f32);
         if (err != NPU_SUCCESS) {
-            printf("Failed to get kernel description: err=%ld\n", err);
             npu_runtime_deinit(&runtime);
-            exit(-1);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded silu_f32 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded silu_f32 kernel desc successfully.\n");
     }
 
     // Launch kernel
     int64_t start_time = RECORD_OP_START();
     int kernel_ret;
+    // GGML_LOG_WARN("silu_f32 %p %p %d %d %d %d\n", src0->data, dst->data, bs, h, n, m);
     npu_runtime_kernel_start(&runtime, silu_f32, &kernel_ret, 6,
                             src0->data, dst->data, bs, h, n, m);
     GGML_UNUSED(ctx);
@@ -1619,11 +1611,10 @@ static int gmma_e4m3q_fp32_AT_QK256(
     {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "gmma_e4m3q_fp32_AT_QK256", &gmma_e4m3q_fp32_AT_QK256_desc);
         if (err != NPU_SUCCESS) {
-          printf("[ERROR] %s: Failed to get kernel description: err=%d\n", __func__, err);
-          npu_runtime_deinit(&runtime);
-          exit(-1);
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("[ERROR] %s: Failed to get kernel description: err=%zu\n", __func__, err);
         }
-        printf("[INFO] Loaded gmma_e4m3q_fp32_AT_QK256 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded gmma_e4m3q_fp32_AT_QK256 kernel desc successfully.\n");
     }
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, gmma_e4m3q_fp32_AT_QK256_desc, &kernel_ret, 9,
@@ -1678,18 +1669,17 @@ static int gmma_bf16_fp32_AT_QK256(
     int g, int h,
     int stride_g, int stride_h, int a_is_transposed)
 {
-    // printf("\nm:%d, n:%d, k:%d, g:%d, h:%d\n", m, n, k, g, h);
-    // printf("lda:%d, ldb:%d, ldc:%d, stride_g:%d, stride_h:%d\n", lda, ldb, ldc, stride_g, stride_h);
+    // GGML_LOG_INFO("\nm:%d, n:%d, k:%d, g:%d, h:%d\n", m, n, k, g, h);
+    // GGML_LOG_INFO("lda:%d, ldb:%d, ldc:%d, stride_g:%d, stride_h:%d\n", lda, ldb, ldc, stride_g, stride_h);
     static struct NPUKernelDesc *gmma_bf16_fp32_AT_QK256_desc = NULL;
     if (gmma_bf16_fp32_AT_QK256_desc == NULL)
     {
         ssize_t err = npu_runtime_get_kernel_desc(&runtime, "gmma_bf16_fp32_AT_QK256", &gmma_bf16_fp32_AT_QK256_desc);
         if (err != NPU_SUCCESS) {
-          printf("Failed to get kernel description: err=%d\n", err);
-          npu_runtime_deinit(&runtime);
-          exit(-1);
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%zu\n", err);
         }
-        printf("[INFO] Loaded gmma_bf16_fp32_AT_QK256 kernel desc successfully.\n");
+        GGML_LOG_INFO("[INFO] Loaded gmma_bf16_fp32_AT_QK256 kernel desc successfully.\n");
     }
     int kernel_ret;
     npu_runtime_kernel_start(&runtime, gmma_bf16_fp32_AT_QK256_desc, &kernel_ret, 14,
@@ -1720,10 +1710,18 @@ static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     int n = src1->ne[1];
     int k = src1->ne[0];
     assert(src1->ne[0] == src0->ne[0]);
-    // printf("name=%s, src0->data: 0x%p, src1->data: 0x%p, dst->data: 0x%p\n", dst->name, src0->data, src1->data, dst->data);
+    // GGML_LOG_INFO("name=%s, src0->data: 0x%p, src1->data: 0x%p, dst->data: 0x%p\n", dst->name, src0->data, src1->data, dst->data);
 
     int a_is_transposed = (src0->nb[0] > src0->nb[1]);
     // Call Kernel
+    // GGML_LOG_WARN("gmma_bf16_fp32_AT_QK256 %p %p %p %d %d %d %zu %zu %zu %zu %zu %zu %zu %d\n", src0->data, src1->data, dst->data,
+    //     m, n, k,
+    //     (a_is_transposed ? src0->nb[0] : src0->nb[1]) / sizeof(uint16_t),
+    //     src1->nb[1] / sizeof(float),
+    //     dst->nb[1] / sizeof(float),
+    //     src0->ne[2], src1->ne[2],
+    //     src0->nb[2] / sizeof(uint16_t), src1->nb[2] / sizeof(float),
+    //     a_is_transposed);
     gmma_bf16_fp32_AT_QK256(
         src0->data, src1->data, dst->data,
         m, n, k,

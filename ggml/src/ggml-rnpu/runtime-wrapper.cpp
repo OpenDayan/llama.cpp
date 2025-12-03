@@ -60,7 +60,7 @@ npuErr_t npuMalloc(void ** ptr, size_t size) {
     // FIXME: error check
     npu_runtime_malloc(&runtime, (uint64_t *)ptr, size);
     // npuErr_t ret = npuMallocHost(ptr, size);
-    printf("npu malloc: size=%ld, ptr=0x%lx\n", size, (uint64_t)(*ptr));
+    GGML_LOG_INFO("npu malloc: size=%ld, ptr=0x%lx\n", size, (uint64_t)(*ptr));
     return npuSuccess;
 }
 
