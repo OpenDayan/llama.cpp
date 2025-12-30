@@ -1,5 +1,7 @@
 import json
 import csv
+import sys
+import os
 
 def convert_json_to_csv(input_file, output_file):
     with open(input_file, 'r') as f:
@@ -53,6 +55,11 @@ def convert_json_to_csv(input_file, output_file):
     print(f"Convert success! CSV file is saved: {output_file}")
 
 if __name__ == "__main__":
-    input_json = "operator_stats.json"
-    output_csv = "operator_stats.csv"
+    print("Usage: python convert_json.py [JSON_FLIE]")
+    if len(sys.argv) > 1:
+        input_json = sys.argv[1]
+    else:
+        input_json = "operator_stats.json"
+
+    output_csv = os.path.splitext(input_json)[0] + ".csv"
     convert_json_to_csv(input_json, output_csv)
