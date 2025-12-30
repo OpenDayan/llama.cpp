@@ -89,16 +89,16 @@ int main(int argc, char ** argv) {
     };
 
     // warm up
-    {
-        for (int i = 0; i < 16; ++i) {
-            common_batch_add(batch, 0, i, { 0 }, false);
-        }
+    // {
+    //     for (int i = 0; i < 16; ++i) {
+    //         common_batch_add(batch, 0, i, { 0 }, false);
+    //     }
 
-        if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
-            LOG_ERR("%s: llama_decode() failed\n", __func__);
-            return 1;
-        }
-    }
+    //     if (!decode_helper(ctx, batch, ctx_params.n_batch)) {
+    //         LOG_ERR("%s: llama_decode() failed\n", __func__);
+    //         return 1;
+    //     }
+    // }
 
     if (!params.batched_bench_output_jsonl) {
         LOG("\n");
