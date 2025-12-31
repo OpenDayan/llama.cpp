@@ -16,9 +16,9 @@ struct NPURuntimeState runtime;
 extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
 
 // reserve 128MB for cpu buffer
-static char src0_cpu_buffer[1024L * 1024L * 256];
-static char src1_cpu_buffer[1024L * 1024L * 256];
-static char dst_cpu_buffer[1024L * 1024L * 256];
+static char src0_cpu_buffer[1024L * 1024L * 512];
+static char src1_cpu_buffer[1024L * 1024L * 512];
+static char dst_cpu_buffer[1024L * 1024L * 512];
 static void copy_binary_op_data_from_dev_to_cpu(
                     ggml_tensor * dst, void ** src0_data_cpu,
                     void ** src1_data_cpu, void ** dst_data_cpu) {
@@ -229,11 +229,8 @@ void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
             GGML_ABORT("get_rows_bf16_cpu should not be called in R-NPU backend (always in CPU)\n");
             break;
         case GGML_TYPE_F32:
-#if (defined GET_ROWS_CPU)
-            ggml_rnpu_get_rows_f32_cpu(ctx, dst);
-#else
+            // ggml_rnpu_get_rows_f32_cpu(ctx, dst);
             ggml_rnpu_get_rows_f32(ctx, dst);
-#endif
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op GET_ROWS in R-NPU\n",
@@ -1741,12 +1738,12 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
-            ggml_rnpu_matmul_bf16(ctx, dst);
+            ggml_rnpu_matmul_bf16_cpu(ctx, dst);
+            // ggml_rnpu_matmul_bf16(ctx, dst);
             break;
         case GGML_TYPE_E4M3_Q:
-            // ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
-            ggml_rnpu_matmul_e4m3q(ctx, dst);
+            ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
+            // ggml_rnpu_matmul_e4m3q(ctx, dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",

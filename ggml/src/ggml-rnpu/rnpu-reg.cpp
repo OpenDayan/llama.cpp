@@ -82,7 +82,7 @@ static const ggml_backend_reg_i ggml_backend_rnpu_reg_interface = {
 // --------------------------------------------------------------------------------
 
 extern struct NPURuntimeState runtime;
-extern struct NPUDeviceKernelSetDesc __general_entry_fpga;
+extern struct NPUDeviceKernelSetDesc __bin_kernels_pack;
 
 /**
  * @brief R-NPU backend registery, initialize registry when first called.
@@ -111,30 +111,12 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
 
             // FIXME: NPU load kernel sets
             GGML_LOG_INFO("[INFO] backend load kernelset\n");
-            err = npu_runtime_load_kernelset(&runtime, &__general_entry_fpga);
+            err = npu_runtime_load_kernelset(&runtime, &__bin_kernels_pack);
             if (err != NPU_SUCCESS) {
                 npu_runtime_deinit(&runtime);
                 GGML_ABORT("Failed to load kernel set: %ld\n", err);
             }
             GGML_LOG_INFO("Kernel set loaded successfully.\n");
-
-            struct NPUKernelDesc *tx_init_kernel_desc;
-            err =
-                npu_runtime_get_kernel_desc(&runtime, "__tx_init", &tx_init_kernel_desc);
-            if (err != NPU_SUCCESS) {
-                npu_runtime_deinit(&runtime);
-                GGML_ABORT("Failed to get kernel description for __tx_init: err=%ld\n", err);
-            }
-            GGML_LOG_INFO("Loaded __tx_init kernel desc successfully.\n");
-            int kernel_ret;
-            GGML_LOG_INFO("Start kernel __tx_init ... \n");
-            err = npu_runtime_kernel_start(&runtime, tx_init_kernel_desc, &kernel_ret, 0);
-            GGML_LOG_INFO("Kernel ret=%d\n", kernel_ret);
-            if (err != NPU_SUCCESS) {
-                npu_runtime_deinit(&runtime);
-                GGML_ABORT("Failed to start kernel : err=%ld\n", err);
-            }
-            GGML_LOG_INFO("Kernel __tx_init run successfully.\n");
 
             ggml_backend_rnpu_reg_context * ctx = new ggml_backend_rnpu_reg_context;
             for (int i = 0; i < ggml_rnpu_info().device_count; ++i) {

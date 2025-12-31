@@ -26,7 +26,7 @@ list(APPEND RT_SRCS ${RT_C_SRCS} ${RT_CXX_SRCS})
 message(STATUS "R-NPU: RT_SRCS = ${RT_SRCS}")
 list(APPEND GGML_SOURCES_RNPU ${RT_SRCS})
 
-file(GLOB  KERNEL_SRCS "${RNPU_KERNEL_PATH}/general_entry_fpga.packed.c")
+file(GLOB  KERNEL_SRCS "${RNPU_KERNEL_PATH}/bin/kernels_pack.packed.c")
 message(STATUS "R-NPU: KERNSL_SRC = ${KERNEL_SRCS}")
 list(APPEND GGML_SOURCES_RNPU ${KERNEL_SRCS})
 
