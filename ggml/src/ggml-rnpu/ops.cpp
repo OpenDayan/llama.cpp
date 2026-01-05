@@ -1738,8 +1738,8 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_BF16:
-            ggml_rnpu_matmul_bf16_cpu(ctx, dst);
-            // ggml_rnpu_matmul_bf16(ctx, dst);
+            // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
+            ggml_rnpu_matmul_bf16(ctx, dst);
             break;
         case GGML_TYPE_E4M3_Q:
             ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
