@@ -1775,13 +1775,13 @@ static void debug_compare_matmul_bf16(ggml_tensor* dst, void * dst_data_cpu) {
                     float npu_val = npu_res[i*h*m*n + j*m*n + p*n + l];
                     if (std::abs(cpu_val - npu_val) > 1e-4) {
                         GGML_LOG_ERROR("[ERRRO] Matmul comparing failed!!!\n");
-                        GGML_LOG_ERROR("src0->name=%s, ne=[%ld, %ld, %ld, %ld], nb=[%ld, %ld, %ld, %ld]\n", src0->name,
+                        GGML_LOG_ERROR("src0->name=%s@0x%09lx, ne=[%ld, %ld, %ld, %ld], nb=[%ld, %ld, %ld, %ld]\n", src0->name, src0->data,
                             src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                             src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
-                        GGML_LOG_ERROR("src1->name=%s, ne=[%ld, %ld, %ld, %ld], nb=[%ld, %ld, %ld, %ld]\n", src1->name,
+                        GGML_LOG_ERROR("src1->name=%s@0x%09lx, ne=[%ld, %ld, %ld, %ld], nb=[%ld, %ld, %ld, %ld]\n", src1->name, src1->data,
                             src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
                             src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
-                        GGML_LOG_ERROR("dst->name=%s, ne=[%ld, %ld, %ld, %ld], nb=[%ld, %ld, %ld, %ld]\n", dst->name,
+                        GGML_LOG_ERROR("dst->name=%s@0x%09lx, ne=[%ld, %ld, %ld, %ld], nb=[%ld, %ld, %ld, %ld]\n", dst->name, dst->data,
                             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
                             dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
                         GGML_ABORT("[ERROR] Matmul comparing failed at [%d][%d][%d][%d] = (%f, %f)\n", i, j, p, l, cpu_val, npu_val);
@@ -1792,7 +1792,7 @@ static void debug_compare_matmul_bf16(ggml_tensor* dst, void * dst_data_cpu) {
     }
 
     // 每两层打印一次
-    if(call_count % 18 == 17) {
+    if(call_count % 2 == 1) {
         GGML_LOG_INFO("[INFO] Matmul bf16 comparing call count at %d\n", call_count + 1);
     }
     ++call_count;
@@ -1800,7 +1800,7 @@ static void debug_compare_matmul_bf16(ggml_tensor* dst, void * dst_data_cpu) {
 
 static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // FIXME: 先用 cpu 版本计算，把 cpu 计算结果存储到 buffer 中
-    void * dst_data_cpu = debug_matmul_bf16_cpu(ctx, dst);
+    // void * dst_data_cpu = debug_matmul_bf16_cpu(ctx, dst);
 
     int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
@@ -1846,7 +1846,7 @@ static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     RECORD_OP_END("ggml_rnpu_matmul_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 
     // FIXME：对比 CPU 和 NPU 运算结果
-    debug_compare_matmul_bf16(dst, dst_data_cpu);
+    // debug_compare_matmul_bf16(dst, dst_data_cpu);
 }
 
 
