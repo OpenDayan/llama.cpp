@@ -1022,6 +1022,10 @@ bool llama_model_loader::load_all_data(
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
             }
+            // if (tensor dtype is FP8 TYPE) {
+            // FIXME: FP8 reorder in read_buf, print warnning for reordering in mmap mode
+            // ggml_reorder_scale_e4m3_q(...) (ggml/src/ggml-fp8.h)
+            // }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
@@ -1042,6 +1046,10 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                // if (tensor dtype is FP8 TYPE) {
+                // FIXME: do not reorder FP8 here because host backend does not support reordered FP8 tensor
+                // FIXME: print warnning for not reordering FP8 tensor in host backend
+                // }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1050,6 +1058,9 @@ bool llama_model_loader::load_all_data(
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
+                    // if (tensor dtype is FP8 TYPE) {
+                    // FIXME: raise error here, we do not support FP8 reorder in async mode
+                    // }
                     file->seek(weight->offs, SEEK_SET);
 
                     size_t bytes_read = 0;
@@ -1070,6 +1081,10 @@ bool llama_model_loader::load_all_data(
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
+                    // if (tensor dtype is FP8 TYPE) {
+                    // FIXME: FP8 reorder in read_buf
+                    // ggml_reorder_scale_e4m3_q(...) (ggml/src/ggml-fp8.h)
+                    // }
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));

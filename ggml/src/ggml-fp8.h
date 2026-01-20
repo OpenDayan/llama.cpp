@@ -47,4 +47,9 @@ extern "C" {
 
 #ifdef  __cplusplus
 }
+
+// FIXME: Add new interface for reordering a FP8 tensor
+// ggml_reorder_scale_e3m4_q()
+// ggml_reorder_scale_e4m3_q()
+
 #endif

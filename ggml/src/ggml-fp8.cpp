@@ -132,3 +132,7 @@ void quantize_row_e3m4_q_ref(const float * GGML_RESTRICT x, block_e3m4_q * GGML_
     assert(k % QK_K == 0);
     conv(x, reinterpret_cast<bloc_fp8<3, QK_K>*>(y), k);
 }
+
+// FIXME: Add interface implementation for reordering a FP8 tensor
+// ggml_reorder_scale_e3m4_q(...) {}
+// ggml_reorder_scale_e4m3_q(...) {}
