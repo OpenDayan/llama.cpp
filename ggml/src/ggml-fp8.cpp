@@ -1,5 +1,6 @@
 #include <cassert>
 #include <algorithm>
+#include <cstring>
 
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -133,6 +134,51 @@ void quantize_row_e3m4_q_ref(const float * GGML_RESTRICT x, block_e3m4_q * GGML_
     conv(x, reinterpret_cast<bloc_fp8<3, QK_K>*>(y), k);
 }
 
-// FIXME: Add interface implementation for reordering a FP8 tensor
-// ggml_reorder_scale_e3m4_q(...) {}
-// ggml_reorder_scale_e4m3_q(...) {}
+extern "C" {
+    void ggml_reorder_scale_e4m3_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+    void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+}
+
+void ggml_reorder_scale_e4m3_q(const void * src, void * dst, int64_t n_elems, int64_t ne0) {
+    const int64_t k = ne0;
+    const int64_t nb_k = k / QK_K;
+    const int64_t n_rows = n_elems / k;
+    
+    const int64_t row_size_bytes = k + nb_k * sizeof(float);
+
+    const block_e4m3_q * s = (const block_e4m3_q *) src;
+    uint8_t * d = (uint8_t *) dst;
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const block_e4m3_q * row_src = s + r * nb_k;
+        uint8_t * row_dst_qs = d + r * row_size_bytes;
+        float   * row_dst_d  = (float *)(row_dst_qs + k);
+
+        for (int64_t i = 0; i < nb_k; ++i) {
+            memcpy(row_dst_qs + i * QK_K, row_src[i].qs, QK_K);
+            row_dst_d[i] = (float)row_src[i].d;
+        }
+    }
+}
+
+void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, int64_t ne0) {
+    const int64_t k = ne0;
+    const int64_t nb_k = k / QK_K;
+    const int64_t n_rows = n_elems / k;
+    
+    const int64_t row_size_bytes = k + nb_k * sizeof(float);
+
+    const block_e3m4_q * s = (const block_e3m4_q *) src;
+    uint8_t * d = (uint8_t *) dst;
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const block_e3m4_q * row_src = s + r * nb_k;
+        uint8_t * row_dst_qs = d + r * row_size_bytes;
+        float   * row_dst_d  = (float *)(row_dst_qs + k);
+
+        for (int64_t i = 0; i < nb_k; ++i) {
+            memcpy(row_dst_qs + i * QK_K, row_src[i].qs, QK_K);
+            row_dst_d[i] = (float)row_src[i].d;
+        }
+    }
+}

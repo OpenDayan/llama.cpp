@@ -45,11 +45,9 @@ extern "C" {
     GGML_API void dequantize_row_e3m4_q(const block_e3m4_q * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     GGML_API void quantize_row_e3m4_q_ref(const float * GGML_RESTRICT x, block_e3m4_q * GGML_RESTRICT y, int64_t k);
 
+    void ggml_reorder_scale_e4m3_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+    void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
 #ifdef  __cplusplus
 }
-
-// FIXME: Add new interface for reordering a FP8 tensor
-// ggml_reorder_scale_e3m4_q()
-// ggml_reorder_scale_e4m3_q()
 
 #endif
