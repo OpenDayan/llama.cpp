@@ -843,6 +843,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_e3m4_q,
         .from_float_ref           = (ggml_from_float_t) quantize_row_e3m4_q_ref,
     },
+    [GGML_TYPE_MXFP8] = {
+        .type_name                = "mxfp8",
+        .blck_size                = 0, // FIXME: MXFP8_K
+        .type_size                = 0, // FIXME: sizeof(block_mxfp8)
+        .is_quantized             = true,
+        .to_float                 = NULL, // FIXME: (ggml_to_float_t) dequantize_row_mxfp8,
+        .from_float_ref           = NULL, // FIXME: (ggml_from_float_t) quantize_row_mxfp8_ref,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1294,6 +1302,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_E4M3:          wtype = GGML_TYPE_E4M3;     break;
         case GGML_FTYPE_MOSTLY_E4M3_Q:        wtype = GGML_TYPE_E4M3_Q;   break;
         case GGML_FTYPE_MOSTLY_E3M4_Q:        wtype = GGML_TYPE_E3M4_Q;   break;
+        case GGML_FTYPE_MOSTLY_MXFP8:         wtype = GGML_TYPE_MXFP8;   break;
         case GGML_FTYPE_UNKNOWN:              wtype = GGML_TYPE_COUNT; break;
         case GGML_FTYPE_MOSTLY_Q4_1_SOME_F16: wtype = GGML_TYPE_COUNT; break;
     }
