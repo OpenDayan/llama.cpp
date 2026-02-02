@@ -1438,12 +1438,16 @@ ggml_tensor * llm_graph_context::build_attn(
         // note: storing RoPE-ed version of K in the KV cache
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cur, k_cache_view));
 
-        // v_cur: (b, g, 1, d)
-        v_cur = ggml_view_3d_uncont(ctx0, v_cur, n_embd_head_v, n_tokens, n_head_kv,
-                                ggml_element_size(v_cur),
-                                n_embd_v_gqa*ggml_element_size(v_cur),
-                                n_embd_head_v*ggml_element_size(v_cur),
-                                0);
+        if (il < n_gpu_layers) {
+            v_cur = ggml_reshape_2d(ctx0, v_cur, n_embd_v_gqa, n_tokens);
+        } else {
+            // v_cur: (b, g, 1, d)
+            v_cur = ggml_view_3d_uncont(ctx0, v_cur, n_embd_head_v, n_tokens, n_head_kv,
+                                    ggml_element_size(v_cur),
+                                    n_embd_v_gqa*ggml_element_size(v_cur),
+                                    n_embd_head_v*ggml_element_size(v_cur),
+                                    0);
+        }
 
         ggml_tensor * v_cache_view = nullptr;
 
@@ -1451,10 +1455,17 @@ ggml_tensor * llm_graph_context::build_attn(
             v_cache_view = ggml_view_1d(ctx0, kv_self->v_l[il], n_tokens*n_embd_v_gqa, ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)*kv_head);
         } else {
             // note: the V cache is transposed when not using flash attention
-            v_cache_view = ggml_view_3d(ctx0, kv_self->v_l[il], n_embd_head_v, n_tokens, n_head_kv,
-                                        n_embd_head_v*ggml_element_size(kv_self->v_l[il]),
-                                        n_ctx*n_embd_head_v*ggml_element_size(kv_self->v_l[il]),
-                                        kv_head*ggml_row_size(kv_self->v_l[il]->type, n_embd_head_v));
+            if (il < n_gpu_layers) {
+                v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
+                                    (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
+                                (kv_head)*ggml_element_size(kv_self->v_l[il]));
+                v_cur = ggml_transpose(ctx0, v_cur);
+            } else {
+                v_cache_view = ggml_view_3d(ctx0, kv_self->v_l[il], n_embd_head_v, n_tokens, n_head_kv,
+                                            n_embd_head_v*ggml_element_size(kv_self->v_l[il]),
+                                            n_ctx*n_embd_head_v*ggml_element_size(kv_self->v_l[il]),
+                                            kv_head*ggml_row_size(kv_self->v_l[il]->type, n_embd_head_v));
+            }
         }
         //cb(v_cache_view, "v_cache_view", il);
 
@@ -1476,18 +1487,30 @@ ggml_tensor * llm_graph_context::build_attn(
                 0);
     //cb(k, "k", il);
 
-    ggml_tensor * v = !v_trans ?
-        ggml_view_3d(ctx0, kv_self->v_l[il],
-                n_embd_head_v, n_kv, n_head_kv,
-                ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),
-                ggml_row_size(kv_self->v_l[il]->type, n_embd_head_v),
-                0) :
+    ggml_tensor * v_no_trans = nullptr;
+
+    if (il < n_gpu_layers) {
         ggml_view_3d_uncont(ctx0, kv_self->v_l[il],
                 n_kv, n_embd_head_v, n_head_kv,
                 ggml_element_size(kv_self->v_l[il])*n_embd_head_v,
                 ggml_element_size(kv_self->v_l[il]),
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
                 0);
+    } else {
+        ggml_view_3d(ctx0, kv_self->v_l[il],
+                n_kv, n_embd_head_v, n_head_kv,
+                ggml_element_size(kv_self->v_l[il])*n_ctx,
+                ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
+                0);
+    }
+
+    ggml_tensor * v = !v_trans ?
+        ggml_view_3d(ctx0, kv_self->v_l[il],
+                n_embd_head_v, n_kv, n_head_kv,
+                ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa),
+                ggml_row_size(kv_self->v_l[il]->type, n_embd_head_v),
+                0) :
+        v_no_trans;
 
     ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale);
     cb(cur, "kqv_out", il);
