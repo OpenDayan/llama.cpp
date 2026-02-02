@@ -1490,14 +1490,14 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v_no_trans = nullptr;
 
     if (il < n_gpu_layers) {
-        ggml_view_3d_uncont(ctx0, kv_self->v_l[il],
+        v_no_trans = ggml_view_3d_uncont(ctx0, kv_self->v_l[il],
                 n_kv, n_embd_head_v, n_head_kv,
                 ggml_element_size(kv_self->v_l[il])*n_embd_head_v,
                 ggml_element_size(kv_self->v_l[il]),
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
                 0);
     } else {
-        ggml_view_3d(ctx0, kv_self->v_l[il],
+        v_no_trans = ggml_view_3d(ctx0, kv_self->v_l[il],
                 n_kv, n_embd_head_v, n_head_kv,
                 ggml_element_size(kv_self->v_l[il])*n_ctx,
                 ggml_element_size(kv_self->v_l[il])*n_ctx*n_embd_head_v,
