@@ -365,6 +365,8 @@ struct llm_graph_params {
     int32_t n_outputs;
 
     const llm_graph_cb & cb;
+
+    int32_t n_gpu_layers = 0;
 };
 
 struct llm_graph_context {
@@ -400,6 +402,7 @@ struct llm_graph_context {
     const int32_t n_tokens;
     const int32_t n_outputs;
     const int32_t n_ctx_orig; // yarn
+    const int32_t n_gpu_layers;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;

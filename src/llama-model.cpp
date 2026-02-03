@@ -13087,6 +13087,10 @@ llm_graph_result_ptr llama_model::build_graph(
         const llm_graph_params & params,
                    ggml_cgraph * gf,
                 llm_graph_type   type) const {
+    llm_graph_params params2 = params;
+    params2.n_gpu_layers = this->params.n_gpu_layers; // <- from llama_model_params
+    // LLAMA_LOG_INFO("params2.n_gpu_layers=%d this->params.n_gpu_layers=%d\n", params2.n_gpu_layers, this->params.n_gpu_layers);
+
     std::unique_ptr<llm_graph_context> llm;
 
     switch (arch) {
@@ -13094,197 +13098,197 @@ llm_graph_result_ptr llama_model::build_graph(
         case LLM_ARCH_LLAMA4:
         case LLM_ARCH_MINICPM:
             {
-                llm = std::make_unique<llm_build_llama>(*this, params, gf);
+                llm = std::make_unique<llm_build_llama>(*this, params2, gf);
             } break;
         case LLM_ARCH_DECI:
             {
-                llm = std::make_unique<llm_build_deci>(*this, params, gf);
+                llm = std::make_unique<llm_build_deci>(*this, params2, gf);
             } break;
         case LLM_ARCH_BAICHUAN:
             {
-                llm = std::make_unique<llm_build_baichuan>(*this, params, gf);
+                llm = std::make_unique<llm_build_baichuan>(*this, params2, gf);
             } break;
         case LLM_ARCH_FALCON:
             {
-                llm = std::make_unique<llm_build_falcon>(*this, params, gf);
+                llm = std::make_unique<llm_build_falcon>(*this, params2, gf);
             } break;
         case LLM_ARCH_GROK:
             {
-                llm = std::make_unique<llm_build_grok>(*this, params, gf);
+                llm = std::make_unique<llm_build_grok>(*this, params2, gf);
             } break;
         case LLM_ARCH_STARCODER:
             {
-                llm = std::make_unique<llm_build_starcoder>(*this, params, gf);
+                llm = std::make_unique<llm_build_starcoder>(*this, params2, gf);
             } break;
         case LLM_ARCH_REFACT:
             {
-                llm = std::make_unique<llm_build_refact>(*this, params, gf);
+                llm = std::make_unique<llm_build_refact>(*this, params2, gf);
             } break;
         case LLM_ARCH_BERT:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_NOMIC_BERT:
         case LLM_ARCH_NOMIC_BERT_MOE:
             {
-                llm = std::make_unique<llm_build_bert>(*this, params, gf);
+                llm = std::make_unique<llm_build_bert>(*this, params2, gf);
             } break;
         case LLM_ARCH_BLOOM:
             {
-                llm = std::make_unique<llm_build_bloom>(*this, params, gf);
+                llm = std::make_unique<llm_build_bloom>(*this, params2, gf);
             } break;
         case LLM_ARCH_MPT:
             {
-                llm = std::make_unique<llm_build_mpt>(*this, params, gf);
+                llm = std::make_unique<llm_build_mpt>(*this, params2, gf);
             } break;
         case LLM_ARCH_STABLELM:
             {
-                llm = std::make_unique<llm_build_stablelm>(*this, params, gf);
+                llm = std::make_unique<llm_build_stablelm>(*this, params2, gf);
             } break;
         case LLM_ARCH_QWEN:
             {
-                llm = std::make_unique<llm_build_qwen>(*this, params, gf);
+                llm = std::make_unique<llm_build_qwen>(*this, params2, gf);
             } break;
         case LLM_ARCH_QWEN2:
             {
-                llm = std::make_unique<llm_build_qwen2>(*this, params, gf);
+                llm = std::make_unique<llm_build_qwen2>(*this, params2, gf);
             } break;
         case LLM_ARCH_QWEN2VL:
             {
-                llm = std::make_unique<llm_build_qwen2vl>(*this, params, gf);
+                llm = std::make_unique<llm_build_qwen2vl>(*this, params2, gf);
             } break;
         case LLM_ARCH_QWEN2MOE:
             {
-                llm = std::make_unique<llm_build_qwen2moe>(*this, params, gf);
+                llm = std::make_unique<llm_build_qwen2moe>(*this, params2, gf);
             } break;
         case LLM_ARCH_QWEN3:
             {
-                llm = std::make_unique<llm_build_qwen3>(*this, params, gf);
+                llm = std::make_unique<llm_build_qwen3>(*this, params2, gf);
             } break;
         case LLM_ARCH_QWEN3MOE:
             {
-                llm = std::make_unique<llm_build_qwen3moe>(*this, params, gf);
+                llm = std::make_unique<llm_build_qwen3moe>(*this, params2, gf);
             } break;
         case LLM_ARCH_PHI2:
             {
-                llm = std::make_unique<llm_build_phi2>(*this, params, gf);
+                llm = std::make_unique<llm_build_phi2>(*this, params2, gf);
             } break;
         case LLM_ARCH_PHI3:
         case LLM_ARCH_PHIMOE:
             {
-                llm = std::make_unique<llm_build_phi3>(*this, params, gf);
+                llm = std::make_unique<llm_build_phi3>(*this, params2, gf);
             } break;
         case LLM_ARCH_PLAMO:
             {
-                llm = std::make_unique<llm_build_plamo>(*this, params, gf);
+                llm = std::make_unique<llm_build_plamo>(*this, params2, gf);
             } break;
         case LLM_ARCH_GPT2:
             {
-                llm = std::make_unique<llm_build_gpt2>(*this, params, gf);
+                llm = std::make_unique<llm_build_gpt2>(*this, params2, gf);
             } break;
         case LLM_ARCH_CODESHELL:
             {
-                llm = std::make_unique<llm_build_codeshell>(*this, params, gf);
+                llm = std::make_unique<llm_build_codeshell>(*this, params2, gf);
             } break;
         case LLM_ARCH_ORION:
             {
-                llm = std::make_unique<llm_build_orion>(*this, params, gf);
+                llm = std::make_unique<llm_build_orion>(*this, params2, gf);
             } break;
         case LLM_ARCH_INTERNLM2:
             {
-                llm = std::make_unique<llm_build_internlm2>(*this, params, gf);
+                llm = std::make_unique<llm_build_internlm2>(*this, params2, gf);
             } break;
         case LLM_ARCH_MINICPM3:
             {
-                llm = std::make_unique<llm_build_minicpm3>(*this, params, gf);
+                llm = std::make_unique<llm_build_minicpm3>(*this, params2, gf);
             } break;
         case LLM_ARCH_GEMMA:
             {
-                llm = std::make_unique<llm_build_gemma>(*this, params, gf);
+                llm = std::make_unique<llm_build_gemma>(*this, params2, gf);
             } break;
         case LLM_ARCH_GEMMA2:
             {
-                llm = std::make_unique<llm_build_gemma2>(*this, params, gf);
+                llm = std::make_unique<llm_build_gemma2>(*this, params2, gf);
             } break;
         case LLM_ARCH_GEMMA3:
             {
-                llm = std::make_unique<llm_build_gemma3>(*this, params, gf);
+                llm = std::make_unique<llm_build_gemma3>(*this, params2, gf);
             } break;
         case LLM_ARCH_STARCODER2:
             {
-                llm = std::make_unique<llm_build_starcoder2>(*this, params, gf);
+                llm = std::make_unique<llm_build_starcoder2>(*this, params2, gf);
             } break;
         case LLM_ARCH_MAMBA:
             {
-                llm = std::make_unique<llm_build_mamba>(*this, params, gf);
+                llm = std::make_unique<llm_build_mamba>(*this, params2, gf);
             } break;
         case LLM_ARCH_XVERSE:
             {
-                llm = std::make_unique<llm_build_xverse>(*this, params, gf);
+                llm = std::make_unique<llm_build_xverse>(*this, params2, gf);
             } break;
         case LLM_ARCH_COMMAND_R:
             {
-                llm = std::make_unique<llm_build_command_r>(*this, params, gf);
+                llm = std::make_unique<llm_build_command_r>(*this, params2, gf);
             } break;
         case LLM_ARCH_COHERE2:
             {
-                llm = std::make_unique<llm_build_cohere2>(*this, params, gf);
+                llm = std::make_unique<llm_build_cohere2>(*this, params2, gf);
             } break;
         case LLM_ARCH_DBRX:
             {
-                llm = std::make_unique<llm_build_dbrx>(*this, params, gf);
+                llm = std::make_unique<llm_build_dbrx>(*this, params2, gf);
             } break;
         case LLM_ARCH_OLMO:
             {
-                llm = std::make_unique<llm_build_olmo>(*this, params, gf);
+                llm = std::make_unique<llm_build_olmo>(*this, params2, gf);
             } break;
         case LLM_ARCH_OLMO2:
             {
-                llm = std::make_unique<llm_build_olmo2>(*this, params, gf);
+                llm = std::make_unique<llm_build_olmo2>(*this, params2, gf);
             } break;
         case LLM_ARCH_OLMOE:
             {
-                llm = std::make_unique<llm_build_olmoe>(*this, params, gf);
+                llm = std::make_unique<llm_build_olmoe>(*this, params2, gf);
             } break;
         case LLM_ARCH_OPENELM:
             {
-                llm = std::make_unique<llm_build_openelm>(*this, params, gf);
+                llm = std::make_unique<llm_build_openelm>(*this, params2, gf);
             } break;
         case LLM_ARCH_GPTNEOX:
             {
-                llm = std::make_unique<llm_build_gptneox>(*this, params, gf);
+                llm = std::make_unique<llm_build_gptneox>(*this, params2, gf);
             } break;
         case LLM_ARCH_ARCTIC:
             {
-                llm = std::make_unique<llm_build_arctic>(*this, params, gf);
+                llm = std::make_unique<llm_build_arctic>(*this, params2, gf);
             } break;
         case LLM_ARCH_DEEPSEEK:
             {
-                llm = std::make_unique<llm_build_deepseek>(*this, params, gf);
+                llm = std::make_unique<llm_build_deepseek>(*this, params2, gf);
             } break;
         case LLM_ARCH_DEEPSEEK2:
             {
-                llm = std::make_unique<llm_build_deepseek2>(*this, params, gf);
+                llm = std::make_unique<llm_build_deepseek2>(*this, params2, gf);
             } break;
         case LLM_ARCH_CHATGLM:
             {
-                llm = std::make_unique<llm_build_chatglm>(*this, params, gf);
+                llm = std::make_unique<llm_build_chatglm>(*this, params2, gf);
             } break;
         case LLM_ARCH_GLM4:
             {
-                llm = std::make_unique<llm_build_glm4>(*this, params, gf);
+                llm = std::make_unique<llm_build_glm4>(*this, params2, gf);
             } break;
         case LLM_ARCH_BITNET:
             {
-                llm = std::make_unique<llm_build_bitnet>(*this, params, gf);
+                llm = std::make_unique<llm_build_bitnet>(*this, params2, gf);
             } break;
         case LLM_ARCH_T5:
             {
                 switch (type) {
                     case LLM_GRAPH_TYPE_ENCODER:
-                        llm = std::make_unique<llm_build_t5_enc>(*this, params, gf);
+                        llm = std::make_unique<llm_build_t5_enc>(*this, params2, gf);
                         break;
                     case LLM_GRAPH_TYPE_DEFAULT:
                     case LLM_GRAPH_TYPE_DECODER:
-                        llm = std::make_unique<llm_build_t5_dec>(*this, params, gf);
+                        llm = std::make_unique<llm_build_t5_dec>(*this, params2, gf);
                         break;
                     default:
                         GGML_ABORT("invalid graph type");
@@ -13292,57 +13296,57 @@ llm_graph_result_ptr llama_model::build_graph(
             } break;
         case LLM_ARCH_T5ENCODER:
             {
-                llm = std::make_unique<llm_build_t5_enc>(*this, params, gf);
+                llm = std::make_unique<llm_build_t5_enc>(*this, params2, gf);
             }
             break;
         case LLM_ARCH_JAIS:
             {
-                llm = std::make_unique<llm_build_jais>(*this, params, gf);
+                llm = std::make_unique<llm_build_jais>(*this, params2, gf);
             } break;
         case LLM_ARCH_NEMOTRON:
             {
-                llm = std::make_unique<llm_build_nemotron>(*this, params, gf);
+                llm = std::make_unique<llm_build_nemotron>(*this, params2, gf);
             } break;
         case LLM_ARCH_EXAONE:
             {
-                llm = std::make_unique<llm_build_exaone>(*this, params, gf);
+                llm = std::make_unique<llm_build_exaone>(*this, params2, gf);
             } break;
         case LLM_ARCH_RWKV6:
             {
-                llm = std::make_unique<llm_build_rwkv6>(*this, params, gf);
+                llm = std::make_unique<llm_build_rwkv6>(*this, params2, gf);
             } break;
         case LLM_ARCH_RWKV6QWEN2:
             {
-                llm = std::make_unique<llm_build_rwkv6qwen2>(*this, params, gf);
+                llm = std::make_unique<llm_build_rwkv6qwen2>(*this, params2, gf);
             } break;
         case LLM_ARCH_RWKV7:
             {
-                llm = std::make_unique<llm_build_rwkv7>(*this, params, gf);
+                llm = std::make_unique<llm_build_rwkv7>(*this, params2, gf);
             } break;
         case LLM_ARCH_ARWKV7:
             {
-                llm = std::make_unique<llm_build_arwkv7>(*this, params, gf);
+                llm = std::make_unique<llm_build_arwkv7>(*this, params2, gf);
             } break;
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
             {
-                llm = std::make_unique<llm_build_granite>(*this, params, gf);
+                llm = std::make_unique<llm_build_granite>(*this, params2, gf);
             } break;
         case LLM_ARCH_CHAMELEON:
             {
-                llm = std::make_unique<llm_build_chameleon>(*this, params, gf);
+                llm = std::make_unique<llm_build_chameleon>(*this, params2, gf);
             } break;
         case LLM_ARCH_WAVTOKENIZER_DEC:
             {
-                llm = std::make_unique<llm_build_wavtokenizer_dec>(*this, params, gf);
+                llm = std::make_unique<llm_build_wavtokenizer_dec>(*this, params2, gf);
             } break;
         case LLM_ARCH_PLM:
             {
-                llm = std::make_unique<llm_build_plm>(*this, params, gf);
+                llm = std::make_unique<llm_build_plm>(*this, params2, gf);
             } break;
         case LLM_ARCH_BAILINGMOE:
             {
-                llm = std::make_unique<llm_build_bailingmoe>(*this, params, gf);
+                llm = std::make_unique<llm_build_bailingmoe>(*this, params2, gf);
             } break;
         default:
             GGML_ABORT("fatal error");
