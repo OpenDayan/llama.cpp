@@ -1465,7 +1465,6 @@ ggml_tensor * llm_graph_context::build_attn(
                 v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
                                     (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
                                 (kv_head)*ggml_element_size(kv_self->v_l[il]));
-                v_cur = ggml_transpose(ctx0, v_cur);
             } else {
                 v_cache_view = ggml_view_3d(ctx0, kv_self->v_l[il], n_embd_head_v, n_tokens, n_head_kv,
                                             n_embd_head_v*ggml_element_size(kv_self->v_l[il]),
