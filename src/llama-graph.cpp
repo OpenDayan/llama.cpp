@@ -1430,6 +1430,8 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool v_trans = !cparams.flash_attn;
 
     const int n_gpu_layers = this->n_gpu_layers;
+    const int n_layer = hparams.n_layer;
+    const int i_gpu_start = std::max(n_layer - n_gpu_layers, 0);
 
     // store to KV cache
     {
@@ -1443,7 +1445,7 @@ ggml_tensor * llm_graph_context::build_attn(
         // note: storing RoPE-ed version of K in the KV cache
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cur, k_cache_view));
 
-        if (il >= n_gpu_layers) {
+        if ((il < i_gpu_start) || (n_gpu_layers == 0)) {
             v_cur = ggml_reshape_2d(ctx0, v_cur, n_embd_v_gqa, n_tokens);
             v_cur = ggml_transpose(ctx0, v_cur);
         } else {
@@ -1461,7 +1463,7 @@ ggml_tensor * llm_graph_context::build_attn(
             v_cache_view = ggml_view_1d(ctx0, kv_self->v_l[il], n_tokens*n_embd_v_gqa, ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)*kv_head);
         } else {
             // note: the V cache is transposed when not using flash attention
-            if (il >= n_gpu_layers) {
+            if ((il < i_gpu_start) || (n_gpu_layers == 0)) {
                 v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
                                     (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
                                 (kv_head)*ggml_element_size(kv_self->v_l[il]));
@@ -1494,7 +1496,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * v_no_trans = nullptr;
 
-    if (il >= n_gpu_layers) {
+    if ((il < i_gpu_start) || (n_gpu_layers == 0)) {
         v_no_trans = ggml_view_3d(ctx0, kv_self->v_l[il],
             n_kv, n_embd_head_v, n_head_kv,
             ggml_element_size(kv_self->v_l[il])*n_ctx,
