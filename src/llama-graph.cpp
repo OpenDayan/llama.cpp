@@ -1191,7 +1191,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_mask,
          ggml_tensor * v_mla,
              bool      v_trans,
-             float     kq_scale) const {
+             float     kq_scale,
+             bool is_cpu_layer) const {
   //const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
   //const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -1238,9 +1239,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #else
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
-            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            if (is_cpu_layer) {
+                cur = ggml_permute_cpu(ctx0, cur, 0, 2, 1, 3);
+            } else {
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            }
             cur = ggml_mul_mat(ctx0, v_mla, cur);
-            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            if (is_cpu_layer) {
+                cur = ggml_permute_cpu(ctx0, cur, 0, 2, 1, 3);
+            } else {
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            }
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
 #endif
         }
@@ -1288,7 +1297,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
         }
 
-        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        if (is_cpu_layer) {
+            cur = ggml_permute_cpu(ctx0, kqv, 0, 2, 1, 3);
+        } else {
+            cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        }
 
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*n_head, n_tokens);
 
@@ -1432,6 +1445,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const int n_gpu_layers = this->n_gpu_layers;
     const int n_layer = hparams.n_layer;
     const int i_gpu_start = std::max(n_layer - n_gpu_layers, 0);
+    const bool is_cpu_layer = (il < i_gpu_start);
 
     // store to KV cache
     {
@@ -1445,7 +1459,7 @@ ggml_tensor * llm_graph_context::build_attn(
         // note: storing RoPE-ed version of K in the KV cache
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_cur, k_cache_view));
 
-        if ((il < i_gpu_start) || (n_gpu_layers == 0)) {
+        if (is_cpu_layer) {
             v_cur = ggml_reshape_2d(ctx0, v_cur, n_embd_v_gqa, n_tokens);
             v_cur = ggml_transpose(ctx0, v_cur);
         } else {
@@ -1463,7 +1477,7 @@ ggml_tensor * llm_graph_context::build_attn(
             v_cache_view = ggml_view_1d(ctx0, kv_self->v_l[il], n_tokens*n_embd_v_gqa, ggml_row_size(kv_self->v_l[il]->type, n_embd_v_gqa)*kv_head);
         } else {
             // note: the V cache is transposed when not using flash attention
-            if ((il < i_gpu_start) || (n_gpu_layers == 0)) {
+            if (is_cpu_layer) {
                 v_cache_view = ggml_view_2d(ctx0, kv_self->v_l[il], n_tokens, n_embd_v_gqa,
                                     (  n_ctx)*ggml_element_size(kv_self->v_l[il]),
                                 (kv_head)*ggml_element_size(kv_self->v_l[il]));
@@ -1483,7 +1497,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();
 
-    ggml_tensor * q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+    ggml_tensor * q;
+    if (is_cpu_layer) {
+        q = ggml_permute_cpu(ctx0, q_cur, 0, 2, 1, 3);
+    } else {
+        q = ggml_permute(ctx0, q_cur, 0, 2, 1, 3);
+    }
     //cb(q, "q", il);
 
     ggml_tensor * k =
@@ -1496,7 +1515,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * v_no_trans = nullptr;
 
-    if ((il < i_gpu_start) || (n_gpu_layers == 0)) {
+    if (is_cpu_layer) {
         v_no_trans = ggml_view_3d(ctx0, kv_self->v_l[il],
             n_kv, n_embd_head_v, n_head_kv,
             ggml_element_size(kv_self->v_l[il])*n_ctx,
@@ -1519,7 +1538,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 0) :
         v_no_trans;
 
-    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale);
+    ggml_tensor * cur = build_attn_mha(gf, q, k, v, kq_b, kq_mask, v_mla, v_trans, kq_scale, is_cpu_layer);
     cb(cur, "kqv_out", il);
 
     if (wo) {
