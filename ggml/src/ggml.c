@@ -845,11 +845,11 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     },
     [GGML_TYPE_MXFP8] = {
         .type_name                = "mxfp8",
-        .blck_size                = 0, // FIXME: MXFP8_K
-        .type_size                = 0, // FIXME: sizeof(block_mxfp8)
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
         .is_quantized             = true,
-        .to_float                 = NULL, // FIXME: (ggml_to_float_t) dequantize_row_mxfp8,
-        .from_float_ref           = NULL, // FIXME: (ggml_from_float_t) quantize_row_mxfp8_ref,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp8_ref,
     },
 };
 
@@ -6669,6 +6669,11 @@ size_t ggml_quantize_chunk(
                 size_t elemsize = sizeof(float);
                 result = n * elemsize;
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                quantize_row_mxfp8_ref(src + start, (block_mxfp8*)((char *) dst + start_row * row_size), (int64_t)nrows*n_per_row);
+                result = (size_t)nrows * row_size; 
             } break;
         default:
             assert(false);

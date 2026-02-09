@@ -246,6 +246,34 @@ void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_REST
     }
 }
 
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    const int qk = QK_MXFP8;
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            amax = fmaxf(amax, fabsf(x[i * qk + j]));
+        }
+
+        int exp;
+        frexpf(amax / 448.0f, &exp);
+        uint8_t e = (uint8_t)fmaxf(0, fminf(255, exp + 135));
+        y[i].e = e;
+
+        union { uint32_t i; float f; } u = { .i = (uint32_t)e << 23 };
+        float id = (e > 0) ? (1.0f / (u.f * 0.00390625f)) : 0.0f;
+
+        for (int j = 0; j < qk; j++) {
+            float val = x[i * qk + j] * id;
+            
+            if (fabsf(val) < 0.015625f) val = 0.0f; 
+
+            y[i].qs[j] = GGML_COMPUTE_FP32_TO_E4M3(val);
+        }
+    }
+}
+
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_0;
 
@@ -352,6 +380,22 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
         for (int j = 0; j < qk; ++j) {
             y[i*qk + j] = x[i].qs[j]*d;
+        }
+    }
+}
+
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    const int qk = QK_MXFP8;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        union { uint32_t i; float f; } u;
+        u.i = (uint32_t)x[i].e << 23;
+        const float d = u.f * 0.00390625f; // 2^(e-127-8)
+
+        for (int j = 0; j < qk; j++) {
+            y[i * qk + j] = GGML_COMPUTE_E4M3_TO_FP32(x[i].qs[j]) * d;
         }
     }
 }
@@ -5231,6 +5275,23 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 }
                 if (nans) {
                     fprintf(stderr, "%s: found %d NaNs in row of %zu FP8 values\n", __func__, nans, nb*QK_K);
+                    return false;
+                }
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                const block_mxfp8 * q = (const block_mxfp8 *) data;
+                int nans = 0;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (int j = 0; j < 32; ++j) {
+                        if ((q[i].qs[j] & 0x7F) == 0x7F) {
+                            nans++;
+                        }
+                    }
+                }
+                
+                if (nans > 0) {
+                    fprintf(stderr, "%s: found %d NaNs in row of %zu MXFP8 values\n", __func__, nans, nb * 32);
                     return false;
                 }
             } break;

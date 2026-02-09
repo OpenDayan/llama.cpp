@@ -47,6 +47,8 @@ extern "C" {
 
     void ggml_reorder_scale_e4m3_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
     void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+
+    void ggml_reorder_scale_mxfp8(const void * src, void * dst, int64_t n_elems, int64_t ne0);
 #ifdef  __cplusplus
 }
 

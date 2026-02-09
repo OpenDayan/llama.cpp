@@ -172,6 +172,8 @@ static bool ggml_backend_rnpu_device_supports_op(
             switch (op->src[0]->type) {
                 case GGML_TYPE_BF16:
                     return true;
+                case GGML_TYPE_MXFP8: 
+                    return true;
                 case GGML_TYPE_E4M3_Q:
                     return ggml_is_contiguous(op->src[0]) &&
                             ggml_is_contiguous(op->src[1]);
