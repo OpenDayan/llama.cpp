@@ -92,6 +92,7 @@ zig-cache/
 ppl-*.txt
 qnt-*.txt
 perf-*.txt
+operator_stats.json
 
 # Examples
 
