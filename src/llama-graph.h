@@ -365,6 +365,8 @@ struct llm_graph_params {
     int32_t n_outputs;
 
     const llm_graph_cb & cb;
+
+    int32_t n_gpu_layers = 0;
 };
 
 struct llm_graph_context {
@@ -400,6 +402,7 @@ struct llm_graph_context {
     const int32_t n_tokens;
     const int32_t n_outputs;
     const int32_t n_ctx_orig; // yarn
+    const int32_t n_gpu_layers;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
@@ -514,7 +517,8 @@ struct llm_graph_context {
              ggml_tensor * kq_mask,
              ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                     bool   v_trans,
-                   float   kq_scale) const;
+                   float   kq_scale,
+                   bool is_cpu_layer = false) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
