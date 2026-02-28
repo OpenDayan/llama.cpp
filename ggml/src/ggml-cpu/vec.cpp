@@ -161,6 +161,45 @@ void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * G
     *s = sumf;
 }
 
+void ggml_vec_dot_mxfp8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    GGML_UNUSED(bs);
+
+    struct block_mxfp8_local {
+        uint8_t scale;
+        uint8_t qs[32];
+    };
+
+    const struct block_mxfp8_local * GGML_RESTRICT x = (const struct block_mxfp8_local *)vx;
+    const float                    * GGML_RESTRICT y = (const float                    *)vy;
+
+    const int qk = 32;
+    const int nb = n / qk;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        uint8_t e = x[i].scale;
+        union { uint32_t i; float f; } u_scale;
+        u_scale.i = (uint32_t)e << 23;
+        float scale = u_scale.f * 0.00390625f;
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < qk; ++j) {
+            float w = ggml_compute_e4m3_to_fp32(x[i].qs[j]); 
+            
+            block_sum += w * y[i * qk + j];
+        }
+        
+        sumf += block_sum * scale;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_silu_f32(const int n, float * y, const float * x) {
     int i = 0;
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
