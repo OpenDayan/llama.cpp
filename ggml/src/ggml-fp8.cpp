@@ -182,3 +182,32 @@ void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, in
         }
     }
 }
+
+void ggml_reorder_scale_mxfp8(const void * src, void * dst, int64_t n_elems, int64_t ne0) {
+    const int64_t k = ne0;
+    const int64_t nb_k = k / QK_MXFP8;
+    const int64_t n_rows = n_elems / k;
+
+    const int64_t row_size_bytes = nb_k * sizeof(block_mxfp8);
+
+    const block_mxfp8 * s = (const block_mxfp8 *) src;
+    uint8_t * d = (uint8_t *) dst;
+
+    uint8_t * temp_row = (uint8_t *)malloc(row_size_bytes);
+
+    for (int64_t r = 0; r < n_rows; ++r) {
+        const block_mxfp8 * row_src = s + r * nb_k;
+
+        memcpy(temp_row, row_src, row_size_bytes);
+        const block_mxfp8 * safe_src = (const block_mxfp8 *)temp_row;
+
+        uint8_t * row_dst_scales = d + r * row_size_bytes;
+        uint8_t * row_dst_payloads = row_dst_scales + nb_k;
+
+        for (int64_t i = 0; i < nb_k; ++i) {
+            row_dst_scales[i] = safe_src[i].e;
+            memcpy(row_dst_payloads + i * QK_MXFP8, safe_src[i].qs, QK_MXFP8);
+        }
+    }
+    free(temp_row);
+}

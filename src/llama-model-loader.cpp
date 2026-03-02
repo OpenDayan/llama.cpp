@@ -14,6 +14,7 @@ static const size_t GiB = 1024*MiB;
 extern "C" {
     void ggml_reorder_scale_e4m3_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
     void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+    void ggml_reorder_scale_mxfp8(const void * src, void * dst, int64_t n_elems, int64_t ne0);
 }
 
 const char * llama_file_version_name(llama_fver version) {
@@ -1014,7 +1015,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        bool is_fp8 = (cur->type == GGML_TYPE_E4M3_Q || cur->type == GGML_TYPE_E3M4_Q);
+        bool is_fp8 = (cur->type == GGML_TYPE_E4M3_Q || cur->type == GGML_TYPE_E3M4_Q || cur->type == GGML_TYPE_MXFP8);
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1099,8 +1100,9 @@ bool llama_model_loader::load_all_data(
                             ggml_reorder_scale_e4m3_q(read_buf.data(), reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
                         } else if (cur->type == GGML_TYPE_E3M4_Q) {
                             ggml_reorder_scale_e3m4_q(read_buf.data(), reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
-                        }
-                        
+                        } else if (cur->type == GGML_TYPE_MXFP8) {
+                            ggml_reorder_scale_mxfp8(read_buf.data(), reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                        }                        
                         std::memcpy(read_buf.data(), reordered_data.data(), n_size);
                     }
 

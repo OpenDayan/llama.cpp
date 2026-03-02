@@ -416,6 +416,7 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, ggml_type new_t
             case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_E4M3_Q:
             case GGML_TYPE_E3M4_Q: new_type = tensor->type;   break;
+            case GGML_TYPE_MXFP8:  new_type = tensor->type;   break;
             default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
         }
         if (tensor->ne[0] % ggml_blck_size(new_type) != 0) {
@@ -496,6 +497,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         case LLAMA_FTYPE_MOSTLY_BF16: default_type = GGML_TYPE_BF16; break;
         case LLAMA_FTYPE_ALL_F32:     default_type = GGML_TYPE_F32;  break;
 
+        case LLAMA_FTYPE_MOSTLY_MXFP8: default_type = GGML_TYPE_MXFP8; break;
+        
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
         case LLAMA_FTYPE_MOSTLY_Q2_K:    default_type = GGML_TYPE_Q2_K;    break;

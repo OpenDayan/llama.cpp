@@ -528,6 +528,7 @@ FILE * ggml_fopen(const char * fname, const char * mode) {
 static void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc);
 static void ggml_vec_dot_f16(int n, float * GGML_RESTRICT s, size_t bs, ggml_fp16_t * GGML_RESTRICT x, size_t bx, ggml_fp16_t * GGML_RESTRICT y, size_t by, int nrc);
 static void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * GGML_RESTRICT x, size_t bx, ggml_bf16_t * GGML_RESTRICT y, size_t by, int nrc);
+static void ggml_vec_dot_mxfp8(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 
 static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
     [GGML_TYPE_I8] = {
@@ -842,6 +843,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_e3m4_q,
         .from_float_ref           = (ggml_from_float_t) quantize_row_e3m4_q_ref,
+    },
+    [GGML_TYPE_MXFP8] = {
+        .type_name                = "mxfp8",
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp8_ref,
     },
 };
 
@@ -1294,6 +1303,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_E4M3:          wtype = GGML_TYPE_E4M3;     break;
         case GGML_FTYPE_MOSTLY_E4M3_Q:        wtype = GGML_TYPE_E4M3_Q;   break;
         case GGML_FTYPE_MOSTLY_E3M4_Q:        wtype = GGML_TYPE_E3M4_Q;   break;
+        case GGML_FTYPE_MOSTLY_MXFP8:         wtype = GGML_TYPE_MXFP8;   break;
         case GGML_FTYPE_UNKNOWN:              wtype = GGML_TYPE_COUNT; break;
         case GGML_FTYPE_MOSTLY_Q4_1_SOME_F16: wtype = GGML_TYPE_COUNT; break;
     }
@@ -6660,6 +6670,11 @@ size_t ggml_quantize_chunk(
                 size_t elemsize = sizeof(float);
                 result = n * elemsize;
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                quantize_row_mxfp8_ref(src + start, (block_mxfp8*)((char *) dst + start_row * row_size), (int64_t)nrows*n_per_row);
+                result = (size_t)nrows * row_size; 
             } break;
         default:
             assert(false);

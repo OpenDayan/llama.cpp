@@ -392,7 +392,8 @@ extern "C" {
         GGML_TYPE_E4M3    = 40,
         GGML_TYPE_E4M3_Q  = 41,
         GGML_TYPE_E3M4_Q  = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_MXFP8   = 43,
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision
@@ -431,7 +432,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_E4M3    = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_E4M3_Q  = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_E3M4_Q  = 28, // except 1d tensors
-
+        GGML_FTYPE_MOSTLY_MXFP8   = 29, // except 1d tensors
     };
 
     // available tensor operations:

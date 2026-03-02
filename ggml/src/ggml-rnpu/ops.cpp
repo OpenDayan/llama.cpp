@@ -1928,6 +1928,100 @@ static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     // debug_compare_matmul_bf16(dst, dst_data_cpu);
 }
 
+static void ggml_rnpu_matmul_mxfp8_cpu_reordered(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    int64_t start_time = RECORD_OP_START();
+    const struct ggml_tensor * src0 = dst->src[0]; // Weights (MXFP8 Reordered)
+    const struct ggml_tensor * src1 = dst->src[1]; // Activations (BF16 or F32)
+
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    int bs = src1->ne[3];
+    int h = src1->ne[2];
+    int n = src0->ne[1];
+    int m = src1->ne[1];
+    int k = src1->ne[0];
+    
+    assert(src1->ne[0] == src0->ne[0]);
+    assert(k % 32 == 0);
+
+    const int QK_MXFP8 = 32;
+    const int nb_k = k / QK_MXFP8;
+
+    const int row_size_in_bytes = nb_k * 33;
+
+    uint8_t * a_base = (uint8_t *) src0_data_cpu;
+    float   * res    = (float *)   dst_data_cpu;
+
+    const bool src1_is_bf16 = (src1->type == GGML_TYPE_BF16);
+    float       * b_base_f32  = src1_is_bf16 ? NULL : (float *) src1_data_cpu;
+    ggml_bf16_t * b_base_bf16 = src1_is_bf16 ? (ggml_bf16_t *) src1_data_cpu : NULL;
+
+    int rbs = bs / src0->ne[3];
+    int rj  = h  / src0->ne[2];
+
+    for (int i = 0; i < bs; ++i) {
+        for (int j = 0; j < h; ++j) {
+            
+            int i0 = i / rbs;
+            int j0 = j / rj;
+
+            for (int p = 0; p < m; ++p) {
+                for (int l = 0; l < n; ++l) {
+                    
+                    float dot_sum = 0.0f;
+
+                    uint8_t * a_row_start = a_base + (i0 * src0->ne[2] * n * row_size_in_bytes)
+                                                   + (j0 * n * row_size_in_bytes)
+                                                   + (l * row_size_in_bytes);
+
+                    uint8_t * row_scales = a_row_start;
+                    uint8_t * row_payloads = a_row_start + nb_k;
+
+                    int64_t b_offset_base = (i * h * m * k) + (j * m * k) + (p * k);
+
+                    for (int ib = 0; ib < nb_k; ++ib) {
+                        
+                        uint8_t e = row_scales[ib];
+                        
+                        uint8_t * qs = row_payloads + (ib * QK_MXFP8);
+
+                        union { uint32_t i; float f; } u_scale;
+                        u_scale.i = (uint32_t)e << 23; 
+                        float scale = u_scale.f * 0.00390625f;
+
+                        for (int x = 0; x < QK_MXFP8; ++x) {
+                            float w = ggml_compute_e4m3_to_fp32(qs[x]);
+                            
+                            float act;
+                            int64_t b_idx = b_offset_base + ib * QK_MXFP8 + x;
+                            
+                            if (src1_is_bf16) {
+                                act = ggml_bf16_to_fp32(b_base_bf16[b_idx]);
+                            } else {
+                                act = b_base_f32[b_idx];
+                            }
+                            
+                            dot_sum += (w * scale) * act;
+                        }
+                    }
+
+                    res[i*h*m*n + j*m*n + p*n + l] = dot_sum;
+                }
+            }
+        }
+    }
+
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("ggml_rnpu_matmul_mxfp8_cpu_reordered", src0->ne, src1->ne, dst->ne, start_time, "CPU");
+}
 
 void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -1943,6 +2037,9 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
                 ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
                 // ggml_rnpu_matmul_e4m3q(ctx, dst);
             }
+            break;
+        case GGML_TYPE_MXFP8: 
+            ggml_rnpu_matmul_mxfp8_cpu_reordered(ctx, dst); 
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",

@@ -4347,7 +4347,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_E4M3  :
         case GGML_TYPE_E4M3_Q:
         case GGML_TYPE_E3M4_Q:
-
+        case GGML_TYPE_MXFP8:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
