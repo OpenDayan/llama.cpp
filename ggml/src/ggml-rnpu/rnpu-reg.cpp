@@ -91,6 +91,7 @@ extern struct NPUDeviceKernelSetDesc __bin_kernels_pack;
  */
 ggml_backend_reg_t ggml_backend_rnpu_reg() {
     static ggml_backend_reg reg;
+    static ggml_backend_reg_t reg_ptr = nullptr;
     static bool initialized = false;
 
     {
@@ -105,7 +106,9 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
             ssize_t err;
             err = npu_runtime_init(&runtime);
             if (err != NPU_SUCCESS) {
-                GGML_ABORT("Failed to initialize Runtime: %ld\n", err);
+                GGML_LOG_WARN("%s: failed to initialize Runtime: %ld, RNPU backend disabled\n", __func__, err);
+                initialized = true;
+                return nullptr;
             }
             GGML_LOG_INFO("Runtime initialized successfully.\n");
 
@@ -114,19 +117,36 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
             err = npu_runtime_load_kernelset(&runtime, &__bin_kernels_pack);
             if (err != NPU_SUCCESS) {
                 npu_runtime_deinit(&runtime);
-                GGML_ABORT("Failed to load kernel set: %ld\n", err);
+                GGML_LOG_WARN("%s: failed to load kernel set: %ld, RNPU backend disabled\n", __func__, err);
+                initialized = true;
+                return nullptr;
             }
             GGML_LOG_INFO("Kernel set loaded successfully.\n");
 
             ggml_backend_rnpu_reg_context * ctx = new ggml_backend_rnpu_reg_context;
-            for (int i = 0; i < ggml_rnpu_info().device_count; ++i) {
+            const int n_devices = ggml_rnpu_info().device_count;
+            if (n_devices <= 0) {
+                GGML_LOG_WARN("%s: no RNPU devices available, backend disabled\n", __func__);
+                delete ctx;
+                npu_runtime_deinit(&runtime);
+                initialized = true;
+                return nullptr;
+            }
+
+            for (int i = 0; i < n_devices; ++i) {
                 ggml_backend_rnpu_device_context * dev_ctx = new ggml_backend_rnpu_device_context;
                 dev_ctx->device = i;
                 dev_ctx->name = GGML_RNPU_NAME + std::to_string(i);
 
                 ggml_rnpu_set_device(i);
                 npuDeviceProp prop;
-                NPU_CHECK(npuGetDeviceProperties(&prop, i));
+                npuErr_t prop_err = npuGetDeviceProperties(&prop, i);
+                if (prop_err != npuSuccess) {
+                    GGML_LOG_WARN("%s: failed to query RNPU device %d properties: %s\n",
+                        __func__, i, npuGetErrorString(prop_err));
+                    delete dev_ctx;
+                    continue;
+                }
                 dev_ctx->description = prop.name;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
@@ -137,15 +157,25 @@ ggml_backend_reg_t ggml_backend_rnpu_reg() {
                 ctx->devices.push_back(dev);
             }
 
+            if (ctx->devices.empty()) {
+                GGML_LOG_WARN("%s: no usable RNPU devices after probing, backend disabled\n", __func__);
+                delete ctx;
+                npu_runtime_deinit(&runtime);
+                initialized = true;
+                return nullptr;
+            }
+
             reg = ggml_backend_reg {
                 /* .api_version = */ GGML_BACKEND_API_VERSION,
                 /* .iface       = */ ggml_backend_rnpu_reg_interface,
                 /* .context     = */ ctx
             };
+
+            reg_ptr = &reg;
         }
 
         initialized = true;
     }
 
-    return &reg;
+    return reg_ptr;
 }

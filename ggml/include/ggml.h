@@ -1608,6 +1608,18 @@ extern "C" {
             size_t                nb2, // slice stride in bytes
             size_t                offset);
 
+    // Like ggml_view_3d, but also allows customizing the stride of dimension 0.
+    GGML_API struct ggml_tensor * ggml_view_3d_uncont(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int64_t               ne0,
+            int64_t               ne1,
+            int64_t               ne2,
+            size_t                nb0,
+            size_t                nb1, // row   stride in bytes
+            size_t                nb2, // slice stride in bytes
+            size_t                offset);
+
     GGML_API struct ggml_tensor * ggml_view_4d(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -1627,6 +1639,14 @@ extern "C" {
             int                   axis1,
             int                   axis2,
             int                   axis3);
+
+    GGML_API struct ggml_tensor * ggml_permute_cpu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   axis0,
+            int                   axis1,
+            int                   axis2,
+            int                   axis3);        
 
     // alias for ggml_permute(ctx, a, 1, 0, 2, 3)
     GGML_API struct ggml_tensor * ggml_transpose(

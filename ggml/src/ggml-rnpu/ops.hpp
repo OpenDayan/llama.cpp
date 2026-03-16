@@ -20,6 +20,14 @@ extern "C" {
 void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst);
 
 /**
+ * @brief Writes source rows into destination rows according to index tensor.
+ *
+ * @param ctx The backend R-NPU context for executing operations.
+ * @param dst The destination tensor. dst->op is `GGML_OP_SET_ROWS`.
+ */
+void ggml_rnpu_set_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst);
+
+/**
  * @brief Adds two tensors element-wise.
  *
  * @param ctx The backend R-NPU context for executing operations.

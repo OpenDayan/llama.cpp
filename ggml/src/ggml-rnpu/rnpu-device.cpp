@@ -210,6 +210,12 @@ static bool ggml_backend_rnpu_device_supports_op(
             return (op->src[0]->type == GGML_TYPE_F32) &&
                    (op->type == GGML_TYPE_BF16);
         }
+        case GGML_OP_SET_ROWS: {
+            const bool src0_ok = op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16;
+            const bool src1_ok = op->src[1]->type == GGML_TYPE_I32 || op->src[1]->type == GGML_TYPE_I64;
+            const bool dst_ok  = op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_BF16;
+            return src0_ok && src1_ok && dst_ok;
+        }
         case GGML_OP_CONT: {
             // NOTE: We only support copy from FP32 to FP32
             return (op->src[0]->type == GGML_TYPE_F32) &&

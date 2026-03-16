@@ -534,6 +534,8 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    int32_t n_gpu_layers = 0;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -729,6 +731,7 @@ struct llm_graph_context {
     const int64_t n_tokens;
     const int64_t n_outputs;
     const int32_t n_ctx_orig; // yarn
+    const int32_t n_gpu_layers;    
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;

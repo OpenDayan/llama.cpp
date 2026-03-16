@@ -881,6 +881,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    n_gpu_layers     (params.n_gpu_layers),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1791,14 +1792,25 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                  int   il) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
+    const int n_gpu_layers = this->n_gpu_layers;
+	const int n_layer = hparams.n_layer;
+    const int i_gpu_start = std::max(n_layer - n_gpu_layers, 0);   
+    const bool is_cpu_layer = (il < i_gpu_start); 
+
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
-    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
-    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (is_cpu_layer) {
+        q = ggml_permute_cpu(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute_cpu(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute_cpu(ctx0, v, 0, 2, 1, 3);
+    } else {
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    }
 
     ggml_tensor * cur;
 
@@ -1835,16 +1847,31 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 #else
             // It's preferable to do the calculation as a matrix-matrix multiplication with n_tokens in dimension 1.
             // The permutations are noops and only change how the tensor data is interpreted.
-            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            if (is_cpu_layer) {
+                cur = ggml_permute_cpu(ctx0, cur, 0, 2, 1, 3);
+            } else {
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);                
+            }
             cur = ggml_mul_mat(ctx0, v_mla, cur);
             cb(cur, "fattn_mla", il);
-            cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+            if (is_cpu_layer) {
+                cur = ggml_permute_cpu(ctx0, cur, 0, 2, 1, 3);
+            } else {
+                cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);                
+            }
             cur = ggml_cont(ctx0, cur); // Needed because ggml_reshape_2d expects contiguous inputs.
 #endif
         }
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        // RNPU BF16 matmul expects B (Q) to have a regular head stride.
+        // q is a permuted view and can be interleaved across heads, so make it contiguous when needed.
+        if (q->type == GGML_TYPE_F32 && q->nb[2] != q->nb[1]*q->ne[1]) {
+            q = ggml_cont(ctx0, q);
+            cb(q, "q_cont", il);
+        }
+
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 
@@ -1897,8 +1924,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);
             cb(kqv, "kqv_mla", il);
         }
-
-        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+            
+        if (is_cpu_layer) {
+            cur = ggml_permute_cpu(ctx0, kqv, 0, 2, 1, 3);
+        } else {
+            cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);               
+        }
 
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);

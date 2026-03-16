@@ -238,6 +238,81 @@ void ggml_rnpu_get_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     }
 }
 
+template<typename idx_t>
+static void ggml_rnpu_set_rows_cpu_impl(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    int64_t start_time = RECORD_OP_START();
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    void * src0_data_cpu;
+    void * src1_data_cpu;
+    void * dst_data_cpu;
+    copy_binary_op_data_from_dev_to_cpu(dst, &src0_data_cpu, &src1_data_cpu, &dst_data_cpu);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int64_t nc = ne00;
+    const int64_t nr = ne01;
+
+    GGML_ASSERT(ne0 == nc);
+    GGML_ASSERT(ne2 == ne02);
+    GGML_ASSERT(ne3 == ne03);
+    GGML_ASSERT(ne11 > 0 && ne12 > 0);
+    GGML_ASSERT(ne02 % ne11 == 0);
+    GGML_ASSERT(ne03 % ne12 == 0);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            const int64_t i12 = i03 % ne12;
+            const int64_t i11 = i02 % ne11;
+
+            for (int64_t i = 0; i < nr; ++i) {
+                const int64_t i1 = *(idx_t *)((char *) src1_data_cpu + i*nb10 + i11*nb11 + i12*nb12);
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                const char * src_row = (const char *) src0_data_cpu + i*nb01 + i02*nb02 + i03*nb03;
+                char * dst_row = (char *) dst_data_cpu + i1*nb1 + i02*nb2 + i03*nb3;
+
+                if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+                    memcpy(dst_row, src_row, nc * sizeof(float));
+                } else if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
+                    ggml_fp32_to_bf16_row_ref((const float *) src_row, (ggml_bf16_t *) dst_row, nc);
+                } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_BF16) {
+                    memcpy(dst_row, src_row, nc * sizeof(ggml_bf16_t));
+                } else if (src0->type == GGML_TYPE_BF16 && dst->type == GGML_TYPE_F32) {
+                    const ggml_bf16_t * src_bf16 = (const ggml_bf16_t *) src_row;
+                    float * dst_f32 = (float *) dst_row;
+                    for (int64_t j = 0; j < nc; ++j) {
+                        dst_f32[j] = ggml_bf16_to_fp32(src_bf16[j]);
+                    }
+                } else {
+                    GGML_ABORT("FATAL ERROR: unsupported set_rows type: src0=%s dst=%s\n",
+                               ggml_type_name(src0->type), ggml_type_name(dst->type));
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(ctx);
+    copy_binary_op_data_from_cpu_to_dev(dst, src0_data_cpu, src1_data_cpu, dst_data_cpu);
+    RECORD_OP_END("ggml_rnpu_set_rows_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
+}
+
+void ggml_rnpu_set_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src1 = dst->src[1];
+    switch (src1->type) {
+        case GGML_TYPE_I32:
+            ggml_rnpu_set_rows_cpu_impl<int32_t>(ctx, dst);
+            break;
+        case GGML_TYPE_I64:
+            ggml_rnpu_set_rows_cpu_impl<int64_t>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("FATAL ERROR: unsupported index type for SET_ROWS: %s\n",
+                       ggml_type_name(src1->type));
+    }
+}
+
 static void ggml_rnpu_op_add_f32_cpu(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
     int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
@@ -899,7 +974,7 @@ void ggml_rnpu_view(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     // Empty op
 }
 
-static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_permute_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     int64_t start_time = RECORD_OP_START();
     const ggml_tensor * src0 = dst->src[0];
     const int axis0 = ((int32_t *) dst->op_params)[0];
@@ -907,8 +982,7 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
     const int axis2 = ((int32_t *) dst->op_params)[2];
     const int axis3 = ((int32_t *) dst->op_params)[3];
 
-    // TODO: Only support fp32 permute
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16);
     // TODO: Only support permute(1,2)
     GGML_ASSERT(axis0 == 0 && axis1 == 2 && axis2 == 1 && axis3 == 3);
 
@@ -922,7 +996,7 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
     int h = src0->ne[1];
     int w = src0->ne[0];
 
-    int row_size = w * sizeof(float);
+    const int row_size = w * ggml_type_size(src0->type);
 
     char * a = (char *) src0_data_cpu;
     char * res = (char *) dst_data_cpu;
@@ -931,7 +1005,7 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
             for (int k = 0; k < h; ++k) {
                 // Copy a[i][j][k][:] to res[i][k][j][:]
                 const char * a_ptr = (char *)a + k*src0->nb[1] + j*src0->nb[2] + i*src0->nb[3];
-                size_t id = (k*n + j) * row_size;
+                size_t id = (i*h*n + k*n + j) * row_size;
                 std::memcpy((char *)res + id, a_ptr, row_size);
             }
         }
@@ -940,7 +1014,7 @@ static void ggml_rnpu_permute_f32_2_1_cpu(ggml_backend_rnpu_context& ctx, ggml_t
     GGML_UNUSED(ctx);
     // FIXME: Copy result to device memory
     copy_unary_op_data_from_cpu_to_dev(dst, src0_data_cpu, dst_data_cpu);
-    RECORD_OP_END("ggml_rnpu_permute_f32_2_1_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
+    RECORD_OP_END("ggml_rnpu_permute_2_1_cpu", src0->ne, nullptr, dst->ne, start_time, "CPU");
 }
 
 static void ggml_rnpu_permute_f32_2_1(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
@@ -974,8 +1048,14 @@ void ggml_rnpu_permute(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
     const ggml_tensor * src0 = dst->src[0];
     switch (src0->type) {
         case GGML_TYPE_F32:
-            // ggml_rnpu_permute_f32_2_1_cpu(ctx, dst);
+            // ggml_rnpu_permute_2_1_cpu(ctx, dst);
             ggml_rnpu_permute_f32_2_1(ctx, dst);
+            break;
+        case GGML_TYPE_BF16:
+            // PERMUTE is a view op in ggml. For BF16 tensors (notably KV-cache views),
+            // materializing a transposed copy can mutate aliased storage and break attention.
+            GGML_UNUSED(ctx);
+            GGML_UNUSED(dst);
             break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op PERMUTE in R-NPU\n",
@@ -1878,9 +1958,6 @@ static void debug_compare_matmul_bf16(ggml_tensor* dst, void * dst_data_cpu) {
 }
 
 static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
-    // FIXME: 先用 cpu 版本计算，把 cpu 计算结果存储到 buffer 中
-    // void * dst_data_cpu = debug_matmul_bf16_cpu(ctx, dst);
-
     int64_t start_time = RECORD_OP_START();
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
@@ -1911,16 +1988,45 @@ static void ggml_rnpu_matmul_bf16(ggml_backend_rnpu_context& ctx, ggml_tensor* d
     //     src0->ne[2], src1->ne[2],
     //     src0->nb[2] / sizeof(uint16_t), src1->nb[2] / sizeof(float),
     //     a_is_transposed);
-    gmma_bf16_fp32_AT_QK256(
+    const size_t lda = (a_is_transposed ? src0->nb[0] : src0->nb[1]) / sizeof(uint16_t);
+    const size_t ldb = src1->nb[1] / sizeof(float);
+    const size_t ldc = dst->nb[1] / sizeof(float);
+    const size_t stride_g = src0->nb[2] / sizeof(uint16_t);
+    const size_t stride_h = src1->nb[2] / sizeof(float);
+
+    const int kernel_ret = gmma_bf16_fp32_AT_QK256(
         src0->data, src1->data, dst->data,
         m, n, k,
-        (a_is_transposed ? src0->nb[0] : src0->nb[1]) / sizeof(uint16_t),
-        src1->nb[1] / sizeof(float),
-        dst->nb[1] / sizeof(float),
+        lda,
+        ldb,
+        ldc,
         src0->ne[2], src1->ne[2],
-        src0->nb[2] / sizeof(uint16_t), src1->nb[2] / sizeof(float),
+        stride_g, stride_h,
         a_is_transposed
     );
+
+    if (kernel_ret != 0) {
+        GGML_LOG_WARN("%s: BF16 kernel failed (%d), falling back to CPU matmul\n", __func__, kernel_ret);
+        GGML_LOG_WARN("src0=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+            src0->name, ggml_type_name(src0->type),
+            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);
+        GGML_LOG_WARN("src1=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+            src1->name, ggml_type_name(src1->type),
+            (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3]);
+        GGML_LOG_WARN("dst=%s type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+            dst->name, ggml_type_name(dst->type),
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+        GGML_LOG_WARN("matmul params: m=%d n=%d k=%d lda=%zu ldb=%zu ldc=%zu g=%lld h=%lld stride_g=%zu stride_h=%zu trans=%d\n",
+            m, n, k, lda, ldb, ldc,
+            (long long) src0->ne[2], (long long) src1->ne[2], stride_g, stride_h, a_is_transposed);
+
+        ggml_rnpu_matmul_bf16_cpu(ctx, dst);
+        return;
+    }
+
     GGML_UNUSED(ctx);
     RECORD_OP_END("ggml_rnpu_matmul_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
 

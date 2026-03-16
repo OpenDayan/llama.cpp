@@ -75,11 +75,20 @@ static ggml_rnpu_device_info ggml_rnpu_init() {
         return info;
     }
 
-    // FIXME: delete in the futre (if support multi-device)
-    GGML_ASSERT(info.device_count == 1);
-    info.devices[0].cc = 0;
+    if (info.device_count == 0) {
+        GGML_LOG_WARN("%s: no R-NPU device found\n", __func__);
+        return info;
+    }
 
-    GGML_ASSERT(info.device_count <= GGML_RNPU_MAX_DEVICES);
+    if (info.device_count > GGML_RNPU_MAX_DEVICES) {
+        GGML_LOG_WARN("%s: truncating device count from %d to %d\n",
+            __func__, info.device_count, GGML_RNPU_MAX_DEVICES);
+        info.device_count = GGML_RNPU_MAX_DEVICES;
+    }
+
+    for (int i = 0; i < info.device_count; ++i) {
+        info.devices[i].cc = 0;
+    }
 
     return info;
 }
@@ -116,6 +125,9 @@ bool ggml_rnpu_compute_forward(ggml_backend_rnpu_context& ctx,
     switch (dst->op) {
         case GGML_OP_GET_ROWS:
             ggml_rnpu_get_rows(ctx, dst);
+            break;
+        case GGML_OP_SET_ROWS:
+            ggml_rnpu_set_rows(ctx, dst);
             break;
         case GGML_OP_ADD:
             ggml_rnpu_op_add(ctx, dst);
