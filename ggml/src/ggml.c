@@ -9,6 +9,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-fp8.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -726,6 +727,46 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_E4M3_Q] = {
+        .type_name                = "fp8_e4m3_q",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_e4m3_q),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_e4m3_q,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_e4m3_q_ref,
+    },
+    [GGML_TYPE_E3M4_Q] = {
+        .type_name                = "fp8_e3m4_q",
+        .blck_size                = QK_K,
+        .type_size                = sizeof(block_e3m4_q),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_e3m4_q,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_e3m4_q_ref,
+    },
+    [GGML_TYPE_MXFP8] = {
+        .type_name                = "mxfp8",
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_mxfp8_ref,
+    },
+    [GGML_TYPE_E5M2] = {
+        .type_name                = "fp8_e5m2",
+        .blck_size                = 1,
+        .type_size                = sizeof(ggml_e5m2_t),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) ggml_e5m2_to_fp32_row,
+        .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_e5m2_row_ref,
+    },
+    [GGML_TYPE_E4M3] = {
+        .type_name                = "fp8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(ggml_e4m3_t),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) ggml_e4m3_to_fp32_row,
+        .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_e4m3_row_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1383,6 +1424,11 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_E4M3_Q:        wtype = GGML_TYPE_E4M3_Q; break;
+        case GGML_FTYPE_MOSTLY_E3M4_Q:        wtype = GGML_TYPE_E3M4_Q; break;
+        case GGML_FTYPE_MOSTLY_MXFP8:         wtype = GGML_TYPE_MXFP8; break;
+        case GGML_FTYPE_MOSTLY_E5M2:          wtype = GGML_TYPE_E5M2; break;
+        case GGML_FTYPE_MOSTLY_E4M3:          wtype = GGML_TYPE_E4M3; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -7778,6 +7824,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_MXFP8:   result = quantize_mxfp8(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
@@ -7794,6 +7841,26 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ1_M:   result = quantize_iq1_m  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_NL:  result = quantize_iq4_nl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_IQ4_XS:  result = quantize_iq4_xs (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_E4M3_Q:
+            quantize_row_e4m3_q_ref(src + start, (block_e4m3_q *) ((char *) dst + start_row * row_size), (int64_t) nrows*n_per_row);
+            result = nrows * row_size;
+            break;
+        case GGML_TYPE_E3M4_Q:
+            quantize_row_e3m4_q_ref(src + start, (block_e3m4_q *) ((char *) dst + start_row * row_size), (int64_t) nrows*n_per_row);
+            result = nrows * row_size;
+            break;
+        case GGML_TYPE_E5M2:
+            {
+                size_t elemsize = sizeof(ggml_e5m2_t);
+                ggml_fp32_to_e5m2_row_ref(src + start, (ggml_e5m2_t *) dst + start, n);
+                result = n * elemsize;
+            } break;
+        case GGML_TYPE_E4M3:
+            {
+                size_t elemsize = sizeof(ggml_e4m3_t);
+                ggml_fp32_to_e4m3_row_ref(src + start, (ggml_e4m3_t *) dst + start, n);
+                result = n * elemsize;
+            } break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);

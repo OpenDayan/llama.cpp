@@ -168,11 +168,15 @@ static bool ggml_backend_rnpu_device_supports_op(
         case GGML_OP_MUL_MAT_ID:
             return false;
         case GGML_OP_MUL_MAT:
-            // NOTE: Latest upstream ggml removed legacy E4M3_Q/MXFP8 enums.
-            // Keep BF16 matmul enabled; FP8-family paths require follow-up remapping.
+            // Support BF16 and custom FP8-family matmul paths.
             switch (op->src[0]->type) {
                 case GGML_TYPE_BF16:
                     return true;
+                case GGML_TYPE_MXFP8:
+                    return true;
+                case GGML_TYPE_E4M3_Q:
+                    return ggml_is_contiguous(op->src[0]) &&
+                           ggml_is_contiguous(op->src[1]);
                 default:
                     return false;
             }

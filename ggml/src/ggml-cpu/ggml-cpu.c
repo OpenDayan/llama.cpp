@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
+#include "ggml-cpu-fp8.h"
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
@@ -388,6 +389,30 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_E5M2] = {
+        .from_float               = (ggml_from_float_t) ggml_fp32_to_e5m2_row,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_e5m2,
+        .vec_dot_type             = GGML_FP8_VECT_DOT_TYPE,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_E4M3] = {
+        .from_float               = (ggml_from_float_t) ggml_fp32_to_e4m3_row,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_e4m3,
+        .vec_dot_type             = GGML_FP8_VECT_DOT_TYPE,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_E4M3_Q] = {
+        .from_float               = (ggml_from_float_t) quantize_row_e4m3_q,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_e4m3_q,
+        .vec_dot_type             = GGML_FP8_VECT_DOT_TYPE,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_E3M4_Q] = {
+        .from_float               = (ggml_from_float_t) quantize_row_e3m4_q,
+        .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_e3m4_q,
+        .vec_dot_type             = GGML_FP8_VECT_DOT_TYPE,
         .nrows                    = 1,
     },
     [GGML_TYPE_I32] = {

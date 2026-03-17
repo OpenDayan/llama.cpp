@@ -17,6 +17,12 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+extern "C" {
+    void ggml_reorder_scale_e4m3_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+    void ggml_reorder_scale_e3m4_q(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+    void ggml_reorder_scale_mxfp8(const void * src, void * dst, int64_t n_elems, int64_t ne0);
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -43,6 +49,11 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q8_0:     return "Q8_0";
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return "MXFP4 MoE";
         case LLAMA_FTYPE_MOSTLY_NVFP4:    return "NVFP4";
+        case LLAMA_FTYPE_MOSTLY_E5M2:     return "E5M2";
+        case LLAMA_FTYPE_MOSTLY_E4M3:     return "E4M3";
+        case LLAMA_FTYPE_MOSTLY_E4M3_Q:   return "E4M3_Q";
+        case LLAMA_FTYPE_MOSTLY_E3M4_Q:   return "E3M4_Q";
+        case LLAMA_FTYPE_MOSTLY_MXFP8:    return "MXFP8";
         case LLAMA_FTYPE_MOSTLY_Q2_K:     return "Q2_K - Medium";
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:   return "Q2_K - Small";
         case LLAMA_FTYPE_MOSTLY_Q3_K_S:   return "Q3_K - Small";
@@ -726,6 +737,11 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
+            case GGML_TYPE_E5M2:    ftype = LLAMA_FTYPE_MOSTLY_E5M2;    break;
+            case GGML_TYPE_E4M3:    ftype = LLAMA_FTYPE_MOSTLY_E4M3;    break;
+            case GGML_TYPE_E4M3_Q:  ftype = LLAMA_FTYPE_MOSTLY_E4M3_Q;  break;
+            case GGML_TYPE_E3M4_Q:  ftype = LLAMA_FTYPE_MOSTLY_E3M4_Q;  break;
+            case GGML_TYPE_MXFP8:   ftype = LLAMA_FTYPE_MOSTLY_MXFP8;   break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1485,6 +1501,9 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+        const bool is_fp8 = cur->type == GGML_TYPE_E4M3_Q ||
+                            cur->type == GGML_TYPE_E3M4_Q ||
+                            cur->type == GGML_TYPE_MXFP8;
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
@@ -1512,7 +1531,20 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                // RNPU FP8 matmul expects per-row reordered layout (payload then scales).
+                if (is_fp8 && !ggml_backend_buffer_is_host(cur->buffer)) {
+                    std::vector<uint8_t> reordered_data(n_size);
+                    if (cur->type == GGML_TYPE_E4M3_Q) {
+                        ggml_reorder_scale_e4m3_q(data, reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                    } else if (cur->type == GGML_TYPE_E3M4_Q) {
+                        ggml_reorder_scale_e3m4_q(data, reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                    } else if (cur->type == GGML_TYPE_MXFP8) {
+                        ggml_reorder_scale_mxfp8(data, reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                    }
+                    ggml_backend_tensor_set(cur, reordered_data.data(), 0, n_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1528,6 +1560,10 @@ bool llama_model_loader::load_all_data(
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
+                    if (is_fp8) {
+                        throw std::runtime_error(format("FP8 reordering not supported in async upload mode for tensor '%s'", cur->name));
+                    }
+
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1583,7 +1619,21 @@ bool llama_model_loader::load_all_data(
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+
+                    if (is_fp8) {
+                        std::vector<uint8_t> reordered_data(n_size);
+                        if (cur->type == GGML_TYPE_E4M3_Q) {
+                            ggml_reorder_scale_e4m3_q(read_buf.data(), reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                        } else if (cur->type == GGML_TYPE_E3M4_Q) {
+                            ggml_reorder_scale_e3m4_q(read_buf.data(), reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                        } else if (cur->type == GGML_TYPE_MXFP8) {
+                            ggml_reorder_scale_mxfp8(read_buf.data(), reordered_data.data(), ggml_nelements(cur), cur->ne[0]);
+                        }
+                        ggml_backend_tensor_set(cur, reordered_data.data(), 0, n_size);
+                    } else {
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                    }
+
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }

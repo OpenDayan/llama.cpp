@@ -2136,6 +2136,17 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
             // ggml_rnpu_matmul_bf16_cpu(ctx, dst);
             ggml_rnpu_matmul_bf16(ctx, dst);
             break;
+        case GGML_TYPE_E4M3_Q:
+            if (src0->buffer && ggml_backend_buffer_is_rnpu(src0->buffer)) {
+                ggml_rnpu_matmul_e4m3q_cpu_reordered(ctx, dst);
+            } else {
+                ggml_rnpu_matmul_e4m3q_cpu(ctx, dst);
+                // ggml_rnpu_matmul_e4m3q(ctx, dst);
+            }
+            break;
+        case GGML_TYPE_MXFP8: 
+            ggml_rnpu_matmul_mxfp8_cpu_reordered(ctx, dst); 
+            break;
         default:
             GGML_ABORT("FATAL ERROR: type %s not supported for op MATMUL in R-NPU\n",
                        ggml_type_name(src0->type));

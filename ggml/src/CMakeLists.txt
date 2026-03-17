@@ -198,6 +198,8 @@ add_library(ggml-base
             ../include/gguf.h
             ggml.c
             ggml.cpp
+            ggml-fp8.cpp
+            ggml-fp8.h
             ggml-alloc.c
             ggml-backend.cpp
             ggml-opt.cpp

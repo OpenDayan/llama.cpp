@@ -546,6 +546,91 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
 }
 
+static inline float ggml_compute_e4m3_to_fp32(uint8_t x) {
+    union {
+        uint32_t i;
+        float f;
+    } u;
+
+    uint32_t s = (x & 0x80) << 24;
+    uint32_t exp = (x & 0x78) >> 3;
+    uint32_t mant = (x & 0x07);
+
+    if (x == 0x7F || x == 0xFF) {
+        return NAN;
+    }
+
+    if (exp > 0) {
+        u.i = s | ((exp + 120) << 23) | (mant << 20);
+        return u.f;
+    }
+
+    if (mant == 0) {
+        u.i = s;
+        return u.f;
+    }
+
+    union {
+        uint32_t i;
+        float f;
+    } scale_u;
+    scale_u.i = (UINT32_C(120) << 23);
+
+    u.i = s | (UINT32_C(127) << 23) | (mant << 20);
+    return u.f / scale_u.f;
+}
+
+static inline uint8_t ggml_compute_fp32_to_e4m3(float f) {
+    if (isnan(f)) {
+        return 0x7F;
+    }
+
+    float abs_f = fabsf(f);
+    uint32_t sign = (copysignf(1.0f, f) < 0.0f) ? 0x80 : 0x00;
+
+    if (abs_f > 448.0f) {
+        return sign | 0x7E;
+    }
+
+    if (abs_f < 0x1.0p-9f) {
+        return sign | 0x00;
+    }
+
+    int exp;
+    float mant = frexpf(abs_f, &exp);
+
+    if (exp >= -6) {
+        int biased_exp = exp + 6;
+
+        uint32_t m_bits = (uint32_t) (mant * 16.0f + 0.5f);
+
+        if (m_bits >= 16) {
+            m_bits = 0;
+            biased_exp++;
+        } else {
+            m_bits &= 0x7;
+        }
+
+        if (biased_exp >= 15) {
+            return sign | 0x7E;
+        }
+
+        return sign | (biased_exp << 3) | m_bits;
+    }
+
+    float v = abs_f * 512.0f;
+    uint32_t m_bits = (uint32_t) (v + 0.5f);
+
+    if (m_bits >= 8) {
+        return sign | (1 << 3) | 0;
+    }
+
+    return sign | m_bits;
+}
+
+#define GGML_COMPUTE_FP32_TO_E4M3(x) ggml_compute_fp32_to_e4m3(x)
+#define GGML_COMPUTE_E4M3_TO_FP32(x) ggml_compute_e4m3_to_fp32(x)
+
 /**
  * Converts brain16 to float32.
  *

@@ -205,6 +205,13 @@ typedef struct {
 } block_nvfp4;
 static_assert(sizeof(block_nvfp4) == sizeof(uint8_t)*(QK_NVFP4/QK_NVFP4_SUB) + QK_NVFP4/2, "wrong nvfp4 block size/padding");
 
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e; // E8M0
+    uint8_t qs[QK_MXFP8];
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -437,6 +444,22 @@ typedef struct {
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
+
+// fp8 support
+typedef struct { uint8_t bits; } ggml_e5m2_t;
+typedef struct { uint8_t bits; } ggml_e4m3_t;
+
+typedef struct {
+    float d;
+    uint8_t qs[QK_K];
+} block_e4m3_q;
+static_assert(sizeof(block_e4m3_q) == sizeof(float) + QK_K, "wrong block_e4m3_q block size/padding");
+
+typedef struct {
+    float d;
+    uint8_t qs[QK_K];
+} block_e3m4_q;
+static_assert(sizeof(block_e3m4_q) == sizeof(float) + QK_K, "wrong block_e3m4_q block size/padding");
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL

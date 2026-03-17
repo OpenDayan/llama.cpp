@@ -449,6 +449,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_E4M3_Q) {
+                new_type = GGML_TYPE_E4M3_Q;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_E3M4_Q) {
+                new_type = GGML_TYPE_E3M4_Q;
+            }
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
@@ -477,6 +483,9 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0) {
                 new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_E4M3_Q || ftype == LLAMA_FTYPE_MOSTLY_E3M4_Q) {
+                new_type = tensor->type;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
@@ -795,6 +804,7 @@ static ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16: return GGML_TYPE_BF16;
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
 
+        case LLAMA_FTYPE_MOSTLY_MXFP8: return GGML_TYPE_MXFP8;
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
         // K-quants
@@ -822,6 +832,11 @@ static ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:  return GGML_TYPE_IQ4_XS;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
+
+        case LLAMA_FTYPE_MOSTLY_E5M2:    return GGML_TYPE_E5M2;
+        case LLAMA_FTYPE_MOSTLY_E4M3:    return GGML_TYPE_E4M3;
+        case LLAMA_FTYPE_MOSTLY_E4M3_Q:  return GGML_TYPE_E4M3_Q;
+        case LLAMA_FTYPE_MOSTLY_E3M4_Q:  return GGML_TYPE_E3M4_Q;
 
         default: throw std::runtime_error(format("invalid output file type %d\n", ftype));
     }
