@@ -2102,7 +2102,8 @@ static void ggml_rnpu_matmul_mxfp8_cpu_reordered(ggml_backend_rnpu_context& ctx,
                         float scale = u_scale.f * 0.00390625f;
 
                         for (int x = 0; x < QK_MXFP8; ++x) {
-                            float w = e4m3q_to_float(qs[x]);
+                            // Keep MXFP8 decode semantics aligned with ggml core/reference branch.
+                            float w = ggml_compute_e4m3_to_fp32(qs[x]);
                             
                             float act;
                             int64_t b_idx = b_offset_base + ib * QK_MXFP8 + x;

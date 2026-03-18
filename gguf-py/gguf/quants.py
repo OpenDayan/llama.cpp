@@ -763,6 +763,72 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
         return (d * vals.astype(np.float32)).reshape(n_super, 64)
 
 
+def _generate_e4m3_lut() -> np.ndarray:
+    lut = np.zeros(256, dtype=np.float32)
+    for i in range(256):
+        s = (i >> 7) & 0x1
+        e = (i >> 3) & 0xF
+        m = i & 0x7
+
+        if e == 0:
+            val = ((-1) ** s) * (2 ** -6) * (m / 8.0)
+        elif e == 15 and m == 7:
+            val = np.nan
+        else:
+            val = ((-1) ** s) * (2 ** (e - 7)) * (1 + m / 8.0)
+
+        lut[i] = val
+
+    return lut
+
+
+_E4M3_VALUES = _generate_e4m3_lut()
+
+
+class MXFP8(__Quant, qtype=GGMLQuantizationType.MXFP8):
+    @staticmethod
+    # See ggml_e8m0_to_fp32_half in ggml-impl.h
+    def e8m0_to_fp32_half(x: np.ndarray) -> np.ndarray:
+        bits = np.where(x < 2, np.uint32(0x00200000) << np.uint32(x), np.uint32(x - 1) << np.uint32(23))
+        return bits.view(np.float32)
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        d = abs(blocks).max(axis=-1, keepdims=True)
+
+        with np.errstate(divide="ignore"):
+            e = np.where(d > 0, np.floor(np.log2(d)) - 8 + 127, 0).astype(np.uint8)
+
+        d_scale = cls.e8m0_to_fp32_half(e)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scaled_blocks = blocks / d_scale
+            scaled_blocks = np.nan_to_num(scaled_blocks, nan=0.0)
+
+        flat_data = np.clip(scaled_blocks.flatten(), -448.0, 448.0)
+        qs = np.zeros_like(flat_data, dtype=np.uint8)
+
+        batch_size = 1024 * 1024
+        for i in range(0, len(flat_data), batch_size):
+            batch = flat_data[i:i + batch_size]
+            idx = np.abs(batch[:, None] - _E4M3_VALUES[None, :]).argmin(axis=1)
+            qs[i:i + batch_size] = idx.astype(np.uint8)
+
+        qs = qs.reshape(blocks.shape)
+
+        return np.concatenate([e, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        e, qs = np.hsplit(blocks, [1])
+        d = cls.e8m0_to_fp32_half(e)
+        qs_float = _E4M3_VALUES[qs].reshape(n_blocks, cls.block_size)
+
+        return d * qs_float
+
+
 class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
     ksigns: bytes = (
         b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"
