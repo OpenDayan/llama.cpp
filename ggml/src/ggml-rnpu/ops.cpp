@@ -298,8 +298,219 @@ static void ggml_rnpu_set_rows_cpu_impl(ggml_backend_rnpu_context & ctx, ggml_te
     RECORD_OP_END("ggml_rnpu_set_rows_cpu", src0->ne, src1->ne, dst->ne, start_time, "CPU");
 }
 
-void ggml_rnpu_set_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+static void ggml_rnpu_set_rows_f32_i32_f32(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    static struct NPUKernelDesc * set_rows_f32_i32_f32 = NULL;
+    if (set_rows_f32_i32_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "set_rows_f32_i32_f32", &set_rows_f32_i32_f32);
+        if (err != NPU_SUCCESS) {
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
+        }
+        GGML_LOG_INFO("[INFO] Loaded set_rows_f32_i32_f32 kernel desc successfully.\n");
+    }
+
+    int64_t start_time = RECORD_OP_START();
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, set_rows_f32_i32_f32, &kernel_ret, 19,
+        src0->data, src1->data, dst->data,
+        (uint64_t) ne00, (uint64_t) ne01, (uint64_t) ne1,
+        (uint64_t) ne02, (uint64_t) ne03, (uint64_t) ne11, (uint64_t) ne12,
+        (uint64_t) nb01, (uint64_t) nb02, (uint64_t) nb03,
+        (uint64_t) nb10, (uint64_t) nb11, (uint64_t) nb12,
+        (uint64_t) nb1, (uint64_t) nb2, (uint64_t) nb3);
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("set_rows_f32_i32_f32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+static void ggml_rnpu_set_rows_f32_i64_f32(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    static struct NPUKernelDesc * set_rows_f32_i64_f32 = NULL;
+    if (set_rows_f32_i64_f32 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "set_rows_f32_i64_f32", &set_rows_f32_i64_f32);
+        if (err != NPU_SUCCESS) {
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
+        }
+        GGML_LOG_INFO("[INFO] Loaded set_rows_f32_i64_f32 kernel desc successfully.\n");
+    }
+
+    int64_t start_time = RECORD_OP_START();
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, set_rows_f32_i64_f32, &kernel_ret, 19,
+        src0->data, src1->data, dst->data,
+        (uint64_t) ne00, (uint64_t) ne01, (uint64_t) ne1,
+        (uint64_t) ne02, (uint64_t) ne03, (uint64_t) ne11, (uint64_t) ne12,
+        (uint64_t) nb01, (uint64_t) nb02, (uint64_t) nb03,
+        (uint64_t) nb10, (uint64_t) nb11, (uint64_t) nb12,
+        (uint64_t) nb1, (uint64_t) nb2, (uint64_t) nb3);
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("set_rows_f32_i64_f32", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+static void ggml_rnpu_set_rows_bf16_i32_bf16(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    static struct NPUKernelDesc * set_rows_bf16_i32_bf16 = NULL;
+    if (set_rows_bf16_i32_bf16 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "set_rows_bf16_i32_bf16", &set_rows_bf16_i32_bf16);
+        if (err != NPU_SUCCESS) {
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
+        }
+        GGML_LOG_INFO("[INFO] Loaded set_rows_bf16_i32_bf16 kernel desc successfully.\n");
+    }
+
+    int64_t start_time = RECORD_OP_START();
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, set_rows_bf16_i32_bf16, &kernel_ret, 19,
+        src0->data, src1->data, dst->data,
+        (uint64_t) ne00, (uint64_t) ne01, (uint64_t) ne1,
+        (uint64_t) ne02, (uint64_t) ne03, (uint64_t) ne11, (uint64_t) ne12,
+        (uint64_t) nb01, (uint64_t) nb02, (uint64_t) nb03,
+        (uint64_t) nb10, (uint64_t) nb11, (uint64_t) nb12,
+        (uint64_t) nb1, (uint64_t) nb2, (uint64_t) nb3);
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("set_rows_bf16_i32_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+static void ggml_rnpu_set_rows_bf16_i64_bf16(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    static struct NPUKernelDesc * set_rows_bf16_i64_bf16 = NULL;
+    if (set_rows_bf16_i64_bf16 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "set_rows_bf16_i64_bf16", &set_rows_bf16_i64_bf16);
+        if (err != NPU_SUCCESS) {
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
+        }
+        GGML_LOG_INFO("[INFO] Loaded set_rows_bf16_i64_bf16 kernel desc successfully.\n");
+    }
+
+    int64_t start_time = RECORD_OP_START();
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, set_rows_bf16_i64_bf16, &kernel_ret, 19,
+        src0->data, src1->data, dst->data,
+        (uint64_t) ne00, (uint64_t) ne01, (uint64_t) ne1,
+        (uint64_t) ne02, (uint64_t) ne03, (uint64_t) ne11, (uint64_t) ne12,
+        (uint64_t) nb01, (uint64_t) nb02, (uint64_t) nb03,
+        (uint64_t) nb10, (uint64_t) nb11, (uint64_t) nb12,
+        (uint64_t) nb1, (uint64_t) nb2, (uint64_t) nb3);
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("set_rows_bf16_i64_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+static void ggml_rnpu_set_rows_f32_i32_bf16(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    static struct NPUKernelDesc * set_rows_f32_i32_bf16 = NULL;
+    if (set_rows_f32_i32_bf16 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "set_rows_f32_i32_bf16", &set_rows_f32_i32_bf16);
+        if (err != NPU_SUCCESS) {
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
+        }
+        GGML_LOG_INFO("[INFO] Loaded set_rows_f32_i32_bf16 kernel desc successfully.\n");
+    }
+
+    int64_t start_time = RECORD_OP_START();
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, set_rows_f32_i32_bf16, &kernel_ret, 19,
+        src0->data, src1->data, dst->data,
+        (uint64_t) ne00, (uint64_t) ne01, (uint64_t) ne1,
+        (uint64_t) ne02, (uint64_t) ne03, (uint64_t) ne11, (uint64_t) ne12,
+        (uint64_t) nb01, (uint64_t) nb02, (uint64_t) nb03,
+        (uint64_t) nb10, (uint64_t) nb11, (uint64_t) nb12,
+        (uint64_t) nb1, (uint64_t) nb2, (uint64_t) nb3);
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("set_rows_f32_i32_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+static void ggml_rnpu_set_rows_f32_i64_bf16(ggml_backend_rnpu_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    static struct NPUKernelDesc * set_rows_f32_i64_bf16 = NULL;
+    if (set_rows_f32_i64_bf16 == NULL) {
+        ssize_t err = npu_runtime_get_kernel_desc(&runtime, "set_rows_f32_i64_bf16", &set_rows_f32_i64_bf16);
+        if (err != NPU_SUCCESS) {
+            npu_runtime_deinit(&runtime);
+            GGML_ABORT("Failed to get kernel description: err=%ld\n", err);
+        }
+        GGML_LOG_INFO("[INFO] Loaded set_rows_f32_i64_bf16 kernel desc successfully.\n");
+    }
+
+    int64_t start_time = RECORD_OP_START();
+    int kernel_ret;
+    npu_runtime_kernel_start(&runtime, set_rows_f32_i64_bf16, &kernel_ret, 19,
+        src0->data, src1->data, dst->data,
+        (uint64_t) ne00, (uint64_t) ne01, (uint64_t) ne1,
+        (uint64_t) ne02, (uint64_t) ne03, (uint64_t) ne11, (uint64_t) ne12,
+        (uint64_t) nb01, (uint64_t) nb02, (uint64_t) nb03,
+        (uint64_t) nb10, (uint64_t) nb11, (uint64_t) nb12,
+        (uint64_t) nb1, (uint64_t) nb2, (uint64_t) nb3);
+
+    GGML_UNUSED(ctx);
+    RECORD_OP_END("set_rows_f32_i64_bf16", src0->ne, src1->ne, dst->ne, start_time, "R-NPU");
+}
+
+void ggml_rnpu_set_rows(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        switch (src1->type) {
+            case GGML_TYPE_I32:
+                ggml_rnpu_set_rows_f32_i32_f32(ctx, dst);
+                return;
+            case GGML_TYPE_I64:
+                ggml_rnpu_set_rows_f32_i64_f32(ctx, dst);
+                return;
+            default:
+                GGML_ABORT("FATAL ERROR: unsupported index type for SET_ROWS: %s\n",
+                           ggml_type_name(src1->type));
+        }
+    }
+
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16) {
+        switch (src1->type) {
+            case GGML_TYPE_I32:
+                ggml_rnpu_set_rows_f32_i32_bf16(ctx, dst);
+                return;
+            case GGML_TYPE_I64:
+                ggml_rnpu_set_rows_f32_i64_bf16(ctx, dst);
+                return;
+            default:
+                GGML_ABORT("FATAL ERROR: unsupported index type for SET_ROWS: %s\n",
+                           ggml_type_name(src1->type));
+        }
+    }
+
+    // Remaining mixed-precision SET_ROWS combinations fallback to CPU.
     switch (src1->type) {
         case GGML_TYPE_I32:
             ggml_rnpu_set_rows_cpu_impl<int32_t>(ctx, dst);
@@ -2153,4 +2364,5 @@ void ggml_rnpu_mul_mat(ggml_backend_rnpu_context& ctx, ggml_tensor* dst) {
                        ggml_type_name(src0->type));
     }
 }
+
 
