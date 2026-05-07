@@ -1794,7 +1794,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     const int n_gpu_layers = this->n_gpu_layers;
 	const int n_layer = hparams.n_layer;
-    const int i_gpu_start = std::max(n_layer - n_gpu_layers, 0);   
+    const int i_gpu_start = std::max(n_layer + 1 - n_gpu_layers, 0);   
     const bool is_cpu_layer = (il < i_gpu_start); 
 
     // split the batch into streams if needed

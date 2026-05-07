@@ -7583,7 +7583,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     if (llama_supports_gpu_offload()) {
-        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
+        const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer + 1));
 
         int n_repeating = n_gpu;
         if (n_repeating > 0) {
