@@ -1,0 +1,10 @@
+#ifndef GGML_DAYAN_FREESTANDING_TYPE_TRAITS
+#define GGML_DAYAN_FREESTANDING_TYPE_TRAITS
+
+namespace std {
+template <typename Base, typename Derived> struct is_base_of {
+    static constexpr bool value = __is_base_of(Base, Derived);
+};
+}  // namespace std
+
+#endif

@@ -268,6 +268,16 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 
+if (GGML_DAYAN)
+    llama_build(test-dayan-graph.cpp)
+    llama_build(test-dayan-flash-attention.cpp)
+    llama_build(test-dayan-attention-projection.cpp)
+    target_include_directories(test-dayan-attention-projection PRIVATE
+        "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan"
+        "${DAYAN_ROOT}/host/include")
+    llama_build(test-dayan-qwen35-dense.cpp)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

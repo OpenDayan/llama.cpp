@@ -233,6 +233,9 @@ option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)
 option(GGML_WEBGPU_GPU_PROFILE              "ggml: enable WebGPU profiling (GPU)"             OFF)
 option(GGML_WEBGPU_JSPI                     "ggml: use JSPI for WebGPU"                       ON)
 option(GGML_ZDNN                            "ggml: use zDNN"                                  OFF)
+option(GGML_DAYAN                           "ggml: use Dayan"                                 OFF)
+set   (DAYAN_ROOT "" CACHE PATH             "ggml: path to the Dayan SDK source or install prefix")
+set   (DAYAN_NPU_KERNELS_DIR "" CACHE PATH  "ggml: path to the Dayan NPU kernel headers")
 option(GGML_VIRTGPU                         "ggml: use the VirtGPU/Virglrenderer API Remoting frontend"     OFF)
 option(GGML_VIRTGPU_BACKEND                 "ggml: build the VirtGPU/Virglrenderer API Remoting backend"    OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
@@ -329,6 +332,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cann.h
     include/ggml-cpp.h
     include/ggml-cuda.h
+    include/ggml-dayan.h
     include/ggml-opt.h
     include/ggml-metal.h
     include/ggml-rpc.h

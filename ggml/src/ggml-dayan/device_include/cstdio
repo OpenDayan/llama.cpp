@@ -1,0 +1,10 @@
+#ifndef GGML_DAYAN_FREESTANDING_CSTDIO
+#define GGML_DAYAN_FREESTANDING_CSTDIO
+
+#include <stdio.h>
+
+namespace std {
+using ::printf;
+}  // namespace std
+
+#endif

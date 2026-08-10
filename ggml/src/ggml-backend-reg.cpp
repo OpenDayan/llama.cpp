@@ -90,6 +90,10 @@
 #include "ggml-et.h"
 #endif
 
+#ifdef GGML_USE_DAYAN
+#include "ggml-dayan.h"
+#endif
+
 namespace fs = std::filesystem;
 
 static std::string path_str(const fs::path & path) {
@@ -167,6 +171,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_ET
         register_backend(ggml_backend_et_reg());
+#endif
+#ifdef GGML_USE_DAYAN
+        register_backend(ggml_backend_dayan_reg());
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
@@ -574,6 +581,7 @@ void ggml_backend_load_all_from_path(const char * dir_path) {
     ggml_backend_load_best("zendnn", silent, dir_path);
     ggml_backend_load_best("cann", silent, dir_path);
     ggml_backend_load_best("cuda", silent, dir_path);
+    ggml_backend_load_best("dayan", silent, dir_path);
     ggml_backend_load_best("hip", silent, dir_path);
     ggml_backend_load_best("metal", silent, dir_path);
     ggml_backend_load_best("rpc", silent, dir_path);

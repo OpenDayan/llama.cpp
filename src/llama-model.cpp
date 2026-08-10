@@ -21,6 +21,7 @@
 #include "models/models.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -2411,6 +2412,29 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
+using ggml_backend_graph_rewrite_t = bool (*)(ggml_backend_t, ggml_context *, ggml_cgraph *);
+
+static void llama_model_apply_backend_graph_rewrites(const llm_graph_params & params, llm_graph_result * result) {
+    if (params.sched == nullptr) {
+        return;
+    }
+
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(params.sched); ++i) {
+        ggml_backend_t     backend = ggml_backend_sched_get_backend(params.sched, i);
+        ggml_backend_dev_t device  = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg     = device == nullptr ? nullptr : ggml_backend_dev_backend_reg(device);
+        if (reg == nullptr) {
+            continue;
+        }
+
+        auto rewrite =
+            (ggml_backend_graph_rewrite_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_rewrite");
+        if (rewrite != nullptr && !rewrite(backend, result->get_ctx(), result->get_gf())) {
+            LLAMA_LOG_WARN("%s: graph rewrite failed for backend %s\n", __func__, ggml_backend_name(backend));
+        }
+    }
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
@@ -2427,10 +2451,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
     llm->res->set_outputs(params);
+    llama_model_apply_backend_graph_rewrites(params, llm->res);
 
     return llm->res->get_gf();
 }
-
 
 //
 // interface implementation
