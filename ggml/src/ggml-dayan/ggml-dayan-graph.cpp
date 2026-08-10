@@ -14,6 +14,18 @@ static bool ggml_backend_dayan_is_storage_type(enum ggml_type type) {
     return type == GGML_TYPE_BF16 || type == GGML_TYPE_F16;
 }
 
+static bool ggml_backend_dayan_3d_size_fits(size_t element_size, uint64_t ne0, uint64_t ne1, uint64_t ne2) {
+    size_t         size          = element_size;
+    const uint64_t dimensions[3] = { ne0, ne1, ne2 };
+    for (int index = 0; index < 3; ++index) {
+        if (dimensions[index] == 0 || dimensions[index] > SIZE_MAX / size) {
+            return false;
+        }
+        size *= (size_t) dimensions[index];
+    }
+    return true;
+}
+
 static bool ggml_backend_dayan_is_flash_type(enum ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F16;
 }
@@ -37,6 +49,36 @@ bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op) {
            ggml_is_contiguous(activation) && ggml_is_contiguous(op);
 }
 
+bool ggml_backend_dayan_supports_mul_mat_id(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_MUL_MAT_ID || op->src[0] == nullptr || op->src[1] == nullptr ||
+        op->src[2] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * weight     = op->src[0];
+    const ggml_tensor * activation = op->src[1];
+    const ggml_tensor * ids        = op->src[2];
+    if (!ggml_backend_dayan_is_storage_type(weight->type) ||
+        (activation->type != GGML_TYPE_F32 && activation->type != weight->type) || ids->type != GGML_TYPE_I32 ||
+        op->type != GGML_TYPE_F32 || weight->ne[3] != 1 || activation->ne[3] != 1 || ids->ne[2] != 1 ||
+        ids->ne[3] != 1 || op->ne[3] != 1 || weight->ne[0] != activation->ne[0] || ids->ne[1] != activation->ne[2] ||
+        activation->ne[1] <= 0 || ids->ne[0] % activation->ne[1] != 0 || op->ne[0] != weight->ne[1] ||
+        op->ne[1] != ids->ne[0] || op->ne[2] != ids->ne[1] || ids->nb[0] != sizeof(int32_t) ||
+        !ggml_is_contiguous(weight) || !ggml_is_contiguous(activation) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    const int64_t dimension_limit = 0x7ffff000LL;
+    return weight->ne[0] > 0 && weight->ne[0] <= dimension_limit && weight->ne[1] > 0 &&
+           weight->ne[1] <= dimension_limit && weight->ne[1] % 16 == 0 && weight->ne[2] > 0 &&
+           weight->ne[2] <= INT32_MAX && activation->ne[1] <= UINT32_MAX && ids->ne[0] > 0 &&
+           ids->ne[0] <= UINT32_MAX && ids->ne[1] > 0 && ids->ne[1] <= UINT32_MAX &&
+           ggml_backend_dayan_3d_size_fits(sizeof(uint16_t), weight->ne[0], weight->ne[1], weight->ne[2]) &&
+           ggml_backend_dayan_3d_size_fits(sizeof(uint16_t), activation->ne[0], activation->ne[1], activation->ne[2]) &&
+           ggml_backend_dayan_3d_size_fits(sizeof(int32_t), ids->ne[0], ids->ne[1], 1) &&
+           ggml_backend_dayan_3d_size_fits(sizeof(float), op->ne[0], op->ne[1], op->ne[2]);
+}
+
 bool ggml_backend_dayan_supports_glu(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_GLU || op->src[0] == nullptr || op->src[1] == nullptr ||
         op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
@@ -52,6 +94,22 @@ bool ggml_backend_dayan_supports_glu(const ggml_tensor * op) {
            gate->src[0]->type == up->src[0]->type && ggml_are_same_shape(gate, up) && ggml_are_same_shape(op, gate);
 }
 
+bool ggml_backend_dayan_supports_mul_mat_id_glu(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_GLU || op->src[0] == nullptr || op->src[1] == nullptr ||
+        op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    const ggml_tensor *    gate = op->src[0];
+    const ggml_tensor *    up   = op->src[1];
+    const enum ggml_glu_op glu  = ggml_get_glu_op(op);
+
+    return (glu == GGML_GLU_OP_SWIGLU || glu == GGML_GLU_OP_GEGLU) && ggml_backend_dayan_supports_mul_mat_id(gate) &&
+           ggml_backend_dayan_supports_mul_mat_id(up) && gate->src[1] == up->src[1] && gate->src[2] == up->src[2] &&
+           gate->src[0]->type == up->src[0]->type && gate->src[0]->ne[2] == up->src[0]->ne[2] &&
+           ggml_are_same_shape(gate, up) && ggml_are_same_shape(op, gate);
+}
+
 bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_CPY || op->src[0] == nullptr ||
         !ggml_backend_dayan_supports_mul_mat(op->src[0]) || !ggml_is_contiguous(op)) {
@@ -64,12 +122,57 @@ bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op) {
 
 bool ggml_backend_dayan_supports_quantized_glu(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_CPY || op->src[0] == nullptr ||
-        !ggml_backend_dayan_supports_glu(op->src[0]) || !ggml_is_contiguous(op)) {
+        (!ggml_backend_dayan_supports_glu(op->src[0]) && !ggml_backend_dayan_supports_mul_mat_id_glu(op->src[0])) ||
+        !ggml_is_contiguous(op)) {
         return false;
     }
 
     const ggml_tensor * glu = op->src[0];
     return op->type == glu->src[0]->src[0]->type && ggml_are_same_shape(op, glu);
+}
+
+bool ggml_backend_dayan_supports_add_id(const ggml_tensor * op) {
+    if (op == nullptr || op->op != GGML_OP_ADD_ID || op->src[0] == nullptr || op->src[1] == nullptr ||
+        op->src[2] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * input = op->src[0];
+    const ggml_tensor * bias  = op->src[1];
+    const ggml_tensor * ids   = op->src[2];
+    return op->type == GGML_TYPE_F32 && input->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32 &&
+           ids->type == GGML_TYPE_I32 && input->ne[3] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1 && ids->ne[2] == 1 &&
+           ids->ne[3] == 1 && input->ne[0] == bias->ne[0] && input->ne[1] == ids->ne[0] && input->ne[2] == ids->ne[1] &&
+           ggml_are_same_shape(op, input) && ids->nb[0] == sizeof(int32_t) && input->ne[0] > 0 &&
+           input->ne[0] <= UINT32_MAX && bias->ne[1] > 0 && bias->ne[1] <= INT32_MAX && input->ne[1] > 0 &&
+           input->ne[1] <= UINT32_MAX && input->ne[2] > 0 && input->ne[2] <= UINT32_MAX &&
+           ggml_backend_dayan_3d_size_fits(sizeof(float), input->ne[0], input->ne[1], input->ne[2]) &&
+           ggml_backend_dayan_3d_size_fits(sizeof(float), bias->ne[0], bias->ne[1], 1) &&
+           ggml_backend_dayan_3d_size_fits(sizeof(int32_t), ids->ne[0], ids->ne[1], 1) && ggml_is_contiguous(input) &&
+           ggml_is_contiguous(bias) && ggml_is_contiguous(op);
+}
+
+static bool ggml_backend_dayan_supports_sort(const ggml_tensor * op, enum ggml_op kind) {
+    if (op == nullptr || op->op != kind || op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_F32 ||
+        op->type != GGML_TYPE_I32 || op->src[0]->ne[0] <= 0 || op->src[0]->ne[0] > 4096 || op->ne[0] <= 0 ||
+        op->ne[0] > op->src[0]->ne[0] || ggml_nrows(op->src[0]) <= 0 || ggml_nrows(op->src[0]) > UINT32_MAX ||
+        !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    return op->ne[1] == op->src[0]->ne[1] && op->ne[2] == op->src[0]->ne[2] && op->ne[3] == op->src[0]->ne[3];
+}
+
+bool ggml_backend_dayan_supports_argsort(const ggml_tensor * op) {
+    if (!ggml_backend_dayan_supports_sort(op, GGML_OP_ARGSORT) || !ggml_are_same_shape(op, op->src[0])) {
+        return false;
+    }
+    const int32_t order = ggml_get_op_params_i32(op, 0);
+    return order == GGML_SORT_ORDER_ASC || order == GGML_SORT_ORDER_DESC;
+}
+
+bool ggml_backend_dayan_supports_top_k(const ggml_tensor * op) {
+    return ggml_backend_dayan_supports_sort(op, GGML_OP_TOP_K);
 }
 
 bool ggml_backend_dayan_supports_residual_add(const ggml_tensor * op) {
@@ -111,8 +214,8 @@ bool ggml_backend_dayan_supports_elementwise_div(const ggml_tensor * op) {
 
 bool ggml_backend_dayan_supports_scale(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_SCALE || op->src[0] == nullptr || op->type != GGML_TYPE_F32 ||
-        op->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(op, op->src[0]) ||
-        ggml_nelements(op) <= 0 || (uint64_t) ggml_nelements(op) > 0x7ffff000ULL) {
+        op->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(op, op->src[0]) || ggml_nelements(op) < 0 ||
+        (uint64_t) ggml_nelements(op) > 0x7ffff000ULL) {
         return false;
     }
 
@@ -723,7 +826,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     std::unordered_map<ggml_backend_dayan_cast_key, ggml_tensor *, ggml_backend_dayan_cast_key_hash> casts;
 
     for (ggml_tensor * node : nodes) {
-        if (ggml_backend_dayan_supports_mul_mat(node) && node->src[1]->type == GGML_TYPE_F32) {
+        if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
+            node->src[1]->type == GGML_TYPE_F32) {
             if (ggml_backend_dayan_supports_gated_attention(node->src[1])) {
                 continue;
             }
@@ -792,6 +896,16 @@ static int ggml_backend_dayan_next_compute(const ggml_cgraph * cgraph, int index
     return index;
 }
 
+static bool ggml_backend_dayan_can_elide_glu_intermediates(const ggml_cgraph * cgraph,
+                                                           int                 first_index,
+                                                           int                 second_index,
+                                                           int                 glu_index) {
+    return first_index >= 0 && second_index >= 0 && glu_index >= 0 && first_index < cgraph->n_nodes &&
+           second_index < cgraph->n_nodes && glu_index < cgraph->n_nodes &&
+           ggml_node_has_n_uses(cgraph, first_index, 1) && ggml_node_has_n_uses(cgraph, second_index, 1) &&
+           ggml_node_has_n_uses(cgraph, glu_index, 1);
+}
+
 static bool ggml_backend_dayan_starts_fused_glu(const ggml_cgraph * cgraph, int matmul_index) {
     if (matmul_index >= cgraph->n_nodes || !ggml_backend_dayan_supports_mul_mat(cgraph->nodes[matmul_index])) {
         return false;
@@ -806,7 +920,8 @@ static bool ggml_backend_dayan_starts_fused_glu(const ggml_cgraph * cgraph, int 
     ggml_tensor * pair       = cgraph->nodes[pair_index];
     const int     glu_index  = ggml_backend_dayan_next_compute(cgraph, pair_index + 1);
     const int     cast_index = ggml_backend_dayan_next_compute(cgraph, glu_index + 1);
-    return matmul->src[1] == pair->src[1] && matmul->src[0]->type == pair->src[0]->type &&
+    return ggml_backend_dayan_can_elide_glu_intermediates(cgraph, matmul_index, pair_index, glu_index) &&
+           matmul->src[1] == pair->src[1] && matmul->src[0]->type == pair->src[0]->type &&
            glu_index < cgraph->n_nodes && cast_index < cgraph->n_nodes &&
            ggml_backend_dayan_supports_glu(cgraph->nodes[glu_index]) &&
            ggml_backend_dayan_supports_quantized_glu(cgraph->nodes[cast_index]) &&
@@ -828,6 +943,9 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
     plan->gated_delta_net_slots = 0;
     plan->gated_output_slots    = 0;
     plan->ssm_conv_slots        = 0;
+    plan->moe_slots             = 0;
+    plan->fused_moe_slots       = 0;
+    plan->routing_slots         = 0;
     *unsupported                = nullptr;
 
     for (int i = 0; i < cgraph->n_nodes;) {
@@ -1001,6 +1119,27 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             slot.nodes[0]   = node;
             slot.node_count = 1;
             plan->slots.push_back(slot);
+            ++i;
+            continue;
+        }
+        if (ggml_backend_dayan_supports_add_id(node)) {
+            ggml_backend_dayan_graph_slot slot;
+            slot.kind       = ggml_backend_dayan_slot_kind::add_id;
+            slot.nodes[0]   = node;
+            slot.node_count = 1;
+            plan->slots.push_back(slot);
+            ++plan->moe_slots;
+            ++i;
+            continue;
+        }
+        if (ggml_backend_dayan_supports_argsort(node) || ggml_backend_dayan_supports_top_k(node)) {
+            ggml_backend_dayan_graph_slot slot;
+            slot.kind       = node->op == GGML_OP_ARGSORT ? ggml_backend_dayan_slot_kind::argsort :
+                                                            ggml_backend_dayan_slot_kind::top_k;
+            slot.nodes[0]   = node;
+            slot.node_count = 1;
+            plan->slots.push_back(slot);
+            ++plan->routing_slots;
             ++i;
             continue;
         }
@@ -1233,6 +1372,51 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             ++i;
             continue;
         }
+        if (ggml_backend_dayan_supports_mul_mat_id(node)) {
+            ggml_backend_dayan_graph_slot slot;
+            slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_id;
+            slot.nodes[0]   = node;
+            slot.node_count = 1;
+
+            const int pair_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
+            if (pair_index < cgraph->n_nodes && ggml_backend_dayan_supports_mul_mat_id(cgraph->nodes[pair_index]) &&
+                node->src[1] == cgraph->nodes[pair_index]->src[1] &&
+                node->src[2] == cgraph->nodes[pair_index]->src[2] &&
+                node->src[0]->type == cgraph->nodes[pair_index]->src[0]->type) {
+                ggml_tensor * pair       = cgraph->nodes[pair_index];
+                const int     glu_index  = ggml_backend_dayan_next_compute(cgraph, pair_index + 1);
+                const int     cast_index = ggml_backend_dayan_next_compute(cgraph, glu_index + 1);
+                if (glu_index < cgraph->n_nodes && cast_index < cgraph->n_nodes &&
+                    ggml_backend_dayan_can_elide_glu_intermediates(cgraph, i, pair_index, glu_index) &&
+                    ggml_backend_dayan_supports_mul_mat_id_glu(cgraph->nodes[glu_index]) &&
+                    ggml_backend_dayan_supports_quantized_glu(cgraph->nodes[cast_index]) &&
+                    ((cgraph->nodes[glu_index]->src[0] == node && cgraph->nodes[glu_index]->src[1] == pair) ||
+                     (cgraph->nodes[glu_index]->src[0] == pair && cgraph->nodes[glu_index]->src[1] == node)) &&
+                    cgraph->nodes[cast_index]->src[0] == cgraph->nodes[glu_index]) {
+                    ggml_tensor * glu = cgraph->nodes[glu_index];
+                    slot.kind         = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU ?
+                                            ggml_backend_dayan_slot_kind::mul_mat_id_swiglu :
+                                            ggml_backend_dayan_slot_kind::mul_mat_id_geglu;
+                    slot.nodes[0]     = glu->src[0];
+                    slot.nodes[1]     = glu->src[1];
+                    slot.nodes[2]     = glu;
+                    slot.nodes[3]     = cgraph->nodes[cast_index];
+                    slot.node_count   = 4;
+                    i                 = cast_index + 1;
+                    ++plan->fused_moe_slots;
+                } else {
+                    slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_id_pair;
+                    slot.nodes[1]   = pair;
+                    slot.node_count = 2;
+                    i               = pair_index + 1;
+                }
+            } else {
+                ++i;
+            }
+            plan->slots.push_back(slot);
+            ++plan->moe_slots;
+            continue;
+        }
         if (!ggml_backend_dayan_supports_mul_mat(node)) {
             *unsupported = node;
             return false;
@@ -1243,7 +1427,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
         slot.node_count = 1;
 
         const int quantized_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
-        if (quantized_index < cgraph->n_nodes &&
+        if (quantized_index < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1) &&
             ggml_backend_dayan_supports_quantized_mul_mat(cgraph->nodes[quantized_index]) &&
             cgraph->nodes[quantized_index]->src[0] == node) {
             slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_quantized;
@@ -1264,6 +1448,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             const int     cast_index = ggml_backend_dayan_next_compute(cgraph, glu_index + 1);
 
             if (glu_index < cgraph->n_nodes && cast_index < cgraph->n_nodes &&
+                ggml_backend_dayan_can_elide_glu_intermediates(cgraph, i, pair_index, glu_index) &&
                 ggml_backend_dayan_supports_glu(cgraph->nodes[glu_index]) &&
                 ggml_backend_dayan_supports_quantized_glu(cgraph->nodes[cast_index]) &&
                 ((cgraph->nodes[glu_index]->src[0] == node && cgraph->nodes[glu_index]->src[1] == pair) ||

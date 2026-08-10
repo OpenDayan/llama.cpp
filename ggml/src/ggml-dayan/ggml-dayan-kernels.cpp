@@ -6,6 +6,7 @@
 #include "ggml-dayan-layout.h"
 #include "ggml-dayan-matmul.h"
 #include "ggml-dayan-memory.h"
+#include "ggml-dayan-moe.h"
 #include "ggml-dayan-normalization.h"
 #include "ggml-dayan-rope.h"
 #include "ggml-dayan-softmax.h"
@@ -136,6 +137,78 @@ __kernel__ void matmul_geglu_fp16_1c(const DayanMatmulConfig * config,
     run_matmul_kernel<Fp16Format, 2, sizeof(uint16_t), true, epilogue_geglu_fp16<0>, epilogue_geglu_fp16<4>,
                       epilogue_geglu_fp16<2>, epilogue_geglu_fp16<0>, epilogue_geglu_fp16<4>, epilogue_geglu_fp16<2>>(
         config, a, gate_bt, up_bt, output, perf);
+}
+
+__kernel__ void mul_mat_id_bf16_1c(const DayanMulMatIdConfig * config,
+                                   const uint16_t *            activation,
+                                   const uint16_t *            weight,
+                                   const int32_t *             ids,
+                                   float *                     output,
+                                   DayanMatmulPerf *           perf) {
+    using namespace ggml_dayan_matmul_detail;
+    run_mul_mat_id<Bf16Format>(config, activation, weight, ids, output, perf);
+}
+
+__kernel__ void mul_mat_id_fp16_1c(const DayanMulMatIdConfig * config,
+                                   const uint16_t *            activation,
+                                   const uint16_t *            weight,
+                                   const int32_t *             ids,
+                                   float *                     output,
+                                   DayanMatmulPerf *           perf) {
+    using namespace ggml_dayan_matmul_detail;
+    run_mul_mat_id<Fp16Format>(config, activation, weight, ids, output, perf);
+}
+
+__kernel__ void mul_mat_id_swiglu_bf16_1c(const DayanMulMatIdConfig * config,
+                                          const uint16_t *            activation,
+                                          const uint16_t *            gate_weight,
+                                          const uint16_t *            up_weight,
+                                          const int32_t *             ids,
+                                          uint16_t *                  output,
+                                          DayanMatmulPerf *           perf) {
+    using namespace ggml_dayan_matmul_detail;
+    run_mul_mat_id_glu<Bf16Format, epilogue_swiglu_bf16<0>, epilogue_swiglu_bf16<4>, epilogue_swiglu_bf16<2>,
+                       epilogue_swiglu_bf16<0>, epilogue_swiglu_bf16<4>, epilogue_swiglu_bf16<2>>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+}
+
+__kernel__ void mul_mat_id_swiglu_fp16_1c(const DayanMulMatIdConfig * config,
+                                          const uint16_t *            activation,
+                                          const uint16_t *            gate_weight,
+                                          const uint16_t *            up_weight,
+                                          const int32_t *             ids,
+                                          uint16_t *                  output,
+                                          DayanMatmulPerf *           perf) {
+    using namespace ggml_dayan_matmul_detail;
+    run_mul_mat_id_glu<Fp16Format, epilogue_swiglu_fp16<0>, epilogue_swiglu_fp16<4>, epilogue_swiglu_fp16<2>,
+                       epilogue_swiglu_fp16<0>, epilogue_swiglu_fp16<4>, epilogue_swiglu_fp16<2>>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+}
+
+__kernel__ void mul_mat_id_geglu_bf16_1c(const DayanMulMatIdConfig * config,
+                                         const uint16_t *            activation,
+                                         const uint16_t *            gate_weight,
+                                         const uint16_t *            up_weight,
+                                         const int32_t *             ids,
+                                         uint16_t *                  output,
+                                         DayanMatmulPerf *           perf) {
+    using namespace ggml_dayan_matmul_detail;
+    run_mul_mat_id_glu<Bf16Format, epilogue_geglu_bf16<0>, epilogue_geglu_bf16<4>, epilogue_geglu_bf16<2>,
+                       epilogue_geglu_bf16<0>, epilogue_geglu_bf16<4>, epilogue_geglu_bf16<2>>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+}
+
+__kernel__ void mul_mat_id_geglu_fp16_1c(const DayanMulMatIdConfig * config,
+                                         const uint16_t *            activation,
+                                         const uint16_t *            gate_weight,
+                                         const uint16_t *            up_weight,
+                                         const int32_t *             ids,
+                                         uint16_t *                  output,
+                                         DayanMatmulPerf *           perf) {
+    using namespace ggml_dayan_matmul_detail;
+    run_mul_mat_id_glu<Fp16Format, epilogue_geglu_fp16<0>, epilogue_geglu_fp16<4>, epilogue_geglu_fp16<2>,
+                       epilogue_geglu_fp16<0>, epilogue_geglu_fp16<4>, epilogue_geglu_fp16<2>>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
 }
 
 __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config,
@@ -539,6 +612,25 @@ __kernel__ void roll_f32_1c(const DayanLayoutConfig * config, const float * inpu
     run_roll_f32(config, input, output);
 }
 
+__kernel__ void add_id_f32_1c(const DayanAddIdConfig * config,
+                              const float *            input,
+                              const float *            bias,
+                              const int32_t *          ids,
+                              float *                  output) {
+    using namespace ggml_dayan_matmul_detail;
+    run_add_id(config, input, bias, ids, output);
+}
+
+__kernel__ void argsort_f32_1c(const DayanSortConfig * config, const float * input, int32_t * output) {
+    using namespace ggml_dayan_matmul_detail;
+    run_sort<false>(config, input, output);
+}
+
+__kernel__ void top_k_f32_1c(const DayanSortConfig * config, const float * input, int32_t * output) {
+    using namespace ggml_dayan_matmul_detail;
+    run_sort<true>(config, input, output);
+}
+
 __kernel__ void clamp_f32_1c(const DayanClampConfig * config, const float * input, float * output) {
     using namespace ggml_dayan_matmul_detail;
     run_clamp_f32(config, input, output);
@@ -703,6 +795,12 @@ DAYAN_KERNEL_DESC(matmul_swiglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN
 DAYAN_KERNEL_DESC(matmul_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(matmul_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(matmul_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_swiglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(flash_attention_bf16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(gated_delta_net_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_qg_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
@@ -755,6 +853,9 @@ DAYAN_KERNEL_DESC(pad_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(pad_circular_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(pad_reflect_1d_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(roll_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(add_id_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(argsort_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(top_k_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(clamp_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(softmax_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(concat_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);

@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #ifndef MATMUL_DAYAN_1C_SLICES
-#    define MATMUL_DAYAN_1C_SLICES 3
+#    define MATMUL_DAYAN_1C_SLICES 1
 #endif
 
 #ifndef MATMUL_DAYAN_1C_URAM_BYTES
@@ -190,6 +190,11 @@ struct DayanSortConfig {
     uint32_t order;
 };
 
+enum : uint32_t {
+    kDayanSortOrderAsc  = 0,
+    kDayanSortOrderDesc = 1,
+};
+
 struct DayanClampConfig {
     uint64_t elements;
     uint32_t min_bits;
@@ -328,6 +333,38 @@ int mul_mat_id_fp16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    output,
                        npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
+int mul_mat_id_swiglu_bf16_1c(npu_buffer_t *                    config,
+                              npu_buffer_t *                    activation,
+                              npu_buffer_t *                    gate_weight,
+                              npu_buffer_t *                    up_weight,
+                              npu_buffer_t *                    ids,
+                              npu_buffer_t *                    output,
+                              npu_buffer_t *                    perf,
+                              const npu_kernel_launch_attrs_t * launch_attrs);
+int mul_mat_id_swiglu_fp16_1c(npu_buffer_t *                    config,
+                              npu_buffer_t *                    activation,
+                              npu_buffer_t *                    gate_weight,
+                              npu_buffer_t *                    up_weight,
+                              npu_buffer_t *                    ids,
+                              npu_buffer_t *                    output,
+                              npu_buffer_t *                    perf,
+                              const npu_kernel_launch_attrs_t * launch_attrs);
+int mul_mat_id_geglu_bf16_1c(npu_buffer_t *                    config,
+                             npu_buffer_t *                    activation,
+                             npu_buffer_t *                    gate_weight,
+                             npu_buffer_t *                    up_weight,
+                             npu_buffer_t *                    ids,
+                             npu_buffer_t *                    output,
+                             npu_buffer_t *                    perf,
+                             const npu_kernel_launch_attrs_t * launch_attrs);
+int mul_mat_id_geglu_fp16_1c(npu_buffer_t *                    config,
+                             npu_buffer_t *                    activation,
+                             npu_buffer_t *                    gate_weight,
+                             npu_buffer_t *                    up_weight,
+                             npu_buffer_t *                    ids,
+                             npu_buffer_t *                    output,
+                             npu_buffer_t *                    perf,
+                             const npu_kernel_launch_attrs_t * launch_attrs);
 int flash_attention_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    q,
                             npu_buffer_t *                    k,

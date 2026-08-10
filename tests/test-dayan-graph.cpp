@@ -39,9 +39,9 @@ static int run_fused_case(ggml_backend_t   dayan,
                           ggml_backend_t   cpu,
                           enum ggml_type   type,
                           enum ggml_glu_op glu_op,
-                          int64_t          m) {
-    constexpr int64_t n          = 16;
-    constexpr int64_t k          = 256;
+                          int64_t          m,
+                          int64_t          n,
+                          int64_t          k) {
     constexpr int64_t n_down     = 16;
     constexpr int     graph_size = 32;
 
@@ -125,11 +125,7 @@ static int run_fused_case(ggml_backend_t   dayan,
     }
 
     ggml_graph_clear(graph);
-    ggml_graph_add_node(graph, gate);
-    ggml_graph_add_node(graph, up);
-    ggml_graph_add_node(graph, fused);
-    ggml_graph_add_node(graph, fused_lowp);
-    ggml_graph_add_node(graph, down);
+    ggml_build_forward_expand(graph, down);
     if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
         return fail("DAYAN fused matrix multiplication graph failed");
     }
@@ -200,6 +196,43 @@ static int run_fused_case(ggml_backend_t   dayan,
     std::printf("type=%s downstream max_abs=%g\n", ggml_type_name(type), down_max_abs);
     if (down_max_abs > 0.001f) {
         return fail("downstream matrix multiplication comparison failed");
+    }
+    return 0;
+}
+
+static int run_fusion_fanout_case(ggml_backend_t dayan) {
+    constexpr int64_t width      = 16;
+    constexpr int     graph_size = 32;
+    ggml_init_params  params     = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the fusion fanout context");
+    }
+
+    ggml_tensor * activation  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, 1);
+    ggml_tensor * gate_weight = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_BF16, width, width);
+    ggml_tensor * up_weight   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_BF16, width, width);
+    ggml_tensor * down_weight = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_BF16, width, width);
+    ggml_tensor * gate        = ggml_mul_mat(ctx.get(), gate_weight, activation);
+    ggml_tensor * up          = ggml_mul_mat(ctx.get(), up_weight, activation);
+    ggml_tensor * fused       = ggml_swiglu_split(ctx.get(), gate, up);
+    ggml_tensor * down        = ggml_mul_mat(ctx.get(), down_weight, fused);
+    ggml_tensor * gate_sum    = ggml_sum(ctx.get(), gate);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, down);
+    ggml_build_forward_expand(graph, gate_sum);
+    if (!rewrite_graph(dayan, ctx.get(), graph)) {
+        return fail("DAYAN fusion fanout rewrite failed");
+    }
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer || ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_FAILED) {
+        return fail("DAYAN fused a matrix result with another consumer");
     }
     return 0;
 }
@@ -439,6 +472,35 @@ static int run_elementwise_case(ggml_backend_t dayan) {
     }
     std::printf("elementwise width=%lld rows=%lld max_abs=%g\n", (long long) width, (long long) rows, max_abs);
     return close ? 0 : fail("elementwise numerical comparison failed");
+}
+
+static int run_empty_scale_case(ggml_backend_t dayan) {
+    constexpr int    graph_size = 4;
+    ggml_init_params params     = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the empty Scale context");
+    }
+
+    ggml_tensor * storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 16);
+    ggml_tensor * empty   = ggml_view_1d(ctx.get(), storage, 0, 0);
+    ggml_tensor * scaled  = ggml_scale_inplace(ctx.get(), empty, 0.0f);
+    ggml_set_input(storage);
+    if (!ggml_backend_supports_op(dayan, scaled)) {
+        return fail("DAYAN rejected empty Scale");
+    }
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, scaled);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer || ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN empty Scale graph failed");
+    }
+    return 0;
 }
 
 static int run_math_case(ggml_backend_t dayan) {
@@ -1666,7 +1728,9 @@ int main() {
         run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 130, true) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, false) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, true) != 0 ||
+        run_fusion_fanout_case(dayan.get()) != 0 ||
         run_elementwise_case(dayan.get()) != 0 ||
+        run_empty_scale_case(dayan.get()) != 0 ||
         run_math_case(dayan.get()) != 0 ||
         run_reduction_norm_case(dayan.get()) != 0 ||
         run_strided_rms_case(dayan.get()) != 0 ||
@@ -1676,10 +1740,11 @@ int main() {
         run_layout_case(dayan.get()) != 0 ||
         run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
         run_softmax_clamp_case(dayan.get()) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 16) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_GEGLU, 1) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_F16, GGML_GLU_OP_GEGLU, 16) != 0 ||
+        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 16, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_GEGLU, 1, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_F16, GGML_GLU_OP_GEGLU, 16, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 8, 3584, 1024) != 0 ||
         run_gated_output_case(dayan.get(), cpu.get(), GGML_TYPE_BF16) != 0 ||
         run_gated_output_case(dayan.get(), cpu.get(), GGML_TYPE_F16) != 0 ||
         run_ssm_conv_case(dayan.get(), 1, 5, 128, 1, false) != 0 ||

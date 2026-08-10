@@ -75,6 +75,7 @@ add_custom_command(
         ggml-dayan-layout.h
         ggml-dayan-matmul.h
         ggml-dayan-memory.h
+        ggml-dayan-moe.h
         ggml-dayan-normalization.h
         ggml-dayan-rope.h
         ggml-dayan-softmax.h
@@ -105,6 +106,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-layout.h
     ggml-dayan-matmul.h
     ggml-dayan-memory.h
+    ggml-dayan-moe.h
     ggml-dayan-normalization.h
     ggml-dayan-rope.h
     ggml-dayan-softmax.h

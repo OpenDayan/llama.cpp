@@ -53,6 +53,33 @@ static bool llama_graph_node_is_metadata(const ggml_tensor * node) {
     }
 }
 
+static void llama_graph_assign_dayan(const llama_model & model, ggml_backend_sched_t sched, ggml_cgraph * gf) {
+    if (!llama_model_uses_dayan(model)) {
+        return;
+    }
+
+    ggml_backend_t dayan = nullptr;
+    for (int index = 0; index < ggml_backend_sched_get_n_backends(sched); ++index) {
+        ggml_backend_t     backend = ggml_backend_sched_get_backend(sched, index);
+        ggml_backend_dev_t device  = ggml_backend_get_device(backend);
+        if (device != nullptr && std::strcmp(ggml_backend_dev_name(device), "DAYAN") == 0) {
+            dayan = backend;
+            break;
+        }
+    }
+    if (dayan == nullptr) {
+        LLAMA_LOG_ERROR("%s: DAYAN model has no DAYAN backend\n", __func__);
+        return;
+    }
+
+    for (int index = 0; index < ggml_graph_n_nodes(gf); ++index) {
+        ggml_tensor * node = ggml_graph_node(gf, index);
+        if (!llama_graph_node_is_metadata(node) && ggml_backend_supports_op(dayan, node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, dayan);
+        }
+    }
+}
+
 static bool llama_graph_is_dayan_only(const llama_model & model, ggml_backend_sched_t sched, ggml_cgraph * gf) {
     if (!llama_model_uses_dayan(model)) {
         return true;
@@ -385,13 +412,29 @@ llama_context::llama_context(
         // add ACCEL backends (such as BLAS)
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-                if (backend == nullptr) {
-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
-                }
-                backends.emplace_back(backend);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                continue;
             }
+
+            bool already_initialized = false;
+            for (const auto & model_dev : model.devices) {
+                if (model_dev.dev == dev) {
+                    already_initialized = true;
+                    break;
+                }
+            }
+            if (already_initialized) {
+                continue;
+            }
+            if (std::strcmp(ggml_backend_dev_name(dev), "DAYAN") == 0) {
+                continue;
+            }
+
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+            }
+            backends.emplace_back(backend);
         }
 
         // add CPU backend
@@ -1423,6 +1466,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+        llama_graph_assign_dayan(model, sched.get(), gf);
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2476,6 +2521,8 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = save_n_outputs;
 
+    llama_graph_assign_dayan(model, sched.get(), gf);
+
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
@@ -2489,7 +2536,8 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
-    if (!llama_graph_is_dayan_only(model, sched.get(), gf)) {
+    // ggml_backend_sched_reserve() resets backend assignments before it returns.
+    if (split_only && !llama_graph_is_dayan_only(model, sched.get(), gf)) {
         return nullptr;
     }
 

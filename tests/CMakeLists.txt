@@ -269,6 +269,7 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 
 if (GGML_DAYAN)
+    llama_build(test-dayan-matmul.cpp)
     llama_build(test-dayan-graph.cpp)
     llama_build(test-dayan-flash-attention.cpp)
     llama_build(test-dayan-gated-delta-net.cpp)
@@ -277,6 +278,7 @@ if (GGML_DAYAN)
         "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan"
         "${DAYAN_ROOT}/host/include")
     llama_build(test-dayan-qwen35-dense.cpp)
+    llama_build(test-dayan-moe.cpp)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

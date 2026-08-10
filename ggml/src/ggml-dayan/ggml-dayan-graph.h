@@ -12,6 +12,13 @@ enum class ggml_backend_dayan_slot_kind {
     mul_mat_pair,
     mul_mat_swiglu,
     mul_mat_geglu,
+    mul_mat_id,
+    mul_mat_id_pair,
+    mul_mat_id_swiglu,
+    mul_mat_id_geglu,
+    add_id,
+    argsort,
+    top_k,
     elementwise_add,
     elementwise_mul,
     elementwise_sub,
@@ -75,12 +82,20 @@ struct ggml_backend_dayan_graph_plan {
     size_t                                     gated_delta_net_slots = 0;
     size_t                                     gated_output_slots    = 0;
     size_t                                     ssm_conv_slots        = 0;
+    size_t                                     moe_slots             = 0;
+    size_t                                     fused_moe_slots       = 0;
+    size_t                                     routing_slots         = 0;
 };
 
 bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op);
+bool ggml_backend_dayan_supports_mul_mat_id(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_glu(const ggml_tensor * op);
+bool ggml_backend_dayan_supports_mul_mat_id_glu(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_quantized_glu(const ggml_tensor * op);
+bool ggml_backend_dayan_supports_add_id(const ggml_tensor * op);
+bool ggml_backend_dayan_supports_argsort(const ggml_tensor * op);
+bool ggml_backend_dayan_supports_top_k(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_residual_add(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_elementwise_add(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_elementwise_mul(const ggml_tensor * op);
