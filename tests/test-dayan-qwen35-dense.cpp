@@ -21,12 +21,18 @@ struct model_case {
 
 struct layer_graph {
     bool          recurrent;
+    ggml_tensor * attention_rms;
+    ggml_tensor * attention_norm;
     ggml_tensor * conv_silu;
+    ggml_tensor * gated_delta;
     ggml_tensor * flash_q;
     ggml_tensor * flash_k;
     ggml_tensor * flash_v;
     ggml_tensor * flash_attention;
     ggml_tensor * attention_output;
+    ggml_tensor * attention_residual;
+    ggml_tensor * ffn_rms;
+    ggml_tensor * ffn_norm;
     ggml_tensor * ffn_gate;
     ggml_tensor * ffn_up;
     ggml_tensor * ffn_fused;
@@ -40,6 +46,8 @@ struct model_graph {
     ggml_tensor *            input;
     ggml_tensor *            positions;
     ggml_tensor *            mask;
+    ggml_tensor *            output_rms;
+    ggml_tensor *            output_norm;
     ggml_tensor *            logits;
     std::vector<layer_graph> layers;
 };
@@ -50,8 +58,8 @@ static constexpr int64_t kEmbedding        = 64;
 static constexpr int64_t kFeedForward      = 192;
 static constexpr int64_t kLayers           = 4;
 static constexpr int64_t kConvKernel       = 4;
-static constexpr int64_t kLinearHeadDim    = 4;
-static constexpr int64_t kLinearHeads      = 16;
+static constexpr int64_t kLinearHeadDim    = 128;
+static constexpr int64_t kLinearHeads      = 1;
 static constexpr int64_t kLinearWidth      = kLinearHeadDim * kLinearHeads;
 static constexpr int64_t kConvChannels     = 3 * kLinearWidth;
 static constexpr int64_t kAttentionHeadDim = 64;
@@ -190,10 +198,12 @@ static ggml_tensor * build_linear_attention(ggml_context *     ctx,
     beta                       = ggml_reshape_4d(ctx, beta, 1, kLinearHeads, config.n_tokens, 1);
     alpha                      = ggml_reshape_4d(ctx, alpha, 1, kLinearHeads, config.n_tokens, 1);
 
-    ggml_tensor * delta = ggml_gated_delta_net(ctx, q, k, v, alpha, beta, state, 1);
-    ggml_tensor * core =
-        ggml_view_4d(ctx, delta, kLinearHeadDim, kLinearHeads, config.n_tokens, 1, kLinearHeadDim * sizeof(float),
-                     kLinearWidth * sizeof(float), kLinearWidth * config.n_tokens * sizeof(float), 0);
+    result->gated_delta = ggml_gated_delta_net(ctx, q, k, v, alpha, beta, state, 1);
+    ggml_format_name(result->gated_delta, "blk.%d.gated_delta_net", layer);
+    ggml_set_output(result->gated_delta);
+    ggml_tensor * core       = ggml_view_4d(ctx, result->gated_delta, kLinearHeadDim, kLinearHeads, config.n_tokens, 1,
+                                            kLinearHeadDim * sizeof(float), kLinearWidth * sizeof(float),
+                                            kLinearWidth * config.n_tokens * sizeof(float), 0);
     ggml_tensor * z_heads    = ggml_reshape_4d(ctx, z, kLinearHeadDim, kLinearHeads, config.n_tokens, 1);
     core                     = build_rms_norm(ctx, core, norm_weight, 1.0e-6f);
     core                     = ggml_mul(ctx, core, ggml_silu(ctx, z_heads));
@@ -330,17 +340,30 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
         std::snprintf(name, sizeof(name), "blk.%d.post_attn_norm.weight", layer);
         ggml_tensor * post_norm_weight = new_input_1d(ctx, GGML_TYPE_F32, kEmbedding, name);
 
-        ggml_tensor * residual   = current;
-        ggml_tensor * normalized = build_rms_norm(ctx, current, attn_norm_weight, 1.0e-6f);
+        ggml_tensor * residual          = current;
+        layer_graph.attention_norm      = build_rms_norm(ctx, current, attn_norm_weight, 1.0e-6f);
+        layer_graph.attention_rms       = layer_graph.attention_norm->src[0];
+        ggml_tensor * normalized        = layer_graph.attention_norm;
+        ggml_format_name(layer_graph.attention_rms, "blk.%d.attn_rms", layer);
+        ggml_format_name(layer_graph.attention_norm, "blk.%d.attn_norm", layer);
+        ggml_set_output(layer_graph.attention_rms);
+        ggml_set_output(layer_graph.attention_norm);
         ggml_tensor * attention =
             layer_graph.recurrent ?
                 build_linear_attention(ctx, config, normalized, layer, cpu_reference, &layer_graph) :
                 build_full_attention(ctx, config, normalized, result.positions, result.mask, layer, cpu_reference,
                                      &layer_graph);
-        ggml_tensor * attention_residual = ggml_add(ctx, attention, residual);
-        ggml_tensor * ffn_input          = build_rms_norm(ctx, attention_residual, post_norm_weight, 1.0e-6f);
-        ggml_tensor * ffn                = build_ffn(ctx, config, ffn_input, layer, &layer_graph);
-        layer_graph.output               = ggml_add(ctx, ffn, attention_residual);
+        layer_graph.attention_residual = ggml_add(ctx, attention, residual);
+        layer_graph.ffn_norm = build_rms_norm(ctx, layer_graph.attention_residual, post_norm_weight, 1.0e-6f);
+        layer_graph.ffn_rms  = layer_graph.ffn_norm->src[0];
+        ggml_format_name(layer_graph.attention_residual, "blk.%d.attn_residual", layer);
+        ggml_format_name(layer_graph.ffn_rms, "blk.%d.ffn_rms", layer);
+        ggml_format_name(layer_graph.ffn_norm, "blk.%d.ffn_norm", layer);
+        ggml_set_output(layer_graph.attention_residual);
+        ggml_set_output(layer_graph.ffn_rms);
+        ggml_set_output(layer_graph.ffn_norm);
+        ggml_tensor * ffn  = build_ffn(ctx, config, layer_graph.ffn_norm, layer, &layer_graph);
+        layer_graph.output = ggml_add(ctx, ffn, layer_graph.attention_residual);
         ggml_format_name(layer_graph.output, "blk.%d.output", layer);
         ggml_set_output(layer_graph.output);
         current = layer_graph.output;
@@ -349,8 +372,13 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
 
     ggml_tensor * output_norm_weight = new_input_1d(ctx, GGML_TYPE_F32, kEmbedding, "output_norm.weight");
     ggml_tensor * output_weight      = new_input_2d(ctx, config.type, kEmbedding, kVocab, "output.weight");
-    current                          = build_rms_norm(ctx, current, output_norm_weight, 1.0e-6f);
-    result.logits                    = ggml_mul_mat(ctx, output_weight, current);
+    result.output_norm               = build_rms_norm(ctx, current, output_norm_weight, 1.0e-6f);
+    result.output_rms                = result.output_norm->src[0];
+    ggml_set_name(result.output_rms, "output_rms");
+    ggml_set_name(result.output_norm, "output_norm");
+    ggml_set_output(result.output_rms);
+    ggml_set_output(result.output_norm);
+    result.logits = ggml_mul_mat(ctx, output_weight, result.output_norm);
     ggml_set_name(result.logits, "logits");
     ggml_set_output(result.logits);
 
@@ -439,7 +467,10 @@ static bool validate_assignment(ggml_backend_sched_t scheduler,
     for (size_t layer = 0; layer < graph.layers.size(); ++layer) {
         const layer_graph & current       = graph.layers[layer];
         ggml_tensor *       dayan_nodes[] = {
-            current.attention_output, current.ffn_gate, current.ffn_up, current.ffn_fused, current.ffn_down,
+            current.attention_rms,      current.attention_norm, current.attention_output,
+            current.attention_residual, current.ffn_rms,       current.ffn_norm,
+            current.ffn_gate,           current.ffn_up,        current.ffn_fused,
+            current.ffn_down,           current.output,
         };
         for (ggml_tensor * node : dayan_nodes) {
             if (ggml_backend_sched_get_tensor_backend(scheduler, node) != dayan) {
@@ -449,12 +480,18 @@ static bool validate_assignment(ggml_backend_sched_t scheduler,
             }
         }
         if (current.recurrent) {
-            if (ggml_backend_sched_get_tensor_backend(scheduler, current.conv_silu) != dayan) {
+            if (ggml_backend_sched_get_tensor_backend(scheduler, current.conv_silu) != dayan ||
+                ggml_backend_sched_get_tensor_backend(scheduler, current.gated_delta) != dayan) {
                 return false;
             }
         } else if (ggml_backend_sched_get_tensor_backend(scheduler, current.flash_attention) != dayan) {
             return false;
         }
+    }
+    if (ggml_backend_sched_get_tensor_backend(scheduler, graph.output_rms) != dayan ||
+        ggml_backend_sched_get_tensor_backend(scheduler, graph.output_norm) != dayan ||
+        ggml_backend_sched_get_tensor_backend(scheduler, graph.logits) != dayan) {
+        return false;
     }
     GGML_UNUSED(cpu);
     return true;
@@ -570,9 +607,15 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
     float            final_hidden_max_abs = 0.0f;
     for (size_t layer = 0; layer < actual.layers.size(); ++layer) {
         char stage[64];
+        std::snprintf(stage, sizeof(stage), "layer.%zu.attention_rms", layer);
+        compare_tensor(stage, reference.layers[layer].attention_rms, actual.layers[layer].attention_rms, &stats);
+        std::snprintf(stage, sizeof(stage), "layer.%zu.attention_norm", layer);
+        compare_tensor(stage, reference.layers[layer].attention_norm, actual.layers[layer].attention_norm, &stats);
         if (actual.layers[layer].recurrent) {
             std::snprintf(stage, sizeof(stage), "layer.%zu.conv_silu", layer);
             compare_tensor(stage, reference.layers[layer].conv_silu, actual.layers[layer].conv_silu, &stats);
+            std::snprintf(stage, sizeof(stage), "layer.%zu.gated_delta", layer);
+            compare_tensor(stage, reference.layers[layer].gated_delta, actual.layers[layer].gated_delta, &stats);
         } else {
             std::snprintf(stage, sizeof(stage), "layer.%zu.flash_q", layer);
             compare_bf16_tensor(stage, reference.layers[layer].flash_q, actual.layers[layer].flash_q, &stats);
@@ -586,6 +629,13 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         }
         std::snprintf(stage, sizeof(stage), "layer.%zu.attention_output", layer);
         compare_tensor(stage, reference.layers[layer].attention_output, actual.layers[layer].attention_output, &stats);
+        std::snprintf(stage, sizeof(stage), "layer.%zu.attention_residual", layer);
+        compare_tensor(stage, reference.layers[layer].attention_residual, actual.layers[layer].attention_residual,
+                       &stats);
+        std::snprintf(stage, sizeof(stage), "layer.%zu.ffn_rms", layer);
+        compare_tensor(stage, reference.layers[layer].ffn_rms, actual.layers[layer].ffn_rms, &stats);
+        std::snprintf(stage, sizeof(stage), "layer.%zu.ffn_norm", layer);
+        compare_tensor(stage, reference.layers[layer].ffn_norm, actual.layers[layer].ffn_norm, &stats);
         std::snprintf(stage, sizeof(stage), "layer.%zu.ffn_output", layer);
         compare_tensor(stage, reference.layers[layer].ffn_down, actual.layers[layer].ffn_down, &stats);
         std::snprintf(stage, sizeof(stage), "layer.%zu.output", layer);
@@ -595,6 +645,8 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
             final_hidden_max_abs = layer_output_max_abs;
         }
     }
+    compare_tensor("output_rms", reference.output_rms, actual.output_rms, &stats);
+    compare_tensor("output_norm", reference.output_norm, actual.output_norm, &stats);
     const float logits_max_abs = compare_tensor("logits", reference.logits, actual.logits, &stats);
 
     const double rmse = stats.count == 0 ? 0.0 : std::sqrt(stats.sum_sq / stats.count);

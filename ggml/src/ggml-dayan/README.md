@@ -6,6 +6,8 @@ Before scheduling a llama graph, the backend rewrite inserts one matching BF16 o
 
 The graph executor lowers a Dayan split to execution slots. Two adjacent matrix multiplications with the same activation use one pair slot and one activation upload. A matching `MUL_MAT + MUL_MAT + SWIGLU/GEGLU + CPY` sequence uses one fused slot. The common matrix multiplication template accepts a compile-time epilogue function pointer, evaluates the activation with VEC before the final writeback, and quantizes the result to the weight type.
 
+Contiguous F32 residual adds and RMSNorm execute on Dayan. The graph compiler recognizes `RMS_NORM + MUL + CPY + MUL_MAT` and `ADD + RMS_NORM + MUL + CPY + MUL_MAT`, and runs normalization, scaling, BF16/FP16 quantization, and matrix multiplication in one device function. VEC tensor dimensions expand complete 64-lane chunks into padded URAM scratch space, while LSU tail stores limit the final DRAM write to the valid byte count.
+
 The attention operator package provides dedicated BF16 and FP16 QG, K, and V projection entry points. Q and K fuse low-precision matrix writeback, RMSNorm, RoPE or MRoPE, and output layout conversion. K and V also have indexed KV-cache variants that write directly to cache rows. The migrated BF16 Flash-Attention implementation is maintained in this backend, uses `dayan_uram_base()` directly, and has an explicit causal offset for KV-cache decode. It supports GQA and right-aligned causal masking. The output path fuses `attention * sigmoid(gate)`, low-precision quantization, and the output projection. The graph compiler recognizes the Qwen3.5 gate view, sigmoid, multiply, and output matrix multiplication pattern.
 
 For Qwen3.5 linear-attention layers, `SSM_CONV` followed by SiLU uses one dedicated device function. It packs the depthwise convolution into BF16 diagonal kernels with 256-channel main slices, 128-channel tail slices, and 64-token tiles. The first tap uses `tx.mat.conv2d`, later taps use `tx.mat.conv2da`, and VEC applies SiLU before the result is written back. The convolution remains a separate operator from the delta-net core.
@@ -29,7 +31,7 @@ The focused graph test checks all BF16/FP16 SWIGLU/GEGLU fused matrix multiplica
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-graph
 ```
 
-The same test also checks the Qwen3.5 attention output gate plus projection pattern and the fused SSM convolution plus SiLU path.
+The same test also checks the Qwen3.5 attention output gate plus projection pattern, fused RMSNorm matrix multiplication paths, residual adds, and the fused SSM convolution plus SiLU path.
 
 The attention projection test runs QG, K, and V projection, indexed KV-cache writes, causal Flash-Attention, gate fusion, low-precision quantization, and output projection as one numerical data flow for BF16 and FP16 model weights:
 
@@ -43,10 +45,10 @@ The standalone Flash-Attention test checks GQA with a right-aligned causal mask 
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-flash-attention
 ```
 
-The Qwen3.5 dense test builds the minimum four-layer hybrid cycle with three gated DeltaNet layers and one causal full-attention layer. Every layer also contains RMSNorm, dense SWIGLU FFN, and residual paths. The mixed scheduler runs eligible projections, fused Conv+SiLU, causal Flash-Attention, gated output projection, and fused FFN operations on Dayan, keeps the remaining graph on CPU, and compares intermediate outputs and final logits against a CPU graph with the same low-precision boundaries:
+The Qwen3.5 dense test builds the minimum four-layer hybrid cycle with three gated DeltaNet layers and one causal full-attention layer. Every layer also contains RMSNorm, dense SWIGLU FFN, and residual paths. It compares Dayan outputs and final logits against a CPU graph with the same low-precision boundaries. Gated Delta Net uses a 128-element head so the test exercises the device kernel instead of CPU fallback:
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-qwen35-dense
 ```
 
-The current matrix kernel requires the weight row count to be a multiple of 16. Batched matrix multiplication, `MUL_MAT_ID`, device-resident weights, arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention consumes BF16 Q/K/V; the FP16 attention data-flow test converts projected Q/K/V to BF16 at the Flash boundary. The dedicated projection and KV-cache kernels are validated through the Dayan runtime but are not yet selected from the complete llama Qwen3.5 graph by the backend scheduler.
+The current matrix kernel requires the weight row count to be a multiple of 16. Batched matrix multiplication, `MUL_MAT_ID`, device-resident weights, arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention consumes BF16 Q/K/V; the FP16 attention data-flow test converts projected Q/K/V to BF16 at the Flash boundary. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.

@@ -40,6 +40,7 @@ struct Constants {
 
 enum VecTcsr {
     kVecControl = 0,
+    kVecSync    = 1,
     kVecDim0    = 2,
     kVecDim1    = 3,
     kVecDim2    = 4,
@@ -303,6 +304,7 @@ static inline void load_matrix(uint64_t major_left,
     if (major_left >= major_tile) {
         __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(major_tile / 64U - 1U);
         __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
+        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
         __tx_lsu_dma_d2u<TcsrId>((long) uram_base, (long) dram_base);
         return;
     }
@@ -314,10 +316,12 @@ static inline void load_matrix(uint64_t major_left,
         if (handled_bytes == 0 && remaining_bytes > 0) {
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(0);
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(remaining_bytes - 1U);
+            __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
             handled_bytes = remaining_bytes;
         } else {
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(handled_bytes / 64U - 1U);
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
+            __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
         }
         __tx_lsu_dma_d2u<TcsrId>((long) uram_base, (long) dram_base);
         uram_base += handled_bytes;
@@ -343,6 +347,7 @@ static inline void store_matrix(uint64_t major_left,
     if (major_left >= major_tile) {
         __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(major_tile / 64U - 1U);
         __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
+        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
         __tx_lsu_dma_u2d<TcsrId>((long) dram_base, (long) uram_base);
         return;
     }
@@ -354,10 +359,12 @@ static inline void store_matrix(uint64_t major_left,
         if (handled_bytes == 0 && remaining_bytes > 0) {
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(0);
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(remaining_bytes - 1U);
+            __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(remaining_bytes - 1U);
             handled_bytes = remaining_bytes;
         } else {
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(handled_bytes / 64U - 1U);
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
+            __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
         }
         __tx_lsu_dma_u2d<TcsrId>((long) dram_base, (long) uram_base);
         uram_base += handled_bytes;

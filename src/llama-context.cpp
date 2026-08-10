@@ -31,6 +31,55 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+static bool llama_model_uses_dayan(const llama_model & model) {
+    for (const llama_device & device : model.devices) {
+        if (device.dev != nullptr && std::strcmp(ggml_backend_dev_name(device.dev), "DAYAN") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool llama_graph_node_is_metadata(const ggml_tensor * node) {
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool llama_graph_is_dayan_only(const llama_model & model, ggml_backend_sched_t sched, ggml_cgraph * gf) {
+    if (!llama_model_uses_dayan(model)) {
+        return true;
+    }
+
+    int compute_nodes = 0;
+    for (int index = 0; index < ggml_graph_n_nodes(gf); ++index) {
+        ggml_tensor * node = ggml_graph_node(gf, index);
+        if (llama_graph_node_is_metadata(node)) {
+            continue;
+        }
+
+        ++compute_nodes;
+        ggml_backend_t     backend = ggml_backend_sched_get_tensor_backend(sched, node);
+        ggml_backend_dev_t device  = backend != nullptr ? ggml_backend_get_device(backend) : nullptr;
+        if (device == nullptr || std::strcmp(ggml_backend_dev_name(device), "DAYAN") != 0) {
+            LLAMA_LOG_ERROR("%s: node %d (%s, %s) is assigned to %s instead of DAYAN\n", __func__, index,
+                            ggml_op_desc(node), node->name,
+                            device != nullptr ? ggml_backend_dev_name(device) : "none");
+            return false;
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: verified %d compute nodes on DAYAN\n", __func__, compute_nodes);
+    return true;
+}
+
 struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
@@ -533,6 +582,11 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                         device_layer ? ggml_backend_dev_name(device_layer) : "none",
                         probe.name,
                         device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                if (device_layer != nullptr && std::strcmp(ggml_backend_dev_name(device_layer), "DAYAN") == 0 &&
+                    (probe.op == LLM_FUSED_OP_FLASH_ATTN || probe.op == LLM_FUSED_OP_GDN_AR ||
+                     probe.op == LLM_FUSED_OP_GDN_CH)) {
+                    throw std::runtime_error(std::string(probe.name) + " must not fall back from DAYAN");
+                }
                 device_mismatch = true;
                 break;
             }
@@ -1208,6 +1262,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     }
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
+
+    if (sampler && llama_model_uses_dayan(model)) {
+        LLAMA_LOG_INFO("%s: keeping sampler for seq_id %d on CPU for DAYAN\n", __func__, (int) seq_id);
+        if (sampling.samplers.count(seq_id) > 0) {
+            sched_need_reserve = true;
+        }
+        sampling.samplers.erase(seq_id);
+        return false;
+    }
 
     if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         static bool warned = false;
@@ -2426,6 +2489,10 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    if (!llama_graph_is_dayan_only(model, sched.get(), gf)) {
+        return nullptr;
+    }
+
     return gf;
 }
 
@@ -2456,6 +2523,10 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    if (!llama_graph_is_dayan_only(model, sched.get(), gf)) {
+        return GGML_STATUS_FAILED;
+    }
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 

@@ -108,14 +108,16 @@ static bool compare_outputs(ggml_tensor * expected_tensor,
     return close;
 }
 
-static int test_permuted_cache_layout(ggml_backend_t dayan, ggml_backend_t cpu) {
-    constexpr int64_t head_dim       = 256;
-    constexpr int64_t q_len          = 3;
-    constexpr int64_t physical_kv_len = 64;
-    constexpr int64_t effective_kv_len = 9;
-    constexpr int64_t q_heads        = 8;
-    constexpr int64_t kv_heads       = 2;
-    constexpr int64_t batch          = 1;
+static int test_permuted_cache_layout(ggml_backend_t dayan,
+                                      ggml_backend_t cpu,
+                                      int64_t        q_len,
+                                      int64_t        physical_kv_len,
+                                      int64_t        effective_kv_len,
+                                      uint32_t       seed) {
+    constexpr int64_t head_dim = 256;
+    constexpr int64_t q_heads  = 8;
+    constexpr int64_t kv_heads = 2;
+    constexpr int64_t batch    = 1;
 
     attention_graph reference = build_graph(GGML_TYPE_F32, GGML_TYPE_F16, head_dim, q_len, physical_kv_len,
                                             q_heads, kv_heads, batch, true, true);
@@ -131,7 +133,7 @@ static int test_permuted_cache_layout(ggml_backend_t dayan, ggml_backend_t cpu) 
         return fail("cannot allocate permuted graph tensors");
     }
 
-    std::mt19937                          generator(0x35f17U);
+    std::mt19937                          generator(seed);
     std::uniform_real_distribution<float> distribution(-0.25f, 0.25f);
     std::vector<float>                    q((size_t) ggml_nelements(reference.q_input));
     std::vector<ggml_fp16_t>              k((size_t) ggml_nelements(reference.k_input));
@@ -264,7 +266,8 @@ int main() {
     if (!close) {
         return fail("numerical comparison failed");
     }
-    if (test_permuted_cache_layout(dayan.get(), cpu.get()) != 0) {
+    if (test_permuted_cache_layout(dayan.get(), cpu.get(), 3, 64, 9, 0x35f17U) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 1, 0x35f18U) != 0) {
         return 1;
     }
 

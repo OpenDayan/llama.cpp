@@ -69,8 +69,15 @@ add_custom_command(
         ggml-dayan-kernels.h
         ggml-dayan-attention.h
         ggml-dayan-conv.h
+        ggml-dayan-elementwise.h
         ggml-dayan-flash-attention.h
+        ggml-dayan-gated-delta-net.h
+        ggml-dayan-layout.h
         ggml-dayan-matmul.h
+        ggml-dayan-memory.h
+        ggml-dayan-normalization.h
+        ggml-dayan-rope.h
+        ggml-dayan-softmax.h
         device_include/cstdint
         device_include/cstdio
         device_include/type_traits
@@ -92,8 +99,15 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-kernels.h
     ggml-dayan-attention.h
     ggml-dayan-conv.h
+    ggml-dayan-elementwise.h
     ggml-dayan-flash-attention.h
+    ggml-dayan-gated-delta-net.h
+    ggml-dayan-layout.h
     ggml-dayan-matmul.h
+    ggml-dayan-memory.h
+    ggml-dayan-normalization.h
+    ggml-dayan-rope.h
+    ggml-dayan-softmax.h
     "${DAYAN_KERNEL_OBJECT}")
 
 find_package(Threads REQUIRED)
