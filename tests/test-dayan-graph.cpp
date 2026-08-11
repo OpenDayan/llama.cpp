@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using ggml_backend_graph_rewrite_t = bool (*)(ggml_backend_t, ggml_context *, ggml_cgraph *);
@@ -35,8 +36,16 @@ static bool rewrite_graph(ggml_backend_t dayan, ggml_context * ctx, ggml_cgraph 
     return rewrite != nullptr && rewrite(dayan, ctx, graph);
 }
 
+static bool has_dependency(const ggml_tensor * tensor, const ggml_tensor * dependency) {
+    for (int index = 2; index < GGML_MAX_SRC; ++index) {
+        if (tensor->src[index] == dependency) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int run_fused_case(ggml_backend_t   dayan,
-                          ggml_backend_t   cpu,
                           enum ggml_type   type,
                           enum ggml_glu_op glu_op,
                           int64_t          m,
@@ -120,8 +129,8 @@ static int run_fused_case(ggml_backend_t   dayan,
 
     ggml_graph_clear(graph);
     ggml_graph_add_node(graph, activation_lowp);
-    if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
-        return fail("CPU activation cast failed");
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN activation cast failed");
     }
 
     ggml_graph_clear(graph);
@@ -280,7 +289,8 @@ static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64
     }
 
     ggml_tensor * lowp = output->src[1];
-    if (lowp == scaled || lowp->op != GGML_OP_CPY || lowp->src[0] != scaled || lowp->type != type) {
+    if (lowp == scaled || lowp->op != GGML_OP_CPY || lowp->src[0] != scaled || lowp->type != type ||
+        !has_dependency(lowp, scale) || !has_dependency(lowp, left) || (has_residual && !has_dependency(lowp, right))) {
         return fail("unexpected RMSNorm matrix multiplication activation rewrite");
     }
 
@@ -337,7 +347,7 @@ static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64
         float square_sum = 0.0f;
         for (int64_t col = 0; col < width; ++col) {
             const size_t index = (size_t) row * width + col;
-            const float value = left_data[index] + (has_residual ? right_data[index] : 0.0f);
+            const float  value = left_data[index] + (has_residual ? right_data[index] : 0.0f);
             square_sum += value * value;
             if (has_residual) {
                 residual_max_abs = std::max(residual_max_abs, std::abs(residual_result[index] - value));
@@ -346,14 +356,14 @@ static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64
         const float inverse = 1.0f / std::sqrt(square_sum / (float) width + epsilon);
         for (int64_t col = 0; col < width; ++col) {
             const size_t index     = (size_t) row * width + col;
-            const float value     = left_data[index] + (has_residual ? right_data[index] : 0.0f);
-            const float rms_ref   = value * inverse;
-            const float scale_ref = rms_ref * scale_data[(size_t) col];
-            const float lowp_ref  = decode_lowp(type, encode_lowp(type, scale_ref));
-            lowp_reference[index] = encode_lowp(type, scale_ref);
-            rms_max_abs           = std::max(rms_max_abs, std::abs(rms_result[index] - rms_ref));
-            scaled_max_abs        = std::max(scaled_max_abs, std::abs(scaled_result[index] - scale_ref));
-            lowp_max_abs = std::max(lowp_max_abs, std::abs(decode_lowp(type, lowp_result[index]) - lowp_ref));
+            const float  value     = left_data[index] + (has_residual ? right_data[index] : 0.0f);
+            const float  rms_ref   = value * inverse;
+            const float  scale_ref = rms_ref * scale_data[(size_t) col];
+            const float  lowp_ref  = decode_lowp(type, encode_lowp(type, scale_ref));
+            lowp_reference[index]  = encode_lowp(type, scale_ref);
+            rms_max_abs            = std::max(rms_max_abs, std::abs(rms_result[index] - rms_ref));
+            scaled_max_abs         = std::max(scaled_max_abs, std::abs(scaled_result[index] - scale_ref));
+            lowp_max_abs           = std::max(lowp_max_abs, std::abs(decode_lowp(type, lowp_result[index]) - lowp_ref));
         }
     }
 
@@ -372,10 +382,9 @@ static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64
     }
     close = close && residual_max_abs <= 1.0e-6f && rms_max_abs <= 0.005f && scaled_max_abs <= 0.006f &&
             lowp_max_abs <= 0.008f;
-    std::printf(
-        "type=%s RMSNorm%s width=%lld rows=%lld residual=%g rms=%g scaled=%g lowp=%g matmul=%g\n",
-        ggml_type_name(type), has_residual ? "+residual" : "", (long long) width, (long long) rows,
-        residual_max_abs, rms_max_abs, scaled_max_abs, lowp_max_abs, output_max_abs);
+    std::printf("type=%s RMSNorm%s width=%lld rows=%lld residual=%g rms=%g scaled=%g lowp=%g matmul=%g\n",
+                ggml_type_name(type), has_residual ? "+residual" : "", (long long) width, (long long) rows,
+                residual_max_abs, rms_max_abs, scaled_max_abs, lowp_max_abs, output_max_abs);
     return close ? 0 : fail("RMSNorm matrix multiplication numerical comparison failed");
 }
 
@@ -451,12 +460,12 @@ static int run_elementwise_case(ggml_backend_t dayan) {
         std::vector<float> normalized_reference((size_t) width);
         float              square_sum = 0.0f;
         for (int64_t column = 0; column < width; ++column) {
-            const size_t index      = (size_t) row * width + column;
-            const float  added_ref  = input_data[index] + bias_data[(size_t) column];
-            const float  sigmoid_ref = 1.0f / (1.0f + std::exp(-added_ref));
-            const float  mul_ref    = sigmoid_ref * gain_data[(size_t) column];
-            const float  scale_ref  = mul_ref * 1.25f - 0.125f;
-            const float  soft_ref   = std::log1p(std::exp(scale_ref));
+            const size_t index                    = (size_t) row * width + column;
+            const float  added_ref                = input_data[index] + bias_data[(size_t) column];
+            const float  sigmoid_ref              = 1.0f / (1.0f + std::exp(-added_ref));
+            const float  mul_ref                  = sigmoid_ref * gain_data[(size_t) column];
+            const float  scale_ref                = mul_ref * 1.25f - 0.125f;
+            const float  soft_ref                 = std::log1p(std::exp(scale_ref));
             normalized_reference[(size_t) column] = soft_ref;
             square_sum += soft_ref * soft_ref;
         }
@@ -466,8 +475,8 @@ static int run_elementwise_case(ggml_backend_t dayan) {
             const float  norm_ref = normalized_reference[(size_t) column] * inverse;
             const float  expected = norm_ref / (1.0f + std::exp(-norm_ref));
             const float  error    = std::abs(observed[index] - expected);
-            max_abs              = std::max(max_abs, error);
-            close                = close && error <= 0.003f + 0.003f * std::abs(expected);
+            max_abs               = std::max(max_abs, error);
+            close                 = close && error <= 0.003f + 0.003f * std::abs(expected);
         }
     }
     std::printf("elementwise width=%lld rows=%lld max_abs=%g\n", (long long) width, (long long) rows, max_abs);
@@ -527,24 +536,14 @@ static int run_math_case(ggml_backend_t dayan) {
     ggml_set_input(divisor);
 
     ggml_tensor * outputs[output_count] = {
-        ggml_sub(ctx.get(), input, divisor),
-        ggml_div(ctx.get(), input, divisor),
-        ggml_sqr(ctx.get(), input),
-        ggml_sqrt(ctx.get(), positive),
-        ggml_log(ctx.get(), positive),
-        ggml_sin(ctx.get(), input),
-        ggml_cos(ctx.get(), input),
-        ggml_abs(ctx.get(), input),
-        ggml_neg(ctx.get(), input),
-        ggml_tanh(ctx.get(), input),
-        ggml_relu(ctx.get(), input),
-        ggml_gelu(ctx.get(), input),
-        ggml_gelu_quick(ctx.get(), input),
-        ggml_exp(ctx.get(), input),
+        ggml_sub(ctx.get(), input, divisor), ggml_div(ctx.get(), input, divisor), ggml_sqr(ctx.get(), input),
+        ggml_sqrt(ctx.get(), positive),      ggml_log(ctx.get(), positive),       ggml_sin(ctx.get(), input),
+        ggml_cos(ctx.get(), input),          ggml_abs(ctx.get(), input),          ggml_neg(ctx.get(), input),
+        ggml_tanh(ctx.get(), input),         ggml_relu(ctx.get(), input),         ggml_gelu(ctx.get(), input),
+        ggml_gelu_quick(ctx.get(), input),   ggml_exp(ctx.get(), input),
     };
     const char * names[output_count] = {
-        "sub", "div", "sqr", "sqrt", "log", "sin", "cos", "abs", "neg", "tanh", "relu", "gelu",
-        "gelu_quick", "exp",
+        "sub", "div", "sqr", "sqrt", "log", "sin", "cos", "abs", "neg", "tanh", "relu", "gelu", "gelu_quick", "exp",
     };
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
@@ -622,8 +621,7 @@ static int run_math_case(ggml_backend_t dayan) {
                     break;
                 case 11:
                     expected = 0.5f * value *
-                               (1.0f + std::tanh(0.7978845608028654f * value *
-                                                (1.0f + 0.044715f * value * value)));
+                               (1.0f + std::tanh(0.7978845608028654f * value * (1.0f + 0.044715f * value * value)));
                     break;
                 case 12:
                     expected = value / (1.0f + std::exp(-1.702f * value));
@@ -721,8 +719,8 @@ static int run_reduction_norm_case(ggml_backend_t dayan) {
         row_error = std::max(row_error, std::abs(row_sum_result[row] - sum));
         row_error = std::max(row_error, std::abs(row_mean_result[row] - sum / (float) width));
 
-        float variance = 0.0f;
-        const float mean = sum / (float) width;
+        float       variance = 0.0f;
+        const float mean     = sum / (float) width;
         for (int64_t column = 0; column < width; ++column) {
             const float centered = input_data[row * width + (size_t) column] - mean;
             variance += centered * centered;
@@ -730,8 +728,8 @@ static int run_reduction_norm_case(ggml_backend_t dayan) {
         const float inverse = 1.0f / std::sqrt(variance / (float) width + epsilon);
         for (int64_t column = 0; column < width; ++column) {
             const size_t index    = row * width + (size_t) column;
-            const float expected = (input_data[index] - mean) * inverse;
-            norm_error           = std::max(norm_error, std::abs(norm_result[index] - expected));
+            const float  expected = (input_data[index] - mean) * inverse;
+            norm_error            = std::max(norm_error, std::abs(norm_result[index] - expected));
         }
     }
 
@@ -741,9 +739,9 @@ static int run_reduction_norm_case(ggml_backend_t dayan) {
         for (int group = 0; group < groups; ++group) {
             const int64_t channel_start = group * channels_per_group;
             const int64_t channel_end   = std::min<int64_t>(channels, channel_start + channels_per_group);
-            const size_t  offset = (size_t) (batch * channels + channel_start) * channel_elements;
-            const size_t  elements = (size_t) (channel_end - channel_start) * channel_elements;
-            float         mean = 0.0f;
+            const size_t  offset        = (size_t) (batch * channels + channel_start) * channel_elements;
+            const size_t  elements      = (size_t) (channel_end - channel_start) * channel_elements;
+            float         mean          = 0.0f;
             for (size_t index = 0; index < elements; ++index) {
                 mean += input_data[offset + index];
             }
@@ -756,7 +754,7 @@ static int run_reduction_norm_case(ggml_backend_t dayan) {
             const float inverse = 1.0f / std::sqrt(variance / (float) elements + epsilon);
             for (size_t index = 0; index < elements; ++index) {
                 const float expected = (input_data[offset + index] - mean) * inverse;
-                group_error = std::max(group_error, std::abs(group_result[offset + index] - expected));
+                group_error          = std::max(group_error, std::abs(group_result[offset + index] - expected));
             }
         }
     }
@@ -785,8 +783,8 @@ static int run_strided_rms_case(ggml_backend_t dayan) {
 
     ggml_tensor * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, full_width, tokens);
     ggml_tensor * scale = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, width);
-    ggml_tensor * view = ggml_view_3d(ctx.get(), input, width, heads, tokens, 2 * width * sizeof(float),
-                                      full_width * sizeof(float), 0);
+    ggml_tensor * view =
+        ggml_view_3d(ctx.get(), input, width, heads, tokens, 2 * width * sizeof(float), full_width * sizeof(float), 0);
     ggml_tensor * norm   = ggml_rms_norm(ctx.get(), view, epsilon);
     ggml_tensor * output = ggml_mul(ctx.get(), norm, scale);
     ggml_set_input(input);
@@ -827,27 +825,27 @@ static int run_strided_rms_case(ggml_backend_t dayan) {
             }
             const float inverse = 1.0f / std::sqrt(square_sum / (float) width + epsilon);
             for (int64_t column = 0; column < width; ++column) {
-                const size_t source = (size_t) token * full_width + head * 2 * width + column;
-                const size_t target = ((size_t) token * heads + head) * width + column;
-                const float expected = input_data[source] * inverse * scale_data[(size_t) column];
-                const float error    = std::abs(observed[target] - expected);
-                max_abs              = std::max(max_abs, error);
-                close                = close && error <= 0.002f + 0.002f * std::abs(expected);
+                const size_t source   = (size_t) token * full_width + head * 2 * width + column;
+                const size_t target   = ((size_t) token * heads + head) * width + column;
+                const float  expected = input_data[source] * inverse * scale_data[(size_t) column];
+                const float  error    = std::abs(observed[target] - expected);
+                max_abs               = std::max(max_abs, error);
+                close                 = close && error <= 0.002f + 0.002f * std::abs(expected);
             }
         }
     }
-    std::printf("strided RMSNorm width=%lld heads=%lld tokens=%lld max_abs=%g\n", (long long) width,
-                (long long) heads, (long long) tokens, max_abs);
+    std::printf("strided RMSNorm width=%lld heads=%lld tokens=%lld max_abs=%g\n", (long long) width, (long long) heads,
+                (long long) tokens, max_abs);
     return close ? 0 : fail("strided RMSNorm numerical comparison failed");
 }
 
 static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
-    constexpr int64_t width      = 130;
-    constexpr int64_t heads      = 2;
-    constexpr int64_t tokens     = 3;
-    constexpr int     n_dims     = 64;
-    constexpr int     graph_size = 8;
-    int sections[4] = { 11, 11, 10, 0 };
+    constexpr int64_t width       = 130;
+    constexpr int64_t heads       = 2;
+    constexpr int64_t tokens      = 3;
+    constexpr int     n_dims      = 64;
+    constexpr int     graph_size  = 8;
+    int               sections[4] = { 11, 11, 10, 0 };
 
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
@@ -861,9 +859,8 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
 
     ggml_tensor * input     = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, heads, tokens);
     ggml_tensor * positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, tokens * 4);
-    ggml_tensor * output    = ggml_rope_multi(ctx.get(), input, positions, nullptr, n_dims, sections,
-                                              GGML_ROPE_TYPE_MROPE, 262144, 10000000.0f, 1.0f, 0.0f, 1.0f,
-                                              32.0f, 1.0f);
+    ggml_tensor * output = ggml_rope_multi(ctx.get(), input, positions, nullptr, n_dims, sections, GGML_ROPE_TYPE_MROPE,
+                                           262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_set_input(input);
     ggml_set_input(positions);
 
@@ -874,7 +871,7 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
         return fail("cannot allocate RoPE tensors");
     }
 
-    std::vector<float> input_data((size_t) width * heads * tokens);
+    std::vector<float>   input_data((size_t) width * heads * tokens);
     std::vector<int32_t> position_data((size_t) tokens * 4);
     for (size_t index = 0; index < input_data.size(); ++index) {
         input_data[index] = ((int) (index % 47) - 23) / 32.0f;
@@ -891,7 +888,7 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
         return fail("CPU RoPE reference failed");
     }
     std::vector<float> reference((size_t) ggml_nelements(output));
-    ggml_backend_tensor_get(output, reference.data(), 0, ggml_nbytes(output));
+    std::memcpy(reference.data(), output->data, ggml_nbytes(output));
 
     if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
         return fail("DAYAN RoPE graph failed");
@@ -906,8 +903,8 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
         max_abs           = std::max(max_abs, error);
         close             = close && error <= 0.002f + 0.002f * std::abs(reference[index]);
     }
-    std::printf("MRoPE width=%lld heads=%lld tokens=%lld n_dims=%d max_abs=%g\n", (long long) width,
-                (long long) heads, (long long) tokens, n_dims, max_abs);
+    std::printf("MRoPE width=%lld heads=%lld tokens=%lld n_dims=%d max_abs=%g\n", (long long) width, (long long) heads,
+                (long long) tokens, n_dims, max_abs);
     return close ? 0 : fail("MRoPE numerical comparison failed");
 }
 
@@ -944,8 +941,8 @@ static int run_memory_case(ggml_backend_t dayan) {
     ggml_tensor * set_ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, set_rows, slices);
     ggml_tensor * set_out = ggml_set_rows(ctx.get(), set_dst, set_src, set_ids);
 
-    ggml_tensor * left       = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, left_width, concat_rows);
-    ggml_tensor * right      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, right_width, concat_rows);
+    ggml_tensor * left         = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, left_width, concat_rows);
+    ggml_tensor * right        = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, right_width, concat_rows);
     ggml_tensor * concatenated = ggml_concat(ctx.get(), left, right, 0);
 
     ggml_set_input(embedding);
@@ -1024,14 +1021,13 @@ static int run_memory_case(ggml_backend_t dayan) {
         for (int64_t row = 0; row < selected_rows; ++row) {
             const int64_t source_row = row_id_data[(size_t) slice * selected_rows + row];
             for (int64_t column = 0; column < width; ++column) {
-                const size_t output_index = ((size_t) slice * selected_rows + row) * width + column;
-                const size_t source_index = ((size_t) slice * source_rows + source_row) * width + column;
-                const float  expected     = decode_lowp(GGML_TYPE_BF16, embedding_data[source_index]);
+                const size_t output_index  = ((size_t) slice * selected_rows + row) * width + column;
+                const size_t source_index  = ((size_t) slice * source_rows + source_row) * width + column;
+                const float  expected      = decode_lowp(GGML_TYPE_BF16, embedding_data[source_index]);
                 const float  copy_expected = decode_lowp(GGML_TYPE_F16, encode_lowp(GGML_TYPE_F16, expected));
-                get_max_abs = std::max(get_max_abs, std::abs(selected_result[output_index] - expected));
-                copy_max_abs =
-                    std::max(copy_max_abs, std::abs(decode_lowp(GGML_TYPE_F16, copied_result[output_index]) -
-                                                    copy_expected));
+                get_max_abs                = std::max(get_max_abs, std::abs(selected_result[output_index] - expected));
+                copy_max_abs               = std::max(
+                    copy_max_abs, std::abs(decode_lowp(GGML_TYPE_F16, copied_result[output_index]) - copy_expected));
             }
         }
     }
@@ -1041,30 +1037,27 @@ static int run_memory_case(ggml_backend_t dayan) {
         for (int64_t row = 0; row < set_rows; ++row) {
             const int64_t target_row = set_id_data[(size_t) slice * set_rows + row];
             for (int64_t column = 0; column < width; ++column) {
-                const size_t source_index = ((size_t) slice * set_rows + row) * width + column;
-                const size_t target_index = ((size_t) slice * target_rows + target_row) * width + column;
+                const size_t source_index   = ((size_t) slice * set_rows + row) * width + column;
+                const size_t target_index   = ((size_t) slice * target_rows + target_row) * width + column;
                 set_reference[target_index] = encode_lowp(GGML_TYPE_BF16, set_src_data[source_index]);
             }
         }
     }
     for (size_t index = 0; index < set_result.size(); ++index) {
-        set_max_abs = std::max(set_max_abs,
-                               std::abs(decode_lowp(GGML_TYPE_BF16, set_result[index]) -
-                                        decode_lowp(GGML_TYPE_BF16, set_reference[index])));
+        set_max_abs = std::max(set_max_abs, std::abs(decode_lowp(GGML_TYPE_BF16, set_result[index]) -
+                                                     decode_lowp(GGML_TYPE_BF16, set_reference[index])));
     }
 
     for (int64_t row = 0; row < concat_rows; ++row) {
         for (int64_t column = 0; column < left_width + right_width; ++column) {
-            const float expected = column < left_width ?
-                                       left_data[(size_t) row * left_width + column] :
-                                       right_data[(size_t) row * right_width + column - left_width];
-            const size_t index = (size_t) row * (left_width + right_width) + column;
-            concat_max_abs = std::max(concat_max_abs, std::abs(concat_result[index] - expected));
+            const float  expected = column < left_width ? left_data[(size_t) row * left_width + column] :
+                                                          right_data[(size_t) row * right_width + column - left_width];
+            const size_t index    = (size_t) row * (left_width + right_width) + column;
+            concat_max_abs        = std::max(concat_max_abs, std::abs(concat_result[index] - expected));
         }
     }
     close = get_max_abs == 0.0f && copy_max_abs == 0.0f && set_max_abs == 0.0f && concat_max_abs == 0.0f;
-    std::printf("memory get=%g copy=%g set=%g concat=%g\n", get_max_abs, copy_max_abs, set_max_abs,
-                concat_max_abs);
+    std::printf("memory get=%g copy=%g set=%g concat=%g\n", get_max_abs, copy_max_abs, set_max_abs, concat_max_abs);
     return close ? 0 : fail("memory operator numerical comparison failed");
 }
 
@@ -1110,7 +1103,7 @@ static int run_empty_memory_case(ggml_backend_t dayan) {
     return 0;
 }
 
-static int run_gated_output_case(ggml_backend_t dayan, ggml_backend_t cpu, enum ggml_type type) {
+static int run_gated_output_case(ggml_backend_t dayan, enum ggml_type type) {
     constexpr int64_t tokens     = 3;
     constexpr int64_t embd       = 64;
     constexpr int64_t head_dim   = 64;
@@ -1190,8 +1183,8 @@ static int run_gated_output_case(ggml_backend_t dayan, ggml_backend_t cpu, enum 
 
     ggml_graph_clear(graph);
     ggml_graph_add_node(graph, activation_lowp);
-    if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
-        return fail("CPU gated output activation cast failed");
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN gated output activation cast failed");
     }
     ggml_graph_clear(graph);
     ggml_graph_add_node(graph, qg);
@@ -1332,15 +1325,15 @@ static int run_ssm_conv_case(ggml_backend_t dayan,
 }
 
 static int run_layout_case(ggml_backend_t dayan) {
-    constexpr int64_t base_width  = 6;
-    constexpr int64_t view_width  = 3;
-    constexpr int64_t view_rows   = 4;
-    constexpr int64_t dup_width   = 5;
-    constexpr int64_t dup_rows    = 3;
-    constexpr int64_t repeat_ne0  = 3;
-    constexpr int64_t repeat_ne1  = 2;
-    constexpr int64_t repeat_ne2  = 2;
-    constexpr int     graph_size  = 32;
+    constexpr int64_t base_width = 6;
+    constexpr int64_t view_width = 3;
+    constexpr int64_t view_rows  = 4;
+    constexpr int64_t dup_width  = 5;
+    constexpr int64_t dup_rows   = 3;
+    constexpr int64_t repeat_ne0 = 3;
+    constexpr int64_t repeat_ne1 = 2;
+    constexpr int64_t repeat_ne2 = 2;
+    constexpr int     graph_size = 32;
 
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
@@ -1352,14 +1345,13 @@ static int run_layout_case(ggml_backend_t dayan) {
         return fail("cannot create the layout context");
     }
 
-    ggml_tensor * base = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, base_width, view_rows);
-    ggml_tensor * view = ggml_view_2d(ctx.get(), base, view_width, view_rows, base->nb[1], sizeof(float));
-    ggml_tensor * contiguous = ggml_cont(ctx.get(), view);
-    ggml_tensor * dup_input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, dup_width, dup_rows);
-    ggml_tensor * duplicated = ggml_dup(ctx.get(), dup_input);
+    ggml_tensor * base         = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, base_width, view_rows);
+    ggml_tensor * view         = ggml_view_2d(ctx.get(), base, view_width, view_rows, base->nb[1], sizeof(float));
+    ggml_tensor * contiguous   = ggml_cont(ctx.get(), view);
+    ggml_tensor * dup_input    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, dup_width, dup_rows);
+    ggml_tensor * duplicated   = ggml_dup(ctx.get(), dup_input);
     ggml_tensor * repeat_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_BF16, repeat_ne0, repeat_ne1, repeat_ne2);
-    ggml_tensor * repeated = ggml_repeat_4d(ctx.get(), repeat_input, 2 * repeat_ne0, 2 * repeat_ne1,
-                                            2 * repeat_ne2, 2);
+    ggml_tensor * repeated = ggml_repeat_4d(ctx.get(), repeat_input, 2 * repeat_ne0, 2 * repeat_ne1, 2 * repeat_ne2, 2);
     ggml_tensor * converted = ggml_cast(ctx.get(), repeat_input, GGML_TYPE_F16);
     ggml_set_input(base);
     ggml_set_input(dup_input);
@@ -1380,7 +1372,7 @@ static int run_layout_case(ggml_backend_t dayan) {
         return fail("cannot allocate layout tensors");
     }
 
-    std::vector<float> base_data((size_t) base_width * view_rows);
+    std::vector<float>    base_data((size_t) base_width * view_rows);
     std::vector<uint16_t> dup_data((size_t) dup_width * dup_rows);
     std::vector<uint16_t> repeat_data((size_t) repeat_ne0 * repeat_ne1 * repeat_ne2);
     for (size_t index = 0; index < base_data.size(); ++index) {
@@ -1400,7 +1392,7 @@ static int run_layout_case(ggml_backend_t dayan) {
         return fail("DAYAN layout graph failed");
     }
 
-    std::vector<float> contiguous_result((size_t) view_width * view_rows);
+    std::vector<float>    contiguous_result((size_t) view_width * view_rows);
     std::vector<uint16_t> duplicated_result(dup_data.size());
     std::vector<uint16_t> repeated_result((size_t) ggml_nelements(repeated));
     std::vector<uint16_t> converted_result(repeat_data.size());
@@ -1411,46 +1403,47 @@ static int run_layout_case(ggml_backend_t dayan) {
 
     float cont_max_abs = 0.0f;
     float cast_max_abs = 0.0f;
-    bool exact = duplicated_result == dup_data;
+    bool  exact        = duplicated_result == dup_data;
     for (int64_t row = 0; row < view_rows; ++row) {
         for (int64_t column = 0; column < view_width; ++column) {
             const float expected = base_data[(size_t) row * base_width + column + 1];
-            cont_max_abs = std::max(cont_max_abs,
-                                    std::abs(contiguous_result[(size_t) row * view_width + column] - expected));
+            cont_max_abs =
+                std::max(cont_max_abs, std::abs(contiguous_result[(size_t) row * view_width + column] - expected));
         }
     }
     for (int64_t index3 = 0; index3 < repeated->ne[3]; ++index3) {
         for (int64_t index2 = 0; index2 < repeated->ne[2]; ++index2) {
             for (int64_t index1 = 0; index1 < repeated->ne[1]; ++index1) {
                 for (int64_t index0 = 0; index0 < repeated->ne[0]; ++index0) {
-                    const size_t output_index = (((size_t) index3 * repeated->ne[2] + index2) * repeated->ne[1] +
-                                                 index1) * repeated->ne[0] + index0;
+                    const size_t output_index =
+                        (((size_t) index3 * repeated->ne[2] + index2) * repeated->ne[1] + index1) * repeated->ne[0] +
+                        index0;
                     const size_t source_index = (((size_t) (index3 % repeat_input->ne[3]) * repeat_input->ne[2] +
-                                                 index2 % repeat_input->ne[2]) * repeat_input->ne[1] +
-                                                 index1 % repeat_input->ne[1]) * repeat_input->ne[0] +
+                                                  index2 % repeat_input->ne[2]) *
+                                                     repeat_input->ne[1] +
+                                                 index1 % repeat_input->ne[1]) *
+                                                    repeat_input->ne[0] +
                                                 index0 % repeat_input->ne[0];
-                    exact = exact && repeated_result[output_index] == repeat_data[source_index];
+                    exact                     = exact && repeated_result[output_index] == repeat_data[source_index];
                 }
             }
         }
     }
     for (size_t index = 0; index < repeat_data.size(); ++index) {
-        const float expected = decode_lowp(GGML_TYPE_F16,
-                                           encode_lowp(GGML_TYPE_F16, decode_lowp(GGML_TYPE_BF16,
-                                                                                  repeat_data[index])));
+        const float expected =
+            decode_lowp(GGML_TYPE_F16, encode_lowp(GGML_TYPE_F16, decode_lowp(GGML_TYPE_BF16, repeat_data[index])));
         const float observed = decode_lowp(GGML_TYPE_F16, converted_result[index]);
-        cast_max_abs = std::max(cast_max_abs, std::abs(observed - expected));
+        cast_max_abs         = std::max(cast_max_abs, std::abs(observed - expected));
     }
 
     std::printf("layout cont=%g cast=%g duplicate=%s repeat=%s\n", cont_max_abs, cast_max_abs,
                 duplicated_result == dup_data ? "PASS" : "FAIL", exact ? "PASS" : "FAIL");
-    return cont_max_abs == 0.0f && cast_max_abs == 0.0f && exact ? 0 :
-                                                                      fail("layout numerical comparison failed");
+    return cont_max_abs == 0.0f && cast_max_abs == 0.0f && exact ? 0 : fail("layout numerical comparison failed");
 }
 
 static int run_indexed_layout_case(ggml_backend_t dayan, ggml_backend_t cpu) {
-    constexpr int graph_size = 64;
-    ggml_init_params params = {
+    constexpr int    graph_size = 64;
+    ggml_init_params params     = {
         /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
@@ -1460,27 +1453,27 @@ static int run_indexed_layout_case(ggml_backend_t dayan, ggml_backend_t cpu) {
         return fail("cannot create the indexed layout context");
     }
 
-    ggml_tensor * set_base   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 6, 4);
-    ggml_tensor * set_source = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 3, 2);
-    ggml_tensor * set_output = ggml_set_2d(ctx.get(), set_base, set_source, set_base->nb[1], sizeof(float));
-    ggml_tensor * diagonal_input = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 7);
-    ggml_tensor * diagonal = ggml_diag(ctx.get(), diagonal_input);
-    ggml_tensor * mask_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 9, 4, 2);
-    ggml_tensor * mask_inf = ggml_diag_mask_inf(ctx.get(), mask_input, 2);
-    ggml_tensor * mask_zero = ggml_diag_mask_zero(ctx.get(), mask_input, 1);
-    ggml_tensor * pad_input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 3);
-    ggml_tensor * padded = ggml_pad_ext(ctx.get(), pad_input, 1, 2, 1, 1, 0, 0, 0, 0);
-    ggml_tensor * padded_circular = ggml_pad_ext_circular(ctx.get(), pad_input, 2, 1, 1, 2, 0, 0, 0, 0);
-    ggml_tensor * reflected = ggml_pad_reflect_1d(ctx.get(), pad_input, 2, 1);
-    ggml_tensor * roll_input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 5, 4, 3);
-    ggml_tensor * rolled = ggml_roll(ctx.get(), roll_input, 2, -1, 1, 0);
-    ggml_tensor * concat_left = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 3, 2, 2);
-    ggml_tensor * concat_right = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 3, 1, 2);
-    ggml_tensor * concatenated = ggml_concat(ctx.get(), concat_left, concat_right, 1);
-    std::vector<ggml_tensor *> inputs = { set_base, set_source, diagonal_input, mask_input,
-                                          pad_input, roll_input, concat_left, concat_right };
-    std::vector<ggml_tensor *> outputs = { set_output, diagonal, mask_inf, mask_zero, padded,
-                                           padded_circular, reflected, rolled, concatenated };
+    ggml_tensor * set_base             = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 6, 4);
+    ggml_tensor * set_source           = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 3, 2);
+    ggml_tensor * set_output           = ggml_set_2d(ctx.get(), set_base, set_source, set_base->nb[1], sizeof(float));
+    ggml_tensor * diagonal_input       = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 7);
+    ggml_tensor * diagonal             = ggml_diag(ctx.get(), diagonal_input);
+    ggml_tensor * mask_input           = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 9, 4, 2);
+    ggml_tensor * mask_inf             = ggml_diag_mask_inf(ctx.get(), mask_input, 2);
+    ggml_tensor * mask_zero            = ggml_diag_mask_zero(ctx.get(), mask_input, 1);
+    ggml_tensor * pad_input            = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, 3);
+    ggml_tensor * padded               = ggml_pad_ext(ctx.get(), pad_input, 1, 2, 1, 1, 0, 0, 0, 0);
+    ggml_tensor * padded_circular      = ggml_pad_ext_circular(ctx.get(), pad_input, 2, 1, 1, 2, 0, 0, 0, 0);
+    ggml_tensor * reflected            = ggml_pad_reflect_1d(ctx.get(), pad_input, 2, 1);
+    ggml_tensor * roll_input           = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 5, 4, 3);
+    ggml_tensor * rolled               = ggml_roll(ctx.get(), roll_input, 2, -1, 1, 0);
+    ggml_tensor * concat_left          = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 3, 2, 2);
+    ggml_tensor * concat_right         = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 3, 1, 2);
+    ggml_tensor * concatenated         = ggml_concat(ctx.get(), concat_left, concat_right, 1);
+    std::vector<ggml_tensor *> inputs  = { set_base,  set_source, diagonal_input, mask_input,
+                                           pad_input, roll_input, concat_left,    concat_right };
+    std::vector<ggml_tensor *> outputs = { set_output,      diagonal,  mask_inf, mask_zero,   padded,
+                                           padded_circular, reflected, rolled,   concatenated };
     for (ggml_tensor * input : inputs) {
         ggml_set_input(input);
     }
@@ -1516,7 +1509,7 @@ static int run_indexed_layout_case(ggml_backend_t dayan, ggml_backend_t cpu) {
     references.reserve(outputs.size());
     for (ggml_tensor * output : outputs) {
         references.emplace_back((size_t) ggml_nelements(output));
-        ggml_backend_tensor_get(output, references.back().data(), 0, ggml_nbytes(output));
+        std::memcpy(references.back().data(), output->data, ggml_nbytes(output));
     }
 
     for (size_t tensor_index = 0; tensor_index < inputs.size(); ++tensor_index) {
@@ -1537,8 +1530,8 @@ static int run_indexed_layout_case(ggml_backend_t dayan, ggml_backend_t cpu) {
                 close = close && observed[element] == references[tensor_index][element];
             } else {
                 const float error = std::abs(observed[element] - references[tensor_index][element]);
-                max_abs = std::max(max_abs, error);
-                close = close && error == 0.0f;
+                max_abs           = std::max(max_abs, error);
+                close             = close && error == 0.0f;
             }
         }
     }
@@ -1555,21 +1548,20 @@ static float softmax_slope_reference(int64_t head, int64_t heads, float max_bias
         head_log2 *= 2;
     }
     return head < head_log2 ? std::exp2(-max_bias * (float) (head + 1) / (float) head_log2) :
-                              std::exp2(-0.5f * max_bias * (float) (2 * (head - head_log2) + 1) /
-                                        (float) head_log2);
+                              std::exp2(-0.5f * max_bias * (float) (2 * (head - head_log2) + 1) / (float) head_log2);
 }
 
 static int run_softmax_clamp_case(ggml_backend_t dayan) {
-    constexpr int64_t width       = 130;
-    constexpr int64_t rows        = 3;
-    constexpr int64_t heads       = 3;
-    constexpr int64_t batches     = 2;
-    constexpr int64_t mask_rows   = 4;
-    constexpr float   scale       = 0.75f;
-    constexpr float   max_bias    = 2.0f;
-    constexpr float   clamp_min   = -0.75f;
-    constexpr float   clamp_max   = 0.625f;
-    constexpr int     graph_size  = 24;
+    constexpr int64_t width      = 130;
+    constexpr int64_t rows       = 3;
+    constexpr int64_t heads      = 3;
+    constexpr int64_t batches    = 2;
+    constexpr int64_t mask_rows  = 4;
+    constexpr float   scale      = 0.75f;
+    constexpr float   max_bias   = 2.0f;
+    constexpr float   clamp_min  = -0.75f;
+    constexpr float   clamp_max  = 0.625f;
+    constexpr int     graph_size = 24;
 
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
@@ -1581,17 +1573,17 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
         return fail("cannot create the softmax context");
     }
 
-    ggml_tensor * plain_input = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, width, rows, heads, batches);
+    ggml_tensor * plain_input  = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, width, rows, heads, batches);
     ggml_tensor * masked_input = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, width, rows, heads, batches);
-    ggml_tensor * mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, width, mask_rows, 1, 1);
-    ggml_tensor * sinks = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, heads);
-    ggml_tensor * clamp_input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, 2);
+    ggml_tensor * mask         = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, width, mask_rows, 1, 1);
+    ggml_tensor * sinks        = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, heads);
+    ggml_tensor * clamp_input  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, 2);
     ggml_set_input(plain_input);
     ggml_set_input(masked_input);
     ggml_set_input(mask);
     ggml_set_input(sinks);
     ggml_set_input(clamp_input);
-    ggml_tensor * plain = ggml_soft_max(ctx.get(), plain_input);
+    ggml_tensor * plain  = ggml_soft_max(ctx.get(), plain_input);
     ggml_tensor * masked = ggml_soft_max_ext(ctx.get(), masked_input, mask, scale, max_bias);
     ggml_soft_max_add_sinks(masked, sinks);
     ggml_tensor * clamped = ggml_clamp(ctx.get(), clamp_input, clamp_min, clamp_max);
@@ -1610,18 +1602,18 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
         return fail("cannot allocate Softmax tensors");
     }
 
-    std::vector<float> plain_data((size_t) ggml_nelements(plain_input));
-    std::vector<float> masked_data((size_t) ggml_nelements(masked_input));
+    std::vector<float>    plain_data((size_t) ggml_nelements(plain_input));
+    std::vector<float>    masked_data((size_t) ggml_nelements(masked_input));
     std::vector<uint16_t> mask_data((size_t) ggml_nelements(mask));
-    std::vector<float> sink_data = { -0.2f, 0.1f, -0.4f };
-    std::vector<float> clamp_data((size_t) ggml_nelements(clamp_input));
+    std::vector<float>    sink_data = { -0.2f, 0.1f, -0.4f };
+    std::vector<float>    clamp_data((size_t) ggml_nelements(clamp_input));
     for (size_t index = 0; index < plain_data.size(); ++index) {
-        plain_data[index] = ((int) (index % 37) - 18) / 17.0f;
+        plain_data[index]  = ((int) (index % 37) - 18) / 17.0f;
         masked_data[index] = ((int) (index % 43) - 21) / 19.0f;
     }
     for (int64_t row = 0; row < mask_rows; ++row) {
         for (int64_t column = 0; column < width; ++column) {
-            const float value = column < 91 + row * 7 ? ((int) (column % 5) - 2) / 16.0f : -8.0f;
+            const float value                        = column < 91 + row * 7 ? ((int) (column % 5) - 2) / 16.0f : -8.0f;
             mask_data[(size_t) row * width + column] = encode_lowp(GGML_TYPE_F16, value);
         }
     }
@@ -1651,33 +1643,28 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
         for (int64_t head = 0; head < heads; ++head) {
             const float slope = softmax_slope_reference(head, heads, max_bias);
             for (int64_t row = 0; row < rows; ++row) {
-                const size_t base = (size_t) (((batch * heads + head) * rows + row) * width);
-                float plain_max = -INFINITY;
-                float masked_max = sink_data[(size_t) head];
+                const size_t base       = (size_t) (((batch * heads + head) * rows + row) * width);
+                float        plain_max  = -INFINITY;
+                float        masked_max = sink_data[(size_t) head];
                 for (int64_t column = 0; column < width; ++column) {
-                    plain_max = std::max(plain_max, plain_data[base + column]);
-                    const float mask_value = decode_lowp(GGML_TYPE_F16,
-                                                         mask_data[(size_t) row * width + column]);
+                    plain_max              = std::max(plain_max, plain_data[base + column]);
+                    const float mask_value = decode_lowp(GGML_TYPE_F16, mask_data[(size_t) row * width + column]);
                     masked_max = std::max(masked_max, scale * masked_data[base + column] + slope * mask_value);
                 }
-                float plain_sum = 0.0f;
+                float plain_sum  = 0.0f;
                 float masked_sum = std::exp(sink_data[(size_t) head] - masked_max);
                 for (int64_t column = 0; column < width; ++column) {
                     plain_sum += std::exp(plain_data[base + column] - plain_max);
-                    const float mask_value = decode_lowp(GGML_TYPE_F16,
-                                                         mask_data[(size_t) row * width + column]);
+                    const float mask_value = decode_lowp(GGML_TYPE_F16, mask_data[(size_t) row * width + column]);
                     masked_sum += std::exp(scale * masked_data[base + column] + slope * mask_value - masked_max);
                 }
                 for (int64_t column = 0; column < width; ++column) {
                     const float plain_expected = std::exp(plain_data[base + column] - plain_max) / plain_sum;
-                    const float mask_value = decode_lowp(GGML_TYPE_F16,
-                                                         mask_data[(size_t) row * width + column]);
+                    const float mask_value     = decode_lowp(GGML_TYPE_F16, mask_data[(size_t) row * width + column]);
                     const float masked_expected =
                         std::exp(scale * masked_data[base + column] + slope * mask_value - masked_max) / masked_sum;
-                    plain_max_abs = std::max(plain_max_abs,
-                                             std::abs(plain_result[base + column] - plain_expected));
-                    masked_max_abs = std::max(masked_max_abs,
-                                              std::abs(masked_result[base + column] - masked_expected));
+                    plain_max_abs  = std::max(plain_max_abs, std::abs(plain_result[base + column] - plain_expected));
+                    masked_max_abs = std::max(masked_max_abs, std::abs(masked_result[base + column] - masked_expected));
                 }
             }
         }
@@ -1686,11 +1673,11 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
     float clamp_max_abs = 0.0f;
     for (size_t index = 0; index < clamp_data.size(); ++index) {
         const float expected = std::max(clamp_min, std::min(clamp_max, clamp_data[index]));
-        clamp_max_abs = std::max(clamp_max_abs, std::abs(clamp_result[index] - expected));
+        clamp_max_abs        = std::max(clamp_max_abs, std::abs(clamp_result[index] - expected));
     }
     std::printf("softmax plain=%g masked=%g clamp=%g\n", plain_max_abs, masked_max_abs, clamp_max_abs);
     if (plain_max_abs > 2.0e-5f || masked_max_abs > 2.0e-5f || clamp_max_abs != 0.0f) {
-        float plain_sum = 0.0f;
+        float plain_sum  = 0.0f;
         float masked_sum = 0.0f;
         for (int64_t column = 0; column < width; ++column) {
             plain_sum += plain_result[(size_t) column];
@@ -1698,13 +1685,13 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
         }
         std::printf("softmax observed sums plain=%g masked=%g\n", plain_sum, masked_sum);
         for (int index = 0; index < 6; ++index) {
-            std::printf("softmax[%d] plain=%g masked=%g clamp=%g input=%g\n", index,
-                        plain_result[(size_t) index], masked_result[(size_t) index], clamp_result[(size_t) index],
-                        clamp_data[(size_t) index]);
+            std::printf("softmax[%d] plain=%g masked=%g clamp=%g input=%g\n", index, plain_result[(size_t) index],
+                        masked_result[(size_t) index], clamp_result[(size_t) index], clamp_data[(size_t) index]);
         }
     }
-    return plain_max_abs <= 2.0e-5f && masked_max_abs <= 2.0e-5f && clamp_max_abs == 0.0f ? 0 :
-                                                                                             fail("Softmax comparison failed");
+    return plain_max_abs <= 2.0e-5f && masked_max_abs <= 2.0e-5f && clamp_max_abs == 0.0f ?
+               0 :
+               fail("Softmax comparison failed");
 }
 
 int main() {
@@ -1727,26 +1714,20 @@ int main() {
         run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 130, false) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 130, true) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, false) != 0 ||
-        run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, true) != 0 ||
-        run_fusion_fanout_case(dayan.get()) != 0 ||
-        run_elementwise_case(dayan.get()) != 0 ||
-        run_empty_scale_case(dayan.get()) != 0 ||
-        run_math_case(dayan.get()) != 0 ||
-        run_reduction_norm_case(dayan.get()) != 0 ||
-        run_strided_rms_case(dayan.get()) != 0 ||
-        run_rope_case(dayan.get(), cpu.get()) != 0 ||
-        run_memory_case(dayan.get()) != 0 ||
-        run_empty_memory_case(dayan.get()) != 0 ||
-        run_layout_case(dayan.get()) != 0 ||
-        run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
+        run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, true) != 0 || run_fusion_fanout_case(dayan.get()) != 0 ||
+        run_elementwise_case(dayan.get()) != 0 || run_empty_scale_case(dayan.get()) != 0 ||
+        run_math_case(dayan.get()) != 0 || run_reduction_norm_case(dayan.get()) != 0 ||
+        run_strided_rms_case(dayan.get()) != 0 || run_rope_case(dayan.get(), cpu.get()) != 0 ||
+        run_memory_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
+        run_layout_case(dayan.get()) != 0 || run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
         run_softmax_clamp_case(dayan.get()) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 16, 256) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 16, 16, 256) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_GEGLU, 1, 16, 256) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_F16, GGML_GLU_OP_GEGLU, 16, 16, 256) != 0 ||
-        run_fused_case(dayan.get(), cpu.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 8, 3584, 1024) != 0 ||
-        run_gated_output_case(dayan.get(), cpu.get(), GGML_TYPE_BF16) != 0 ||
-        run_gated_output_case(dayan.get(), cpu.get(), GGML_TYPE_F16) != 0 ||
+        run_fused_case(dayan.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, 16, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), GGML_TYPE_BF16, GGML_GLU_OP_GEGLU, 1, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), GGML_TYPE_F16, GGML_GLU_OP_GEGLU, 16, 16, 256) != 0 ||
+        run_fused_case(dayan.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 8, 3584, 1024) != 0 ||
+        run_gated_output_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
+        run_gated_output_case(dayan.get(), GGML_TYPE_F16) != 0 ||
         run_ssm_conv_case(dayan.get(), 1, 5, 128, 1, false) != 0 ||
         run_ssm_conv_case(dayan.get(), 4, 5, 130, 2, true) != 0 ||
         run_ssm_conv_case(dayan.get(), 4, 69, 384, 1, true) != 0) {

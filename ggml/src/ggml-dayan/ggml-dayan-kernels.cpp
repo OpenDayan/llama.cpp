@@ -228,7 +228,13 @@ __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config
 
     const long status = flash_attention_bf16_f32(
         (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
-        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags);
+        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
+        config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
+        config->k_head_stride, config->k_batch_stride, config->v_row_stride, config->v_head_stride,
+        config->v_batch_stride);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
     *result = status;
 #else
     (void) config;
@@ -241,21 +247,27 @@ __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config
 }
 
 __kernel__ void gated_delta_net_f32_1c(const DayanGatedDeltaNetConfig * config,
-                                       const float *                    input,
+                                       const float *                    q,
+                                       const float *                    k,
+                                       const float *                    v,
+                                       const float *                    g,
+                                       const float *                    beta,
                                        const float *                    state,
-                                       float *                          output,
-                                       int64_t *                        result) {
+                                       float *                          output) {
 #if defined(__DAYAN_DEVICE__)
-    if (result == nullptr) {
-        return;
+    const long status = ggml_dayan_gdn_detail::run_gated_delta_net(config, q, k, v, g, beta, state, output);
+    if (status < 0) {
+        dayan_proc_exit(status);
     }
-    *result = ggml_dayan_gdn_detail::run_gated_delta_net(config, input, state, output);
 #else
     (void) config;
-    (void) input;
+    (void) q;
+    (void) k;
+    (void) v;
+    (void) g;
+    (void) beta;
     (void) state;
     (void) output;
-    (void) result;
 #endif
 }
 
@@ -546,17 +558,14 @@ __kernel__ void l2_norm_f32_1c(const DayanNormConfig * config, const float * inp
     run_l2_norm(config, input, output);
 }
 
-__kernel__ void get_rows_1c(const DayanRowsConfig * config,
-                            const void *             source,
-                            const uint64_t *         indices,
-                            float *                  output) {
+__kernel__ void get_rows_1c(const DayanRowsConfig * config, const void * source, const void * indices, float * output) {
     using namespace ggml_dayan_matmul_detail;
     run_get_rows(config, source, indices, output);
 }
 
 __kernel__ void set_rows_1c(const DayanRowsConfig * config,
                             const float *           source,
-                            const uint64_t *        indices,
+                            const void *            indices,
                             void *                  destination) {
     using namespace ggml_dayan_matmul_detail;
     run_set_rows(config, source, indices, destination);
@@ -645,10 +654,7 @@ __kernel__ void softmax_f32_1c(const DayanSoftmaxConfig * config,
     run_softmax_f32(config, input, mask, sinks, output);
 }
 
-__kernel__ void concat_1c(const DayanConcatConfig * config,
-                          const void *              left,
-                          const void *              right,
-                          void *                    output) {
+__kernel__ void concat_1c(const DayanConcatConfig * config, const void * left, const void * right, void * output) {
     using namespace ggml_dayan_matmul_detail;
     run_concat(config, left, right, output);
 }
@@ -677,114 +683,16 @@ __kernel__ void group_norm_f32_1c(const DayanGroupNormConfig * config, const flo
     run_group_norm(config, input, output);
 }
 
-__kernel__ void rms_norm_scale_f32_1c(const DayanNormConfig * config,
-                                      const float *           input,
-                                      const float *           scale,
-                                      float *                 rms,
-                                      float *                 output) {
+__kernel__ void rms_norm_pipeline_1c(const DayanNormPipelineConfig * config,
+                                     const float *                   left,
+                                     const float *                   right,
+                                     const float *                   scale,
+                                     float *                         residual,
+                                     float *                         rms,
+                                     float *                         scaled,
+                                     uint16_t *                      lowp) {
     using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_scale<Bf16Format, false, false>(config, input, nullptr, scale, nullptr, rms, output, nullptr);
-}
-
-__kernel__ void rms_norm_scale_bf16_1c(const DayanNormConfig * config,
-                                       const float *           input,
-                                       const float *           scale,
-                                       float *                 rms,
-                                       float *                 output,
-                                       uint16_t *              lowp) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_scale<Bf16Format, false, true>(config, input, nullptr, scale, nullptr, rms, output, lowp);
-}
-
-__kernel__ void rms_norm_scale_fp16_1c(const DayanNormConfig * config,
-                                       const float *           input,
-                                       const float *           scale,
-                                       float *                 rms,
-                                       float *                 output,
-                                       uint16_t *              lowp) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_scale<Fp16Format, false, true>(config, input, nullptr, scale, nullptr, rms, output, lowp);
-}
-
-__kernel__ void add_rms_norm_scale_f32_1c(const DayanNormConfig * config,
-                                          const float *           left,
-                                          const float *           right,
-                                          const float *           scale,
-                                          float *                 residual,
-                                          float *                 rms,
-                                          float *                 output) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_scale<Bf16Format, true, false>(config, left, right, scale, residual, rms, output, nullptr);
-}
-
-__kernel__ void add_rms_norm_scale_bf16_1c(const DayanNormConfig * config,
-                                           const float *           left,
-                                           const float *           right,
-                                           const float *           scale,
-                                           float *                 residual,
-                                           float *                 rms,
-                                           float *                 output,
-                                           uint16_t *              lowp) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_scale<Bf16Format, true, true>(config, left, right, scale, residual, rms, output, lowp);
-}
-
-__kernel__ void add_rms_norm_scale_fp16_1c(const DayanNormConfig * config,
-                                           const float *           left,
-                                           const float *           right,
-                                           const float *           scale,
-                                           float *                 residual,
-                                           float *                 rms,
-                                           float *                 output,
-                                           uint16_t *              lowp) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_scale<Fp16Format, true, true>(config, left, right, scale, residual, rms, output, lowp);
-}
-
-__kernel__ void rms_norm_matmul_bf16_1c(const DayanNormMatmulConfig * config,
-                                        const float *                 input,
-                                        const float *                 scale,
-                                        float *                       rms,
-                                        float *                       scaled,
-                                        uint16_t *                    lowp,
-                                        const uint16_t *              weight,
-                                        float *                       output) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_matmul<Bf16Format>(config, input, scale, rms, scaled, lowp, weight, output);
-}
-
-__kernel__ void rms_norm_matmul_fp16_1c(const DayanNormMatmulConfig * config,
-                                        const float *                 input,
-                                        const float *                 scale,
-                                        float *                       rms,
-                                        float *                       scaled,
-                                        uint16_t *                    lowp,
-                                        const uint16_t *              weight,
-                                        float *                       output) {
-    using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_matmul<Fp16Format>(config, input, scale, rms, scaled, lowp, weight, output);
-}
-
-__kernel__ void add_rms_norm_matmul_bf16_1c(const DayanNormMatmulConfig * config,
-                                            const float *                 left,
-                                            const float *                 right,
-                                            const float *                 scale,
-                                            void *                        intermediates,
-                                            const uint16_t *              weight,
-                                            float *                       output) {
-    using namespace ggml_dayan_matmul_detail;
-    run_add_rms_norm_matmul<Bf16Format>(config, left, right, scale, intermediates, weight, output);
-}
-
-__kernel__ void add_rms_norm_matmul_fp16_1c(const DayanNormMatmulConfig * config,
-                                            const float *                 left,
-                                            const float *                 right,
-                                            const float *                 scale,
-                                            void *                        intermediates,
-                                            const uint16_t *              weight,
-                                            float *                       output) {
-    using namespace ggml_dayan_matmul_detail;
-    run_add_rms_norm_matmul<Fp16Format>(config, left, right, scale, intermediates, weight, output);
+    run_rms_norm_pipeline(config, left, right, scale, residual, rms, scaled, lowp);
 }
 
 DAYAN_KERNEL_DESC(matmul_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
@@ -802,7 +710,7 @@ DAYAN_KERNEL_DESC(mul_mat_id_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_D
 DAYAN_KERNEL_DESC(mul_mat_id_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(mul_mat_id_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(flash_attention_bf16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(gated_delta_net_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 2, 0, 0, DAYAN_GATED_DELTA_NET_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_qg_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_qg_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_k_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
@@ -816,60 +724,55 @@ DAYAN_KERNEL_DESC(project_v_cache_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAY
 DAYAN_KERNEL_DESC(project_gated_output_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_gated_output_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(ssm_conv_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(residual_add_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(elementwise_add_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(elementwise_mul_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(elementwise_sub_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(elementwise_div_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(scale_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(sigmoid_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(silu_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(softplus_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(square_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(sqrt_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(log_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(sin_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(cos_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(abs_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(neg_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(tanh_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(relu_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(gelu_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(gelu_quick_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(exp_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(sum_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(sum_rows_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mean_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(l2_norm_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(get_rows_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(set_rows_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(copy_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(repeat_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(set_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(diag_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(diag_mask_inf_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(diag_mask_zero_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(pad_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(pad_circular_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(pad_reflect_1d_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(roll_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(add_id_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(argsort_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(top_k_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(clamp_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(softmax_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(concat_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rope_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rms_norm_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(norm_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(group_norm_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rms_norm_scale_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rms_norm_scale_bf16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rms_norm_scale_fp16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(add_rms_norm_scale_f32_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(add_rms_norm_scale_bf16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(add_rms_norm_scale_fp16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rms_norm_matmul_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(rms_norm_matmul_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(add_rms_norm_matmul_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(add_rms_norm_matmul_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+#define DAYAN_NATIVE_KERNEL_DESC(kernel) DAYAN_KERNEL_TASK_DESC(kernel, 2, 0, 0, DAYAN_NATIVE_TASK_URAM_BYTES)
+
+DAYAN_NATIVE_KERNEL_DESC(residual_add_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(elementwise_add_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(elementwise_mul_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(elementwise_sub_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(elementwise_div_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(scale_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(sigmoid_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(silu_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(softplus_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(square_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(sqrt_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(log_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(sin_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(cos_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(abs_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(neg_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(tanh_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(relu_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(gelu_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(gelu_quick_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(exp_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(sum_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(sum_rows_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(mean_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(l2_norm_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(get_rows_1c);
+DAYAN_NATIVE_KERNEL_DESC(set_rows_1c);
+DAYAN_NATIVE_KERNEL_DESC(copy_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(repeat_1c);
+DAYAN_NATIVE_KERNEL_DESC(set_1c);
+DAYAN_NATIVE_KERNEL_DESC(diag_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(diag_mask_inf_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(diag_mask_zero_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(pad_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(pad_circular_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(pad_reflect_1d_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(roll_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(add_id_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(argsort_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(top_k_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(clamp_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(softmax_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(concat_1c);
+DAYAN_NATIVE_KERNEL_DESC(rope_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(rms_norm_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(norm_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(group_norm_f32_1c);
+DAYAN_NATIVE_KERNEL_DESC(rms_norm_pipeline_1c);
+
+#undef DAYAN_NATIVE_KERNEL_DESC

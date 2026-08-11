@@ -25,7 +25,7 @@ constexpr long kUramDelta   = 0x18c00;
 constexpr long kUramLog2E   = 0x18e00;
 constexpr long kUramEnd     = 0x19000;
 
-static_assert(kUramEnd <= 256 * 1024, "Gated Delta Net URAM layout is too large");
+static_assert(kUramEnd <= DAYAN_GATED_DELTA_NET_URAM_BYTES, "Gated Delta Net URAM layout is too large");
 
 enum VecTcsr {
     kVecControl = 0,
@@ -200,31 +200,55 @@ static inline float bits_to_float(uint32_t bits) {
     return value.f;
 }
 
+static inline const float * gdn_row(const float *  base,
+                                    const uint64_t nb[4],
+                                    uint32_t       head,
+                                    uint32_t       token,
+                                    uint32_t       sequence) {
+    return reinterpret_cast<const float *>(reinterpret_cast<const char *>(base) + (uint64_t) head * nb[1] +
+                                           (uint64_t) token * nb[2] + (uint64_t) sequence * nb[3]);
+}
+
+static inline size_t gdn_span(const uint64_t nb[4],
+                              uint32_t       width,
+                              uint32_t       heads,
+                              uint32_t       tokens,
+                              uint32_t       sequences) {
+    return (size_t) ((uint64_t) (width - 1U) * nb[0] + (uint64_t) (heads - 1U) * nb[1] +
+                     (uint64_t) (tokens - 1U) * nb[2] + (uint64_t) (sequences - 1U) * nb[3] + sizeof(float));
+}
+
 static inline long run_gated_delta_net(const DayanGatedDeltaNetConfig * config,
-                                       const float *                    input,
+                                       const float *                    q,
+                                       const float *                    k,
+                                       const float *                    v,
+                                       const float *                    g,
+                                       const float *                    beta,
                                        const float *                    state,
                                        float *                          output) {
-    if (config == nullptr || input == nullptr || state == nullptr || output == nullptr ||
-        config->head_dim != kHeadDim || config->heads == 0 || config->tokens == 0 || config->sequences == 0 ||
-        config->snapshots == 0 || (config->gate_width != 1 && config->gate_width != kHeadDim) ||
-        config->beta_offset >= config->input_bytes || dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) != 1U ||
+    if (config == nullptr || q == nullptr || k == nullptr || v == nullptr || g == nullptr || beta == nullptr ||
+        state == nullptr || output == nullptr || config->head_dim != kHeadDim || config->heads == 0 ||
+        config->tokens == 0 || config->sequences == 0 || config->snapshots == 0 ||
+        (config->gate_width != 1 && config->gate_width != kHeadDim) || config->q_heads == 0 || config->k_heads == 0 ||
+        config->heads % config->q_heads != 0 || config->heads % config->k_heads != 0 || config->q_sequences == 0 ||
+        config->k_sequences == 0 || config->sequences % config->q_sequences != 0 ||
+        config->sequences % config->k_sequences != 0 || dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) == 0U ||
+        dayan_task_dim(DAYAN_TASK_X) > 2U || dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
         dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U || dayan_uram_base() == nullptr ||
         dayan_uram_size() < kUramEnd) {
         return -22;
     }
 
-    const float * q_base = reinterpret_cast<const float *>(reinterpret_cast<const char *>(input) + config->q_offset);
-    const float * k_base = reinterpret_cast<const float *>(reinterpret_cast<const char *>(input) + config->k_offset);
-    const float * v_base = reinterpret_cast<const float *>(reinterpret_cast<const char *>(input) + config->v_offset);
-    const float * g_base = reinterpret_cast<const float *>(reinterpret_cast<const char *>(input) + config->g_offset);
-    const float * beta_base =
-        reinterpret_cast<const float *>(reinterpret_cast<const char *>(input) + config->beta_offset);
     const uint64_t vector_count     = (uint64_t) config->sequences * config->tokens * config->heads;
     const uint64_t state_count      = (uint64_t) config->sequences * config->heads * kHeadDim * kHeadDim;
     const uint64_t attn_count       = vector_count * kHeadDim;
     const uint64_t state_slot_count = state_count;
 
-    cache_inval_range(input, (size_t) config->input_bytes);
+    cache_inval_range(q, gdn_span(config->q_nb, kHeadDim, config->q_heads, config->tokens, config->q_sequences));
+    cache_inval_range(k, gdn_span(config->k_nb, kHeadDim, config->k_heads, config->tokens, config->k_sequences));
+    cache_inval_range(v, gdn_span(config->v_nb, kHeadDim, config->heads, config->tokens, config->sequences));
+    cache_inval_range(g, gdn_span(config->g_nb, config->gate_width, config->heads, config->tokens, config->sequences));
+    cache_inval_range(beta, gdn_span(config->beta_nb, 1, config->heads, config->tokens, config->sequences));
     cache_inval_range(state, (size_t) state_count * sizeof(float));
     *uram_pointer<float>(kUramLog2E) = 1.4426950408889634f;
 
@@ -236,72 +260,81 @@ static inline long run_gated_delta_net(const DayanGatedDeltaNetConfig * config,
     const float scale        = bits_to_float(config->scale_bits);
 
     configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
-    for (uint32_t sequence = 0; sequence < config->sequences; ++sequence) {
-        for (uint32_t head = 0; head < config->heads; ++head) {
-            const uint64_t state_index = ((uint64_t) sequence * config->heads + head) * kHeadDim * kHeadDim;
-            __tx_lsu_dma_d2u<0>(uram_address(kUramState), reinterpret_cast<uint64_t>(state + state_index));
+    const uint32_t task       = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t tasks      = dayan_task_dim(DAYAN_TASK_X);
+    const uint64_t work_items = (uint64_t) config->sequences * config->heads;
+    for (uint64_t work = task; work < work_items; work += tasks) {
+        const uint32_t sequence    = (uint32_t) (work / config->heads);
+        const uint32_t head        = (uint32_t) (work % config->heads);
+        const uint64_t state_index = ((uint64_t) sequence * config->heads + head) * kHeadDim * kHeadDim;
+        __tx_lsu_dma_d2u<0>(uram_address(kUramState), reinterpret_cast<uint64_t>(state + state_index));
+        dayan_wait_lsu();
+
+        for (uint32_t token = 0; token < config->tokens; ++token) {
+            const uint64_t vector_index = ((uint64_t) sequence * config->tokens + token) * config->heads + head;
+            const uint64_t value_index  = vector_index * kHeadDim;
+            const uint32_t q_sequence   = sequence / (config->sequences / config->q_sequences);
+            const uint32_t k_sequence   = sequence / (config->sequences / config->k_sequences);
+            const float *  q_row        = gdn_row(q, config->q_nb, head % config->q_heads, token, q_sequence);
+            const float *  k_row        = gdn_row(k, config->k_nb, head % config->k_heads, token, k_sequence);
+            const float *  v_row        = gdn_row(v, config->v_nb, head, token, sequence);
+            const float *  g_row        = gdn_row(g, config->g_nb, head, token, sequence);
+            const float *  beta_row     = gdn_row(beta, config->beta_nb, head, token, sequence);
+            configure_lsu_rows<0>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
+            __tx_lsu_dma_d2u<0>(uram_address(kUramQ), reinterpret_cast<uint64_t>(q_row));
+            __tx_lsu_dma_d2u<0>(uram_address(kUramK), reinterpret_cast<uint64_t>(k_row));
+            __tx_lsu_dma_d2u<0>(uram_address(kUramV), reinterpret_cast<uint64_t>(v_row));
+            if (config->gate_width == kHeadDim) {
+                __tx_lsu_dma_d2u<0>(uram_address(kUramG), reinterpret_cast<uint64_t>(g_row));
+            } else {
+                g_uram[0] = g_row[0];
+            }
             dayan_wait_lsu();
 
-            for (uint32_t token = 0; token < config->tokens; ++token) {
-                const uint64_t vector_index = ((uint64_t) sequence * config->tokens + token) * config->heads + head;
-                const uint64_t value_index  = vector_index * kHeadDim;
-                configure_lsu_rows<0>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
-                __tx_lsu_dma_d2u<0>(uram_address(kUramQ), reinterpret_cast<uint64_t>(q_base + value_index));
-                __tx_lsu_dma_d2u<0>(uram_address(kUramK), reinterpret_cast<uint64_t>(k_base + value_index));
-                __tx_lsu_dma_d2u<0>(uram_address(kUramV), reinterpret_cast<uint64_t>(v_base + value_index));
+            if (config->gate_width == 1) {
+                issue_gate(uram_address(kUramG), true);
+                dayan_wait_vec();
+            }
+            for (long half = 0; half < 2; ++half) {
                 if (config->gate_width == kHeadDim) {
-                    __tx_lsu_dma_d2u<0>(uram_address(kUramG), reinterpret_cast<uint64_t>(g_base + value_index));
-                } else {
-                    g_uram[0] = g_base[vector_index];
+                    issue_gate(uram_address(kUramG + half * kVecBytes), false);
+                    dayan_wait_vec();
                 }
+                issue_scale_dot(half);
+                dayan_wait_vec();
+                for (uint32_t row = 0; row < kHeadDim; ++row) {
+                    const float partial = partial_uram[(uint64_t) row * kLanes];
+                    dot_uram[row]       = half == 0 ? partial : dot_uram[row] + partial;
+                }
+            }
+
+            const float beta_value = beta_row[0];
+            for (uint32_t row = 0; row < kHeadDim; ++row) {
+                delta_uram[row] = (v_uram[row] - dot_uram[row]) * beta_value;
+            }
+
+            for (long half = 0; half < 2; ++half) {
+                issue_update_dot(half);
+                dayan_wait_vec();
+                for (uint32_t row = 0; row < kHeadDim; ++row) {
+                    const float partial = partial_uram[(uint64_t) row * kLanes];
+                    dot_uram[row]       = half == 0 ? partial : dot_uram[row] + partial;
+                }
+            }
+
+            float * attn_output = output + value_index;
+            for (uint32_t row = 0; row < kHeadDim; ++row) {
+                attn_output[row] = dot_uram[row] * scale;
+            }
+
+            const int64_t target_slot = (int64_t) config->tokens - 1 - token;
+            if (target_slot >= 0 && target_slot < config->snapshots) {
+                const uint64_t output_state_index =
+                    attn_count + (uint64_t) target_slot * state_slot_count + state_index;
+                configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
+                                      kHeadDim * sizeof(float));
+                __tx_lsu_dma_u2d<0>(reinterpret_cast<uint64_t>(output + output_state_index), uram_address(kUramState));
                 dayan_wait_lsu();
-
-                if (config->gate_width == 1) {
-                    issue_gate(uram_address(kUramG), true);
-                    dayan_wait_vec();
-                }
-                for (long half = 0; half < 2; ++half) {
-                    if (config->gate_width == kHeadDim) {
-                        issue_gate(uram_address(kUramG + half * kVecBytes), false);
-                        dayan_wait_vec();
-                    }
-                    issue_scale_dot(half);
-                    dayan_wait_vec();
-                    for (uint32_t row = 0; row < kHeadDim; ++row) {
-                        const float partial = partial_uram[(uint64_t) row * kLanes];
-                        dot_uram[row]       = half == 0 ? partial : dot_uram[row] + partial;
-                    }
-                }
-
-                const float beta = beta_base[vector_index];
-                for (uint32_t row = 0; row < kHeadDim; ++row) {
-                    delta_uram[row] = (v_uram[row] - dot_uram[row]) * beta;
-                }
-
-                for (long half = 0; half < 2; ++half) {
-                    issue_update_dot(half);
-                    dayan_wait_vec();
-                    for (uint32_t row = 0; row < kHeadDim; ++row) {
-                        const float partial = partial_uram[(uint64_t) row * kLanes];
-                        dot_uram[row]       = half == 0 ? partial : dot_uram[row] + partial;
-                    }
-                }
-
-                float * attn_output = output + value_index;
-                for (uint32_t row = 0; row < kHeadDim; ++row) {
-                    attn_output[row] = dot_uram[row] * scale;
-                }
-
-                const int64_t target_slot = (int64_t) config->tokens - 1 - token;
-                if (target_slot >= 0 && target_slot < config->snapshots) {
-                    const uint64_t output_state_index =
-                        attn_count + (uint64_t) target_slot * state_slot_count + state_index;
-                    configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
-                                          kHeadDim * sizeof(float));
-                    __tx_lsu_dma_u2d<0>(reinterpret_cast<uint64_t>(output + output_state_index),
-                                        uram_address(kUramState));
-                    dayan_wait_lsu();
-                }
             }
         }
     }

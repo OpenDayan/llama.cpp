@@ -52,12 +52,7 @@ enum class ggml_backend_dayan_slot_kind {
     rms_norm,
     norm,
     group_norm,
-    rms_norm_scaled,
-    rms_norm_quantized,
-    add_rms_norm_scaled,
-    add_rms_norm_quantized,
-    rms_norm_mul_mat,
-    add_rms_norm_mul_mat,
+    norm_pipeline,
     flash_attention,
     gated_delta_net,
     gated_output_projection,
@@ -77,7 +72,6 @@ struct ggml_backend_dayan_graph_plan {
     size_t                                     fused_mul_mat_slots   = 0;
     size_t                                     residual_add_slots    = 0;
     size_t                                     rms_norm_slots        = 0;
-    size_t                                     rms_norm_matmul_slots = 0;
     size_t                                     flash_attention_slots = 0;
     size_t                                     gated_delta_net_slots = 0;
     size_t                                     gated_output_slots    = 0;
@@ -123,9 +117,7 @@ bool ggml_backend_dayan_supports_group_norm(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_rms_norm_scale(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_quantized_rms_norm(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_flash_attention(const ggml_tensor * op);
-bool ggml_backend_dayan_flash_attention_lengths(const ggml_tensor * op,
-                                                uint32_t *          causal_offset,
-                                                uint32_t *          kv_len);
+bool ggml_backend_dayan_flash_attention_lengths(const ggml_tensor * op, uint32_t * causal_offset, uint32_t * kv_len);
 bool ggml_backend_dayan_supports_gated_delta_net(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_gate_cont(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_gate_sigmoid(const ggml_tensor * op);

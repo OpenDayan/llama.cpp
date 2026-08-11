@@ -340,10 +340,10 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
         std::snprintf(name, sizeof(name), "blk.%d.post_attn_norm.weight", layer);
         ggml_tensor * post_norm_weight = new_input_1d(ctx, GGML_TYPE_F32, kEmbedding, name);
 
-        ggml_tensor * residual          = current;
-        layer_graph.attention_norm      = build_rms_norm(ctx, current, attn_norm_weight, 1.0e-6f);
-        layer_graph.attention_rms       = layer_graph.attention_norm->src[0];
-        ggml_tensor * normalized        = layer_graph.attention_norm;
+        ggml_tensor * residual     = current;
+        layer_graph.attention_norm = build_rms_norm(ctx, current, attn_norm_weight, 1.0e-6f);
+        layer_graph.attention_rms  = layer_graph.attention_norm->src[0];
+        ggml_tensor * normalized   = layer_graph.attention_norm;
         ggml_format_name(layer_graph.attention_rms, "blk.%d.attn_rms", layer);
         ggml_format_name(layer_graph.attention_norm, "blk.%d.attn_norm", layer);
         ggml_set_output(layer_graph.attention_rms);
@@ -354,8 +354,8 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
                 build_full_attention(ctx, config, normalized, result.positions, result.mask, layer, cpu_reference,
                                      &layer_graph);
         layer_graph.attention_residual = ggml_add(ctx, attention, residual);
-        layer_graph.ffn_norm = build_rms_norm(ctx, layer_graph.attention_residual, post_norm_weight, 1.0e-6f);
-        layer_graph.ffn_rms  = layer_graph.ffn_norm->src[0];
+        layer_graph.ffn_norm           = build_rms_norm(ctx, layer_graph.attention_residual, post_norm_weight, 1.0e-6f);
+        layer_graph.ffn_rms            = layer_graph.ffn_norm->src[0];
         ggml_format_name(layer_graph.attention_residual, "blk.%d.attn_residual", layer);
         ggml_format_name(layer_graph.ffn_rms, "blk.%d.ffn_rms", layer);
         ggml_format_name(layer_graph.ffn_norm, "blk.%d.ffn_norm", layer);
@@ -467,10 +467,9 @@ static bool validate_assignment(ggml_backend_sched_t scheduler,
     for (size_t layer = 0; layer < graph.layers.size(); ++layer) {
         const layer_graph & current       = graph.layers[layer];
         ggml_tensor *       dayan_nodes[] = {
-            current.attention_rms,      current.attention_norm, current.attention_output,
-            current.attention_residual, current.ffn_rms,       current.ffn_norm,
-            current.ffn_gate,           current.ffn_up,        current.ffn_fused,
-            current.ffn_down,           current.output,
+            current.attention_rms, current.attention_norm, current.attention_output, current.attention_residual,
+            current.ffn_rms,       current.ffn_norm,       current.ffn_gate,         current.ffn_up,
+            current.ffn_fused,     current.ffn_down,       current.output,
         };
         for (ggml_tensor * node : dayan_nodes) {
             if (ggml_backend_sched_get_tensor_backend(scheduler, node) != dayan) {
@@ -572,7 +571,6 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         !rewrite_graph(dayan, actual.ctx.get(), actual.graph)) {
         return fail("model graph rewrite failed");
     }
-
     const tensor_blobs      blobs = make_tensor_blobs(actual, config);
     ggml_backend_buffer_ptr reference_buffer(ggml_backend_alloc_ctx_tensors(reference.ctx.get(), cpu));
     if (!reference_buffer || !upload_tensor_blobs(reference, blobs)) {

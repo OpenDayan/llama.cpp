@@ -127,7 +127,11 @@ static inline void configure_lsu_rows(long rows, long row_bytes, long input_stri
 // 32-column slice of [D, 64] in URAM.  BlockPadding makes a short panel exactly 32 rows and
 // fills the missing K positions with zero before the 32x32 transpose.
 template <long GROUP>
-static inline void load_v_panel_transposed(uint64_t v_dram, uint64_t vt_uram, long rows, long head_dim) {
+static inline void load_v_panel_transposed(uint64_t v_dram,
+                                           uint64_t vt_uram,
+                                           long     rows,
+                                           long     head_dim,
+                                           uint64_t row_stride) {
     constexpr long side      = 32;
     constexpr long vt_stride = kBc * sizeof(uint16_t);
 
@@ -135,7 +139,7 @@ static inline void load_v_panel_transposed(uint64_t v_dram, uint64_t vt_uram, lo
     __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_DIM0>(head_dim / side - 1);
     __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_DIM1>(0);
     __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_DIM2>(0);
-    __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(head_dim * sizeof(uint16_t));
+    __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(row_stride);
     __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_INDIM0STRIDE>(64);
     __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_INDIM1STRIDE>(0);
     __tx_lsu_tcsr_write<GROUP * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
@@ -155,7 +159,7 @@ static inline void load_v_panel_transposed(uint64_t v_dram, uint64_t vt_uram, lo
     __tx_lsu_dma_d2u<GROUP>(vt_uram, v_dram);
 }
 
-static inline void load_v_transposed(uint64_t v_dram, long vt_base, long rows, long head_dim) {
+static inline void load_v_transposed(uint64_t v_dram, long vt_base, long rows, long head_dim, uint64_t row_stride) {
     // A single short panel populates K positions [0, 31].  The second half is not touched by
     // that DMA and must not retain values from the preceding key tile.  Clear the strided 64-byte
     // half-rows with one U2U DMA instead of head_dim*32 scalar BF16 stores.
@@ -165,10 +169,10 @@ static inline void load_v_transposed(uint64_t v_dram, long vt_base, long rows, l
     }
 
     const long first_rows = min_long(rows, 32);
-    load_v_panel_transposed<kLsuVTranspose>(v_dram, uram_addr(vt_base), first_rows, head_dim);
+    load_v_panel_transposed<kLsuVTranspose>(v_dram, uram_addr(vt_base), first_rows, head_dim, row_stride);
     if (rows > 32) {
-        load_v_panel_transposed<kLsuVTranspose>(v_dram + 32 * head_dim * sizeof(uint16_t),
-                                                uram_addr(vt_base) + 32 * sizeof(uint16_t), rows - 32, head_dim);
+        load_v_panel_transposed<kLsuVTranspose>(v_dram + 32 * row_stride, uram_addr(vt_base) + 32 * sizeof(uint16_t),
+                                                rows - 32, head_dim, row_stride);
     }
 }
 
@@ -519,6 +523,32 @@ static inline bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t * result) {
     return true;
 }
 
+static inline bool checked_add_u64(uint64_t a, uint64_t b, uint64_t * result) {
+    if (b > (~uint64_t{ 0 }) - a) {
+        return false;
+    }
+    *result = a + b;
+    return true;
+}
+
+static inline bool checked_strided_tensor_span(uint32_t   batches,
+                                               uint32_t   heads,
+                                               uint32_t   rows,
+                                               uint64_t   row_bytes,
+                                               uint64_t   batch_stride,
+                                               uint64_t   head_stride,
+                                               uint64_t   row_stride,
+                                               uint64_t * result) {
+    uint64_t batch_offset;
+    uint64_t head_offset;
+    uint64_t row_offset;
+    uint64_t span;
+    return checked_mul_u64(batches - 1U, batch_stride, &batch_offset) &&
+           checked_mul_u64(heads - 1U, head_stride, &head_offset) &&
+           checked_mul_u64(rows - 1U, row_stride, &row_offset) && checked_add_u64(batch_offset, head_offset, &span) &&
+           checked_add_u64(span, row_offset, &span) && checked_add_u64(span, row_bytes, result);
+}
+
 static inline bool checked_tensor_bytes(uint32_t   d0,
                                         uint32_t   d1,
                                         uint32_t   d2,
@@ -587,9 +617,16 @@ class FlashAttentionState {
     const uint64_t     k_base;
     const uint64_t     v_base;
     const uint64_t     out_base;
-    const uint64_t     q_head_bytes;
-    const uint64_t     kv_head_bytes;
-    const uint64_t     out_head_bytes;
+    const uint64_t     q_row_stride;
+    const uint64_t     q_head_stride;
+    const uint64_t     q_batch_stride;
+    const uint64_t     k_row_stride;
+    const uint64_t     k_head_stride;
+    const uint64_t     k_batch_stride;
+    const uint64_t     v_row_stride;
+    const uint64_t     v_head_stride;
+    const uint64_t     v_batch_stride;
+    const uint64_t     out_batch_bytes;
     const uint32_t     batch;
     const uint32_t     q_heads;
     const uint32_t     kv_heads;
@@ -616,14 +653,30 @@ class FlashAttentionState {
                         uint32_t           head_dim_arg,
                         uint32_t           causal_offset_arg,
                         bool               causal_arg,
+                        uint64_t           q_row_stride_arg,
+                        uint64_t           q_head_stride_arg,
+                        uint64_t           q_batch_stride_arg,
+                        uint64_t           k_row_stride_arg,
+                        uint64_t           k_head_stride_arg,
+                        uint64_t           k_batch_stride_arg,
+                        uint64_t           v_row_stride_arg,
+                        uint64_t           v_head_stride_arg,
+                        uint64_t           v_batch_stride_arg,
                         NPUSequencedURAM * kv_buffers_arg) :
         q_base(q_base_arg),
         k_base(k_base_arg),
         v_base(v_base_arg),
         out_base(out_base_arg),
-        q_head_bytes(static_cast<uint64_t>(q_len_arg) * head_dim_arg * sizeof(uint16_t)),
-        kv_head_bytes(static_cast<uint64_t>(kv_len_arg) * head_dim_arg * sizeof(uint16_t)),
-        out_head_bytes(static_cast<uint64_t>(q_len_arg) * head_dim_arg * sizeof(float)),
+        q_row_stride(q_row_stride_arg),
+        q_head_stride(q_head_stride_arg),
+        q_batch_stride(q_batch_stride_arg),
+        k_row_stride(k_row_stride_arg),
+        k_head_stride(k_head_stride_arg),
+        k_batch_stride(k_batch_stride_arg),
+        v_row_stride(v_row_stride_arg),
+        v_head_stride(v_head_stride_arg),
+        v_batch_stride(v_batch_stride_arg),
+        out_batch_bytes(static_cast<uint64_t>(q_heads_arg) * q_len_arg * head_dim_arg * sizeof(float)),
         batch(batch_arg),
         q_heads(q_heads_arg),
         kv_heads(kv_heads_arg),
@@ -640,16 +693,24 @@ class FlashAttentionState {
 
     inline uint32_t kv_head_for(uint32_t q_head) const { return q_head / q_per_kv; }
 
-    inline uint64_t q_head_address(uint32_t b, uint32_t q_head) const {
-        return q_base + (static_cast<uint64_t>(b) * q_heads + q_head) * q_head_bytes;
+    inline uint64_t q_row_address(uint32_t b, uint32_t q_head, uint32_t row) const {
+        return q_base + static_cast<uint64_t>(b) * q_batch_stride + static_cast<uint64_t>(q_head) * q_head_stride +
+               static_cast<uint64_t>(row) * q_row_stride;
     }
 
-    inline uint64_t kv_head_address(uint64_t base, uint32_t b, uint32_t q_head) const {
-        return base + (static_cast<uint64_t>(b) * kv_heads + kv_head_for(q_head)) * kv_head_bytes;
+    inline uint64_t k_row_address(uint32_t b, uint32_t q_head, uint32_t row) const {
+        return k_base + static_cast<uint64_t>(b) * k_batch_stride +
+               static_cast<uint64_t>(kv_head_for(q_head)) * k_head_stride + static_cast<uint64_t>(row) * k_row_stride;
     }
 
-    inline uint64_t out_head_address(uint32_t b, uint32_t q_head) const {
-        return out_base + (static_cast<uint64_t>(b) * q_heads + q_head) * out_head_bytes;
+    inline uint64_t v_row_address(uint32_t b, uint32_t q_head, uint32_t row) const {
+        return v_base + static_cast<uint64_t>(b) * v_batch_stride +
+               static_cast<uint64_t>(kv_head_for(q_head)) * v_head_stride + static_cast<uint64_t>(row) * v_row_stride;
+    }
+
+    inline uint64_t out_row_address(uint32_t b, uint32_t q_head, uint32_t row) const {
+        return out_base + static_cast<uint64_t>(b) * out_batch_bytes +
+               (static_cast<uint64_t>(row) * q_heads + q_head) * head_dim * sizeof(float);
     }
 
     inline long q_tile_for(long q_group, long fixed_slice) const { return q_group * kConsumerCount + fixed_slice; }
@@ -726,15 +787,13 @@ class FlashAttentionKvProducerTask : public NPUTask {
 
                         k_row  = ki * kBc;
                         cols   = min_long(kBc, static_cast<long>(s->kv_len) - k_row);
-                        k_tile = s->kv_head_address(s->k_base, b, qh) +
-                                 static_cast<uint64_t>(k_row) * s->head_dim * sizeof(uint16_t);
-                        v_tile = s->kv_head_address(s->v_base, b, qh) +
-                                 static_cast<uint64_t>(k_row) * s->head_dim * sizeof(uint16_t);
+                        k_tile = s->k_row_address(b, qh, k_row);
+                        v_tile = s->v_row_address(b, qh, k_row);
 
-                        configure_lsu_rows<kLsuK>(cols, s->head_dim * sizeof(uint16_t), s->head_dim * sizeof(uint16_t),
+                        configure_lsu_rows<kLsuK>(cols, s->head_dim * sizeof(uint16_t), s->k_row_stride,
                                                   s->head_dim * sizeof(uint16_t));
                         __tx_lsu_dma_d2u<kLsuK>(uram_addr(kv->uram), k_tile);
-                        load_v_transposed(v_tile, kv->uram + kKvVtOffset, cols, s->head_dim);
+                        load_v_transposed(v_tile, kv->uram + kKvVtOffset, cols, s->head_dim, s->v_row_stride);
                         NPUDMABar(0);
 
                         kv->produce(sched, generation);
@@ -805,11 +864,9 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
                         // Q needs no initialization: load it directly.  Initialize the independent
                         // online state on the output LSU group so both DMA streams can run in
                         // parallel; the existing barrier waits for both groups.
-                        configure_lsu_rows<kLsuQGroup>(rows, s->head_dim * sizeof(uint16_t),
-                                                       s->head_dim * sizeof(uint16_t), s->head_dim * sizeof(uint16_t));
-                        __tx_lsu_dma_d2u<kLsuQGroup>(
-                            uram_addr(kCtxBase + kCtxQ),
-                            s->q_head_address(b, qh) + static_cast<uint64_t>(q_row) * s->head_dim * sizeof(uint16_t));
+                        configure_lsu_rows<kLsuQGroup>(rows, s->head_dim * sizeof(uint16_t), s->q_row_stride,
+                                                       s->head_dim * sizeof(uint16_t));
+                        __tx_lsu_dma_d2u<kLsuQGroup>(uram_addr(kCtxBase + kCtxQ), s->q_row_address(b, qh, q_row));
                         issue_initialize_online_state<kLsuOutGroup>(kCtxBase, rows, s->head_dim);
                         NPUDMABar(0);
 
@@ -846,10 +903,8 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
                         NPUVecBar(0);
 
                         configure_lsu_rows<kLsuOutGroup>(rows, s->head_dim * sizeof(float), s->head_dim * sizeof(float),
-                                                         s->head_dim * sizeof(float));
-                        __tx_lsu_dma_u2d<kLsuOutGroup>(
-                            s->out_head_address(b, qh) + static_cast<uint64_t>(q_row) * s->head_dim * sizeof(float),
-                            uram_addr(kCtxBase + kCtxO));
+                                                         s->q_heads * s->head_dim * sizeof(float));
+                        __tx_lsu_dma_u2d<kLsuOutGroup>(s->out_row_address(b, qh, q_row), uram_addr(kCtxBase + kCtxO));
                         NPUDMABar(0);
                     }
                     // All fixed consumers advance over the producer's full generation range,
@@ -868,9 +923,7 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
 
 }  // namespace
 
-// Layouts are contiguous:
-//   q   : BF16 [batch, q_heads,  q_len,  head_dim]
-//   k/v : BF16 [batch, kv_heads, kv_len, head_dim]
+// Q/K/V rows are contiguous BF16.  The row, head, and batch strides describe their outer layout.
 //   out : FP32 [batch, q_heads,  q_len,  head_dim]
 // q_heads may be an integer multiple of kv_heads (grouped-query attention). flags bit 0 enables
 // a causal mask and causal_offset aligns query row zero with its absolute KV-cache position.
@@ -890,7 +943,16 @@ __device__ long flash_attention_bf16_f32(void *   q,
                                          uint32_t head_dim,
                                          uint32_t scale_bits,
                                          uint32_t causal_offset,
-                                         uint32_t flags) {
+                                         uint32_t flags,
+                                         uint64_t q_row_stride,
+                                         uint64_t q_head_stride,
+                                         uint64_t q_batch_stride,
+                                         uint64_t k_row_stride,
+                                         uint64_t k_head_stride,
+                                         uint64_t k_batch_stride,
+                                         uint64_t v_row_stride,
+                                         uint64_t v_head_stride,
+                                         uint64_t v_batch_stride) {
     const uint32_t scale_magnitude = scale_bits & 0x7fffffffu;
     if (!q || !k || !v || !out || batch == 0 || q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 ||
         (flags & ~kFlagCausal) != 0 || ((flags & kFlagCausal) == 0 && causal_offset != 0) ||
@@ -900,6 +962,13 @@ __device__ long flash_attention_bf16_f32(void *   q,
     }
     if (head_dim == 0 || head_dim > kMaxHeadDim || (head_dim % kVecLanes) != 0) {
         return FA_UNSUPPORTED_HEAD_DIM;
+    }
+    const uint64_t row_bytes = static_cast<uint64_t>(head_dim) * sizeof(uint16_t);
+    if (q_row_stride < row_bytes || k_row_stride < row_bytes || v_row_stride < row_bytes ||
+        ((q_row_stride | q_head_stride | q_batch_stride | k_row_stride | k_head_stride | k_batch_stride | v_row_stride |
+          v_head_stride | v_batch_stride) &
+         63U) != 0U) {
+        return FA_INVALID_ARGUMENT;
     }
     if ((q_heads % kv_heads) != 0) {
         return FA_UNSUPPORTED_HEAD_MAPPING;
@@ -917,32 +986,39 @@ __device__ long flash_attention_bf16_f32(void *   q,
     const uint64_t k_base_addr   = reinterpret_cast<uint64_t>(k);
     const uint64_t v_base_addr   = reinterpret_cast<uint64_t>(v);
     const uint64_t out_base_addr = reinterpret_cast<uint64_t>(out);
-    uint64_t       q_bytes;
-    uint64_t       kv_bytes;
+    uint64_t       q_span;
+    uint64_t       k_span;
+    uint64_t       v_span;
     uint64_t       out_bytes;
     uint64_t       traversal_generations;
     const uint64_t q_tiles  = (static_cast<uint64_t>(q_len) + kBr - 1) / kBr;
     const uint64_t q_groups = (q_tiles + kConsumerCount - 1) / kConsumerCount;
     const uint64_t kv_tiles = (static_cast<uint64_t>(kv_len) + kBc - 1) / kBc;
-    if (!checked_tensor_bytes(batch, q_heads, q_len, head_dim, sizeof(uint16_t), &q_bytes) ||
-        !checked_tensor_bytes(batch, kv_heads, kv_len, head_dim, sizeof(uint16_t), &kv_bytes) ||
+    if (!checked_strided_tensor_span(batch, q_heads, q_len, row_bytes, q_batch_stride, q_head_stride, q_row_stride,
+                                     &q_span) ||
+        !checked_strided_tensor_span(batch, kv_heads, kv_len, row_bytes, k_batch_stride, k_head_stride, k_row_stride,
+                                     &k_span) ||
+        !checked_strided_tensor_span(batch, kv_heads, kv_len, row_bytes, v_batch_stride, v_head_stride, v_row_stride,
+                                     &v_span) ||
         !checked_tensor_bytes(batch, q_heads, q_len, head_dim, sizeof(float), &out_bytes) ||
         !checked_mul_u64(batch, q_heads, &traversal_generations) ||
         !checked_mul_u64(traversal_generations, q_groups, &traversal_generations) ||
         !checked_mul_u64(traversal_generations, kv_tiles, &traversal_generations) ||
-        !valid_address_range(q_base_addr, q_bytes) || !valid_address_range(k_base_addr, kv_bytes) ||
-        !valid_address_range(v_base_addr, kv_bytes) || !valid_address_range(out_base_addr, out_bytes)) {
+        !valid_address_range(q_base_addr, q_span) || !valid_address_range(k_base_addr, k_span) ||
+        !valid_address_range(v_base_addr, v_span) || !valid_address_range(out_base_addr, out_bytes)) {
         return FA_SIZE_OVERFLOW;
     }
-    if (ranges_overlap(out_base_addr, out_bytes, q_base_addr, q_bytes) ||
-        ranges_overlap(out_base_addr, out_bytes, k_base_addr, kv_bytes) ||
-        ranges_overlap(out_base_addr, out_bytes, v_base_addr, kv_bytes)) {
+    if (ranges_overlap(out_base_addr, out_bytes, q_base_addr, q_span) ||
+        ranges_overlap(out_base_addr, out_bytes, k_base_addr, k_span) ||
+        ranges_overlap(out_base_addr, out_bytes, v_base_addr, v_span)) {
         return FA_OUTPUT_ALIAS;
     }
 
     NPUSequencedURAM    kv_buffers[2] = { NPUSequencedURAM(kv_k_base(0)), NPUSequencedURAM(kv_k_base(1)) };
     FlashAttentionState state(q_base_addr, k_base_addr, v_base_addr, out_base_addr, batch, q_heads, kv_heads, q_len,
-                              kv_len, head_dim, causal_offset, (flags & kFlagCausal) != 0, kv_buffers);
+                              kv_len, head_dim, causal_offset, (flags & kFlagCausal) != 0, q_row_stride, q_head_stride,
+                              q_batch_stride, k_row_stride, k_head_stride, k_batch_stride, v_row_stride, v_head_stride,
+                              v_batch_stride, kv_buffers);
     initialize_constants(scale_log2e);
     FlashAttentionKvProducerTask producer(&state);
     FlashAttentionComputeTask<0> consumer0(&state);

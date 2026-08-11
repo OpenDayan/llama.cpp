@@ -7,7 +7,7 @@
 namespace ggml_dayan_matmul_detail {
 
 static inline bool moe_allocation_fits(uint64_t element_size, uint64_t ne0, uint64_t ne1, uint64_t ne2) {
-    uint64_t size = element_size;
+    uint64_t       size          = element_size;
     const uint64_t dimensions[3] = { ne0, ne1, ne2 };
     for (int index = 0; index < 3; ++index) {
         if (dimensions[index] == 0 || dimensions[index] > UINT64_MAX / size) {
@@ -136,23 +136,24 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t bias_uram  = uram + NormalizationLayout::kAux;
     const uint64_t out_uram   = uram + NormalizationLayout::kValue;
-    for (uint32_t token = 0; token < config->tokens; ++token) {
-        for (uint32_t used = 0; used < config->experts_used; ++used) {
-            const int32_t expert = ids[(uint64_t) token * config->experts_used + used];
-            if (expert < 0 || expert >= (int32_t) config->experts) {
-                dayan_proc_exit(-22);
-            }
-            const uint64_t row = (uint64_t) token * config->experts_used + used;
-            for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
-                const uint32_t elements =
-                    min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
-                normalization_load(input_uram, input + row * config->width + offset, elements);
-                normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements);
-                elementwise_add_tile(out_uram, input_uram, bias_uram, elements);
-                dayan_wait_macro();
-                normalization_store_f32(output + row * config->width + offset, out_uram, elements);
-                dayan_wait_lsu();
-            }
+    const uint32_t task       = dayan_native_task_id();
+    const uint32_t tasks      = dayan_native_task_count();
+    const uint64_t rows       = (uint64_t) config->tokens * config->experts_used;
+    for (uint64_t row = task; row < rows; row += tasks) {
+        const uint32_t used   = (uint32_t) (row % config->experts_used);
+        const uint32_t token  = (uint32_t) (row / config->experts_used);
+        const int32_t  expert = ids[(uint64_t) token * config->experts_used + used];
+        if (expert < 0 || expert >= (int32_t) config->experts) {
+            dayan_proc_exit(-22);
+        }
+        for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
+            const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
+            normalization_load(input_uram, input + row * config->width + offset, elements);
+            normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements);
+            elementwise_add_tile(out_uram, input_uram, bias_uram, elements);
+            dayan_wait_macro();
+            normalization_store_f32(output + row * config->width + offset, out_uram, elements);
+            dayan_wait_lsu();
         }
     }
 }
@@ -160,31 +161,33 @@ static inline void run_add_id(const DayanAddIdConfig * config,
 template <bool TopK> static void run_sort(const DayanSortConfig * config, const float * input, int32_t * output) {
     memory_validate(config);
     if (input == nullptr || output == nullptr || config->width == 0 || config->rows == 0 || config->output_width == 0 ||
-        config->output_width > config->width || config->order > 1U || (TopK && config->order != kDayanSortOrderDesc) ||
-        dayan_uram_base() == nullptr || (uint64_t) config->width * sizeof(int32_t) > dayan_uram_size()) {
+        config->output_width > config->width || config->order > 1U || (TopK && config->order != kDayanSortOrderDesc)) {
         dayan_proc_exit(-22);
     }
 
-    int32_t * indices = (int32_t *) ((uintptr_t) dayan_uram_base() + NormalizationLayout::kInput);
-    for (uint32_t row = 0; row < config->rows; ++row) {
-        const float * values = input + (uint64_t) row * config->width;
+    const uint32_t task  = dayan_native_task_id();
+    const uint32_t tasks = dayan_native_task_count();
+    for (uint32_t row = task; row < config->rows; row += tasks) {
+        const float * values  = input + (uint64_t) row * config->width;
+        int32_t *     indices = output + (uint64_t) row * config->output_width;
         for (uint32_t index = 0; index < config->width; ++index) {
-            indices[index] = (int32_t) index;
-        }
-        for (uint32_t index = 1; index < config->width; ++index) {
-            const int32_t key      = indices[index];
-            uint32_t      position = index;
+            const uint32_t count    = index < config->output_width ? index : config->output_width;
+            uint32_t       position = count;
             while (position > 0) {
                 const int32_t previous = indices[position - 1U];
-                const bool    before   = config->order == kDayanSortOrderAsc ? values[key] < values[previous] :
-                                                                               values[key] > values[previous];
+                const bool    before   = config->order == kDayanSortOrderAsc ? values[index] < values[previous] :
+                                                                               values[index] > values[previous];
                 if (!before) {
                     break;
                 }
-                indices[position] = previous;
+                if (position < config->output_width) {
+                    indices[position] = previous;
+                }
                 --position;
             }
-            indices[position] = key;
+            if (position < config->output_width) {
+                indices[position] = (int32_t) index;
+            }
         }
         if constexpr (TopK) {
             if (config->output_width > 1) {
@@ -192,9 +195,6 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
                 indices[0]          = indices[1];
                 indices[1]          = first;
             }
-        }
-        for (uint32_t index = 0; index < config->output_width; ++index) {
-            output[(uint64_t) row * config->output_width + index] = indices[index];
         }
     }
 }

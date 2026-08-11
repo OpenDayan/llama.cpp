@@ -11,6 +11,14 @@
 #    define MATMUL_DAYAN_1C_URAM_BYTES (1024U * 1024U)
 #endif
 
+#ifndef DAYAN_NATIVE_TASK_URAM_BYTES
+#    define DAYAN_NATIVE_TASK_URAM_BYTES (8U * 1024U)
+#endif
+
+#ifndef DAYAN_GATED_DELTA_NET_URAM_BYTES
+#    define DAYAN_GATED_DELTA_NET_URAM_BYTES (100U * 1024U)
+#endif
+
 struct DayanMatmulConfig {
     uint64_t m;
     uint64_t n;
@@ -43,6 +51,15 @@ struct DayanFlashAttentionConfig {
     uint32_t scale_bits;
     uint32_t causal_offset;
     uint32_t flags;
+    uint64_t q_row_stride;
+    uint64_t q_head_stride;
+    uint64_t q_batch_stride;
+    uint64_t k_row_stride;
+    uint64_t k_head_stride;
+    uint64_t k_batch_stride;
+    uint64_t v_row_stride;
+    uint64_t v_head_stride;
+    uint64_t v_batch_stride;
 };
 
 struct DayanGatedDeltaNetConfig {
@@ -53,13 +70,16 @@ struct DayanGatedDeltaNetConfig {
     uint32_t snapshots;
     uint32_t gate_width;
     uint32_t scale_bits;
+    uint32_t q_heads;
+    uint32_t k_heads;
+    uint32_t q_sequences;
+    uint32_t k_sequences;
     uint32_t reserved;
-    uint64_t q_offset;
-    uint64_t k_offset;
-    uint64_t v_offset;
-    uint64_t g_offset;
-    uint64_t beta_offset;
-    uint64_t input_bytes;
+    uint64_t q_nb[4];
+    uint64_t k_nb[4];
+    uint64_t v_nb[4];
+    uint64_t g_nb[4];
+    uint64_t beta_nb[4];
 };
 
 struct DayanAttentionProjectionConfig {
@@ -127,6 +147,8 @@ enum : uint32_t {
     kDayanDataTypeF32  = 0,
     kDayanDataTypeBF16 = 1,
     kDayanDataTypeF16  = 2,
+    kDayanDataTypeI32  = 3,
+    kDayanDataTypeI64  = 4,
 };
 
 struct DayanRowsConfig {
@@ -136,12 +158,23 @@ struct DayanRowsConfig {
     uint64_t destination_rows;
     uint32_t source_type;
     uint32_t destination_type;
+    uint32_t index_type;
+    uint32_t flags;
+    uint32_t index_ne[3];
+    uint32_t source_ne[3];
+    uint32_t destination_ne[3];
+};
+
+enum : uint32_t {
+    kDayanRowsSet = 1U << 0,
 };
 
 struct DayanCopyConfig {
     uint64_t elements;
     uint32_t source_type;
     uint32_t destination_type;
+    uint32_t source_ne[4];
+    uint64_t source_nb[4];
 };
 
 struct DayanRepeatConfig {
@@ -225,6 +258,9 @@ struct DayanConcatConfig {
     uint32_t left_ne[4];
     uint32_t right_ne[4];
     uint32_t output_ne[4];
+    uint64_t left_nb[4];
+    uint64_t right_nb[4];
+    uint64_t output_nb[4];
     uint32_t axis;
     uint32_t type;
 };
@@ -250,6 +286,22 @@ struct DayanNormConfig {
     uint32_t rows;
     uint32_t epsilon_bits;
     uint32_t reserved;
+    uint32_t input_ne[4];
+    uint64_t input_nb[4];
+};
+
+enum : uint32_t {
+    kDayanNormHasResidual   = 1U << 0,
+    kDayanNormWriteResidual = 1U << 1,
+    kDayanNormWriteRms      = 1U << 2,
+    kDayanNormWriteScaled   = 1U << 3,
+    kDayanNormWriteLowp     = 1U << 4,
+};
+
+struct DayanNormPipelineConfig {
+    DayanNormConfig norm;
+    uint32_t        flags;
+    uint32_t        output_type;
 };
 
 struct DayanGroupNormConfig {
@@ -259,11 +311,6 @@ struct DayanGroupNormConfig {
     uint32_t batches;
     uint32_t groups;
     uint32_t epsilon_bits;
-};
-
-struct DayanNormMatmulConfig {
-    DayanNormConfig   norm;
-    DayanMatmulConfig matmul;
 };
 
 #if !defined(__DAYAN_DEVICE__)
@@ -373,10 +420,13 @@ int flash_attention_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    result,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int gated_delta_net_f32_1c(npu_buffer_t *                    config,
-                           npu_buffer_t *                    input,
+                           npu_buffer_t *                    q,
+                           npu_buffer_t *                    k,
+                           npu_buffer_t *                    v,
+                           npu_buffer_t *                    g,
+                           npu_buffer_t *                    beta,
                            npu_buffer_t *                    state,
                            npu_buffer_t *                    output,
-                           npu_buffer_t *                    result,
                            const npu_kernel_launch_attrs_t * launch_attrs);
 int project_qg_bf16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
@@ -687,84 +737,13 @@ int group_norm_f32_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    input,
                       npu_buffer_t *                    output,
                       const npu_kernel_launch_attrs_t * launch_attrs);
-int rms_norm_scale_f32_1c(npu_buffer_t *                    config,
-                          npu_buffer_t *                    input,
-                          npu_buffer_t *                    scale,
-                          npu_buffer_t *                    rms,
-                          npu_buffer_t *                    output,
-                          const npu_kernel_launch_attrs_t * launch_attrs);
-int rms_norm_scale_bf16_1c(npu_buffer_t *                    config,
-                           npu_buffer_t *                    input,
-                           npu_buffer_t *                    scale,
-                           npu_buffer_t *                    rms,
-                           npu_buffer_t *                    output,
-                           npu_buffer_t *                    lowp,
-                           const npu_kernel_launch_attrs_t * launch_attrs);
-int rms_norm_scale_fp16_1c(npu_buffer_t *                    config,
-                           npu_buffer_t *                    input,
-                           npu_buffer_t *                    scale,
-                           npu_buffer_t *                    rms,
-                           npu_buffer_t *                    output,
-                           npu_buffer_t *                    lowp,
-                           const npu_kernel_launch_attrs_t * launch_attrs);
-int add_rms_norm_scale_f32_1c(npu_buffer_t *                    config,
-                              npu_buffer_t *                    left,
-                              npu_buffer_t *                    right,
-                              npu_buffer_t *                    scale,
-                              npu_buffer_t *                    residual,
-                              npu_buffer_t *                    rms,
-                              npu_buffer_t *                    output,
-                              const npu_kernel_launch_attrs_t * launch_attrs);
-int add_rms_norm_scale_bf16_1c(npu_buffer_t *                    config,
-                               npu_buffer_t *                    left,
-                               npu_buffer_t *                    right,
-                               npu_buffer_t *                    scale,
-                               npu_buffer_t *                    residual,
-                               npu_buffer_t *                    rms,
-                               npu_buffer_t *                    output,
-                               npu_buffer_t *                    lowp,
-                               const npu_kernel_launch_attrs_t * launch_attrs);
-int add_rms_norm_scale_fp16_1c(npu_buffer_t *                    config,
-                               npu_buffer_t *                    left,
-                               npu_buffer_t *                    right,
-                               npu_buffer_t *                    scale,
-                               npu_buffer_t *                    residual,
-                               npu_buffer_t *                    rms,
-                               npu_buffer_t *                    output,
-                               npu_buffer_t *                    lowp,
-                               const npu_kernel_launch_attrs_t * launch_attrs);
-int rms_norm_matmul_bf16_1c(npu_buffer_t *                    config,
-                            npu_buffer_t *                    input,
-                            npu_buffer_t *                    scale,
-                            npu_buffer_t *                    rms,
-                            npu_buffer_t *                    scaled,
-                            npu_buffer_t *                    lowp,
-                            npu_buffer_t *                    weight,
-                            npu_buffer_t *                    output,
-                            const npu_kernel_launch_attrs_t * launch_attrs);
-int rms_norm_matmul_fp16_1c(npu_buffer_t *                    config,
-                            npu_buffer_t *                    input,
-                            npu_buffer_t *                    scale,
-                            npu_buffer_t *                    rms,
-                            npu_buffer_t *                    scaled,
-                            npu_buffer_t *                    lowp,
-                            npu_buffer_t *                    weight,
-                            npu_buffer_t *                    output,
-                            const npu_kernel_launch_attrs_t * launch_attrs);
-int add_rms_norm_matmul_bf16_1c(npu_buffer_t *                    config,
-                                npu_buffer_t *                    left,
-                                npu_buffer_t *                    right,
-                                npu_buffer_t *                    scale,
-                                npu_buffer_t *                    intermediates,
-                                npu_buffer_t *                    weight,
-                                npu_buffer_t *                    output,
-                                const npu_kernel_launch_attrs_t * launch_attrs);
-int add_rms_norm_matmul_fp16_1c(npu_buffer_t *                    config,
-                                npu_buffer_t *                    left,
-                                npu_buffer_t *                    right,
-                                npu_buffer_t *                    scale,
-                                npu_buffer_t *                    intermediates,
-                                npu_buffer_t *                    weight,
-                                npu_buffer_t *                    output,
-                                const npu_kernel_launch_attrs_t * launch_attrs);
+int rms_norm_pipeline_1c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    left,
+                         npu_buffer_t *                    right,
+                         npu_buffer_t *                    scale,
+                         npu_buffer_t *                    residual,
+                         npu_buffer_t *                    rms,
+                         npu_buffer_t *                    scaled,
+                         npu_buffer_t *                    lowp,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
 #endif
