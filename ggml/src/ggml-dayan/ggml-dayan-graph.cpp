@@ -1366,11 +1366,17 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             }
             ggml_tensor *                 gate_cont = node->src[0];
             ggml_tensor *                 gate_view = gate_cont->src[0];
+            ggml_tensor *                 projection = cgraph->nodes[projection_index];
+            if (gate_view->ne[0] % 64 != 0 || gate_view->ne[0] > 256 || 256 % gate_view->ne[0] != 0 ||
+                projection->ne[1] >= projection->ne[0]) {
+                *unsupported = node;
+                return false;
+            }
             ggml_backend_dayan_graph_slot slot;
             slot.kind       = ggml_backend_dayan_slot_kind::gated_output_projection;
             slot.nodes[0]   = node;
             slot.nodes[1]   = cgraph->nodes[mul_index];
-            slot.nodes[2]   = cgraph->nodes[projection_index];
+            slot.nodes[2]   = projection;
             slot.nodes[3]   = gate_view->view_src != nullptr ? gate_view->view_src : gate_view->src[0];
             slot.node_count = 3;
             plan->slots.push_back(slot);

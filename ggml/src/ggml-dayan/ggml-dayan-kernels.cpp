@@ -430,23 +430,21 @@ __kernel__ void project_v_cache_fp16_1c(const DayanKVProjectionConfig * config,
 __kernel__ void project_gated_output_bf16_1c(const DayanGatedProjectionConfig * config,
                                              const float *                      attention,
                                              const uint16_t *                   gate,
-                                             uint16_t *                         activation,
                                              const uint16_t *                   weight,
                                              float *                            output,
                                              DayanMatmulPerf *                  perf) {
     using namespace ggml_dayan_matmul_detail;
-    run_gated_output_projection<Bf16Format>(config, attention, gate, activation, weight, output, perf);
+    run_gated_output_projection<Bf16Format>(config, attention, gate, weight, output, perf);
 }
 
 __kernel__ void project_gated_output_fp16_1c(const DayanGatedProjectionConfig * config,
                                              const float *                      attention,
                                              const uint16_t *                   gate,
-                                             uint16_t *                         activation,
                                              const uint16_t *                   weight,
                                              float *                            output,
                                              DayanMatmulPerf *                  perf) {
     using namespace ggml_dayan_matmul_detail;
-    run_gated_output_projection<Fp16Format>(config, attention, gate, activation, weight, output, perf);
+    run_gated_output_projection<Fp16Format>(config, attention, gate, weight, output, perf);
 }
 
 __kernel__ void ssm_conv_f32_1c(const DayanSSMConvConfig * config,

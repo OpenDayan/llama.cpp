@@ -1268,8 +1268,8 @@ static int run_empty_memory_case(ggml_backend_t dayan) {
 static int run_gated_output_case(ggml_backend_t dayan, enum ggml_type type) {
     constexpr int64_t tokens     = 3;
     constexpr int64_t embd       = 64;
-    constexpr int64_t head_dim   = 64;
-    constexpr int64_t heads      = 2;
+    constexpr int64_t head_dim   = 128;
+    constexpr int64_t heads      = 4;
     constexpr int64_t width      = head_dim * heads;
     constexpr int64_t output_dim = 64;
     constexpr int     graph_size = 32;

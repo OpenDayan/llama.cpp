@@ -699,10 +699,6 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
         gated_status = create_buffer(runtime->context, qg_observed.size() * sizeof(uint16_t), &gated_buffers.norm);
     }
     if (gated_status == 0) {
-        gated_status =
-            create_buffer(runtime->context, gated_activation.size() * sizeof(uint16_t), &gated_buffers.activation);
-    }
-    if (gated_status == 0) {
         gated_status = create_buffer(runtime->context, output_weight.size() * sizeof(uint16_t), &gated_buffers.weight);
     }
     if (gated_status == 0) {
@@ -731,23 +727,17 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
         attrs.config.task_dim  = NPUTaskDim3{ 1, 1, 1 };
         attrs.config.task_mode = NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
-        gated_status = type == GGML_TYPE_BF16 ?
-                           project_gated_output_bf16_1c(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
-                                                        gated_buffers.activation, gated_buffers.weight,
-                                                        gated_buffers.output, gated_buffers.perf, &attrs) :
-                           project_gated_output_fp16_1c(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
-                                                        gated_buffers.activation, gated_buffers.weight,
-                                                        gated_buffers.output, gated_buffers.perf, &attrs);
+        gated_status =
+            type == GGML_TYPE_BF16 ?
+                project_gated_output_bf16_1c(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
+                                             gated_buffers.weight, gated_buffers.output, gated_buffers.perf, &attrs) :
+                project_gated_output_fp16_1c(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
+                                             gated_buffers.weight, gated_buffers.output, gated_buffers.perf, &attrs);
     }
     std::vector<float> gated_observed(gated_expected.size());
-    std::vector<uint16_t> gated_activation_observed(gated_activation.size());
     if (gated_status == 0) {
         gated_status = download(runtime->stream, gated_observed.data(), gated_buffers.output,
                                 gated_observed.size() * sizeof(float));
-    }
-    if (gated_status == 0) {
-        gated_status = download(runtime->stream, gated_activation_observed.data(), gated_buffers.activation,
-                                gated_activation_observed.size() * sizeof(uint16_t));
     }
     if (gated_status == 0) {
         gated_status = download(runtime->stream, &gated_perf, gated_buffers.perf, sizeof(gated_perf));
@@ -765,7 +755,6 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     float      k_cache_error   = 0.0f;
     float      v_cache_error   = 0.0f;
     float      attention_error = 0.0f;
-    float      gated_activation_error = 0.0f;
     float      gated_error     = 0.0f;
     const bool close           = compare_lowp(type, qg_expected, qg_observed, &qg_error) &&
                                  compare_lowp(type, q_expected, q_observed, &q_error) &&
@@ -774,14 +763,12 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                                  compare_lowp(type, k_cache_expected, k_cache_observed, &k_cache_error) &&
                                  compare_lowp(type, v_cache_expected, v_cache_observed, &v_cache_error) &&
                                  compare_fp32(attention_expected, attention, &attention_error) &&
-                                 compare_lowp(type, gated_activation, gated_activation_observed,
-                                              &gated_activation_error) &&
                                  compare_fp32(gated_expected, gated_observed, &gated_error);
     std::printf(
         "type=%s tokens=%u embd=%u head_dim=%u q_heads=%u kv_heads=%u qg=%g q=%g k=%g v=%g kc=%g vc=%g attn=%g "
-        "gated-activation=%g gated=%g\n",
+        "gated=%g\n",
         ggml_type_name(type), tokens, embd, head_dim, q_heads, kv_heads, qg_error, q_error, k_error, v_error,
-        k_cache_error, v_cache_error, attention_error, gated_activation_error, gated_error);
+        k_cache_error, v_cache_error, attention_error, gated_error);
     return close ? 0 : fail("projection numerical comparison failed");
 }
 

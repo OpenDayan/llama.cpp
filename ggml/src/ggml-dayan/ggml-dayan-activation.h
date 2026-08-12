@@ -54,13 +54,17 @@ static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, lo
     __tx_vec_tcsr_write<Base + 6>(0);
 }
 
-static inline void configure_vec_dims(long rows, long chunks = 1) {
+static inline void configure_vec_grid(long dim2, long dim3 = 1) {
     __tx_vec_tcsr_write<kVecDim0>(0);
     __tx_vec_tcsr_write<kVecDim1>(0);
-    __tx_vec_tcsr_write<kVecDim2>(rows - 1);
-    __tx_vec_tcsr_write<kVecDim3>(chunks - 1);
+    __tx_vec_tcsr_write<kVecDim2>(dim2 - 1);
+    __tx_vec_tcsr_write<kVecDim3>(dim3 - 1);
     __tx_vec_tcsr_write<kVecDim4>(0);
     __tx_vec_tcsr_write<kVecDim5>(0);
+}
+
+static inline void configure_vec_dims(long rows, long chunks = 1) {
+    configure_vec_grid(rows, chunks);
 }
 
 static inline long vec_control(long instructions) {
@@ -87,11 +91,11 @@ static inline void configure_activation(const F32Tensor & input0,
                                         long              columns) {
     const long chunks = (columns + kVecLanes - 1) / kVecLanes;
 
-    configure_vec_dims(rows, chunks);
-    configure_vec_iterator<kVecV0Base>(0, 0, input0.row_stride, kVecBytes);
-    configure_vec_iterator<kVecV1Base>(0, 0, input1.row_stride, kVecBytes);
+    configure_vec_grid(chunks, rows);
+    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, input0.row_stride);
+    configure_vec_iterator<kVecV1Base>(0, 0, kVecBytes, input1.row_stride);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, output.row_stride, kVecBytes);
+    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, output.row_stride);
 }
 
 static inline void issue_sigmoid_mul(const F32Tensor &            gate,
@@ -113,7 +117,7 @@ static inline void issue_sigmoid_mul(const F32Tensor &            gate,
     __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.one);
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     __tx_vec_v_fp32_sfu<0, 5, 0>();
-    __tx_vec_lsu_u2v<1, 0>(value.address);
+    __tx_vec_lsu_u2v<1, 1>(value.address);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_v2u<3, 0>(output.address);
     start_vec_block(kInstructions);

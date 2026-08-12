@@ -113,6 +113,14 @@ The four audited scalar tensor paths now use accelerator instructions:
 - Gated Delta Net uses LSU transpose/gather for reductions and VEC for reduction combine, delta, and output scale. Its two native Tasks use disjoint 100 KiB URAM regions without a VEC lock.
 - Gated output projection uses LSU, VEC sigmoid-multiply, and MACRO conversion for its tensor path.
 
+Gated output preparation is now the MatMul A-tile loader. The loader uses LSU multi-Dim access to load one `128 x 256` attention/gate tile, expands packed BF16/FP16 gate values to the 32-bit lane layout in URAM, and runs one VEC block per phase. VEC `Dim0` and `Dim1` stay at zero, `Dim2` is the real count of 64-lane slices, and `Dim3` is the token row count. MACRO converts the gated FP32 tile directly into the low-precision shared A buffer consumed by MAT.
+
+The gated activation is not allocated or written in Device DRAM. The common MatMul template has a compile-time input-loader function slot and an optional URAM scratch size. The ordinary loader still copies low-precision A from Device memory with MAT swizzle. The gated loader writes an unswizzled low-precision A tile in shared URAM, marks the existing producer resource ready, and MAT consumes it without another LSU load. The graph compiler restricts this prototype to head dimensions divisible by 64 that do not cross a 256-element K tile.
+
+The multi-Dim path exposed an iterator bug in the shared sigmoid-multiply implementation. Its value operand configured the v1 iterator but selected v0 in the load instruction. This was invisible when `rows=1` because both outer offsets were zero. Multi-row execution then applied the gate row stride to the attention input. The load now selects v1, so gate, attention, and output can use independent multi-Dim strides.
+
+`test-dayan-attention-projection` passes for BF16 and FP16 after full fusion. Final gated output errors are 1.66707e-05 for BF16 and 4.46122e-05 for FP16. The graph regression uses `head_dim=128`, four heads, and width 512. Each head covers two real VEC Dim2 slices, and the projection covers two MatMul K tiles. BF16 is exact and FP16 has maximum absolute error 3.32892e-05.
+
 The cmodel `dyperf` comparison uses the same `test-dayan-hotspots` shapes before and after these changes. The values below are the full lifetime span of the named Device task, in cmodel cycles:
 
 | Operator task | Baseline | VEC/LSU version | Change |

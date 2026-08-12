@@ -189,11 +189,26 @@ struct MatmulState {
     uint64_t          output_stride;
     uint64_t          uram_address;
     uint64_t          uram_offset;
+    uint64_t          a_swizzle;
+    uint64_t          input_scratch;
+    const void *      input_context;
     SharedBuffer      shared[2];
     volatile int      status;
     volatile uint32_t start;
     volatile uint32_t abort;
 };
+
+struct MatmulInputArgs {
+    const void * context;
+    uint64_t     output;
+    uint64_t     scratch;
+    int          row_base;
+    int          k_base;
+    int          rows;
+    int          cols;
+};
+
+using MatmulInputLoader = int (*)(const MatmulInputArgs * args);
 
 struct MatmulEpilogueArgs {
     uint64_t accumulator[2];
@@ -519,7 +534,7 @@ static inline void configure_consumer(const MatmulState * state) {
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_ASTRIDE>(Constants::kTileK * sizeof(uint16_t));
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_BSTRIDE>(Constants::kTileK * sizeof(uint16_t));
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_CSTRIDE>(cols * sizeof(float));
-    __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_ASWIZZLEMBS>(swizzle);
+    __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_ASWIZZLEMBS>(state->a_swizzle);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_BSWIZZLEMBS>(swizzle);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_CSWIZZLEMBS>(c_swizzle);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_PERSISTENTMODE>(0);
@@ -724,7 +739,12 @@ template <bool ProducerLoadsA> static inline void configure_producer(const Matmu
     __tx_lsu_tcsr_write<Constants::kLsuShared * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(swizzle);
 }
 
-template <bool ProducerLoadsA, int AccumulatorCount, int OutputElementBytes, bool HasEpilogue>
+template <bool              ProducerLoadsA,
+          int               AccumulatorCount,
+          int               OutputElementBytes,
+          bool              HasEpilogue,
+          MatmulInputLoader InputLoader,
+          uint64_t          InputScratchBytes>
 static int produce_shared(MatmulState * state) {
     configure_producer<ProducerLoadsA>(state);
 
@@ -762,12 +782,29 @@ static int produce_shared(MatmulState * state) {
                     }
 
                     shared->generation = generation;
-                    load_matrix<Constants::kLsuShared>(
-                        (uint64_t) real_k * sizeof(uint16_t),
-                        ProducerLoadsA ? rows_for_tile(state, tile_m) : cols_for_tile(state, tile_n),
-                        Constants::kTileK * sizeof(uint16_t), ProducerLoadsA ? Constants::kTileM : Constants::kTileN,
-                        state->uram_address + (shared->uram_offset - state->uram_offset), shared_dram);
-                    dayan_wait_lsu();
+                    if constexpr (ProducerLoadsA && InputLoader != nullptr) {
+                        const MatmulInputArgs args = {
+                            state->input_context,
+                            state->uram_address + (shared->uram_offset - state->uram_offset),
+                            state->input_scratch,
+                            tile_m * Constants::kTileM,
+                            tile_k * Constants::kTileK,
+                            rows_for_tile(state, tile_m),
+                            real_k,
+                        };
+                        status = InputLoader(&args);
+                        if (status < 0) {
+                            return remember_error(state, status);
+                        }
+                    } else {
+                        load_matrix<Constants::kLsuShared>(
+                            (uint64_t) real_k * sizeof(uint16_t),
+                            ProducerLoadsA ? rows_for_tile(state, tile_m) : cols_for_tile(state, tile_n),
+                            Constants::kTileK * sizeof(uint16_t),
+                            ProducerLoadsA ? Constants::kTileM : Constants::kTileN,
+                            state->uram_address + (shared->uram_offset - state->uram_offset), shared_dram);
+                        dayan_wait_lsu();
+                    }
 
                     status = dayan_resource_produce(&shared->resource);
                     if (status < 0) {
@@ -782,13 +819,15 @@ static int produce_shared(MatmulState * state) {
 }
 
 template <typename Format,
-          bool           ProducerLoadsA,
-          int            AccumulatorCount,
-          int            OutputElementBytes,
-          bool           HasEpilogue,
-          MatmulEpilogue Epilogue0,
-          MatmulEpilogue Epilogue1,
-          MatmulEpilogue Epilogue2>
+          bool              ProducerLoadsA,
+          int               AccumulatorCount,
+          int               OutputElementBytes,
+          bool              HasEpilogue,
+          MatmulEpilogue    Epilogue0,
+          MatmulEpilogue    Epilogue1,
+          MatmulEpilogue    Epilogue2,
+          MatmulInputLoader InputLoader,
+          uint64_t          InputScratchBytes>
 static int run_pipeline(const DayanMatmulConfig * config,
                         const uint16_t *          a,
                         const uint16_t *          bt0,
@@ -796,7 +835,8 @@ static int run_pipeline(const DayanMatmulConfig * config,
                         void *                    output,
                         uint64_t                  uram_address,
                         uint64_t                  uram_offset,
-                        uint64_t *                pipeline_begin) {
+                        uint64_t *                pipeline_begin,
+                        const void *              input_context) {
     using Layout = UramLayout<ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue>;
 
     MatmulState state;
@@ -815,6 +855,9 @@ static int run_pipeline(const DayanMatmulConfig * config,
     state.output_stride = config->output_stride;
     state.uram_address  = uram_address;
     state.uram_offset   = uram_offset;
+    state.a_swizzle     = InputLoader == nullptr ? MAT_BATCH_SWIZZLE(5, 3, 5) : 0;
+    state.input_scratch = uram_address + Layout::total_bytes();
+    state.input_context = input_context;
     state.status        = 0;
     state.start         = 0;
     state.abort         = 0;
@@ -854,7 +897,8 @@ static int run_pipeline(const DayanMatmulConfig * config,
 
     *pipeline_begin = read_cycle();
     state.start     = 1;
-    status          = produce_shared<ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue>(&state);
+    status          = produce_shared<ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue, InputLoader,
+                                     InputScratchBytes>(&state);
     if (status < 0) {
         state.status = status;
     }
@@ -900,40 +944,47 @@ template <bool HasEpilogue, typename Layout> static inline void initialize_const
 }
 
 template <typename Format,
-          int            AccumulatorCount,
-          int            OutputElementBytes,
-          bool           HasEpilogue,
-          MatmulEpilogue AProducerEpilogue0,
-          MatmulEpilogue AProducerEpilogue1,
-          MatmulEpilogue AProducerEpilogue2,
-          MatmulEpilogue BProducerEpilogue0,
-          MatmulEpilogue BProducerEpilogue1,
-          MatmulEpilogue BProducerEpilogue2>
+          int               AccumulatorCount,
+          int               OutputElementBytes,
+          bool              HasEpilogue,
+          MatmulEpilogue    AProducerEpilogue0,
+          MatmulEpilogue    AProducerEpilogue1,
+          MatmulEpilogue    AProducerEpilogue2,
+          MatmulEpilogue    BProducerEpilogue0,
+          MatmulEpilogue    BProducerEpilogue1,
+          MatmulEpilogue    BProducerEpilogue2,
+          MatmulInputLoader InputLoader       = nullptr,
+          uint64_t          InputScratchBytes = 0>
 static void run_matmul_kernel(const DayanMatmulConfig * config,
                               const uint16_t *          a,
                               const uint16_t *          bt0,
                               const uint16_t *          bt1,
                               void *                    output,
-                              DayanMatmulPerf *         perf) {
+                              DayanMatmulPerf *         perf,
+                              const void *              input_context = nullptr) {
     using AProducerLayout = UramLayout<true, AccumulatorCount, OutputElementBytes, HasEpilogue>;
     using BProducerLayout = UramLayout<false, AccumulatorCount, OutputElementBytes, HasEpilogue>;
 
     static_assert(AProducerLayout::total_bytes() <= MATMUL_DAYAN_1C_URAM_BYTES,
                   "A-producer matmul URAM layout is too large");
+    static_assert(AProducerLayout::total_bytes() + InputScratchBytes <= MATMUL_DAYAN_1C_URAM_BYTES,
+                  "A-producer matmul input scratch is too large");
     static_assert(BProducerLayout::total_bytes() <= MATMUL_DAYAN_1C_URAM_BYTES,
                   "B-producer matmul URAM layout is too large");
 
     const uint64_t kernel_begin = read_cycle();
 
     if (!config_valid<AccumulatorCount, OutputElementBytes>(config) || !a || !bt0 || !output || !perf ||
-        (AccumulatorCount == 2 && !bt1) || dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) != 1U ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
+        (AccumulatorCount == 2 && !bt1) || (InputLoader != nullptr && config != nullptr && config->m >= config->n) ||
+        dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) != 1U || dayan_task_dim(DAYAN_TASK_Y) != 1U ||
+        dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         DAYAN_PARAMS_ERROR();
     }
 
     void *         uram             = dayan_uram_base();
     const bool     producer_loads_a = config->m < config->n;
-    const uint64_t required_uram = producer_loads_a ? AProducerLayout::total_bytes() : BProducerLayout::total_bytes();
+    const uint64_t required_uram =
+        (producer_loads_a ? AProducerLayout::total_bytes() : BProducerLayout::total_bytes()) + InputScratchBytes;
     if (!uram || dayan_uram_size() < required_uram) {
         dayan_proc_exit(-12);
     }
@@ -946,13 +997,13 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
     if (producer_loads_a) {
         initialize_constants<HasEpilogue, AProducerLayout>(uram_address);
         status = run_pipeline<Format, true, AccumulatorCount, OutputElementBytes, HasEpilogue, AProducerEpilogue0,
-                              AProducerEpilogue1, AProducerEpilogue2>(config, a, bt0, bt1, output, uram_address,
-                                                                      uram_offset, &pipeline_begin);
+                              AProducerEpilogue1, AProducerEpilogue2, InputLoader, InputScratchBytes>(
+            config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context);
     } else {
         initialize_constants<HasEpilogue, BProducerLayout>(uram_address);
         status = run_pipeline<Format, false, AccumulatorCount, OutputElementBytes, HasEpilogue, BProducerEpilogue0,
-                              BProducerEpilogue1, BProducerEpilogue2>(config, a, bt0, bt1, output, uram_address,
-                                                                      uram_offset, &pipeline_begin);
+                              BProducerEpilogue1, BProducerEpilogue2, InputLoader, InputScratchBytes>(
+            config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context);
     }
     if (status < 0) {
         dayan_proc_exit(status);

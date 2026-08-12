@@ -1939,17 +1939,14 @@ static int ggml_backend_dayan_gated_output_projection(ggml_backend_dayan_context
             ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     }
     if (status == 0) {
-        status = ggml_backend_dayan_prepare_slot_workspace(ctx, (size_t) tokens * width * sizeof(uint16_t), &buffers);
-    }
-    if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_launch_attrs(ctx, "gate-out", &attrs);
         status = weight->type == GGML_TYPE_BF16 ?
                      project_gated_output_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_lowp,
-                                                  buffers.input2, ggml_backend_dayan_tensor_buffer(weight),
+                                                  ggml_backend_dayan_tensor_buffer(weight),
                                                   ggml_backend_dayan_tensor_buffer(projection), buffers.perf, &attrs) :
                      project_gated_output_fp16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_lowp,
-                                                  buffers.input2, ggml_backend_dayan_tensor_buffer(weight),
+                                                  ggml_backend_dayan_tensor_buffer(weight),
                                                   ggml_backend_dayan_tensor_buffer(projection), buffers.perf, &attrs);
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
