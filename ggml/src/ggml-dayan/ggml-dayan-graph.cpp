@@ -1,12 +1,15 @@
 #include "ggml-dayan-graph.h"
 
 #include "ggml-dayan.h"
+#include "ggml-dayan-kernels.h"
 #include "ggml-impl.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -512,7 +515,7 @@ bool ggml_backend_dayan_supports_rope(const ggml_tensor * op) {
 
     const int32_t n_dims = ggml_get_op_params_i32(op, 1);
     const int32_t mode   = ggml_get_op_params_i32(op, 2);
-    if (n_dims <= 0 || n_dims > op->ne[0] || (n_dims & 1) != 0 ||
+    if (n_dims <= 0 || n_dims > op->ne[0] || (uint32_t) n_dims / 2U > DAYAN_ROPE_MAX_PAIRS || (n_dims & 1) != 0 ||
         (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && mode != GGML_ROPE_TYPE_MROPE &&
          mode != GGML_ROPE_TYPE_IMROPE)) {
         return false;
@@ -680,15 +683,16 @@ bool ggml_backend_dayan_supports_flash_attention(const ggml_tensor * op) {
     const bool          mask_supported =
         mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] == k->ne[1] && mask->ne[1] == q->ne[1] &&
                             mask->ne[2] == 1 && mask->ne[3] == 1 && ggml_is_contiguous_rows(mask));
-    return q->type == GGML_TYPE_BF16 && k->type == GGML_TYPE_BF16 && v->type == GGML_TYPE_BF16 &&
-           ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) && ggml_is_contiguous_rows(v) &&
-           q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0] && q->ne[0] > 0 && q->ne[0] <= 256 && q->ne[0] % 64 == 0 &&
-           q->ne[1] > 0 && q->ne[1] <= dimension_limit && k->ne[1] > 0 && k->ne[1] <= dimension_limit && q->ne[2] > 0 &&
-           q->ne[2] <= dimension_limit && k->ne[2] > 0 && k->ne[2] <= dimension_limit && q->ne[2] % k->ne[2] == 0 &&
-           q->ne[3] > 0 && q->ne[3] <= dimension_limit && k->ne[3] == q->ne[3] && v->ne[1] == k->ne[1] &&
-           v->ne[2] == k->ne[2] && v->ne[3] == k->ne[3] && op->ne[0] == v->ne[0] && op->ne[1] == q->ne[2] &&
-           op->ne[2] == q->ne[1] && op->ne[3] == q->ne[3] && std::isfinite(scale) && scale >= 0.0f &&
-           max_bias == 0.0f && logit_softcap == 0.0f && mask_supported;
+    const bool input_type_supported =
+        ggml_backend_dayan_is_storage_type(q->type) && k->type == q->type && v->type == q->type;
+    return input_type_supported && ggml_is_contiguous_rows(q) && ggml_is_contiguous_rows(k) &&
+           ggml_is_contiguous_rows(v) && q->ne[0] == k->ne[0] && q->ne[0] == v->ne[0] && q->ne[0] > 0 &&
+           q->ne[0] <= 256 && q->ne[0] % 64 == 0 && q->ne[1] > 0 && q->ne[1] <= dimension_limit && k->ne[1] > 0 &&
+           k->ne[1] <= dimension_limit && q->ne[2] > 0 && q->ne[2] <= dimension_limit && k->ne[2] > 0 &&
+           k->ne[2] <= dimension_limit && q->ne[2] % k->ne[2] == 0 && q->ne[3] > 0 && q->ne[3] <= dimension_limit &&
+           k->ne[3] == q->ne[3] && v->ne[1] == k->ne[1] && v->ne[2] == k->ne[2] && v->ne[3] == k->ne[3] &&
+           op->ne[0] == v->ne[0] && op->ne[1] == q->ne[2] && op->ne[2] == q->ne[1] && op->ne[3] == q->ne[3] &&
+           std::isfinite(scale) && scale >= 0.0f && max_bias == 0.0f && logit_softcap == 0.0f && mask_supported;
 }
 
 bool ggml_backend_dayan_supports_gated_delta_net(const ggml_tensor * op) {
@@ -797,6 +801,173 @@ struct ggml_backend_dayan_cast_key_hash {
     }
 };
 
+struct ggml_backend_dayan_cast_input {
+    ggml_tensor *               op;
+    int                         source;
+    ggml_backend_dayan_cast_key key;
+};
+
+struct ggml_backend_dayan_cast_hoist {
+    ggml_backend_dayan_cast_key key;
+    std::vector<ggml_tensor *>  layouts;
+};
+
+struct ggml_backend_dayan_tensor_use {
+    ggml_tensor * node;
+    int           source;
+};
+
+using ggml_backend_dayan_use_map = std::unordered_map<ggml_tensor *, std::vector<ggml_backend_dayan_tensor_use>>;
+
+static bool ggml_backend_dayan_is_cast_hoist_layout(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->src[0] == nullptr || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+    switch (tensor->op) {
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool ggml_backend_dayan_layout_can_change_type(const ggml_tensor * tensor, enum ggml_type type) {
+    const size_t source_size = ggml_type_size(tensor->type);
+    const size_t target_size = ggml_type_size(type);
+    if (source_size == 0 || target_size == 0 || source_size % target_size != 0 || tensor->buffer != nullptr ||
+        tensor->data != nullptr || tensor->extra != nullptr || (tensor->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+
+    const size_t scale = source_size / target_size;
+    if (tensor->view_offs % scale != 0) {
+        return false;
+    }
+    for (size_t stride : tensor->nb) {
+        if (stride % scale != 0) {
+            return false;
+        }
+    }
+    if (tensor->op == GGML_OP_VIEW) {
+        size_t offset;
+        std::memcpy(&offset, tensor->op_params, sizeof(offset));
+        if (offset % scale != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_backend_dayan_find_cast_hoist(ggml_tensor *                      activation,
+                                               enum ggml_type                     type,
+                                               const ggml_backend_dayan_use_map & uses,
+                                               ggml_backend_dayan_cast_hoist *    hoist) {
+    std::vector<ggml_tensor *> layouts;
+    ggml_tensor *              root = activation;
+    while (ggml_backend_dayan_is_cast_hoist_layout(root)) {
+        layouts.push_back(root);
+        root = root->src[0];
+    }
+    if (layouts.empty() || !ggml_backend_dayan_supports_mul_mat(root) || root->type != GGML_TYPE_F32 ||
+        (root->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+    std::reverse(layouts.begin(), layouts.end());
+    for (ggml_tensor * layout : layouts) {
+        if (!ggml_backend_dayan_layout_can_change_type(layout, type)) {
+            return false;
+        }
+    }
+
+    ggml_tensor * expected = layouts.front();
+    auto          found    = uses.find(root);
+    if (found == uses.end() || found->second.size() != 1 || found->second[0].node != expected ||
+        found->second[0].source != 0) {
+        return false;
+    }
+    for (size_t index = 0; index + 1 < layouts.size(); ++index) {
+        found = uses.find(layouts[index]);
+        if (found == uses.end() || found->second.size() != 1 || found->second[0].node != layouts[index + 1] ||
+            found->second[0].source != 0) {
+            return false;
+        }
+    }
+
+    found = uses.find(activation);
+    if (found == uses.end() || found->second.empty()) {
+        return false;
+    }
+    for (const ggml_backend_dayan_tensor_use & use : found->second) {
+        if (use.source != 1 ||
+            (!ggml_backend_dayan_supports_mul_mat(use.node) && !ggml_backend_dayan_supports_mul_mat_id(use.node)) ||
+            use.node->src[0]->type != type) {
+            return false;
+        }
+    }
+
+    hoist->key     = { root, type };
+    hoist->layouts = std::move(layouts);
+    return true;
+}
+
+static ggml_tensor * ggml_backend_dayan_apply_cast_hoist(ggml_context *                        ctx,
+                                                         const ggml_backend_dayan_cast_hoist & hoist,
+                                                         ggml_tensor *                         cast) {
+    ggml_tensor * source = cast;
+    for (const ggml_tensor * layout : hoist.layouts) {
+        const size_t scale  = ggml_type_size(layout->type) / ggml_type_size(hoist.key.type);
+        size_t       offset = 0;
+        if (layout->op == GGML_OP_VIEW) {
+            std::memcpy(&offset, layout->op_params, sizeof(offset));
+            offset /= scale;
+        }
+
+        ggml_tensor * replacement =
+            ggml_view_4d(ctx, source, layout->ne[0], layout->ne[1], layout->ne[2], layout->ne[3], layout->nb[1] / scale,
+                         layout->nb[2] / scale, layout->nb[3] / scale, offset);
+        replacement->nb[0] = layout->nb[0] / scale;
+        replacement->op    = layout->op;
+        std::memcpy(replacement->op_params, layout->op_params, sizeof(replacement->op_params));
+        if (replacement->op == GGML_OP_VIEW) {
+            std::memcpy(replacement->op_params, &offset, sizeof(offset));
+        }
+        ggml_set_name(replacement, layout->name);
+        source = replacement;
+    }
+    return source;
+}
+
+static bool ggml_backend_dayan_flash_rewrite_type(const ggml_tensor * op, enum ggml_type * type) {
+    if (op == nullptr || type == nullptr || op->op != GGML_OP_FLASH_ATTN_EXT || op->src[0] == nullptr ||
+        op->src[1] == nullptr || op->src[2] == nullptr) {
+        return false;
+    }
+    for (int source = 0; source < 3; ++source) {
+        if (!ggml_backend_dayan_is_flash_type(op->src[source]->type)) {
+            return false;
+        }
+    }
+
+    const enum ggml_type k_type = op->src[1]->type;
+    const enum ggml_type v_type = op->src[2]->type;
+    if (ggml_backend_dayan_is_storage_type(k_type) && ggml_backend_dayan_is_storage_type(v_type) && k_type != v_type) {
+        return false;
+    }
+    if (ggml_backend_dayan_is_storage_type(k_type)) {
+        *type = k_type;
+    } else if (ggml_backend_dayan_is_storage_type(v_type)) {
+        *type = v_type;
+    } else if (ggml_backend_dayan_is_storage_type(op->src[0]->type)) {
+        *type = op->src[0]->type;
+    } else {
+        *type = GGML_TYPE_BF16;
+    }
+    return true;
+}
+
 static int ggml_backend_dayan_next_compute(const ggml_cgraph * cgraph, int index);
 
 static bool ggml_backend_dayan_add_dependency(ggml_tensor * node, ggml_tensor * dependency) {
@@ -875,10 +1046,42 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
         return false;
     }
 
+    const int64_t rewrite_start_us = ggml_time_us();
+
     std::vector<ggml_tensor *> nodes(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
     std::vector<std::pair<ggml_tensor *, ggml_backend_dayan_cast_key>>                               matmuls;
+    std::vector<ggml_backend_dayan_cast_input>                                                       flash_inputs;
     std::vector<ggml_backend_dayan_cast_key>                                                         cast_keys;
     std::unordered_map<ggml_backend_dayan_cast_key, ggml_tensor *, ggml_backend_dayan_cast_key_hash> casts;
+    ggml_backend_dayan_use_map                                                                       uses;
+    std::unordered_map<ggml_tensor *, enum ggml_type>                                                activation_types;
+    std::unordered_set<ggml_tensor *>                                conflicting_activations;
+    std::unordered_map<ggml_tensor *, ggml_backend_dayan_cast_hoist> hoists;
+    std::unordered_map<ggml_tensor *, ggml_tensor *>                 hoisted_replacements;
+    std::unordered_set<ggml_tensor *>                                elided_layouts;
+
+    for (ggml_tensor * node : nodes) {
+        for (int source = 0; source < GGML_MAX_SRC; ++source) {
+            if (node->src[source] != nullptr) {
+                uses[node->src[source]].push_back({ node, source });
+            }
+        }
+        if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
+            node->src[1]->type == GGML_TYPE_F32 && !ggml_backend_dayan_supports_gated_attention(node->src[1])) {
+            auto inserted = activation_types.emplace(node->src[1], node->src[0]->type);
+            if (!inserted.second && inserted.first->second != node->src[0]->type) {
+                conflicting_activations.insert(node->src[1]);
+            }
+        }
+    }
+    for (const auto & activation : activation_types) {
+        if (conflicting_activations.count(activation.first) == 0) {
+            ggml_backend_dayan_cast_hoist hoist;
+            if (ggml_backend_dayan_find_cast_hoist(activation.first, activation.second, uses, &hoist)) {
+                hoists.emplace(activation.first, std::move(hoist));
+            }
+        }
+    }
 
     for (ggml_tensor * node : nodes) {
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
@@ -886,16 +1089,39 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
             if (ggml_backend_dayan_supports_gated_attention(node->src[1])) {
                 continue;
             }
-            const ggml_backend_dayan_cast_key key = { node->src[1], node->src[0]->type };
+            const auto                        hoist = hoists.find(node->src[1]);
+            const ggml_backend_dayan_cast_key key =
+                hoist == hoists.end() ? ggml_backend_dayan_cast_key{ node->src[1], node->src[0]->type } :
+                                        hoist->second.key;
             matmuls.emplace_back(node, key);
             if (casts.emplace(key, nullptr).second) {
                 cast_keys.push_back(key);
             }
         }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            enum ggml_type target_type;
+            if (!ggml_backend_dayan_flash_rewrite_type(node, &target_type)) {
+                continue;
+            }
+            for (int source = 0; source < 3; ++source) {
+                ggml_tensor * input = node->src[source];
+                if (input->type == target_type) {
+                    continue;
+                }
+                const ggml_backend_dayan_cast_key key = { input, target_type };
+                flash_inputs.push_back({ node, source, key });
+                if (casts.emplace(key, nullptr).second) {
+                    cast_keys.push_back(key);
+                }
+            }
+        }
     }
 
     if (cast_keys.empty()) {
-        return ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph);
+        const bool success = ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph);
+        GGML_LOG_DEBUG("%s: no activation casts, time=%.3f ms\n", __func__,
+                       (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
+        return success;
     }
 
     if (cgraph->n_nodes + (int) cast_keys.size() > ggml_graph_size(cgraph)) {
@@ -914,21 +1140,40 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
         casts[key] = cast;
     }
 
+    for (const auto & hoist : hoists) {
+        ggml_tensor * replacement = ggml_backend_dayan_apply_cast_hoist(ctx, hoist.second, casts.at(hoist.second.key));
+        hoisted_replacements.emplace(hoist.first, replacement);
+        elided_layouts.insert(hoist.second.layouts.begin(), hoist.second.layouts.end());
+    }
+
     for (const auto & matmul : matmuls) {
-        matmul.first->src[1] = casts.at(matmul.second);
+        const auto replacement = hoisted_replacements.find(matmul.first->src[1]);
+        if (replacement == hoisted_replacements.end()) {
+            matmul.first->src[1] = casts.at(matmul.second);
+        } else {
+            matmul.first->src[1] = replacement->second;
+        }
+    }
+    for (const ggml_backend_dayan_cast_input & input : flash_inputs) {
+        input.op->src[input.source] = casts.at(input.key);
     }
 
     ggml_graph_clear(cgraph);
     for (ggml_tensor * node : nodes) {
-        ggml_build_forward_expand(cgraph, node);
+        if (elided_layouts.count(node) == 0) {
+            ggml_build_forward_expand(cgraph, node);
+        }
     }
     if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph)) {
         GGML_LOG_WARN("%s: graph has no source slots for fused RMSNorm dependencies\n", __func__);
         return false;
     }
 
-    GGML_LOG_DEBUG("%s: rewrote %zu matrix multiplications with %zu low-precision casts\n", __func__, matmuls.size(),
-                   cast_keys.size());
+    GGML_LOG_DEBUG(
+        "%s: rewrote %zu matrix multiplications and %zu FlashAttention inputs with %zu low-precision casts, "
+        "hoisted=%zu, time=%.3f ms\n",
+        __func__, matmuls.size(), flash_inputs.size(), cast_keys.size(), hoists.size(),
+        (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
     return true;
 }
 
@@ -982,6 +1227,24 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
     plan->routing_slots         = 0;
     *unsupported                = nullptr;
 
+    std::unordered_map<const ggml_tensor *, int>           node_indices;
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> quantized_outputs;
+    std::unordered_set<const ggml_tensor *>                elided_nodes;
+    for (int index = 0; index < cgraph->n_nodes; ++index) {
+        node_indices.emplace(cgraph->nodes[index], index);
+    }
+    for (int index = 0; index < cgraph->n_nodes; ++index) {
+        ggml_tensor * output = cgraph->nodes[index];
+        if (!ggml_backend_dayan_supports_quantized_mul_mat(output)) {
+            continue;
+        }
+        const auto producer = node_indices.find(output->src[0]);
+        if (producer != node_indices.end() && producer->second < index &&
+            ggml_node_has_n_uses(cgraph, producer->second, 1)) {
+            quantized_outputs.emplace(output->src[0], output);
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes;) {
         i = ggml_backend_dayan_next_compute(cgraph, i);
         if (i >= cgraph->n_nodes) {
@@ -989,6 +1252,10 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
         }
 
         ggml_tensor * node = cgraph->nodes[i];
+        if (elided_nodes.count(node) != 0) {
+            ++i;
+            continue;
+        }
         if (ggml_backend_dayan_supports_residual_add(node)) {
             ggml_backend_dayan_graph_slot slot;
             slot.kind       = ggml_backend_dayan_slot_kind::residual_add;
@@ -1435,15 +1702,14 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
         slot.nodes[0]   = node;
         slot.node_count = 1;
 
-        const int quantized_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
-        if (quantized_index < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1) &&
-            ggml_backend_dayan_supports_quantized_mul_mat(cgraph->nodes[quantized_index]) &&
-            cgraph->nodes[quantized_index]->src[0] == node) {
+        const auto quantized = quantized_outputs.find(node);
+        if (quantized != quantized_outputs.end()) {
             slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_quantized;
-            slot.nodes[1]   = cgraph->nodes[quantized_index];
+            slot.nodes[1]   = quantized->second;
             slot.node_count = 2;
             ++plan->fused_mul_mat_slots;
-            i = quantized_index + 1;
+            elided_nodes.insert(quantized->second);
+            ++i;
             plan->slots.push_back(slot);
             continue;
         }

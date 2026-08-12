@@ -1,11 +1,11 @@
 #pragma once
 
-// Single-core FlashAttention for contiguous BF16 Q/K/V tensors.
+// Single-core FlashAttention for contiguous BF16 or FP16 Q/K/V tensors.
 //
 // A shared KV producer feeds three fixed Q-slice consumers, following the coroutine pipeline in
-// kernel_bf16_matmul_os.cpp.  The two matrix products use BF16 inputs and accumulate to FP32:
-//   S  = Q_bf16 * K_bf16^T
-//   PV = P_bf16 * V_bf16
+// kernel_bf16_matmul_os.cpp. The two matrix products use one 16-bit type and accumulate to FP32:
+//   S  = Q_lowp * K_lowp^T
+//   PV = P_lowp * V_lowp
 // Online-softmax state (m, l, O) stays in FP32.  Scores are never materialized in DRAM.
 
 #include "npu_instruction.hpp"
@@ -37,7 +37,7 @@ constexpr long kQBytes        = kBr * kMaxHeadDim * sizeof(uint16_t);
 constexpr long kKBytes        = kBc * kMaxHeadDim * sizeof(uint16_t);
 constexpr long kVtBytes       = kMaxHeadDim * kBc * sizeof(uint16_t);
 constexpr long kScoreBytes    = kBr * kBc * sizeof(float);
-constexpr long kPBf16Bytes    = kBr * kBc * sizeof(uint16_t);
+constexpr long kPBytes        = kBr * kBc * sizeof(uint16_t);
 constexpr long kPVBytes       = kBr * kMaxHeadDim * sizeof(float);
 constexpr long kOBytes        = kBr * kMaxHeadDim * sizeof(float);
 constexpr long kRowStateBytes = kBr * kVecBytes;
@@ -46,7 +46,7 @@ constexpr long kRowStateBytes = kBr * kVecBytes;
 // contexts leave enough room for a shared double-buffered K/Vt pipeline and read-only vectors.
 constexpr long kCtxQ         = 0x00000;
 constexpr long kCtxScore     = 0x08000;
-constexpr long kCtxPBf16     = 0x0c000;
+constexpr long kCtxP         = 0x0c000;
 constexpr long kCtxPV        = 0x0e000;
 constexpr long kCtxO         = 0x1e000;
 constexpr long kCtxM         = 0x2e000;
@@ -71,11 +71,11 @@ constexpr long kUramFloor = kUramScale + kVecBytes;
 constexpr long kUramZero  = kUramFloor + kVecBytes;
 constexpr long kUramEnd   = kUramZero + kVecBytes;
 
-static_assert(kCtxScore == kCtxQ + kQBytes && kCtxPBf16 == kCtxScore + kScoreBytes &&
-                  kCtxPV == kCtxPBf16 + kPBf16Bytes && kCtxO == kCtxPV + kPVBytes && kCtxM == kCtxO + kOBytes &&
-                  kCtxL == kCtxM + kRowStateBytes && kCtxNewM == kCtxL + kRowStateBytes &&
-                  kCtxTileSum == kCtxNewM + kRowStateBytes && kCtxAlpha == kCtxTileSum + kRowStateBytes &&
-                  kCtxThreshold == kCtxAlpha + kRowStateBytes && kContextBytes == kCtxThreshold + kRowStateBytes,
+static_assert(kCtxScore == kCtxQ + kQBytes && kCtxP == kCtxScore + kScoreBytes && kCtxPV == kCtxP + kPBytes &&
+                  kCtxO == kCtxPV + kPVBytes && kCtxM == kCtxO + kOBytes && kCtxL == kCtxM + kRowStateBytes &&
+                  kCtxNewM == kCtxL + kRowStateBytes && kCtxTileSum == kCtxNewM + kRowStateBytes &&
+                  kCtxAlpha == kCtxTileSum + kRowStateBytes && kCtxThreshold == kCtxAlpha + kRowStateBytes &&
+                  kContextBytes == kCtxThreshold + kRowStateBytes,
               "FlashAttention compute-context layout is inconsistent");
 static_assert(kUramK0 == 0xd2000 && kUramEnd == 0xf2400 && kUramEnd <= kUramBytes,
               "FlashAttention URAM layout exceeds 1 MiB");
@@ -176,7 +176,7 @@ static inline void load_v_transposed(uint64_t v_dram, long vt_base, long rows, l
     }
 }
 
-template <long GROUP>
+template <typename Format, long GROUP>
 static inline void configure_mat(long m, long n, long k, long a_stride, long b_stride, long c_stride) {
     __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_M>(m - 1);
     __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_N>(n - 1);
@@ -189,19 +189,20 @@ static inline void configure_mat(long m, long n, long k, long a_stride, long b_s
     __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_BSWIZZLEMBS>(0);
     __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_CSWIZZLEMBS>(0);
     __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_PERSISTENTMODE>(0);
-    __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_DATATYPE>(BaseNPUInstBuilder::DT_BF16);
+    __tx_mat_tcsr_write<GROUP * MAT_GROUPSZ + MAT_DATATYPE>(Format::kMatDataType);
 }
 
-template <long GROUP> static inline void issue_qk(long ctx_base, long rows, long cols, long head_dim, long k_base) {
-    configure_mat<GROUP>(rows, cols, head_dim, head_dim * sizeof(uint16_t), head_dim * sizeof(uint16_t),
-                         kBc * sizeof(float));
+template <typename Format, long GROUP>
+static inline void issue_qk(long ctx_base, long rows, long cols, long head_dim, long k_base) {
+    configure_mat<Format, GROUP>(rows, cols, head_dim, head_dim * sizeof(uint16_t), head_dim * sizeof(uint16_t),
+                                 kBc * sizeof(float));
     // MAT addresses are 20-bit URAM offsets.  Unlike LSU, MACRO, and VEC, the MAT unit does not
     // normalize the mapped URAM address before indexing its local memory.
     // MM overwrites the score tile, so kCtxScore must not be initialized beforehand.
     __tx_mat_mm<GROUP>(ctx_base + kCtxScore, ctx_base + kCtxQ, k_base);
 }
 
-template <long GROUP> static inline void issue_p_to_bf16(long ctx_base, long rows) {
+template <typename Format, long GROUP> static inline void issue_p_to_lowp(long ctx_base, long rows) {
     __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM0>(kBc - 1);
     __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM1>(rows - 1);
     __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM2>(0);
@@ -218,14 +219,21 @@ template <long GROUP> static inline void issue_p_to_bf16(long ctx_base, long row
     __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC0SWIZZLEMBS>(0);
     __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC1SWIZZLEMBS>(0);
     __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DSTSWIZZLEMBS>(0);
-    __tx_macro_convert_fp32_bf16<GROUP>(reinterpret_cast<void *>(uram_addr(ctx_base + kCtxPBf16)),
-                                        reinterpret_cast<void *>(uram_addr(ctx_base + kCtxScore)));
+    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
+        __tx_macro_convert_fp32_bf16<GROUP>(reinterpret_cast<void *>(uram_addr(ctx_base + kCtxP)),
+                                            reinterpret_cast<void *>(uram_addr(ctx_base + kCtxScore)));
+    } else {
+        __tx_macro_convert_fp32_fp16<GROUP>(reinterpret_cast<void *>(uram_addr(ctx_base + kCtxP)),
+                                            reinterpret_cast<void *>(uram_addr(ctx_base + kCtxScore)));
+    }
 }
 
-template <long GROUP> static inline void issue_pv(long ctx_base, long rows, long head_dim, long vt_base) {
-    configure_mat<GROUP>(rows, head_dim, kBc, kBc * sizeof(uint16_t), kBc * sizeof(uint16_t), head_dim * sizeof(float));
+template <typename Format, long GROUP>
+static inline void issue_pv(long ctx_base, long rows, long head_dim, long vt_base) {
+    configure_mat<Format, GROUP>(rows, head_dim, kBc, kBc * sizeof(uint16_t), kBc * sizeof(uint16_t),
+                                 head_dim * sizeof(float));
     // MM overwrites the PV tile; only O is an online accumulator and needs an initial value.
-    __tx_mat_mm<GROUP>(ctx_base + kCtxPV, ctx_base + kCtxPBf16, vt_base);
+    __tx_mat_mm<GROUP>(ctx_base + kCtxPV, ctx_base + kCtxP, vt_base);
 }
 
 // VEC uses the linear TCSR layout documented by the current VEC specification.  The older
@@ -816,7 +824,7 @@ class FlashAttentionKvProducerTask : public NPUTask {
 // to different Q tiles to cover one another's latency.  On the current RVTNG target this creates
 // at most four outstanding LSU Produce markers and three on every other unit, below each 8-entry
 // completion FIFO; FlexVec additionally has exactly three of its four block slots in flight.
-template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
+template <typename Format, long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
   private:
     static_assert(FIXED_SLICE >= 0 && FIXED_SLICE < kConsumerCount, "FlashAttention consumer slice is out of range");
     static constexpr long kCtxBase     = context_base(FIXED_SLICE);
@@ -877,7 +885,7 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
 
                             k_row = ki * kBc;
                             cols  = min_long(kBc, static_cast<long>(s->kv_len) - k_row);
-                            issue_qk<kMatQKGroup>(kCtxBase, rows, cols, s->head_dim, kv->uram);
+                            issue_qk<Format, kMatQKGroup>(kCtxBase, rows, cols, s->head_dim, kv->uram);
                             // Threshold preparation touches a disjoint URAM region and can run on
                             // the scalar core while QK is executing.
                             mask_scores = prepare_softmax_mask(kCtxBase, rows, cols, q_row + s->causal_offset, k_row,
@@ -887,10 +895,10 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
                             issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
                             NPUVecBar(0);
 
-                            issue_p_to_bf16<kMacroGroup>(kCtxBase, rows);
+                            issue_p_to_lowp<Format, kMacroGroup>(kCtxBase, rows);
                             NPUMACROBar(0);
 
-                            issue_pv<kMatPVGroup>(kCtxBase, rows, s->head_dim, kv->uram + kKvVtOffset);
+                            issue_pv<Format, kMatPVGroup>(kCtxBase, rows, s->head_dim, kv->uram + kKvVtOffset);
                             NPUMatBar(0);
 
                             // K/Vt are dead after PV.  Refill may overlap the independent O update.
@@ -917,13 +925,13 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
     }
 
     static int32_t wrapper(NPUTask * task, int * err) {
-        return static_cast<FlashAttentionComputeTask<FIXED_SLICE> *>(task)->execute(err);
+        return static_cast<FlashAttentionComputeTask<Format, FIXED_SLICE> *>(task)->execute(err);
     }
 };
 
 }  // namespace
 
-// Q/K/V rows are contiguous BF16.  The row, head, and batch strides describe their outer layout.
+// Q/K/V rows use the Format storage type. The row, head, and batch strides describe their outer layout.
 //   out : FP32 [batch, q_heads,  q_len,  head_dim]
 // q_heads may be an integer multiple of kv_heads (grouped-query attention). flags bit 0 enables
 // a causal mask and causal_offset aligns query row zero with its absolute KV-cache position.
@@ -931,28 +939,29 @@ template <long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
 // must be finite and small enough that FP32 MAT accumulation and scaled scores stay finite.
 // scale_bits contains a finite nonnegative IEEE-754 FP32 bit pattern.  Returns 0 on success or
 // FlashAttentionError.
-__device__ long flash_attention_bf16_f32(void *   q,
-                                         void *   k,
-                                         void *   v,
-                                         void *   out,
-                                         uint32_t batch,
-                                         uint32_t q_heads,
-                                         uint32_t kv_heads,
-                                         uint32_t q_len,
-                                         uint32_t kv_len,
-                                         uint32_t head_dim,
-                                         uint32_t scale_bits,
-                                         uint32_t causal_offset,
-                                         uint32_t flags,
-                                         uint64_t q_row_stride,
-                                         uint64_t q_head_stride,
-                                         uint64_t q_batch_stride,
-                                         uint64_t k_row_stride,
-                                         uint64_t k_head_stride,
-                                         uint64_t k_batch_stride,
-                                         uint64_t v_row_stride,
-                                         uint64_t v_head_stride,
-                                         uint64_t v_batch_stride) {
+template <typename Format>
+static __device__ long flash_attention_lowp_f32(void *   q,
+                                                void *   k,
+                                                void *   v,
+                                                void *   out,
+                                                uint32_t batch,
+                                                uint32_t q_heads,
+                                                uint32_t kv_heads,
+                                                uint32_t q_len,
+                                                uint32_t kv_len,
+                                                uint32_t head_dim,
+                                                uint32_t scale_bits,
+                                                uint32_t causal_offset,
+                                                uint32_t flags,
+                                                uint64_t q_row_stride,
+                                                uint64_t q_head_stride,
+                                                uint64_t q_batch_stride,
+                                                uint64_t k_row_stride,
+                                                uint64_t k_head_stride,
+                                                uint64_t k_batch_stride,
+                                                uint64_t v_row_stride,
+                                                uint64_t v_head_stride,
+                                                uint64_t v_batch_stride) {
     const uint32_t scale_magnitude = scale_bits & 0x7fffffffu;
     if (!q || !k || !v || !out || batch == 0 || q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 ||
         (flags & ~kFlagCausal) != 0 || ((flags & kFlagCausal) == 0 && causal_offset != 0) ||
@@ -977,7 +986,7 @@ __device__ long flash_attention_bf16_f32(void *   q,
     if ((float_as_u32(scale_log2e) & 0x7f800000u) == 0x7f800000u) {
         return FA_INVALID_ARGUMENT;
     }
-    // BF16 transpose uses 64-byte source transactions and therefore requires an aligned base.
+    // The 16-bit transpose uses 64-byte source transactions and therefore requires an aligned base.
     if ((reinterpret_cast<uint64_t>(v) & 63u) != 0) {
         return FA_UNALIGNED_V;
     }
@@ -1020,12 +1029,12 @@ __device__ long flash_attention_bf16_f32(void *   q,
                               q_batch_stride, k_row_stride, k_head_stride, k_batch_stride, v_row_stride, v_head_stride,
                               v_batch_stride, kv_buffers);
     initialize_constants(scale_log2e);
-    FlashAttentionKvProducerTask producer(&state);
-    FlashAttentionComputeTask<0> consumer0(&state);
-    FlashAttentionComputeTask<1> consumer1(&state);
-    FlashAttentionComputeTask<2> consumer2(&state);
-    NPUTask *                    tasks[4] = { &producer, &consumer0, &consumer1, &consumer2 };
-    NPUScheduler                 scheduler(4, tasks);
+    FlashAttentionKvProducerTask         producer(&state);
+    FlashAttentionComputeTask<Format, 0> consumer0(&state);
+    FlashAttentionComputeTask<Format, 1> consumer1(&state);
+    FlashAttentionComputeTask<Format, 2> consumer2(&state);
+    NPUTask *                            tasks[4] = { &producer, &consumer0, &consumer1, &consumer2 };
+    NPUScheduler                         scheduler(4, tasks);
     for (NPUTask * task : tasks) {
         task->sched = &scheduler;
     }

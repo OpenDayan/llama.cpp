@@ -39,11 +39,11 @@ static inline float layout_bits_float(uint32_t value) {
 static inline void layout_validate_f32(const DayanLayoutConfig * config, const float * input, float * output) {
     memory_validate(config);
     if (input == nullptr || output == nullptr || config->type != kDayanDataTypeF32) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     for (uint32_t dimension = 0; dimension < 4; ++dimension) {
         if (config->input_ne[dimension] == 0 || config->output_ne[dimension] == 0) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
     }
 }
@@ -67,7 +67,7 @@ static inline void run_set(const DayanSetConfig * config, const void * base, con
     memory_validate(config);
     if (base == nullptr || source == nullptr || output == nullptr || config->output_bytes == 0 ||
         config->element_bytes == 0) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     (void) base;
 
@@ -85,7 +85,7 @@ static inline void run_set(const DayanSetConfig * config, const void * base, con
                                             (uint64_t) index2 * config->destination_nb[1] +
                                             (uint64_t) index3 * config->destination_nb[2];
         if (destination_offset + row_bytes > config->output_bytes) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         layout_copy_bytes((char *) output + destination_offset, (const char *) source + row * row_bytes, row_bytes);
     }
@@ -96,7 +96,7 @@ static inline void run_diag_f32(const DayanLayoutConfig * config, const float * 
     if (config->input_ne[1] != 1 || config->output_ne[0] != config->input_ne[0] ||
         config->output_ne[1] != config->input_ne[0] || config->output_ne[2] != config->input_ne[2] ||
         config->output_ne[3] != config->input_ne[3]) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const uint32_t task  = dayan_native_task_id();
@@ -122,7 +122,7 @@ static void run_diag_mask_f32(const DayanLayoutConfig * config, const float * in
     if (layout_elements(config->input_ne) != layout_elements(config->output_ne) ||
         config->input_ne[0] != config->output_ne[0] || config->input_ne[1] != config->output_ne[1] ||
         config->parameters[0] < 0) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const float    mask   = layout_bits_float(MaskBits);
@@ -177,7 +177,7 @@ static inline void run_pad_reflect_1d_f32(const DayanLayoutConfig * config, cons
     const int32_t right = config->parameters[1];
     if (left < 0 || right < 0 || left >= (int32_t) config->input_ne[0] || right >= (int32_t) config->input_ne[0] ||
         config->output_ne[0] != config->input_ne[0] + (uint32_t) left + (uint32_t) right) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const uint64_t rows  = (uint64_t) config->output_ne[1] * config->output_ne[2] * config->output_ne[3];
@@ -201,7 +201,7 @@ static inline void run_pad_reflect_1d_f32(const DayanLayoutConfig * config, cons
 static inline void run_roll_f32(const DayanLayoutConfig * config, const float * input, float * output) {
     layout_validate_f32(config, input, output);
     if (layout_elements(config->input_ne) != layout_elements(config->output_ne)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     const uint32_t task     = dayan_native_task_id();
     const uint32_t tasks    = dayan_native_task_count();

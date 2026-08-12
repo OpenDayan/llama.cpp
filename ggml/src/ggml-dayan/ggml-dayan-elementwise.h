@@ -34,7 +34,7 @@ template <long Group> static inline void elementwise_scalar_mul(uint64_t output,
 
 static inline void elementwise_validate(uint64_t elements, const void * input, void * output) {
     if (elements == 0 || input == nullptr || output == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
@@ -69,7 +69,7 @@ static void run_binary_f32(const DayanElementwiseConfig * config,
                            const float *                  right,
                            float *                        output) {
     if (config == nullptr || right == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, left, output);
     configure_normalization_lsu();
@@ -227,7 +227,7 @@ static inline void gelu_quick_tile(uint64_t output, uint64_t input, uint64_t tem
 template <void (*Operation)(uint64_t, uint64_t, uint64_t, uint64_t, uint32_t)>
 static void run_unary_f32(const DayanElementwiseConfig * config, const float * input, float * output) {
     if (config == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();
@@ -255,7 +255,7 @@ static void run_unary_f32(const DayanElementwiseConfig * config, const float * i
 
 static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const float * input, float * output) {
     if (config == nullptr || config->width == 0 || config->rows == 0 || input == nullptr || output == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
@@ -283,7 +283,7 @@ static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const f
 
 static inline void run_scale_f32(const DayanScaleConfig * config, const float * input, float * output) {
     if (config == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();
@@ -315,7 +315,7 @@ static inline void run_scale_f32(const DayanScaleConfig * config, const float * 
 
 static inline void run_clamp_f32(const DayanClampConfig * config, const float * input, float * output) {
     if (config == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();
@@ -348,7 +348,7 @@ static inline void run_clamp_f32(const DayanClampConfig * config, const float * 
 static inline void run_l2_norm(const DayanNormConfig * config, const float * input, float * output) {
     normalization_validate(config);
     if (input == nullptr || output == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();

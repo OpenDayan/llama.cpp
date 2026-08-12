@@ -8,6 +8,8 @@
 #include <random>
 #include <vector>
 
+using ggml_backend_graph_rewrite_t = bool (*)(ggml_backend_t, ggml_context *, ggml_cgraph *);
+
 struct attention_graph {
     ggml_context_ptr ctx;
     ggml_cgraph *    graph;
@@ -24,6 +26,13 @@ struct attention_graph {
 static int fail(const char * message) {
     std::fprintf(stderr, "test-dayan-flash-attention: %s\n", message);
     return 1;
+}
+
+static bool rewrite_graph(ggml_backend_t dayan, ggml_context * ctx, ggml_cgraph * graph) {
+    ggml_backend_dev_t device = ggml_backend_get_device(dayan);
+    ggml_backend_reg_t reg    = ggml_backend_dev_backend_reg(device);
+    auto rewrite = (ggml_backend_graph_rewrite_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_rewrite");
+    return rewrite != nullptr && rewrite(dayan, ctx, graph);
 }
 
 static attention_graph build_graph(enum ggml_type q_type,
@@ -204,11 +213,21 @@ int main() {
     }
 
     attention_graph reference =
-        build_graph(GGML_TYPE_F32, GGML_TYPE_BF16, head_dim, q_len, kv_len, q_heads, kv_heads, batch, causal, false);
+        build_graph(GGML_TYPE_F32, GGML_TYPE_F16, head_dim, q_len, kv_len, q_heads, kv_heads, batch, causal, false);
     attention_graph actual =
-        build_graph(GGML_TYPE_BF16, GGML_TYPE_BF16, head_dim, q_len, kv_len, q_heads, kv_heads, batch, causal, false);
+        build_graph(GGML_TYPE_F32, GGML_TYPE_F16, head_dim, q_len, kv_len, q_heads, kv_heads, batch, causal, false);
     if (!reference.ctx || !actual.ctx) {
         return fail("cannot create graph contexts");
+    }
+    if (ggml_backend_supports_op(dayan.get(), actual.output)) {
+        return fail("mixed-precision FlashAttention unexpectedly supported before rewrite");
+    }
+    if (!rewrite_graph(dayan.get(), actual.ctx.get(), actual.graph)) {
+        return fail("FlashAttention graph rewrite failed");
+    }
+    if (actual.output->src[0]->type != GGML_TYPE_F16 || actual.output->src[1]->type != GGML_TYPE_F16 ||
+        actual.output->src[2]->type != GGML_TYPE_F16 || !ggml_backend_supports_op(dayan.get(), actual.output)) {
+        return fail("FlashAttention graph rewrite did not preserve FP16 inputs");
     }
 
     ggml_backend_buffer_ptr reference_buffer(ggml_backend_alloc_ctx_tensors(reference.ctx.get(), cpu.get()));
@@ -219,20 +238,20 @@ int main() {
 
     std::mt19937                          generator(0x351faU);
     std::uniform_real_distribution<float> distribution(-0.25f, 0.25f);
-    std::vector<ggml_bf16_t>              q_bf16((size_t) ggml_nelements(actual.q));
-    std::vector<ggml_bf16_t>              k_bf16((size_t) ggml_nelements(actual.k));
-    std::vector<ggml_bf16_t>              v_bf16((size_t) ggml_nelements(actual.v));
-    std::vector<float>                    q_f32(q_bf16.size());
+    std::vector<ggml_fp16_t>              q_f16((size_t) ggml_nelements(actual.q));
+    std::vector<ggml_fp16_t>              k_f16((size_t) ggml_nelements(actual.k));
+    std::vector<ggml_fp16_t>              v_f16((size_t) ggml_nelements(actual.v));
+    std::vector<float>                    q_f32(q_f16.size());
     std::vector<ggml_fp16_t>              mask((size_t) q_len * kv_len);
-    for (size_t index = 0; index < q_bf16.size(); ++index) {
-        q_bf16[index] = ggml_fp32_to_bf16(distribution(generator));
-        q_f32[index]  = ggml_bf16_to_fp32(q_bf16[index]);
+    for (size_t index = 0; index < q_f16.size(); ++index) {
+        q_f16[index] = ggml_fp32_to_fp16(distribution(generator));
+        q_f32[index] = ggml_fp16_to_fp32(q_f16[index]);
     }
-    for (ggml_bf16_t & value : k_bf16) {
-        value = ggml_fp32_to_bf16(distribution(generator));
+    for (ggml_fp16_t & value : k_f16) {
+        value = ggml_fp32_to_fp16(distribution(generator));
     }
-    for (ggml_bf16_t & value : v_bf16) {
-        value = ggml_fp32_to_bf16(distribution(generator));
+    for (ggml_fp16_t & value : v_f16) {
+        value = ggml_fp32_to_fp16(distribution(generator));
     }
     const int64_t causal_offset = kv_len - q_len;
     for (int64_t query = 0; query < q_len; ++query) {
@@ -242,11 +261,11 @@ int main() {
     }
 
     ggml_backend_tensor_set(reference.q_input, q_f32.data(), 0, ggml_nbytes(reference.q_input));
-    ggml_backend_tensor_set(reference.k_input, k_bf16.data(), 0, ggml_nbytes(reference.k_input));
-    ggml_backend_tensor_set(reference.v_input, v_bf16.data(), 0, ggml_nbytes(reference.v_input));
-    ggml_backend_tensor_set(actual.q_input, q_bf16.data(), 0, ggml_nbytes(actual.q_input));
-    ggml_backend_tensor_set(actual.k_input, k_bf16.data(), 0, ggml_nbytes(actual.k_input));
-    ggml_backend_tensor_set(actual.v_input, v_bf16.data(), 0, ggml_nbytes(actual.v_input));
+    ggml_backend_tensor_set(reference.k_input, k_f16.data(), 0, ggml_nbytes(reference.k_input));
+    ggml_backend_tensor_set(reference.v_input, v_f16.data(), 0, ggml_nbytes(reference.v_input));
+    ggml_backend_tensor_set(actual.q_input, q_f32.data(), 0, ggml_nbytes(actual.q_input));
+    ggml_backend_tensor_set(actual.k_input, k_f16.data(), 0, ggml_nbytes(actual.k_input));
+    ggml_backend_tensor_set(actual.v_input, v_f16.data(), 0, ggml_nbytes(actual.v_input));
     ggml_backend_tensor_set(reference.mask, mask.data(), 0, ggml_nbytes(reference.mask));
     ggml_backend_tensor_set(actual.mask, mask.data(), 0, ggml_nbytes(actual.mask));
 

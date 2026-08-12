@@ -67,6 +67,8 @@ add_custom_command(
     DEPENDS
         ggml-dayan-kernels.cpp
         ggml-dayan-kernels.h
+        ggml-dayan-activation.h
+        ggml-dayan-common.h
         ggml-dayan-attention.h
         ggml-dayan-conv.h
         ggml-dayan-elementwise.h
@@ -98,6 +100,8 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-graph.cpp
     ggml-dayan-graph.h
     ggml-dayan-kernels.h
+    ggml-dayan-activation.h
+    ggml-dayan-common.h
     ggml-dayan-attention.h
     ggml-dayan-conv.h
     ggml-dayan-elementwise.h

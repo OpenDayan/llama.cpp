@@ -413,24 +413,14 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
         return fail("projection kernel launch failed");
     }
 
-    std::vector<ggml_bf16_t> q_flash(q_observed.size());
-    std::vector<ggml_bf16_t> k_flash(k_observed.size());
-    std::vector<ggml_bf16_t> v_flash(v_observed.size());
-    std::vector<ggml_bf16_t> q_flash_reference(q_expected.size());
-    std::vector<ggml_bf16_t> k_flash_reference(k_expected.size());
-    std::vector<ggml_bf16_t> v_flash_reference(v_expected.size());
-    for (size_t index = 0; index < q_flash.size(); ++index) {
-        q_flash[index]           = ggml_fp32_to_bf16(decode_lowp(type, q_observed[index]));
-        q_flash_reference[index] = ggml_fp32_to_bf16(decode_lowp(type, q_expected[index]));
-    }
-    for (size_t index = 0; index < k_flash.size(); ++index) {
-        k_flash[index]           = ggml_fp32_to_bf16(decode_lowp(type, k_observed[index]));
-        k_flash_reference[index] = ggml_fp32_to_bf16(decode_lowp(type, k_expected[index]));
-        v_flash[index]           = ggml_fp32_to_bf16(decode_lowp(type, v_observed[index]));
-        v_flash_reference[index] = ggml_fp32_to_bf16(decode_lowp(type, v_expected[index]));
-    }
-    const float        attention_scale = 1.0f / std::sqrt((float) head_dim);
-    std::vector<float> attention_expected(attention.size());
+    const std::vector<uint16_t> & q_flash           = q_observed;
+    const std::vector<uint16_t> & k_flash           = k_observed;
+    const std::vector<uint16_t> & v_flash           = v_observed;
+    const std::vector<uint16_t> & q_flash_reference = q_expected;
+    const std::vector<uint16_t> & k_flash_reference = k_expected;
+    const std::vector<uint16_t> & v_flash_reference = v_expected;
+    const float                   attention_scale   = 1.0f / std::sqrt((float) head_dim);
+    std::vector<float>            attention_expected(attention.size());
     for (uint32_t query = 0; query < tokens; ++query) {
         for (uint32_t head = 0; head < q_heads; ++head) {
             const uint32_t kv_head = head / (q_heads / kv_heads);
@@ -443,8 +433,8 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                 }
                 float score = 0.0f;
                 for (uint32_t dim = 0; dim < head_dim; ++dim) {
-                    score += ggml_bf16_to_fp32(q_flash_reference[((size_t) head * tokens + query) * head_dim + dim]) *
-                             ggml_bf16_to_fp32(k_flash_reference[((size_t) kv_head * tokens + key) * head_dim + dim]);
+                    score += decode_lowp(type, q_flash_reference[((size_t) head * tokens + query) * head_dim + dim]) *
+                             decode_lowp(type, k_flash_reference[((size_t) kv_head * tokens + key) * head_dim + dim]);
                 }
                 scores[key] = score * attention_scale;
                 max_score   = std::max(max_score, scores[key]);
@@ -458,7 +448,7 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                 float value = 0.0f;
                 for (uint32_t key = 0; key <= query; ++key) {
                     value += scores[key] / sum *
-                             ggml_bf16_to_fp32(v_flash_reference[((size_t) kv_head * tokens + key) * head_dim + dim]);
+                             decode_lowp(type, v_flash_reference[((size_t) kv_head * tokens + key) * head_dim + dim]);
                 }
                 attention_expected[((size_t) query * q_heads + head) * head_dim + dim] = value;
             }
@@ -474,17 +464,26 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     flash_config.head_dim                  = head_dim;
     flash_config.scale_bits                = float_bits(attention_scale);
     flash_config.flags                     = 1U;
+    flash_config.q_row_stride              = head_dim * sizeof(uint16_t);
+    flash_config.q_head_stride             = tokens * flash_config.q_row_stride;
+    flash_config.q_batch_stride            = q_heads * flash_config.q_head_stride;
+    flash_config.k_row_stride              = head_dim * sizeof(uint16_t);
+    flash_config.k_head_stride             = tokens * flash_config.k_row_stride;
+    flash_config.k_batch_stride            = kv_heads * flash_config.k_head_stride;
+    flash_config.v_row_stride              = head_dim * sizeof(uint16_t);
+    flash_config.v_head_stride             = tokens * flash_config.v_row_stride;
+    flash_config.v_batch_stride            = kv_heads * flash_config.v_head_stride;
     device_buffers flash_buffers;
     int64_t        flash_result = -1;
     int            flash_status = create_buffer(runtime->context, sizeof(flash_config), &flash_buffers.config);
     if (flash_status == 0) {
-        flash_status = create_buffer(runtime->context, q_flash.size() * sizeof(ggml_bf16_t), &flash_buffers.weight);
+        flash_status = create_buffer(runtime->context, q_flash.size() * sizeof(uint16_t), &flash_buffers.weight);
     }
     if (flash_status == 0) {
-        flash_status = create_buffer(runtime->context, k_flash.size() * sizeof(ggml_bf16_t), &flash_buffers.norm);
+        flash_status = create_buffer(runtime->context, k_flash.size() * sizeof(uint16_t), &flash_buffers.norm);
     }
     if (flash_status == 0) {
-        flash_status = create_buffer(runtime->context, v_flash.size() * sizeof(ggml_bf16_t), &flash_buffers.positions);
+        flash_status = create_buffer(runtime->context, v_flash.size() * sizeof(uint16_t), &flash_buffers.positions);
     }
     if (flash_status == 0) {
         flash_status = create_buffer(runtime->context, attention.size() * sizeof(float), &flash_buffers.output);
@@ -496,16 +495,14 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
         flash_status = upload(runtime->stream, flash_buffers.config, &flash_config, sizeof(flash_config));
     }
     if (flash_status == 0) {
-        flash_status =
-            upload(runtime->stream, flash_buffers.weight, q_flash.data(), q_flash.size() * sizeof(ggml_bf16_t));
+        flash_status = upload(runtime->stream, flash_buffers.weight, q_flash.data(), q_flash.size() * sizeof(uint16_t));
+    }
+    if (flash_status == 0) {
+        flash_status = upload(runtime->stream, flash_buffers.norm, k_flash.data(), k_flash.size() * sizeof(uint16_t));
     }
     if (flash_status == 0) {
         flash_status =
-            upload(runtime->stream, flash_buffers.norm, k_flash.data(), k_flash.size() * sizeof(ggml_bf16_t));
-    }
-    if (flash_status == 0) {
-        flash_status =
-            upload(runtime->stream, flash_buffers.positions, v_flash.data(), v_flash.size() * sizeof(ggml_bf16_t));
+            upload(runtime->stream, flash_buffers.positions, v_flash.data(), v_flash.size() * sizeof(uint16_t));
     }
     if (flash_status == 0) {
         npu_kernel_launch_attrs_t attrs;
@@ -514,8 +511,11 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
         attrs.config.task_mode = NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
         flash_status =
-            flash_attention_bf16_1c(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
-                                    flash_buffers.positions, flash_buffers.output, flash_buffers.perf, &attrs);
+            type == GGML_TYPE_BF16 ?
+                flash_attention_bf16_1c(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
+                                        flash_buffers.positions, flash_buffers.output, flash_buffers.perf, &attrs) :
+                flash_attention_fp16_1c(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
+                                        flash_buffers.positions, flash_buffers.output, flash_buffers.perf, &attrs);
     }
     std::vector<float> flash_layout(attention.size());
     if (flash_status == 0) {
@@ -534,14 +534,7 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                      (long long) flash_result);
         return fail("Flash-Attention kernel launch failed");
     }
-    for (uint32_t query = 0; query < tokens; ++query) {
-        for (uint32_t head = 0; head < q_heads; ++head) {
-            for (uint32_t dim = 0; dim < head_dim; ++dim) {
-                attention[((size_t) query * q_heads + head) * head_dim + dim] =
-                    flash_layout[((size_t) head * tokens + query) * head_dim + dim];
-            }
-        }
-    }
+    attention = flash_layout;
 
     const std::vector<int32_t> cache_indices     = { 5, 1, 6 };
     std::vector<int32_t>       positions_indices = positions;
@@ -747,9 +740,14 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                                                         gated_buffers.output, gated_buffers.perf, &attrs);
     }
     std::vector<float> gated_observed(gated_expected.size());
+    std::vector<uint16_t> gated_activation_observed(gated_activation.size());
     if (gated_status == 0) {
         gated_status = download(runtime->stream, gated_observed.data(), gated_buffers.output,
                                 gated_observed.size() * sizeof(float));
+    }
+    if (gated_status == 0) {
+        gated_status = download(runtime->stream, gated_activation_observed.data(), gated_buffers.activation,
+                                gated_activation_observed.size() * sizeof(uint16_t));
     }
     if (gated_status == 0) {
         gated_status = download(runtime->stream, &gated_perf, gated_buffers.perf, sizeof(gated_perf));
@@ -767,6 +765,7 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     float      k_cache_error   = 0.0f;
     float      v_cache_error   = 0.0f;
     float      attention_error = 0.0f;
+    float      gated_activation_error = 0.0f;
     float      gated_error     = 0.0f;
     const bool close           = compare_lowp(type, qg_expected, qg_observed, &qg_error) &&
                                  compare_lowp(type, q_expected, q_observed, &q_error) &&
@@ -775,12 +774,14 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                                  compare_lowp(type, k_cache_expected, k_cache_observed, &k_cache_error) &&
                                  compare_lowp(type, v_cache_expected, v_cache_observed, &v_cache_error) &&
                                  compare_fp32(attention_expected, attention, &attention_error) &&
+                                 compare_lowp(type, gated_activation, gated_activation_observed,
+                                              &gated_activation_error) &&
                                  compare_fp32(gated_expected, gated_observed, &gated_error);
     std::printf(
         "type=%s tokens=%u embd=%u head_dim=%u q_heads=%u kv_heads=%u qg=%g q=%g k=%g v=%g kc=%g vc=%g attn=%g "
-        "gated=%g\n",
+        "gated-activation=%g gated=%g\n",
         ggml_type_name(type), tokens, embd, head_dim, q_heads, kv_heads, qg_error, q_error, k_error, v_error,
-        k_cache_error, v_cache_error, attention_error, gated_error);
+        k_cache_error, v_cache_error, attention_error, gated_activation_error, gated_error);
     return close ? 0 : fail("projection numerical comparison failed");
 }
 

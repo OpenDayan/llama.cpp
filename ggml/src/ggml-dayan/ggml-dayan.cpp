@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -27,11 +28,23 @@ struct ggml_backend_dayan_device_state {
     size_t          references = 0;
 };
 
+struct ggml_backend_dayan_slot_resources {
+    npu_buffer_t *       config          = nullptr;
+    size_t               config_capacity = 0;
+    std::vector<uint8_t> config_data;
+    npu_buffer_t *       perf               = nullptr;
+    size_t               perf_capacity      = 0;
+    npu_buffer_t *       workspace          = nullptr;
+    size_t               workspace_capacity = 0;
+};
+
 struct ggml_backend_dayan_context {
-    ggml_backend_dayan_device_state * device  = nullptr;
-    npu_runtime_t *                   runtime = nullptr;
-    npu_context_t *                   context = nullptr;
-    npu_stream_t *                    stream  = nullptr;
+    ggml_backend_dayan_device_state *              device  = nullptr;
+    npu_runtime_t *                                runtime = nullptr;
+    npu_context_t *                                context = nullptr;
+    npu_stream_t *                                 stream  = nullptr;
+    std::vector<ggml_backend_dayan_slot_resources> slot_resources;
+    size_t                                         active_slot = SIZE_MAX;
 };
 
 struct ggml_backend_dayan_buffer_context {
@@ -51,6 +64,186 @@ static std::mutex                                       ggml_backend_dayan_devic
 static ggml_backend_dayan_device_state *                ggml_backend_dayan_device;
 static std::mutex                                       ggml_backend_dayan_buffer_mutex;
 static std::vector<ggml_backend_dayan_buffer_context *> ggml_backend_dayan_buffer_contexts;
+static std::mutex                                       ggml_backend_dayan_trace_mutex;
+static ggml_backend_dayan_slot_trace_callback           ggml_backend_dayan_trace_callback;
+static void *                                           ggml_backend_dayan_trace_user_data;
+
+void ggml_backend_dayan_set_slot_trace_callback(ggml_backend_dayan_slot_trace_callback callback, void * user_data) {
+    std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
+    ggml_backend_dayan_trace_callback  = callback;
+    ggml_backend_dayan_trace_user_data = user_data;
+}
+
+static const char * ggml_backend_dayan_slot_kind_name(ggml_backend_dayan_slot_kind kind) {
+    switch (kind) {
+        case ggml_backend_dayan_slot_kind::mul_mat:
+            return "mul_mat";
+        case ggml_backend_dayan_slot_kind::mul_mat_quantized:
+            return "mul_mat_quantized";
+        case ggml_backend_dayan_slot_kind::mul_mat_pair:
+            return "mul_mat_pair";
+        case ggml_backend_dayan_slot_kind::mul_mat_swiglu:
+            return "mul_mat_swiglu";
+        case ggml_backend_dayan_slot_kind::mul_mat_geglu:
+            return "mul_mat_geglu";
+        case ggml_backend_dayan_slot_kind::mul_mat_id:
+            return "mul_mat_id";
+        case ggml_backend_dayan_slot_kind::mul_mat_id_pair:
+            return "mul_mat_id_pair";
+        case ggml_backend_dayan_slot_kind::mul_mat_id_swiglu:
+            return "mul_mat_id_swiglu";
+        case ggml_backend_dayan_slot_kind::mul_mat_id_geglu:
+            return "mul_mat_id_geglu";
+        case ggml_backend_dayan_slot_kind::add_id:
+            return "add_id";
+        case ggml_backend_dayan_slot_kind::argsort:
+            return "argsort";
+        case ggml_backend_dayan_slot_kind::top_k:
+            return "top_k";
+        case ggml_backend_dayan_slot_kind::elementwise_add:
+            return "elementwise_add";
+        case ggml_backend_dayan_slot_kind::elementwise_mul:
+            return "elementwise_mul";
+        case ggml_backend_dayan_slot_kind::elementwise_sub:
+            return "elementwise_sub";
+        case ggml_backend_dayan_slot_kind::elementwise_div:
+            return "elementwise_div";
+        case ggml_backend_dayan_slot_kind::scale:
+            return "scale";
+        case ggml_backend_dayan_slot_kind::sigmoid:
+            return "sigmoid";
+        case ggml_backend_dayan_slot_kind::silu:
+            return "silu";
+        case ggml_backend_dayan_slot_kind::softplus:
+            return "softplus";
+        case ggml_backend_dayan_slot_kind::unary_math:
+            return "unary_math";
+        case ggml_backend_dayan_slot_kind::sum:
+            return "sum";
+        case ggml_backend_dayan_slot_kind::sum_rows:
+            return "sum_rows";
+        case ggml_backend_dayan_slot_kind::mean:
+            return "mean";
+        case ggml_backend_dayan_slot_kind::l2_norm:
+            return "l2_norm";
+        case ggml_backend_dayan_slot_kind::get_rows:
+            return "get_rows";
+        case ggml_backend_dayan_slot_kind::set_rows:
+            return "set_rows";
+        case ggml_backend_dayan_slot_kind::copy:
+            return "copy";
+        case ggml_backend_dayan_slot_kind::repeat:
+            return "repeat";
+        case ggml_backend_dayan_slot_kind::set:
+            return "set";
+        case ggml_backend_dayan_slot_kind::diag:
+            return "diag";
+        case ggml_backend_dayan_slot_kind::diag_mask_inf:
+            return "diag_mask_inf";
+        case ggml_backend_dayan_slot_kind::diag_mask_zero:
+            return "diag_mask_zero";
+        case ggml_backend_dayan_slot_kind::pad:
+            return "pad";
+        case ggml_backend_dayan_slot_kind::pad_circular:
+            return "pad_circular";
+        case ggml_backend_dayan_slot_kind::pad_reflect_1d:
+            return "pad_reflect_1d";
+        case ggml_backend_dayan_slot_kind::roll:
+            return "roll";
+        case ggml_backend_dayan_slot_kind::clamp:
+            return "clamp";
+        case ggml_backend_dayan_slot_kind::softmax:
+            return "softmax";
+        case ggml_backend_dayan_slot_kind::concat:
+            return "concat";
+        case ggml_backend_dayan_slot_kind::rope:
+            return "rope";
+        case ggml_backend_dayan_slot_kind::residual_add:
+            return "residual_add";
+        case ggml_backend_dayan_slot_kind::rms_norm:
+            return "rms_norm";
+        case ggml_backend_dayan_slot_kind::norm:
+            return "norm";
+        case ggml_backend_dayan_slot_kind::group_norm:
+            return "group_norm";
+        case ggml_backend_dayan_slot_kind::norm_pipeline:
+            return "norm_pipeline";
+        case ggml_backend_dayan_slot_kind::flash_attention:
+            return "flash_attention";
+        case ggml_backend_dayan_slot_kind::gated_delta_net:
+            return "gated_delta_net";
+        case ggml_backend_dayan_slot_kind::gated_output_projection:
+            return "gated_output_projection";
+        case ggml_backend_dayan_slot_kind::ssm_conv:
+            return "ssm_conv";
+        case ggml_backend_dayan_slot_kind::ssm_conv_silu:
+            return "ssm_conv_silu";
+    }
+    return "unknown";
+}
+
+static size_t ggml_backend_dayan_slot_outputs(const ggml_backend_dayan_graph_slot & slot,
+                                              const ggml_tensor **                  outputs) {
+    switch (slot.kind) {
+        case ggml_backend_dayan_slot_kind::mul_mat_pair:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_pair:
+            outputs[0] = slot.nodes[0];
+            outputs[1] = slot.nodes[1];
+            return 2;
+        case ggml_backend_dayan_slot_kind::mul_mat_quantized:
+            outputs[0] = slot.nodes[1];
+            return 1;
+        case ggml_backend_dayan_slot_kind::mul_mat_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_geglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_geglu:
+            outputs[0] = slot.nodes[3];
+            return 1;
+        case ggml_backend_dayan_slot_kind::norm_pipeline:
+            outputs[0] = slot.nodes[3] != nullptr ? slot.nodes[3] :
+                         slot.nodes[2] != nullptr ? slot.nodes[2] :
+                                                    slot.nodes[1];
+            return 1;
+        case ggml_backend_dayan_slot_kind::gated_output_projection:
+            outputs[0] = slot.nodes[2];
+            return 1;
+        case ggml_backend_dayan_slot_kind::ssm_conv_silu:
+            outputs[0] = slot.nodes[1];
+            return 1;
+        default:
+            outputs[0] = slot.nodes[0];
+            return 1;
+    }
+}
+
+static void ggml_backend_dayan_trace_slot(const ggml_backend_dayan_graph_slot & slot,
+                                          size_t                                slot_index,
+                                          int                                   status,
+                                          int64_t                               elapsed_us) {
+    ggml_backend_dayan_slot_trace_callback callback  = nullptr;
+    void *                                 user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
+        callback  = ggml_backend_dayan_trace_callback;
+        user_data = ggml_backend_dayan_trace_user_data;
+    }
+    if (callback == nullptr) {
+        return;
+    }
+
+    ggml_backend_dayan_slot_trace_event event = {};
+    event.version                             = 1;
+    event.kind                                = ggml_backend_dayan_slot_kind_name(slot.kind);
+    event.slot_index                          = slot_index;
+    event.node_count                          = slot.node_count;
+    event.status                              = status;
+    event.elapsed_us                          = elapsed_us;
+    for (size_t i = 0; i < slot.nodes.size(); ++i) {
+        event.nodes[i] = slot.nodes[i];
+    }
+    event.output_count = ggml_backend_dayan_slot_outputs(slot, event.outputs);
+    callback(&event, user_data);
+}
 
 static void ggml_backend_dayan_device_destroy(ggml_backend_dayan_device_state * device) {
     if (device->stream != nullptr) {
@@ -122,14 +315,17 @@ static bool ggml_backend_dayan_find_device_pointer(const void *                 
 }
 
 struct ggml_backend_dayan_buffers {
-    npu_buffer_t * config  = nullptr;
-    npu_buffer_t * weight0 = nullptr;
-    npu_buffer_t * weight1 = nullptr;
-    npu_buffer_t * input2  = nullptr;
-    npu_buffer_t * input3  = nullptr;
-    npu_buffer_t * output  = nullptr;
-    npu_buffer_t * output1 = nullptr;
-    npu_buffer_t * perf    = nullptr;
+    npu_buffer_t * config      = nullptr;
+    npu_buffer_t * weight0     = nullptr;
+    npu_buffer_t * weight1     = nullptr;
+    npu_buffer_t * input2      = nullptr;
+    npu_buffer_t * input3      = nullptr;
+    npu_buffer_t * output      = nullptr;
+    npu_buffer_t * output1     = nullptr;
+    npu_buffer_t * perf        = nullptr;
+    bool           owns_config = true;
+    bool           owns_input2 = true;
+    bool           owns_perf   = true;
 };
 
 struct ggml_backend_dayan_activation_key {
@@ -216,7 +412,7 @@ static void ggml_backend_dayan_preserve_error(int candidate, int * status) {
 }
 
 static void ggml_backend_dayan_buffers_free(ggml_backend_dayan_buffers * buffers, int * status) {
-    if (buffers->perf != nullptr) {
+    if (buffers->perf != nullptr && buffers->owns_perf) {
         ggml_backend_dayan_preserve_error(npu_buffer_destroy(buffers->perf), status);
     }
     if (buffers->output1 != nullptr) {
@@ -228,7 +424,7 @@ static void ggml_backend_dayan_buffers_free(ggml_backend_dayan_buffers * buffers
     if (buffers->input3 != nullptr) {
         ggml_backend_dayan_preserve_error(npu_buffer_destroy(buffers->input3), status);
     }
-    if (buffers->input2 != nullptr) {
+    if (buffers->input2 != nullptr && buffers->owns_input2) {
         ggml_backend_dayan_preserve_error(npu_buffer_destroy(buffers->input2), status);
     }
     if (buffers->weight1 != nullptr) {
@@ -237,9 +433,116 @@ static void ggml_backend_dayan_buffers_free(ggml_backend_dayan_buffers * buffers
     if (buffers->weight0 != nullptr) {
         ggml_backend_dayan_preserve_error(npu_buffer_destroy(buffers->weight0), status);
     }
-    if (buffers->config != nullptr) {
+    if (buffers->config != nullptr && buffers->owns_config) {
         ggml_backend_dayan_preserve_error(npu_buffer_destroy(buffers->config), status);
     }
+}
+
+static int ggml_backend_dayan_reserve_slot_buffer(npu_context_t * context,
+                                                  size_t          size,
+                                                  npu_buffer_t ** buffer,
+                                                  size_t *        capacity) {
+    if (*buffer != nullptr && *capacity >= size) {
+        return 0;
+    }
+
+    npu_buffer_t * replacement = nullptr;
+    int            status      = ggml_backend_dayan_buffer_create(context, size, &replacement);
+    if (status < 0) {
+        return status;
+    }
+    if (*buffer != nullptr) {
+        status = npu_buffer_destroy(*buffer);
+        if (status < 0) {
+            npu_buffer_destroy(replacement);
+            return status;
+        }
+    }
+    *buffer   = replacement;
+    *capacity = size;
+    return 0;
+}
+
+static int ggml_backend_dayan_upload_slot_config(ggml_backend_dayan_context * ctx,
+                                                 const void *                 config,
+                                                 size_t                       config_size,
+                                                 size_t                       config_capacity,
+                                                 npu_buffer_t **              buffer) {
+    if (ctx->active_slot >= ctx->slot_resources.size() || config == nullptr || config_size == 0) {
+        return -1;
+    }
+
+    ggml_backend_dayan_slot_resources & resources = ctx->slot_resources[ctx->active_slot];
+    int status = ggml_backend_dayan_reserve_slot_buffer(ctx->context, config_capacity, &resources.config,
+                                                        &resources.config_capacity);
+    if (status < 0) {
+        GGML_LOG_ERROR("%s: slot %zu failed to reserve %zu-byte config buffer with status %d\n", __func__,
+                       ctx->active_slot, config_capacity, status);
+    }
+    if (status == 0 && (resources.config_data.size() != config_size ||
+                        std::memcmp(resources.config_data.data(), config, config_size) != 0)) {
+        status = ggml_backend_dayan_upload(ctx->stream, resources.config, config, config_size);
+        if (status == 0) {
+            resources.config_data.assign((const uint8_t *) config, (const uint8_t *) config + config_size);
+        } else {
+            GGML_LOG_ERROR("%s: slot %zu failed to upload %zu-byte config with status %d\n", __func__,
+                           ctx->active_slot, config_size, status);
+        }
+    }
+    if (status == 0) {
+        *buffer = resources.config;
+    }
+    return status;
+}
+
+static int ggml_backend_dayan_prepare_launch_buffers_with_capacity(ggml_backend_dayan_context * ctx,
+                                                                   const void *                 config,
+                                                                   size_t                       config_size,
+                                                                   size_t                       config_capacity,
+                                                                   size_t                       perf_size,
+                                                                   ggml_backend_dayan_buffers * buffers) {
+    npu_buffer_t * config_buffer = nullptr;
+    int status = ggml_backend_dayan_upload_slot_config(ctx, config, config_size, config_capacity, &config_buffer);
+    if (status < 0) {
+        return status;
+    }
+    ggml_backend_dayan_slot_resources & resources = ctx->slot_resources[ctx->active_slot];
+    if (perf_size > 0) {
+        status =
+            ggml_backend_dayan_reserve_slot_buffer(ctx->context, perf_size, &resources.perf, &resources.perf_capacity);
+    }
+    if (status == 0) {
+        buffers->config      = config_buffer;
+        buffers->perf        = perf_size > 0 ? resources.perf : nullptr;
+        buffers->owns_config = false;
+        buffers->owns_perf   = false;
+    }
+    return status;
+}
+
+static int ggml_backend_dayan_prepare_launch_buffers(ggml_backend_dayan_context * ctx,
+                                                     const void *                 config,
+                                                     size_t                       config_size,
+                                                     size_t                       perf_size,
+                                                     ggml_backend_dayan_buffers * buffers) {
+    return ggml_backend_dayan_prepare_launch_buffers_with_capacity(ctx, config, config_size, config_size, perf_size,
+                                                                   buffers);
+}
+
+static int ggml_backend_dayan_prepare_slot_workspace(ggml_backend_dayan_context * ctx,
+                                                     size_t                       size,
+                                                     ggml_backend_dayan_buffers * buffers) {
+    if (ctx->active_slot >= ctx->slot_resources.size() || size == 0) {
+        return -1;
+    }
+    ggml_backend_dayan_slot_resources & resources = ctx->slot_resources[ctx->active_slot];
+    const int                           status =
+        ggml_backend_dayan_reserve_slot_buffer(ctx->context, size, &resources.workspace, &resources.workspace_capacity);
+    if (status == 0) {
+        buffers->input2      = resources.workspace;
+        buffers->owns_input2 = false;
+    }
+    return status;
 }
 
 static void ggml_backend_dayan_graph_buffers_free(ggml_backend_dayan_graph_buffers * buffers, int * status) {
@@ -338,19 +641,15 @@ static int ggml_backend_dayan_prepare_activation(ggml_backend_dayan_context *   
             config.source_ne[dimension] = (uint32_t) activation->ne[dimension];
             config.source_nb[dimension] = activation->nb[dimension];
         }
-        npu_buffer_t * config_buffer = nullptr;
-        status                       = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &config_buffer);
-        if (status == 0) {
-            status = ggml_backend_dayan_upload(ctx->stream, config_buffer, &config, sizeof(config));
-        }
+        ggml_backend_dayan_buffers launch_buffers;
+        status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &launch_buffers);
         if (status == 0) {
             npu_kernel_launch_attrs_t attrs;
             ggml_backend_dayan_init_native_launch_attrs(ctx, "activation-cast", &attrs);
-            status = copy_f32_1c(config_buffer, ggml_backend_dayan_tensor_buffer(activation), device_buffer, &attrs);
+            status =
+                copy_f32_1c(launch_buffers.config, ggml_backend_dayan_tensor_buffer(activation), device_buffer, &attrs);
         }
-        if (config_buffer != nullptr) {
-            ggml_backend_dayan_preserve_error(npu_buffer_destroy(config_buffer), &status);
-        }
+        ggml_backend_dayan_buffers_free(&launch_buffers, &status);
     } else if (status == 0) {
         status = -1;
     }
@@ -409,15 +708,8 @@ static int ggml_backend_dayan_mul_mat(ggml_backend_dayan_context * ctx,
         m, n, k, k * sizeof(uint16_t), weight->nb[1], dst->nb[1],
     };
     ggml_backend_dayan_buffers buffers;
-    int                        status = 0;
-
-    status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanMatmulPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int                        status =
+        ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_launch_attrs(ctx, "ggml-mul-mat", &attrs);
@@ -451,17 +743,8 @@ static int ggml_backend_dayan_mul_mat_quantized(ggml_backend_dayan_context *    
         m, n, k, k * sizeof(uint16_t), weight->nb[1], output->nb[1],
     };
     ggml_backend_dayan_buffers buffers;
-    int                        status = 0;
-
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanMatmulPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int                        status =
+        ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_launch_attrs(ctx, "ggml-mm-lowp", &attrs);
@@ -496,17 +779,8 @@ static int ggml_backend_dayan_mul_mat_glu(ggml_backend_dayan_context *          
         m, n, k, k * sizeof(uint16_t), gate->src[0]->nb[1], output->nb[1],
     };
     ggml_backend_dayan_buffers buffers;
-    int                        status = 0;
-
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanMatmulPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int                        status =
+        ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_launch_attrs(
@@ -556,13 +830,8 @@ static int ggml_backend_dayan_mul_mat_id(ggml_backend_dayan_context * ctx,
     const ggml_tensor *        weight = dst->src[0];
     const DayanMulMatIdConfig  config = ggml_backend_dayan_mul_mat_id_config(dst);
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanMatmulPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int                        status =
+        ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_launch_attrs(ctx, "ggml-mul-mat-id", &attrs);
@@ -590,13 +859,8 @@ static int ggml_backend_dayan_mul_mat_id_glu(ggml_backend_dayan_context *       
     ggml_tensor *              output = slot.nodes[3];
     const DayanMulMatIdConfig  config = ggml_backend_dayan_mul_mat_id_config(gate);
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanMatmulPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int                        status =
+        ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         const bool                swiglu = slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_swiglu;
@@ -643,10 +907,7 @@ static int ggml_backend_dayan_add_id(ggml_backend_dayan_context * ctx, const ggm
         (uint32_t) output->ne[2],
     };
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "ggml-add-id", &attrs);
@@ -671,10 +932,7 @@ static int ggml_backend_dayan_sort(ggml_backend_dayan_context * ctx, const ggml_
     };
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, top_k ? "ggml-top-k" : "ggml-argsort", &attrs);
@@ -713,8 +971,8 @@ static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *   
     const DayanElementwiseConfig config = { (uint64_t) ggml_nelements(output) };
     const size_t                 bytes  = (size_t) config.elements * sizeof(float);
     ggml_backend_dayan_buffers   buffers;
-    int status = ggml_backend_dayan_buffer_create(ctx->context, std::max(sizeof(config), sizeof(DayanRepeatConfig)),
-                                                  &buffers.config);
+    int                          status = ggml_backend_dayan_prepare_launch_buffers_with_capacity(
+        ctx, &config, sizeof(config), std::max(sizeof(config), sizeof(DayanRepeatConfig)), 0, &buffers);
     npu_buffer_t * right_buffer = ggml_backend_dayan_tensor_buffer(right);
     if (status == 0 && !ggml_are_same_shape(right, output)) {
         status                   = ggml_backend_dayan_buffer_create(ctx->context, bytes, &buffers.weight1);
@@ -726,7 +984,8 @@ static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *   
             repeat.output_ne[dimension] = (uint32_t) output->ne[dimension];
         }
         if (status == 0) {
-            status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &repeat, sizeof(repeat));
+            status =
+                ggml_backend_dayan_upload_slot_config(ctx, &repeat, sizeof(repeat), sizeof(repeat), &buffers.config);
         }
         if (status == 0) {
             npu_kernel_launch_attrs_t attrs;
@@ -738,7 +997,8 @@ static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *   
         }
     }
     if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
+        status = ggml_backend_dayan_upload_slot_config(ctx, &config, sizeof(config), sizeof(DayanRepeatConfig),
+                                                       &buffers.config);
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
@@ -786,10 +1046,7 @@ static int ggml_backend_dayan_scale(ggml_backend_dayan_context * ctx, const ggml
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "scale", &attrs);
@@ -805,10 +1062,7 @@ static int ggml_backend_dayan_unary(ggml_backend_dayan_context * ctx, const ggml
     const ggml_tensor *          input  = output->src[0];
     const DayanElementwiseConfig config = { (uint64_t) ggml_nelements(output) };
     ggml_backend_dayan_buffers   buffers;
-    int status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         const char *              launch_name = nullptr;
@@ -914,10 +1168,7 @@ static int ggml_backend_dayan_reduce(ggml_backend_dayan_context * ctx, const ggm
     std::memcpy(&config.scale_bits, &scale, sizeof(scale));
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         switch (slot.kind) {
@@ -950,10 +1201,7 @@ static int ggml_backend_dayan_l2_norm(ggml_backend_dayan_context * ctx, const gg
     const ggml_tensor *        input  = output->src[0];
     DayanNormConfig            config = ggml_backend_dayan_norm_config(output);
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "l2-norm", &attrs);
@@ -992,10 +1240,7 @@ static int ggml_backend_dayan_get_rows(ggml_backend_dayan_context * ctx, const g
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "get-rows", &attrs);
@@ -1033,10 +1278,7 @@ static int ggml_backend_dayan_set_rows(ggml_backend_dayan_context * ctx, const g
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         status = ggml_backend_dayan_copy(ctx->stream, ggml_backend_dayan_tensor_buffer(output), 0,
                                          ggml_backend_dayan_tensor_buffer(output->src[2]), 0, ggml_nbytes(output));
@@ -1077,15 +1319,26 @@ static int ggml_backend_dayan_copy_tensor(ggml_backend_dayan_context *          
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
+    if (status < 0) {
+        GGML_LOG_ERROR("%s: slot %zu failed before launch: %s %s -> %s, ne=[%" PRId64 ", %" PRId64 ", %" PRId64
+                       ", %" PRId64 "], nb=[%zu, %zu, %zu, %zu], status=%d\n",
+                       __func__, ctx->active_slot, source->name, ggml_type_name(source->type),
+                       ggml_type_name(output->type), source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                       source->nb[0], source->nb[1], source->nb[2], source->nb[3], status);
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "copy", &attrs);
         status = copy_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(source),
                              ggml_backend_dayan_tensor_buffer(output), &attrs);
+        if (status < 0) {
+            GGML_LOG_ERROR("%s: slot %zu launch failed: %s %s -> %s, ne=[%" PRId64 ", %" PRId64 ", %" PRId64
+                           ", %" PRId64 "], nb=[%zu, %zu, %zu, %zu], status=%d\n",
+                           __func__, ctx->active_slot, source->name, ggml_type_name(source->type),
+                           ggml_type_name(output->type), source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                           source->nb[0], source->nb[1], source->nb[2], source->nb[3], status);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     return status;
@@ -1108,10 +1361,7 @@ static int ggml_backend_dayan_repeat(ggml_backend_dayan_context * ctx, const ggm
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "repeat", &attrs);
@@ -1138,10 +1388,7 @@ static int ggml_backend_dayan_set(ggml_backend_dayan_context * ctx, const ggml_b
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         status = ggml_backend_dayan_copy(ctx->stream, ggml_backend_dayan_tensor_buffer(output), 0,
                                          ggml_backend_dayan_tensor_buffer(base), 0, ggml_nbytes(output));
@@ -1172,10 +1419,7 @@ static int ggml_backend_dayan_layout(ggml_backend_dayan_context * ctx, const ggm
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         using kernel_t = int (*)(npu_buffer_t *, npu_buffer_t *, npu_buffer_t *, const npu_kernel_launch_attrs_t *);
         kernel_t     kernel      = nullptr;
@@ -1233,10 +1477,7 @@ static int ggml_backend_dayan_clamp(ggml_backend_dayan_context * ctx, const ggml
     std::memcpy(&config.max_bits, (const char *) output->op_params + sizeof(float), sizeof(config.max_bits));
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "clamp", &attrs);
@@ -1274,9 +1515,9 @@ static int ggml_backend_dayan_softmax(ggml_backend_dayan_context * ctx, const gg
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    npu_buffer_t *             mask_buffer = ggml_backend_dayan_tensor_buffer(mask);
-    npu_buffer_t *             sink_buffer = ggml_backend_dayan_tensor_buffer(sinks);
+    int            status      = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
+    npu_buffer_t * mask_buffer = ggml_backend_dayan_tensor_buffer(mask);
+    npu_buffer_t * sink_buffer = ggml_backend_dayan_tensor_buffer(sinks);
     if (status == 0 && mask_buffer == nullptr) {
         status      = ggml_backend_dayan_buffer_create(ctx->context, sizeof(float), &buffers.weight1);
         mask_buffer = buffers.weight1;
@@ -1284,9 +1525,6 @@ static int ggml_backend_dayan_softmax(ggml_backend_dayan_context * ctx, const gg
     if (status == 0 && sink_buffer == nullptr) {
         status      = ggml_backend_dayan_buffer_create(ctx->context, sizeof(float), &buffers.input2);
         sink_buffer = buffers.input2;
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
@@ -1317,10 +1555,7 @@ static int ggml_backend_dayan_concat(ggml_backend_dayan_context * ctx, const ggm
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "concat", &attrs);
@@ -1360,21 +1595,13 @@ static int ggml_backend_dayan_rope(ggml_backend_dayan_context * ctx, const ggml_
     float corr_dims[2];
     ggml_rope_yarn_corr_dims(n_dims, ggml_get_op_params_i32(output, 4), freq_base, beta_fast, beta_slow, corr_dims);
 
-    DayanRopeConfig config = {
-        (uint32_t) output->ne[0],
-        (uint32_t) output->ne[1],
-        (uint32_t) output->ne[2],
-        (uint32_t) output->ne[3],
-        (uint32_t) n_dims,
-        (uint32_t) mode,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        { 0, 0, 0, 0 },
-    };
+    DayanRopeConfig config = {};
+    config.width           = (uint32_t) output->ne[0];
+    config.heads           = (uint32_t) output->ne[1];
+    config.tokens          = (uint32_t) output->ne[2];
+    config.batches         = (uint32_t) output->ne[3];
+    config.n_dims          = (uint32_t) n_dims;
+    config.mode            = (uint32_t) mode;
     std::memcpy(&config.theta_scale_bits, &theta_scale, sizeof(theta_scale));
     std::memcpy(&config.freq_scale_bits, &freq_scale, sizeof(freq_scale));
     std::memcpy(&config.ext_factor_bits, &ext_factor, sizeof(ext_factor));
@@ -1382,18 +1609,53 @@ static int ggml_backend_dayan_rope(ggml_backend_dayan_context * ctx, const ggml_
     std::memcpy(&config.corr_dim0_bits, &corr_dims[0], sizeof(corr_dims[0]));
     std::memcpy(&config.corr_dim1_bits, &corr_dims[1], sizeof(corr_dims[1]));
     std::memcpy(config.sections, (const int32_t *) output->op_params + 11, sizeof(config.sections));
+    config.axis_values[0] = 0;
+    config.axis_values[1] = 1;
+    config.axis_values[2] = 2;
+
+    float theta_factor = 1.0f;
+    for (int32_t pair = 0; pair < n_dims / 2; ++pair) {
+        uint32_t axis = 0;
+        if ((mode & GGML_ROPE_TYPE_MROPE) != 0) {
+            const int32_t section_count =
+                config.sections[0] + config.sections[1] + config.sections[2] + config.sections[3];
+            if (section_count > 0) {
+                const int32_t sector = pair % section_count;
+                if (mode == GGML_ROPE_TYPE_IMROPE) {
+                    if (sector % 3 == 1 && sector < 3 * config.sections[1]) {
+                        axis = 1;
+                    } else if (sector % 3 == 2 && sector < 3 * config.sections[2]) {
+                        axis = 2;
+                    } else if (sector % 3 != 0 || sector >= 3 * config.sections[0]) {
+                        axis = 3;
+                    }
+                } else if (sector >= config.sections[0] + config.sections[1] + config.sections[2]) {
+                    axis = 3;
+                } else if (sector >= config.sections[0] + config.sections[1]) {
+                    axis = 2;
+                } else if (sector >= config.sections[0]) {
+                    axis = 1;
+                }
+            }
+        }
+        config.axes[pair] = axis;
+
+        const float range = std::max(corr_dims[1] - corr_dims[0], 0.001f);
+        const float ramp  = std::clamp(((float) pair - corr_dims[0]) / range, 0.0f, 1.0f);
+        const float mix   = (1.0f - ramp) * ext_factor;
+        const float multiplier = theta_factor * (freq_scale * (1.0f - mix) + mix);
+        std::memcpy(&config.multipliers[pair], &multiplier, sizeof(multiplier));
+        theta_factor *= theta_scale;
+    }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    npu_buffer_t *             factor_buffer = ggml_backend_dayan_tensor_buffer(factors);
-    std::vector<float>         factor_values;
+    int                status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
+    npu_buffer_t *     factor_buffer = ggml_backend_dayan_tensor_buffer(factors);
+    std::vector<float> factor_values;
     if (status == 0 && factor_buffer == nullptr) {
         factor_values.assign((size_t) n_dims / 2, 1.0f);
         status = ggml_backend_dayan_buffer_create(ctx->context, factor_values.size() * sizeof(float), &buffers.input2);
         factor_buffer = buffers.input2;
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
     }
     if (status == 0 && factors == nullptr) {
         status = ggml_backend_dayan_upload(ctx->stream, buffers.input2, factor_values.data(),
@@ -1417,10 +1679,7 @@ static int ggml_backend_dayan_residual_add(ggml_backend_dayan_context *         
         (uint64_t) ggml_nelements(add),
     };
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "residual-add", &attrs);
@@ -1441,10 +1700,7 @@ static int ggml_backend_dayan_norm_raw(ggml_backend_dayan_context * ctx, const g
     const DayanNormConfig config = ggml_backend_dayan_norm_config(output);
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, rms ? "rms-norm" : "norm", &attrs);
@@ -1475,10 +1731,7 @@ static int ggml_backend_dayan_group_norm(ggml_backend_dayan_context * ctx, const
     std::memcpy(&config.epsilon_bits, &epsilon, sizeof(epsilon));
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "group-norm", &attrs);
@@ -1529,10 +1782,7 @@ static int ggml_backend_dayan_norm_pipeline(ggml_backend_dayan_context *        
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, has_add ? "add-rms" : "rms-scale", &attrs);
@@ -1586,23 +1836,22 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
     }
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = 0;
-
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(int64_t), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(int64_t), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        ggml_backend_dayan_init_launch_attrs(ctx, "ggml-fattn", &attrs);
-        status = flash_attention_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
-                                         ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
-                                         ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
+        ggml_backend_dayan_init_launch_attrs(ctx, q->type == GGML_TYPE_BF16 ? "ggml-fattn-bf16" : "ggml-fattn-fp16",
+                                             &attrs);
+        if (q->type == GGML_TYPE_BF16) {
+            status = flash_attention_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
+                                             ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
+                                             ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
+        } else if (q->type == GGML_TYPE_F16) {
+            status = flash_attention_fp16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
+                                             ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
+                                             ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
+        } else {
+            status = -1;
+        }
     }
 
     ggml_backend_dayan_buffers_free(&buffers, &status);
@@ -1643,13 +1892,7 @@ static int ggml_backend_dayan_gated_delta_net(ggml_backend_dayan_context * ctx, 
     std::memcpy(&config.scale_bits, &scale, sizeof(scale));
 
     ggml_backend_dayan_buffers buffers;
-    int                        status = 0;
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, "ggml-gdn", &attrs);
@@ -1692,17 +1935,11 @@ static int ggml_backend_dayan_gated_output_projection(ggml_backend_dayan_context
     ggml_backend_dayan_buffers buffers;
     int status = ggml_backend_dayan_prepare_activation(ctx, graph_buffers, qg, weight->type, &qg_lowp);
     if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    }
-    if (status == 0) {
         status =
-            ggml_backend_dayan_buffer_create(ctx->context, (size_t) tokens * width * sizeof(uint16_t), &buffers.input2);
+            ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
     }
     if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanMatmulPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
+        status = ggml_backend_dayan_prepare_slot_workspace(ctx, (size_t) tokens * width * sizeof(uint16_t), &buffers);
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
@@ -1727,19 +1964,20 @@ static int ggml_backend_dayan_ssm_conv(ggml_backend_dayan_context * ctx, const g
     const ggml_tensor * input  = conv->src[0];
     const ggml_tensor * weight = conv->src[1];
     ggml_tensor * output = slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu ? slot.nodes[1] : slot.nodes[0];
-    const DayanSSMConvConfig config = {
+    DayanSSMConvConfig config = {
         (uint32_t) input->ne[0],  (uint32_t) input->ne[1],
         (uint32_t) output->ne[1], (uint32_t) input->ne[2],
-        (uint32_t) weight->ne[0], slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu ? 1U : 0U,
+        (uint32_t) weight->ne[0], slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu ? 1U : 0U, 0, 0, 0,
     };
+    const float zero      = 0.0f;
+    const float neg_log2e = -1.4426950408889634f;
+    const float one       = 1.0f;
+    std::memcpy(&config.zero_bits, &zero, sizeof(zero));
+    std::memcpy(&config.neg_log2e_bits, &neg_log2e, sizeof(neg_log2e));
+    std::memcpy(&config.one_bits, &one, sizeof(one));
     ggml_backend_dayan_buffers buffers;
-    int                        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(config), &buffers.config);
-    if (status == 0) {
-        status = ggml_backend_dayan_buffer_create(ctx->context, sizeof(DayanSSMConvPerf), &buffers.perf);
-    }
-    if (status == 0) {
-        status = ggml_backend_dayan_upload(ctx->stream, buffers.config, &config, sizeof(config));
-    }
+    int                        status =
+        ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanSSMConvPerf), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_launch_attrs(ctx, "ssm-conv", &attrs);
@@ -1760,6 +1998,17 @@ static const char * ggml_backend_dayan_get_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_dayan_context_free(ggml_backend_dayan_context * ctx) {
+    for (ggml_backend_dayan_slot_resources & resources : ctx->slot_resources) {
+        if (resources.workspace != nullptr) {
+            npu_buffer_destroy(resources.workspace);
+        }
+        if (resources.perf != nullptr) {
+            npu_buffer_destroy(resources.perf);
+        }
+        if (resources.config != nullptr) {
+            npu_buffer_destroy(resources.config);
+        }
+    }
     if (ctx->device != nullptr) {
         ggml_backend_dayan_device_release(ctx->device);
     }
@@ -1987,17 +2236,27 @@ static ggml_backend_buffer_type_t ggml_backend_dayan_buffer_type(ggml_backend_de
 static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_dayan_context *  ctx = (ggml_backend_dayan_context *) backend->context;
     ggml_backend_dayan_graph_plan plan;
-    const ggml_tensor *           unsupported = nullptr;
+    const ggml_tensor *           unsupported      = nullptr;
+    const int64_t                 compile_start_us = ggml_time_us();
 
     if (!ggml_backend_dayan_compile_graph(cgraph, &plan, &unsupported)) {
-        GGML_LOG_ERROR("%s: unsupported op %s\n", __func__, ggml_op_desc(unsupported));
+        GGML_LOG_ERROR("%s: unsupported op %s after %.3f ms\n", __func__, ggml_op_desc(unsupported),
+                       (double) (ggml_time_us() - compile_start_us) / 1000.0);
         return GGML_STATUS_FAILED;
     }
+    const double compile_ms = (double) (ggml_time_us() - compile_start_us) / 1000.0;
 
     ggml_backend_dayan_graph_buffers graph_buffers;
     int                              status = 0;
 
-    for (const ggml_backend_dayan_graph_slot & slot : plan.slots) {
+    if (ctx->slot_resources.size() < plan.slots.size()) {
+        ctx->slot_resources.resize(plan.slots.size());
+    }
+
+    for (size_t slot_index = 0; slot_index < plan.slots.size(); ++slot_index) {
+        ctx->active_slot                                    = slot_index;
+        const ggml_backend_dayan_graph_slot & slot          = plan.slots[slot_index];
+        const int64_t                         slot_start_us = ggml_time_us();
         switch (slot.kind) {
             case ggml_backend_dayan_slot_kind::mul_mat:
             case ggml_backend_dayan_slot_kind::mul_mat_pair:
@@ -2146,10 +2405,14 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
                 status = ggml_backend_dayan_ssm_conv(ctx, slot);
                 break;
         }
+        ggml_backend_dayan_trace_slot(slot, slot_index, status, ggml_time_us() - slot_start_us);
         if (status < 0) {
+            GGML_LOG_ERROR("%s: slot %zu (%s, %s) failed with status %d\n", __func__, slot_index,
+                           ggml_op_desc(slot.nodes[0]), slot.nodes[0]->name, status);
             break;
         }
     }
+    ctx->active_slot = SIZE_MAX;
 
     ggml_backend_dayan_graph_buffers_free(&graph_buffers, &status);
 
@@ -2161,11 +2424,12 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
     if (!plan.slots.empty()) {
         GGML_LOG_DEBUG(
             "%s: lowered %d nodes to %zu slots, paired=%zu, fused=%zu, residual=%zu, rms=%zu, "
-            "attention=%zu, delta=%zu, gated=%zu, conv=%zu, moe=%zu, moe-fused=%zu, routing=%zu, activations=%zu\n",
+            "attention=%zu, delta=%zu, gated=%zu, conv=%zu, moe=%zu, moe-fused=%zu, routing=%zu, activations=%zu, "
+            "compile=%.3f ms\n",
             __func__, cgraph->n_nodes, plan.slots.size(), plan.paired_mul_mat_slots, plan.fused_mul_mat_slots,
             plan.residual_add_slots, plan.rms_norm_slots, plan.flash_attention_slots, plan.gated_delta_net_slots,
             plan.gated_output_slots, plan.ssm_conv_slots, plan.moe_slots, plan.fused_moe_slots, plan.routing_slots,
-            graph_buffers.activation_by_tensor.size());
+            graph_buffers.activation_by_tensor.size(), compile_ms);
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -2410,6 +2674,9 @@ static void * ggml_backend_dayan_reg_get_proc_address(ggml_backend_reg_t reg, co
 
     if (strcmp(name, "ggml_backend_graph_rewrite") == 0) {
         return (void *) ggml_backend_dayan_graph_rewrite;
+    }
+    if (strcmp(name, "ggml_backend_dayan_set_slot_trace_callback") == 0) {
+        return (void *) ggml_backend_dayan_set_slot_trace_callback;
     }
     return nullptr;
 }

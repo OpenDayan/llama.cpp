@@ -33,7 +33,7 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
         !moe_allocation_fits(sizeof(uint16_t), config->k, config->activation_slots, config->tokens) ||
         !moe_allocation_fits(sizeof(int32_t), config->experts_used, config->tokens, 1) ||
         !moe_allocation_fits(sizeof(float), config->n, config->experts_used, config->tokens)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const DayanMatmulConfig matmul = {
@@ -49,7 +49,7 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
         for (uint32_t used = 0; used < config->experts_used; ++used) {
             const int32_t expert = ids[(uint64_t) token * config->experts_used + used];
             if (expert < 0 || expert >= (int32_t) config->experts) {
-                dayan_proc_exit(-22);
+                DAYAN_PARAMS_ERROR();
             }
             const uint32_t activation_slot = used % config->activation_slots;
             const uint64_t activation_offset =
@@ -85,7 +85,7 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
         !moe_allocation_fits(sizeof(uint16_t), config->k, config->activation_slots, config->tokens) ||
         !moe_allocation_fits(sizeof(int32_t), config->experts_used, config->tokens, 1) ||
         !moe_allocation_fits(sizeof(uint16_t), config->n, config->experts_used, config->tokens)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const DayanMatmulConfig matmul = {
@@ -101,7 +101,7 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
         for (uint32_t used = 0; used < config->experts_used; ++used) {
             const int32_t expert = ids[(uint64_t) token * config->experts_used + used];
             if (expert < 0 || expert >= (int32_t) config->experts) {
-                dayan_proc_exit(-22);
+                DAYAN_PARAMS_ERROR();
             }
             const uint32_t activation_slot = used % config->activation_slots;
             const uint64_t activation_offset =
@@ -127,7 +127,7 @@ static inline void run_add_id(const DayanAddIdConfig * config,
         !moe_allocation_fits(sizeof(float), config->width, config->experts_used, config->tokens) ||
         !moe_allocation_fits(sizeof(float), config->width, config->experts, 1) ||
         !moe_allocation_fits(sizeof(int32_t), config->experts_used, config->tokens, 1)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     elementwise_validate((uint64_t) config->width * config->experts_used * config->tokens, input, output);
     configure_normalization_lsu();
@@ -144,7 +144,7 @@ static inline void run_add_id(const DayanAddIdConfig * config,
         const uint32_t token  = (uint32_t) (row / config->experts_used);
         const int32_t  expert = ids[(uint64_t) token * config->experts_used + used];
         if (expert < 0 || expert >= (int32_t) config->experts) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
@@ -162,7 +162,7 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
     memory_validate(config);
     if (input == nullptr || output == nullptr || config->width == 0 || config->rows == 0 || config->output_width == 0 ||
         config->output_width > config->width || config->order > 1U || (TopK && config->order != kDayanSortOrderDesc)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const uint32_t task  = dayan_native_task_id();

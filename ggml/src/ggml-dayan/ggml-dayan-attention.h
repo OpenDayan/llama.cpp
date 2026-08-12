@@ -294,7 +294,7 @@ static inline void run_attention_projection(const DayanAttentionProjectionConfig
                                             DayanMatmulPerf *                      perf) {
     if (!attention_projection_config_valid(config, HasGate) || activation == nullptr || weight == nullptr ||
         norm == nullptr || positions == nullptr || raw_output == nullptr || output == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output, perf);
@@ -313,7 +313,7 @@ inline void run_attention_projection<Fp16Format, true>(const DayanAttentionProje
                                                        DayanMatmulPerf *                      perf) {
     if (!attention_projection_config_valid(config, true) || activation == nullptr || weight == nullptr ||
         norm == nullptr || positions == nullptr || raw_output == nullptr || output == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     run_projection_matmul<Fp16Format>(&config->matmul, activation, weight, raw_output, perf);
     cache_inval_range(raw_output, (size_t) config->tokens * config->matmul.n * sizeof(uint16_t));
@@ -331,7 +331,7 @@ inline void run_attention_projection<Fp16Format, false>(const DayanAttentionProj
                                                         DayanMatmulPerf *                      perf) {
     if (!attention_projection_config_valid(config, false) || activation == nullptr || weight == nullptr ||
         norm == nullptr || positions == nullptr || raw_output == nullptr || output == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     run_projection_matmul<Fp16Format>(&config->matmul, activation, weight, raw_output, perf);
     cache_inval_range(raw_output, (size_t) config->tokens * config->matmul.n * sizeof(uint16_t));
@@ -347,7 +347,7 @@ static inline void run_value_projection(const DayanAttentionProjectionConfig * c
                                         DayanMatmulPerf *                      perf) {
     if (!attention_projection_config_valid(config, false) || activation == nullptr || weight == nullptr ||
         raw_output == nullptr || output == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output, perf);
@@ -374,7 +374,7 @@ inline void run_value_projection<Fp16Format>(const DayanAttentionProjectionConfi
                                              DayanMatmulPerf *                      perf) {
     if (!attention_projection_config_valid(config, false) || activation == nullptr || weight == nullptr ||
         raw_output == nullptr || output == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     run_projection_matmul<Fp16Format>(&config->matmul, activation, weight, raw_output, perf);
     cache_inval_range(raw_output, (size_t) config->tokens * config->matmul.n * sizeof(uint16_t));
@@ -406,7 +406,7 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
                                           DayanMatmulPerf *               perf) {
     if (!kv_projection_config_valid(config) || activation == nullptr || weight == nullptr || norm == nullptr ||
         positions_indices == nullptr || workspace == nullptr || cache == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const DayanAttentionProjectionConfig * projection    = &config->projection;
@@ -414,7 +414,7 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
     const int32_t *                        indices = positions_indices + (uint64_t) position_axes * projection->tokens;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         if (indices[token] < 0 || (uint32_t) indices[token] >= config->cache_rows) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
     }
 
@@ -444,13 +444,13 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
                                           DayanMatmulPerf *               perf) {
     if (!kv_projection_config_valid(config) || activation == nullptr || weight == nullptr || indices == nullptr ||
         workspace == nullptr || cache == nullptr || perf == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const DayanAttentionProjectionConfig * projection = &config->projection;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         if (indices[token] < 0 || (uint32_t) indices[token] >= config->cache_rows) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
     }
 
@@ -468,27 +468,116 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
 }
 
 static inline void issue_gated_attention(uint64_t attention, uint64_t gate, uint64_t output, uint64_t constants) {
-    enum : long {
-        kInstructions = 10,
-    };
+    ggml_dayan_vec_detail::issue_sigmoid_mul({ gate, 0 }, { attention, 0 }, { output, 0 },
+                                             { constants, constants + sizeof(float), 0, 0, 0, 0, 0 }, 1,
+                                             Constants::kVecLanes);
+}
 
-    configure_vec_dims(1, 1);
+static inline void configure_gated_lsu(long block,
+                                       long dim0,
+                                       long input_block_stride,
+                                       long input_dim0_stride,
+                                       long output_block_stride,
+                                       long output_dim0_stride,
+                                       long transpose,
+                                       long read_size,
+                                       long write_size) {
+    __tx_lsu_tcsr_write<LSU_BLOCK>(block);
+    __tx_lsu_tcsr_write<LSU_DIM0>(dim0);
+    __tx_lsu_tcsr_write<LSU_DIM1>(0);
+    __tx_lsu_tcsr_write<LSU_DIM2>(0);
+    __tx_lsu_tcsr_write<LSU_INBLOCKSTRIDE>(input_block_stride);
+    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(input_dim0_stride);
+    __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<LSU_INDIM2STRIDE>(0);
+    __tx_lsu_tcsr_write<LSU_OUTBLOCKSTRIDE>(output_block_stride);
+    __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(output_dim0_stride);
+    __tx_lsu_tcsr_write<LSU_OUTDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<LSU_OUTDIM2STRIDE>(0);
+    __tx_lsu_tcsr_write<LSU_BLOCKTRANSPOSE>(transpose);
+    __tx_lsu_tcsr_write<LSU_BLOCKPADDING>(block);
+    __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(read_size);
+    __tx_lsu_tcsr_write<LSU_PADDINGVALUE>(0);
+    __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(0);
+    __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(0);
+    __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(write_size);
+    __tx_lsu_tcsr_write<LSU_TABLESIZE>(0);
+    __tx_lsu_tcsr_write<LSU_TABLESTRIDE>(64);
+}
+
+static inline void issue_gated_load(uint64_t output, uint64_t input, uint32_t bytes) {
+    const uint32_t full_bytes = bytes & ~63U;
+    const uint32_t tail_bytes = bytes & 63U;
+
+    if (full_bytes != 0) {
+        configure_gated_lsu(full_bytes / 64 - 1, 0, 64, 0, 64, 0, 6, 63, 63);
+        __tx_lsu_dma_d2u<0>(output, input);
+    }
+    if (tail_bytes != 0) {
+        configure_gated_lsu(0, 0, 64, 0, 64, 0, 6, tail_bytes - 1, 63);
+        __tx_lsu_dma_d2u<0>(output + full_bytes, input + full_bytes);
+    }
+}
+
+static inline void issue_gated_store(uint64_t output, uint64_t input, uint32_t bytes) {
+    const uint32_t full_bytes = bytes & ~63U;
+    const uint32_t tail_bytes = bytes & 63U;
+
+    if (full_bytes != 0) {
+        configure_gated_lsu(full_bytes / 64 - 1, 0, 64, 0, 64, 0, 6, 63, 63);
+        __tx_lsu_dma_u2d<0>(output, input);
+    }
+    if (tail_bytes != 0) {
+        configure_gated_lsu(0, 0, 64, 0, 64, 0, 6, 63, tail_bytes - 1);
+        __tx_lsu_dma_u2d<0>(output + full_bytes, input + full_bytes);
+    }
+}
+
+template <typename Format> static inline void issue_gated_lowp_to_f32(uint64_t input, uint64_t output) {
+    constexpr long instructions = 3;
+
+    configure_vec_dims(1);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
-    begin_vec_block(kInstructions);
-    __tx_vec_lsu_u2v<0, 0>(gate);
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants + sizeof(float));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 5, 0>();
-    __tx_vec_lsu_u2v<1, 0>(attention);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 0>(output);
-    start_vec_block(kInstructions);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>(input);
+    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
+        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
+    } else {
+        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+    }
+    __tx_vec_lsu_v2u<3, 0>(output);
+    start_vec_block(instructions);
+}
+
+template <typename Format> static inline void issue_gated_f32_to_lowp(uint64_t input, uint64_t output) {
+    __tx_macro_tcsr_write<MACRO_DIM0>(16 - 1);
+    __tx_macro_tcsr_write<MACRO_DIM1>(0);
+    __tx_macro_tcsr_write<MACRO_DIM2>(0);
+    __tx_macro_tcsr_write<MACRO_DIM3>(0);
+    __tx_macro_tcsr_write<MACRO_SRC0DIM1STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_SRC0DIM2STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_SRC0DIM3STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_SRC1DIM1STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_SRC1DIM2STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_SRC1DIM3STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_DSTDIM1STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_DSTDIM2STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_DSTDIM3STRIDE>(0);
+    __tx_macro_tcsr_write<MACRO_SRC0SWIZZLEMBS>(0);
+    __tx_macro_tcsr_write<MACRO_SRC1SWIZZLEMBS>(0);
+    __tx_macro_tcsr_write<MACRO_DSTSWIZZLEMBS>(0);
+    for (long row = 0; row < 4; ++row) {
+        if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
+            __tx_macro_convert_fp32_bf16<0>((void *) (output + row * 16 * sizeof(uint16_t)),
+                                             (void *) (input + row * Constants::kVecBytes));
+        } else {
+            __tx_macro_convert_fp32_fp16<0>((void *) (output + row * 16 * sizeof(uint16_t)),
+                                             (void *) (input + row * Constants::kVecBytes));
+        }
+    }
 }
 
 template <typename Format>
@@ -496,13 +585,17 @@ static inline void prepare_gated_attention(const DayanGatedProjectionConfig * co
                                            const float *                      attention,
                                            const uint16_t *                   gate,
                                            uint16_t *                         activation) {
-    float * uram           = (float *) dayan_uram_base();
-    float * attention_uram = uram;
-    float * gate_uram      = uram + Constants::kVecLanes;
-    float * output_uram    = uram + 2 * Constants::kVecLanes;
-    float * constants      = uram + 3 * Constants::kVecLanes;
-    constants[0]           = -1.4426950408889634f;
-    constants[1]           = 1.0f;
+    const uint64_t uram_address       = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t attention_uram     = uram_address;
+    const uint64_t gate_rows_uram     = attention_uram + Constants::kVecBytes;
+    const uint64_t gate_packed_uram   = gate_rows_uram + 64 * 64;
+    const uint64_t gate_f32_uram      = gate_packed_uram + 4 * 1024;
+    const uint64_t output_f32_uram    = gate_f32_uram + 4 * Constants::kVecBytes;
+    const uint64_t activation_uram    = output_f32_uram + 4 * Constants::kVecBytes;
+    const uint64_t constants_address  = activation_uram + Constants::kVecLanes * sizeof(uint16_t);
+    float *        constants          = (float *) (uintptr_t) constants_address;
+    constants[0]                      = -1.4426950408889634f;
+    constants[1]                      = 1.0f;
 
     const uint32_t width      = config->heads * config->head_dim;
     const uint32_t gate_width = 2 * width;
@@ -517,16 +610,28 @@ static inline void prepare_gated_attention(const DayanGatedProjectionConfig * co
                 const uint64_t attention_base = (uint64_t) token * width + head * config->head_dim + chunk;
                 const uint64_t gate_base =
                     (uint64_t) token * gate_width + head * 2U * config->head_dim + config->head_dim + chunk;
-                for (uint32_t lane = 0; lane < Constants::kVecLanes; ++lane) {
-                    attention_uram[lane] = lane < count ? attention[attention_base + lane] : 0.0f;
-                    gate_uram[lane]      = lane < count ? ScalarLowp<Format>::decode(gate[gate_base + lane]) : -32.0f;
+                configure_gated_lsu(0, count - 1, 64, sizeof(uint16_t), 64, 64, 6, sizeof(uint16_t) - 1, 63);
+                __tx_lsu_dma_d2u<0>(gate_rows_uram, reinterpret_cast<uint64_t>(gate + gate_base));
+                configure_gated_lsu(15, 3, 64, 1024, 64, 1024, 2, 63, 63);
+                __tx_lsu_dma_u2u<0>(gate_packed_uram, gate_rows_uram);
+                issue_gated_load(attention_uram, reinterpret_cast<uint64_t>(attention + attention_base),
+                                 count * sizeof(float));
+                dayan_wait_lsu();
+                for (long row = 0; row < 4; ++row) {
+                    issue_gated_lowp_to_f32<Format>(gate_packed_uram + row * 1024,
+                                                    gate_f32_uram + row * Constants::kVecBytes);
+                    dayan_wait_vec();
+                    ggml_dayan_vec_detail::issue_sigmoid_mul(
+                        { gate_f32_uram + row * Constants::kVecBytes, 0 }, { attention_uram + row * 16 * sizeof(float), 0 },
+                        { output_f32_uram + row * Constants::kVecBytes, 0 },
+                        { constants_address, constants_address + sizeof(float), 0, 0, 0, 0, 0 }, 1, 16);
+                    dayan_wait_vec();
                 }
-                issue_gated_attention((uint64_t) attention_uram, (uint64_t) gate_uram, (uint64_t) output_uram,
-                                      (uint64_t) constants);
-                dayan_wait_vec();
-                for (uint32_t lane = 0; lane < count; ++lane) {
-                    activation[attention_base + lane] = ScalarLowp<Format>::encode(output_uram[lane]);
-                }
+                issue_gated_f32_to_lowp<Format>(output_f32_uram, activation_uram);
+                dayan_wait_macro();
+                issue_gated_store(reinterpret_cast<uint64_t>(activation + attention_base), activation_uram,
+                                  count * sizeof(uint16_t));
+                dayan_wait_lsu();
             }
         }
     }
@@ -541,10 +646,11 @@ static inline void run_gated_output_projection(const DayanGatedProjectionConfig 
                                                const uint16_t *                   weight,
                                                float *                            output,
                                                DayanMatmulPerf *                  perf) {
-    if (config == nullptr || attention == nullptr || gate == nullptr || activation == nullptr || weight == nullptr ||
-        output == nullptr || perf == nullptr || config->tokens == 0 || config->heads == 0 || config->head_dim == 0 ||
-        config->matmul.m != config->tokens || config->matmul.k != (uint64_t) config->heads * config->head_dim) {
-        dayan_proc_exit(-22);
+    DAYAN_PARAMS_IF(config == nullptr || attention == nullptr || gate == nullptr || activation == nullptr ||
+                    weight == nullptr || output == nullptr || perf == nullptr || config->tokens == 0 ||
+                    config->heads == 0 || config->head_dim == 0 || config->matmul.m != config->tokens ||
+                    config->matmul.k != (uint64_t) config->heads * config->head_dim) {
+        DAYAN_PARAMS_ERROR();
     }
 
     prepare_gated_attention<Format>(config, attention, gate, activation);

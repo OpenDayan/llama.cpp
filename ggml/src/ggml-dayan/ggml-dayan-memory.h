@@ -56,24 +56,24 @@ static inline uint64_t memory_read_index(const void * indices, uint32_t index, u
     if (type == kDayanDataTypeI32) {
         const int32_t value = ((const int32_t *) indices)[index];
         if (value < 0) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         return (uint64_t) value;
     }
     if (type == kDayanDataTypeI64) {
         const int64_t value = ((const int64_t *) indices)[index];
         if (value < 0) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         return (uint64_t) value;
     }
-    dayan_proc_exit(-22);
+    DAYAN_PARAMS_ERROR();
     return 0;
 }
 
 static inline void memory_validate(const void * config) {
     if (config == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
@@ -103,7 +103,7 @@ static inline void memory_convert_to_f32(uint64_t output, uint64_t input, uint32
         return;
     }
     if (type != kDayanDataTypeBF16 && type != kDayanDataTypeF16) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     float *          destination = (float *) (uintptr_t) output;
@@ -130,7 +130,7 @@ static inline uint64_t memory_convert_from_f32(uint64_t output, uint64_t input, 
     } else if (type == kDayanDataTypeF16) {
         __tx_macro_convert_fp32_fp16<0>((void *) output, (void *) input);
     } else {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     dayan_wait_macro();
     return output;
@@ -143,7 +143,7 @@ static inline void run_get_rows(const DayanRowsConfig * config,
     memory_validate(config);
     if (source == nullptr || indices == nullptr || output == nullptr || config->row_elements == 0 ||
         config->rows == 0 || (config->source_type != kDayanDataTypeF32 && config->source_type != kDayanDataTypeBF16)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -161,7 +161,7 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         const uint64_t source_index =
             selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
         if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         const char * source_row = (const char *) source + source_index * row_bytes;
         float *      output_row = output + (uint64_t) row * config->row_elements;
@@ -186,7 +186,7 @@ static inline void run_set_rows(const DayanRowsConfig * config,
         config->rows == 0 || config->source_type != kDayanDataTypeF32 ||
         (config->destination_type != kDayanDataTypeF32 && config->destination_type != kDayanDataTypeBF16 &&
          config->destination_type != kDayanDataTypeF16)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -210,7 +210,7 @@ static inline void run_set_rows(const DayanRowsConfig * config,
         const uint64_t destination_index = selected + (uint64_t) config->destination_ne[0] *
                                                           (source2 + (uint64_t) config->destination_ne[1] * source3);
         if (selected >= config->destination_ne[0] || destination_index >= config->destination_rows) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         const float * source_row      = source + (uint64_t) row * config->row_elements;
         char *        destination_row = (char *) destination + destination_index * row_bytes;
@@ -232,17 +232,17 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
          config->source_type != kDayanDataTypeF16) ||
         (config->destination_type != kDayanDataTypeF32 && config->destination_type != kDayanDataTypeBF16 &&
          config->destination_type != kDayanDataTypeF16)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     uint64_t source_elements = 1;
     for (uint32_t dimension = 0; dimension < 4; ++dimension) {
         if (config->source_ne[dimension] == 0 || config->source_nb[dimension] == 0) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
         source_elements *= config->source_ne[dimension];
     }
     if (source_elements != config->elements) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -302,12 +302,12 @@ static inline void run_repeat(const DayanRepeatConfig * config, const void * sou
     if (source == nullptr || output == nullptr ||
         (config->type != kDayanDataTypeF32 && config->type != kDayanDataTypeBF16 &&
          config->type != kDayanDataTypeF16)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     for (uint32_t dimension = 0; dimension < 4; ++dimension) {
         if (config->source_ne[dimension] == 0 || config->output_ne[dimension] == 0 ||
             config->output_ne[dimension] % config->source_ne[dimension] != 0) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
     }
 
@@ -329,7 +329,7 @@ static inline void run_repeat(const DayanRepeatConfig * config, const void * sou
                 config->source_ne[1] +
             index1 % config->source_ne[1];
         if (source_row >= source_rows) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
 
         for (uint32_t output0 = 0; output0 < config->output_ne[0];) {
@@ -356,7 +356,7 @@ static inline void run_concat(const DayanConcatConfig * config, const void * lef
     if (left == nullptr || right == nullptr || output == nullptr || config->axis >= 4 ||
         (config->type != kDayanDataTypeF32 && config->type != kDayanDataTypeBF16 &&
          config->type != kDayanDataTypeF16)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     for (uint32_t dimension = 0; dimension < 4; ++dimension) {
         if (config->left_ne[dimension] == 0 || config->right_ne[dimension] == 0 || config->output_ne[dimension] == 0 ||
@@ -364,7 +364,7 @@ static inline void run_concat(const DayanConcatConfig * config, const void * lef
                  config->output_ne[dimension] != config->left_ne[dimension] + config->right_ne[dimension] :
                  (config->output_ne[dimension] != config->left_ne[dimension] ||
                   config->output_ne[dimension] != config->right_ne[dimension]))) {
-            dayan_proc_exit(-22);
+            DAYAN_PARAMS_ERROR();
         }
     }
 

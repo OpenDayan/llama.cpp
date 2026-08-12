@@ -29,7 +29,7 @@ static inline uint32_t dayan_native_task_id() {
     const uint32_t task  = dayan_task_id(DAYAN_TASK_X);
     if (dayan_task_mode() != 1U || tasks == 0U || tasks > 2U || task >= tasks || dayan_task_dim(DAYAN_TASK_Y) != 1U ||
         dayan_task_dim(DAYAN_TASK_Z) != 1U) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     return task;
 }
@@ -125,7 +125,7 @@ static inline void normalization_validate(const DayanNormConfig * config) {
         config->input_nb[0] != sizeof(float) || config->input_ne[1] == 0 || config->input_ne[2] == 0 ||
         config->input_ne[3] == 0 ||
         (uint64_t) config->input_ne[1] * config->input_ne[2] * config->input_ne[3] != config->rows) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
@@ -196,7 +196,7 @@ static void run_rms_norm_scale(const DayanNormConfig * config,
     normalization_validate(config);
     if (left == nullptr || scale == nullptr || rms == nullptr || scaled == nullptr ||
         (HasResidual && (right == nullptr || residual == nullptr)) || (Quantize && lowp == nullptr)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -245,7 +245,7 @@ static void run_rms_norm_scale(const DayanNormConfig * config,
 static inline void run_rms_norm(const DayanNormConfig * config, const float * input, float * output) {
     normalization_validate(config);
     if (input == nullptr || output == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -332,7 +332,7 @@ static inline void normalization_centered(const float * input, float * output, u
 static inline void run_norm(const DayanNormConfig * config, const float * input, float * output) {
     normalization_validate(config);
     if (input == nullptr || output == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -347,7 +347,7 @@ static inline void run_group_norm(const DayanGroupNormConfig * config, const flo
     if (config == nullptr || config->width == 0 || config->height == 0 || config->channels == 0 ||
         config->batches == 0 || config->groups == 0 || config->groups > config->channels || input == nullptr ||
         output == nullptr || normalization_bits_float(config->epsilon_bits) < 0.0f) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
@@ -378,7 +378,7 @@ static inline void run_residual_add(const DayanElementwiseConfig * config,
                                     const float *                  right,
                                     float *                        output) {
     if (config == nullptr || config->elements == 0 || left == nullptr || right == nullptr || output == nullptr) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
@@ -417,13 +417,13 @@ static inline void run_rms_norm_pipeline(const DayanNormPipelineConfig * config,
     const uint32_t allowed  = kDayanNormHasResidual | kDayanNormWriteResidual | required | kDayanNormWriteLowp;
     if (config == nullptr || (config->flags & required) != required || (config->flags & ~allowed) != 0U ||
         ((config->flags & kDayanNormHasResidual) != 0U) != ((config->flags & kDayanNormWriteResidual) != 0U)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     const bool has_residual = (config->flags & kDayanNormHasResidual) != 0U;
     const bool write_lowp   = (config->flags & kDayanNormWriteLowp) != 0U;
     if (write_lowp && config->output_type != kDayanDataTypeBF16 && config->output_type != kDayanDataTypeF16) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     if (has_residual) {

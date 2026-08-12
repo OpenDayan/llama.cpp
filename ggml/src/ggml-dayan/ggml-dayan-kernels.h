@@ -15,8 +15,16 @@
 #    define DAYAN_NATIVE_TASK_URAM_BYTES (8U * 1024U)
 #endif
 
+#ifndef DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES
+#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (120U * 1024U)
+#endif
+
 #ifndef DAYAN_GATED_DELTA_NET_URAM_BYTES
-#    define DAYAN_GATED_DELTA_NET_URAM_BYTES (100U * 1024U)
+#    define DAYAN_GATED_DELTA_NET_URAM_BYTES (2U * DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES)
+#endif
+
+#ifndef DAYAN_ROPE_MAX_PAIRS
+#    define DAYAN_ROPE_MAX_PAIRS 256U
 #endif
 
 struct DayanMatmulConfig {
@@ -115,6 +123,9 @@ struct DayanSSMConvConfig {
     uint32_t sequences;
     uint32_t kernel_size;
     uint32_t flags;
+    uint32_t zero_bits;
+    uint32_t neg_log2e_bits;
+    uint32_t one_bits;
 };
 
 enum : uint64_t {
@@ -279,6 +290,9 @@ struct DayanRopeConfig {
     uint32_t corr_dim0_bits;
     uint32_t corr_dim1_bits;
     int32_t  sections[4];
+    uint32_t axis_values[3];
+    uint32_t axes[DAYAN_ROPE_MAX_PAIRS];
+    uint32_t multipliers[DAYAN_ROPE_MAX_PAIRS];
 };
 
 struct DayanNormConfig {
@@ -413,6 +427,13 @@ int mul_mat_id_geglu_fp16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    perf,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int flash_attention_bf16_1c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    q,
+                            npu_buffer_t *                    k,
+                            npu_buffer_t *                    v,
+                            npu_buffer_t *                    output,
+                            npu_buffer_t *                    result,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
+int flash_attention_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    q,
                             npu_buffer_t *                    k,
                             npu_buffer_t *                    v,

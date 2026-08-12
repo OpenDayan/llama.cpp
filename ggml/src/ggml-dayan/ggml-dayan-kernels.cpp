@@ -1,5 +1,6 @@
 #include "ggml-dayan-kernels.h"
 
+#include "ggml-dayan-common.h"
 #include "ggml-dayan-attention.h"
 #include "ggml-dayan-conv.h"
 #include "ggml-dayan-elementwise.h"
@@ -218,15 +219,54 @@ __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config
                                         float *                           output,
                                         int64_t *                         result) {
 #if defined(__DAYAN_DEVICE__)
-    if (result == nullptr) {
+    DAYAN_PARAMS_IF(result == nullptr) {
         return;
     }
+#if defined(ENABLE_PARAMS_CHECK)
     *result = -22;
-    if (config == nullptr) {
+#endif
+    DAYAN_PARAMS_IF(config == nullptr) {
         return;
     }
 
-    const long status = flash_attention_bf16_f32(
+    const long status = flash_attention_lowp_f32<ggml_dayan_matmul_detail::Bf16Format>(
+        (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
+        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
+        config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
+        config->k_head_stride, config->k_batch_stride, config->v_row_stride, config->v_head_stride,
+        config->v_batch_stride);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+    *result = status;
+#else
+    (void) config;
+    (void) q;
+    (void) k;
+    (void) v;
+    (void) output;
+    (void) result;
+#endif
+}
+
+__kernel__ void flash_attention_fp16_1c(const DayanFlashAttentionConfig * config,
+                                        const uint16_t *                  q,
+                                        const uint16_t *                  k,
+                                        const uint16_t *                  v,
+                                        float *                           output,
+                                        int64_t *                         result) {
+#if defined(__DAYAN_DEVICE__)
+    DAYAN_PARAMS_IF(result == nullptr) {
+        return;
+    }
+#if defined(ENABLE_PARAMS_CHECK)
+    *result = -22;
+#endif
+    DAYAN_PARAMS_IF(config == nullptr) {
+        return;
+    }
+
+    const long status = flash_attention_lowp_f32<ggml_dayan_matmul_detail::Fp16Format>(
         (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
         config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
         config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
@@ -710,6 +750,7 @@ DAYAN_KERNEL_DESC(mul_mat_id_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_D
 DAYAN_KERNEL_DESC(mul_mat_id_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(mul_mat_id_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(flash_attention_bf16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(flash_attention_fp16_1c, 0, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 2, 0, 0, DAYAN_GATED_DELTA_NET_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_qg_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
 DAYAN_KERNEL_DESC(project_qg_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);

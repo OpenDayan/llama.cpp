@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ggml-dayan-activation.h"
+
 #if defined(__DAYAN_DEVICE__)
 
 #    include <dayan_sys.h>
@@ -13,6 +15,17 @@
 __asm__(".globl z\n.set z, 0");
 
 namespace ggml_dayan_matmul_detail {
+
+using ggml_dayan_vec_detail::begin_vec_block;
+using ggml_dayan_vec_detail::configure_vec_dims;
+using ggml_dayan_vec_detail::configure_vec_iterator;
+using ggml_dayan_vec_detail::start_vec_block;
+
+static constexpr long kVecSync   = ggml_dayan_vec_detail::kVecSync;
+static constexpr long kVecV0Base = ggml_dayan_vec_detail::kVecV0Base;
+static constexpr long kVecV1Base = ggml_dayan_vec_detail::kVecV1Base;
+static constexpr long kVecV2Base = ggml_dayan_vec_detail::kVecV2Base;
+static constexpr long kVecV3Base = ggml_dayan_vec_detail::kVecV3Base;
 
 struct Constants {
     enum : int {
@@ -36,21 +49,6 @@ struct Constants {
         kConstantHalf        = 6,
         kConstantCount       = 7,
     };
-};
-
-enum VecTcsr {
-    kVecControl = 0,
-    kVecSync    = 1,
-    kVecDim0    = 2,
-    kVecDim1    = 3,
-    kVecDim2    = 4,
-    kVecDim3    = 5,
-    kVecDim4    = 6,
-    kVecDim5    = 7,
-    kVecV0Base  = 37,
-    kVecV1Base  = 44,
-    kVecV2Base  = 51,
-    kVecV3Base  = 58,
 };
 
 struct Bf16Format {
@@ -387,117 +385,34 @@ static inline int wait_for_generation(SharedBuffer * buffer, uint64_t expected_g
     }
 }
 
-template <long Base>
-static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, long dim2_stride, long dim3_stride) {
-    __tx_vec_tcsr_write<Base>(0);
-    __tx_vec_tcsr_write<Base + 1>(dim0_stride);
-    __tx_vec_tcsr_write<Base + 2>(dim1_stride);
-    __tx_vec_tcsr_write<Base + 3>(dim2_stride);
-    __tx_vec_tcsr_write<Base + 4>(dim3_stride);
-    __tx_vec_tcsr_write<Base + 5>(0);
-    __tx_vec_tcsr_write<Base + 6>(0);
-}
-
-static inline void configure_vec_dims(long rows, long chunks) {
-    __tx_vec_tcsr_write<kVecDim0>(0);
-    __tx_vec_tcsr_write<kVecDim1>(0);
-    __tx_vec_tcsr_write<kVecDim2>(rows - 1);
-    __tx_vec_tcsr_write<kVecDim3>(chunks - 1);
-    __tx_vec_tcsr_write<kVecDim4>(0);
-    __tx_vec_tcsr_write<kVecDim5>(0);
-}
-
-static inline long vec_control(long instructions) {
-    const uint64_t count = (uint64_t) instructions & 0xffU;
-    return (long) (count | (count << 8) | (count << 16) | (count << 24) | (count << 32));
-}
-
-static inline void begin_vec_block(long instructions) {
-    long free_entries;
-
-    do {
-        __tx_vec_tcsr_read<kVecControl>(free_entries);
-    } while (free_entries < instructions);
-}
-
-static inline void start_vec_block(long instructions) {
-    __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
-}
-
 static inline uint64_t constant_address(const MatmulEpilogueArgs * args, int constant) {
     return args->constants + (uint64_t) constant * Constants::kConstantStride;
 }
 
-static inline void configure_epilogue_vec(const MatmulEpilogueArgs * args) {
-    const long chunks = (args->cols + Constants::kVecLanes - 1) / Constants::kVecLanes;
-
-    configure_vec_dims(args->rows, chunks);
-    configure_vec_iterator<kVecV0Base>(0, 0, args->row_stride * (int) sizeof(float), Constants::kVecBytes);
-    configure_vec_iterator<kVecV1Base>(0, 0, args->row_stride * (int) sizeof(float), Constants::kVecBytes);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+static inline ggml_dayan_vec_detail::ActivationConstants activation_constants(const MatmulEpilogueArgs * args) {
+    return {
+        constant_address(args, Constants::kConstantNegLog2E),
+        constant_address(args, Constants::kConstantOne),
+        constant_address(args, Constants::kConstantGeluA),
+        constant_address(args, Constants::kConstantSqrt2OverPi),
+        constant_address(args, Constants::kConstantNeg2Log2E),
+        constant_address(args, Constants::kConstantTwo),
+        constant_address(args, Constants::kConstantHalf),
+    };
 }
 
 static inline void issue_swiglu(const MatmulEpilogueArgs * args) {
-    enum : long {
-        kInstructions = 12,
-    };
-
-    configure_epilogue_vec(args);
-    begin_vec_block(kInstructions);
-    __tx_vec_lsu_u2v<0, 0>(args->accumulator[0]);
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantNegLog2E));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantOne));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 5, 0>();
-    __tx_vec_lsu_u2v<1, 0>(args->accumulator[0]);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 1>(args->accumulator[1]);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 0>(args->accumulator[0]);
-    start_vec_block(kInstructions);
+    const long stride = args->row_stride * (int) sizeof(float);
+    ggml_dayan_vec_detail::issue_swiglu(
+        { args->accumulator[0], stride }, { args->accumulator[1], stride }, { args->accumulator[0], stride },
+        activation_constants(args), args->rows, args->cols);
 }
 
 static inline void issue_geglu(const MatmulEpilogueArgs * args) {
-    enum : long {
-        kInstructions = 30,
-    };
-
-    configure_epilogue_vec(args);
-    begin_vec_block(kInstructions);
-    __tx_vec_lsu_u2v<0, 0>(args->accumulator[0]);
-    __tx_vec_lsu_u2v<1, 0>(args->accumulator[0]);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantGeluA));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantOne));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 0>(args->accumulator[0]);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantSqrt2OverPi));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantNeg2Log2E));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantOne));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 5, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantTwo));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantOne));
-    __tx_vec_vv_fp32_sub<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantOne));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constant_address(args, Constants::kConstantHalf));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 0>(args->accumulator[0]);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 1>(args->accumulator[1]);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 0>(args->accumulator[0]);
-    start_vec_block(kInstructions);
+    const long stride = args->row_stride * (int) sizeof(float);
+    ggml_dayan_vec_detail::issue_geglu(
+        { args->accumulator[0], stride }, { args->accumulator[1], stride }, { args->accumulator[0], stride },
+        activation_constants(args), args->rows, args->cols);
 }
 
 template <long GroupBase> static inline void configure_quantize(const MatmulEpilogueArgs * args) {
@@ -1013,7 +928,7 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
     if (!config_valid<AccumulatorCount, OutputElementBytes>(config) || !a || !bt0 || !output || !perf ||
         (AccumulatorCount == 2 && !bt1) || dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) != 1U ||
         dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     void *         uram             = dayan_uram_base();

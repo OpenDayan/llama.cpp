@@ -256,9 +256,9 @@ static ggml_tensor * build_full_attention(ggml_context *     ctx,
     q               = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
     k               = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
     v               = ggml_reshape_4d(ctx, v, kAttentionHeadDim, config.n_tokens, 1, 1);
-    result->flash_q = ggml_cast(ctx, q, GGML_TYPE_BF16);
-    result->flash_k = ggml_cast(ctx, k, GGML_TYPE_BF16);
-    result->flash_v = ggml_cast(ctx, v, GGML_TYPE_BF16);
+    result->flash_q = ggml_cast(ctx, q, config.type);
+    result->flash_k = ggml_cast(ctx, k, config.type);
+    result->flash_v = ggml_cast(ctx, v, config.type);
     ggml_format_name(result->flash_q, "blk.%d.flash_q", layer);
     ggml_format_name(result->flash_k, "blk.%d.flash_k", layer);
     ggml_format_name(result->flash_v, "blk.%d.flash_v", layer);
@@ -532,20 +532,24 @@ static float compare_tensor(const char *        stage,
     return stage_max_abs;
 }
 
-static float compare_bf16_tensor(const char *        stage,
+static float compare_lowp_tensor(const char *        stage,
                                  const ggml_tensor * expected_tensor,
                                  const ggml_tensor * observed_tensor,
                                  comparison_stats *  stats) {
-    const size_t             elements = (size_t) ggml_nelements(expected_tensor);
-    std::vector<ggml_bf16_t> expected(elements);
-    std::vector<ggml_bf16_t> observed(elements);
-    float                    stage_max_abs = 0.0f;
+    const size_t          elements = (size_t) ggml_nelements(expected_tensor);
+    std::vector<uint16_t> expected(elements);
+    std::vector<uint16_t> observed(elements);
+    float                 stage_max_abs = 0.0f;
     ggml_backend_tensor_get(expected_tensor, expected.data(), 0, ggml_nbytes(expected_tensor));
     ggml_backend_tensor_get(observed_tensor, observed.data(), 0, ggml_nbytes(observed_tensor));
 
     for (size_t index = 0; index < elements; ++index) {
-        const float expected_value = ggml_bf16_to_fp32(expected[index]);
-        const float observed_value = ggml_bf16_to_fp32(observed[index]);
+        const float expected_value = expected_tensor->type == GGML_TYPE_BF16 ?
+                                         ggml_bf16_to_fp32(ggml_bf16_t{ expected[index] }) :
+                                         ggml_fp16_to_fp32(expected[index]);
+        const float observed_value = observed_tensor->type == GGML_TYPE_BF16 ?
+                                         ggml_bf16_to_fp32(ggml_bf16_t{ observed[index] }) :
+                                         ggml_fp16_to_fp32(observed[index]);
         const float abs_error      = std::abs(observed_value - expected_value);
         const float rel_error      = abs_error / std::max(std::abs(expected_value), 1.0e-6f);
         stage_max_abs              = std::max(stage_max_abs, abs_error);
@@ -567,10 +571,24 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
     if (!reference.ctx || !actual.ctx) {
         return fail("cannot create model graph contexts");
     }
+    std::vector<ggml_tensor *> reference_flash_inputs;
+    for (const layer_graph & layer : reference.layers) {
+        if (!layer.recurrent) {
+            reference_flash_inputs.push_back(layer.flash_attention->src[0]);
+        }
+    }
     if (!rewrite_graph(dayan, reference.ctx.get(), reference.graph) ||
         !rewrite_graph(dayan, actual.ctx.get(), actual.graph)) {
         return fail("model graph rewrite failed");
     }
+    size_t flash_index = 0;
+    for (layer_graph & layer : reference.layers) {
+        if (!layer.recurrent) {
+            layer.flash_attention->src[0] = reference_flash_inputs[flash_index++];
+        }
+    }
+    ggml_graph_clear(reference.graph);
+    ggml_build_forward_expand(reference.graph, reference.logits);
     const tensor_blobs      blobs = make_tensor_blobs(actual, config);
     ggml_backend_buffer_ptr reference_buffer(ggml_backend_alloc_ctx_tensors(reference.ctx.get(), cpu));
     if (!reference_buffer || !upload_tensor_blobs(reference, blobs)) {
@@ -616,11 +634,11 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
             compare_tensor(stage, reference.layers[layer].gated_delta, actual.layers[layer].gated_delta, &stats);
         } else {
             std::snprintf(stage, sizeof(stage), "layer.%zu.flash_q", layer);
-            compare_bf16_tensor(stage, reference.layers[layer].flash_q, actual.layers[layer].flash_q, &stats);
+            compare_lowp_tensor(stage, reference.layers[layer].flash_q, actual.layers[layer].flash_q, &stats);
             std::snprintf(stage, sizeof(stage), "layer.%zu.flash_k", layer);
-            compare_bf16_tensor(stage, reference.layers[layer].flash_k, actual.layers[layer].flash_k, &stats);
+            compare_lowp_tensor(stage, reference.layers[layer].flash_k, actual.layers[layer].flash_k, &stats);
             std::snprintf(stage, sizeof(stage), "layer.%zu.flash_v", layer);
-            compare_bf16_tensor(stage, reference.layers[layer].flash_v, actual.layers[layer].flash_v, &stats);
+            compare_lowp_tensor(stage, reference.layers[layer].flash_v, actual.layers[layer].flash_v, &stats);
             std::snprintf(stage, sizeof(stage), "layer.%zu.flash_attention", layer);
             flash_max_abs = compare_tensor(stage, reference.layers[layer].flash_attention,
                                            actual.layers[layer].flash_attention, &stats);

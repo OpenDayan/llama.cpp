@@ -279,6 +279,7 @@ if (GGML_DAYAN)
         "${DAYAN_ROOT}/host/include")
     llama_build(test-dayan-qwen35-dense.cpp)
     llama_build(test-dayan-moe.cpp)
+    llama_build(test-dayan-hotspots.cpp)
 endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

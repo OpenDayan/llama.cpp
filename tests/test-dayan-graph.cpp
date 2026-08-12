@@ -246,6 +246,110 @@ static int run_fusion_fanout_case(ggml_backend_t dayan) {
     return 0;
 }
 
+static int run_layout_cast_hoist_case(ggml_backend_t dayan, enum ggml_type type) {
+    constexpr int64_t m          = 2;
+    constexpr int64_t k          = 16;
+    constexpr int64_t n          = 32;
+    constexpr int64_t output_dim = 16;
+    constexpr int     graph_size = 32;
+    ggml_init_params  params     = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the layout cast hoist context");
+    }
+
+    ggml_tensor * activation      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, m);
+    ggml_tensor * producer_weight = ggml_new_tensor_2d(ctx.get(), type, k, n);
+    ggml_tensor * output_weight   = ggml_new_tensor_2d(ctx.get(), type, n, output_dim);
+    ggml_set_input(activation);
+    ggml_set_input(producer_weight);
+    ggml_set_input(output_weight);
+
+    ggml_tensor * producer = ggml_mul_mat(ctx.get(), producer_weight, activation);
+    ggml_tensor * view     = ggml_view_2d(ctx.get(), producer, n, m, producer->nb[1], 0);
+    ggml_tensor * reshaped = ggml_reshape_4d(ctx.get(), view, n, m, 1, 1);
+    ggml_tensor * permuted = ggml_permute(ctx.get(), reshaped, 0, 1, 3, 2);
+    ggml_tensor * output   = ggml_mul_mat(ctx.get(), output_weight, permuted);
+    ggml_set_name(producer, "layout producer");
+    ggml_set_name(output, "layout consumer");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, output);
+    if (!rewrite_graph(dayan, ctx.get(), graph)) {
+        return fail("DAYAN layout cast hoist rewrite failed");
+    }
+
+    ggml_tensor * permuted_lowp = output->src[1];
+    ggml_tensor * reshaped_lowp = permuted_lowp->src[0];
+    ggml_tensor * view_lowp     = reshaped_lowp->src[0];
+    ggml_tensor * producer_lowp = view_lowp->src[0];
+    if (producer_lowp == producer || producer_lowp->op != GGML_OP_CPY || producer_lowp->src[0] != producer ||
+        producer_lowp->type != type || view_lowp->type != type || reshaped_lowp->type != type ||
+        permuted_lowp->type != type || view_lowp->view_src != producer_lowp ||
+        reshaped_lowp->view_src != producer_lowp || permuted_lowp->view_src != producer_lowp ||
+        view_lowp->op != GGML_OP_VIEW || reshaped_lowp->op != GGML_OP_RESHAPE || permuted_lowp->op != GGML_OP_PERMUTE ||
+        view->type != GGML_TYPE_F32 || reshaped->type != GGML_TYPE_F32 || permuted->type != GGML_TYPE_F32) {
+        return fail("DAYAN did not move the cast before the layout chain");
+    }
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) {
+        return fail("cannot allocate layout cast hoist tensors");
+    }
+
+    std::vector<float>    activation_data((size_t) k * m);
+    std::vector<uint16_t> producer_weight_data((size_t) k * n);
+    std::vector<uint16_t> output_weight_data((size_t) n * output_dim);
+    for (size_t index = 0; index < activation_data.size(); ++index) {
+        activation_data[index] = ((int) (index % 17) - 8) / 32.0f;
+    }
+    for (size_t index = 0; index < producer_weight_data.size(); ++index) {
+        producer_weight_data[index] = encode_lowp(type, ((int) (index % 13) - 6) / 32.0f);
+    }
+    for (size_t index = 0; index < output_weight_data.size(); ++index) {
+        output_weight_data[index] = encode_lowp(type, ((int) (index % 11) - 5) / 32.0f);
+    }
+    ggml_backend_tensor_set(activation, activation_data.data(), 0, ggml_nbytes(activation));
+    ggml_backend_tensor_set(producer_weight, producer_weight_data.data(), 0, ggml_nbytes(producer_weight));
+    ggml_backend_tensor_set(output_weight, output_weight_data.data(), 0, ggml_nbytes(output_weight));
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS ||
+        ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN layout cast hoist graph failed");
+    }
+
+    std::vector<float> observed((size_t) m * output_dim);
+    ggml_backend_tensor_get(output, observed.data(), 0, ggml_nbytes(output));
+    float max_abs = 0.0f;
+    bool  close   = true;
+    for (int64_t row = 0; row < m; ++row) {
+        std::vector<float> intermediate((size_t) n);
+        for (int64_t column = 0; column < n; ++column) {
+            float sum = 0.0f;
+            for (int64_t inner = 0; inner < k; ++inner) {
+                const float value = decode_lowp(type, encode_lowp(type, activation_data[(size_t) row * k + inner]));
+                sum += value * decode_lowp(type, producer_weight_data[(size_t) column * k + inner]);
+            }
+            intermediate[(size_t) column] = decode_lowp(type, encode_lowp(type, sum));
+        }
+        for (int64_t column = 0; column < output_dim; ++column) {
+            float expected = 0.0f;
+            for (int64_t inner = 0; inner < n; ++inner) {
+                expected +=
+                    intermediate[(size_t) inner] * decode_lowp(type, output_weight_data[(size_t) column * n + inner]);
+            }
+            const float error = std::abs(observed[(size_t) row * output_dim + column] - expected);
+            max_abs           = std::max(max_abs, error);
+            close             = close && error <= 0.01f + 0.01f * std::abs(expected);
+        }
+    }
+    std::printf("type=%s layout cast hoist max_abs=%g\n", ggml_type_name(type), max_abs);
+    return close ? 0 : fail("layout cast hoist numerical comparison failed");
+}
+
 static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64_t width, bool has_residual) {
     constexpr int64_t rows       = 3;
     constexpr int64_t output_dim = 16;
@@ -508,6 +612,54 @@ static int run_empty_scale_case(ggml_backend_t dayan) {
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
     if (!buffer || ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
         return fail("DAYAN empty Scale graph failed");
+    }
+    return 0;
+}
+
+static int run_offset_scale_case(ggml_backend_t dayan) {
+    constexpr int64_t view_elements    = 18432;
+    constexpr int64_t storage_elements = 64 + view_elements;
+    constexpr size_t  view_offset      = 64 * sizeof(float);
+    constexpr int     graph_size       = 4;
+    ggml_init_params  params           = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the offset Scale context");
+    }
+
+    ggml_tensor * storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, storage_elements);
+    ggml_tensor * view    = ggml_view_1d(ctx.get(), storage, view_elements, view_offset);
+    ggml_tensor * scaled  = ggml_scale_inplace(ctx.get(), view, 0.0f);
+    ggml_set_input(storage);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, scaled);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer || storage->extra == nullptr || view->extra == nullptr || scaled->extra == nullptr) {
+        return fail("DAYAN did not initialize offset Scale buffers");
+    }
+
+    std::vector<float> values(storage_elements);
+    for (int64_t index = 0; index < storage_elements; ++index) {
+        values[(size_t) index] = (float) index + 1.0f;
+    }
+    ggml_backend_tensor_set(storage, values.data(), 0, ggml_nbytes(storage));
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN offset Scale graph failed");
+    }
+
+    std::vector<float> observed(storage_elements);
+    ggml_backend_tensor_get(storage, observed.data(), 0, ggml_nbytes(storage));
+    for (int64_t index = 0; index < storage_elements; ++index) {
+        const bool  in_view  = index >= 64 && index < 64 + view_elements;
+        const float expected = in_view ? 0.0f : values[(size_t) index];
+        if (observed[(size_t) index] != expected) {
+            return fail("DAYAN offset Scale result mismatch");
+        }
     }
     return 0;
 }
@@ -839,13 +991,14 @@ static int run_strided_rms_case(ggml_backend_t dayan) {
     return close ? 0 : fail("strided RMSNorm numerical comparison failed");
 }
 
-static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
+static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
     constexpr int64_t width       = 130;
     constexpr int64_t heads       = 2;
     constexpr int64_t tokens      = 3;
     constexpr int     n_dims      = 64;
     constexpr int     graph_size  = 8;
     int               sections[4] = { 11, 11, 10, 0 };
+    const int         position_axes = (mode & GGML_ROPE_TYPE_MROPE) != 0 ? 4 : 1;
 
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
@@ -858,9 +1011,9 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
     }
 
     ggml_tensor * input     = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, heads, tokens);
-    ggml_tensor * positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, tokens * 4);
-    ggml_tensor * output = ggml_rope_multi(ctx.get(), input, positions, nullptr, n_dims, sections, GGML_ROPE_TYPE_MROPE,
-                                           262144, 10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    ggml_tensor * positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, tokens * position_axes);
+    ggml_tensor * output = ggml_rope_multi(ctx.get(), input, positions, nullptr, n_dims, sections, mode, 262144,
+                                           10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_set_input(input);
     ggml_set_input(positions);
 
@@ -872,11 +1025,11 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
     }
 
     std::vector<float>   input_data((size_t) width * heads * tokens);
-    std::vector<int32_t> position_data((size_t) tokens * 4);
+    std::vector<int32_t> position_data((size_t) tokens * position_axes);
     for (size_t index = 0; index < input_data.size(); ++index) {
         input_data[index] = ((int) (index % 47) - 23) / 32.0f;
     }
-    for (int axis = 0; axis < 4; ++axis) {
+    for (int axis = 0; axis < position_axes; ++axis) {
         for (int token = 0; token < tokens; ++token) {
             position_data[(size_t) axis * tokens + token] = token + 3 * axis;
         }
@@ -903,9 +1056,18 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu) {
         max_abs           = std::max(max_abs, error);
         close             = close && error <= 0.002f + 0.002f * std::abs(reference[index]);
     }
-    std::printf("MRoPE width=%lld heads=%lld tokens=%lld n_dims=%d max_abs=%g\n", (long long) width, (long long) heads,
-                (long long) tokens, n_dims, max_abs);
-    return close ? 0 : fail("MRoPE numerical comparison failed");
+    std::printf("RoPE mode=%d width=%lld heads=%lld tokens=%lld n_dims=%d max_abs=%g\n", mode, (long long) width,
+                (long long) heads, (long long) tokens, n_dims, max_abs);
+    return close ? 0 : fail("RoPE numerical comparison failed");
+}
+
+static int run_rope_cases(ggml_backend_t dayan, ggml_backend_t cpu) {
+    return run_rope_case(dayan, cpu, GGML_ROPE_TYPE_NORMAL) != 0 ||
+                   run_rope_case(dayan, cpu, GGML_ROPE_TYPE_NEOX) != 0 ||
+                   run_rope_case(dayan, cpu, GGML_ROPE_TYPE_MROPE) != 0 ||
+                   run_rope_case(dayan, cpu, GGML_ROPE_TYPE_IMROPE) != 0 ?
+               1 :
+               0;
 }
 
 static int run_memory_case(ggml_backend_t dayan) {
@@ -1694,7 +1856,7 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
                fail("Softmax comparison failed");
 }
 
-int main() {
+int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
     ggml_backend_ptr dayan(ggml_backend_init_by_name("DAYAN", nullptr));
@@ -1707,6 +1869,26 @@ int main() {
         return fail("cannot initialize the CPU backend");
     }
 
+    if (argc == 2 && std::strcmp(argv[1], "rope") == 0) {
+        return run_rope_cases(dayan.get(), cpu.get());
+    }
+    if (argc == 2 && std::strcmp(argv[1], "ssm-conv") == 0) {
+        return run_ssm_conv_case(dayan.get(), 1, 5, 128, 1, false) != 0 ||
+                       run_ssm_conv_case(dayan.get(), 4, 5, 130, 2, true) != 0 ||
+                       run_ssm_conv_case(dayan.get(), 4, 69, 384, 1, true) != 0 ?
+                   1 :
+                   0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "gated-output") == 0) {
+        return run_gated_output_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
+                       run_gated_output_case(dayan.get(), GGML_TYPE_F16) != 0 ?
+                   1 :
+                   0;
+    }
+    if (argc != 1) {
+        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output]");
+    }
+
     if (run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 256, false) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 256, true) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 128, false) != 0 ||
@@ -1715,9 +1897,11 @@ int main() {
         run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 130, true) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, false) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 130, true) != 0 || run_fusion_fanout_case(dayan.get()) != 0 ||
-        run_elementwise_case(dayan.get()) != 0 || run_empty_scale_case(dayan.get()) != 0 ||
+        run_layout_cast_hoist_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
+        run_layout_cast_hoist_case(dayan.get(), GGML_TYPE_F16) != 0 || run_elementwise_case(dayan.get()) != 0 ||
+        run_empty_scale_case(dayan.get()) != 0 || run_offset_scale_case(dayan.get()) != 0 ||
         run_math_case(dayan.get()) != 0 || run_reduction_norm_case(dayan.get()) != 0 ||
-        run_strided_rms_case(dayan.get()) != 0 || run_rope_case(dayan.get(), cpu.get()) != 0 ||
+        run_strided_rms_case(dayan.get()) != 0 || run_rope_cases(dayan.get(), cpu.get()) != 0 ||
         run_memory_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
         run_layout_case(dayan.get()) != 0 || run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
         run_softmax_clamp_case(dayan.get()) != 0 ||

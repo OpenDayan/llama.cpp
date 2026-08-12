@@ -76,7 +76,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
           (config->mask_type != kDayanDataTypeF32 && config->mask_type != kDayanDataTypeF16))) ||
         (((config->flags & kDayanSoftmaxHasSinks) != 0U) && sinks == nullptr) ||
         (normalization_bits_float(config->max_bias_bits) > 0.0f && (config->flags & kDayanSoftmaxHasMask) == 0U)) {
-        dayan_proc_exit(-22);
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
