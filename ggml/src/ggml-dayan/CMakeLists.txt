@@ -6,10 +6,6 @@ if (NOT DAYAN_ROOT AND DEFINED ENV{DAYAN_ROOT})
     set(DAYAN_ROOT "$ENV{DAYAN_ROOT}")
 endif()
 
-if (NOT DAYAN_NPU_KERNELS_DIR AND DEFINED ENV{DAYAN_NPU_KERNELS_DIR})
-    set(DAYAN_NPU_KERNELS_DIR "$ENV{DAYAN_NPU_KERNELS_DIR}")
-endif()
-
 find_program(DAYAN_DYCC
     NAMES dycc
     HINTS
@@ -22,6 +18,12 @@ find_path(DAYAN_INCLUDE_DIR
         "${DAYAN_ROOT}/host/include"
         "${DAYAN_ROOT}/include")
 
+find_path(DAYAN_DEVICE_INCLUDE_DIR
+    NAMES dayan_intrinsics.h
+    HINTS
+        "${DAYAN_ROOT}/device/include/api"
+        "${DAYAN_ROOT}/include")
+
 find_file(DAYAN_RUNTIME_LIBRARY
     NAMES libDayanRuntime.a
     HINTS
@@ -29,28 +31,21 @@ find_file(DAYAN_RUNTIME_LIBRARY
         "${DAYAN_ROOT}/lib"
         "${DAYAN_ROOT}/lib64")
 
-find_path(DAYAN_NPU_KERNEL_INCLUDE_DIR
-    NAMES npu_instruction.hpp
-    HINTS
-        "${DAYAN_NPU_KERNELS_DIR}/include"
-        "${DAYAN_ROOT}/../npu-kernels/include"
-        "${DAYAN_ROOT}/lib/dayan")
-
 if (NOT DAYAN_DYCC)
     message(FATAL_ERROR "ggml-dayan: dycc not found; set DAYAN_ROOT")
 endif()
 if (NOT DAYAN_INCLUDE_DIR)
     message(FATAL_ERROR "ggml-dayan: Dayan host headers not found; set DAYAN_ROOT")
 endif()
+if (NOT DAYAN_DEVICE_INCLUDE_DIR)
+    message(FATAL_ERROR "ggml-dayan: Dayan Device API headers not found; set DAYAN_ROOT")
+endif()
 if (NOT DAYAN_RUNTIME_LIBRARY)
     message(FATAL_ERROR "ggml-dayan: libDayanRuntime.a not found; build the Dayan host driver or set DAYAN_ROOT")
 endif()
-if (NOT DAYAN_NPU_KERNEL_INCLUDE_DIR)
-    message(FATAL_ERROR "ggml-dayan: npu_instruction.hpp not found; set DAYAN_NPU_KERNELS_DIR")
-endif()
 message(STATUS "ggml-dayan: dycc: ${DAYAN_DYCC}")
 message(STATUS "ggml-dayan: runtime: ${DAYAN_RUNTIME_LIBRARY}")
-message(STATUS "ggml-dayan: NPU headers: ${DAYAN_NPU_KERNEL_INCLUDE_DIR}")
+message(STATUS "ggml-dayan: Device API: ${DAYAN_DEVICE_INCLUDE_DIR}")
 
 set(DAYAN_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/ggml-dayan-kernels.o")
 
@@ -59,7 +54,6 @@ add_custom_command(
     COMMAND "${DAYAN_DYCC}"
         -O2 -Wall -Wextra -Werror -Wno-error=format -Wno-error=unused-parameter -Wno-error=unused-variable
         "-I${CMAKE_CURRENT_SOURCE_DIR}"
-        "-I${DAYAN_NPU_KERNEL_INCLUDE_DIR}"
         -Xhost -fPIC
         -Xdevice "-I${CMAKE_CURRENT_SOURCE_DIR}/device_include"
         -c "${CMAKE_CURRENT_SOURCE_DIR}/ggml-dayan-kernels.cpp"
@@ -84,12 +78,11 @@ add_custom_command(
         device_include/cstdint
         device_include/cstdio
         device_include/type_traits
-        "${DAYAN_NPU_KERNEL_INCLUDE_DIR}/npu_instruction.hpp"
-        "${DAYAN_NPU_KERNEL_INCLUDE_DIR}/npu_lsu_csr.hpp"
-        "${DAYAN_NPU_KERNEL_INCLUDE_DIR}/npu_macro_csr.hpp"
-        "${DAYAN_NPU_KERNEL_INCLUDE_DIR}/npu_mat_csr.hpp"
-        "${DAYAN_NPU_KERNEL_INCLUDE_DIR}/npu_task.hpp"
-        "${DAYAN_NPU_KERNEL_INCLUDE_DIR}/npu_kernel.h"
+        "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_attrs.h"
+        "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_intrinsics.h"
+        "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_list.h"
+        "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_sys.h"
+        "${DAYAN_INCLUDE_DIR}/dayan_kernel.h"
     COMMENT "Compiling Dayan kernels"
     VERBATIM)
 

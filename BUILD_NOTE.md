@@ -11,7 +11,6 @@ cmake -S . -B build-dayan \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_DAYAN=ON \
   -DDAYAN_ROOT="$HOME/npu-firmware" \
-  -DDAYAN_NPU_KERNELS_DIR="$HOME/npu-kernels" \
   -DLLAMA_BUILD_TOOLS=ON \
   -DLLAMA_BUILD_SERVER=OFF
 

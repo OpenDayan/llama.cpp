@@ -277,7 +277,9 @@ static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const f
             dayan_wait_macro();
             sum += partial[0];
         }
-        output[row] = sum * scale;
+        partial[0] = sum * scale;
+        normalization_store_f32(output + row, (uint64_t) (uintptr_t) partial, 1);
+        dayan_wait_lsu();
     }
 }
 

@@ -4,8 +4,6 @@
 
 #if defined(__DAYAN_DEVICE__)
 
-#    include <npu_cache.h>
-
 namespace ggml_dayan_matmul_detail {
 
 enum : uint32_t {
@@ -210,9 +208,6 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
         dayan_proc_exit(-12);
     }
 
-    cache_inval_range(input, (size_t) config->input_length * config->channels * config->sequences * sizeof(float));
-    cache_inval_range(weight, (size_t) config->kernel_size * config->channels * sizeof(float));
-
     load_ssm_constants(uram_address, config);
     dayan_wait_lsu();
 
@@ -255,10 +250,12 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
         }
     }
 
-    cache_bypass_flush();
-    perf->magic  = kDayanSSMConvPerfMagic;
-    perf->cycles = read_cycle() - start_cycle;
-    cache_bypass_flush();
+    DayanSSMConvPerf * perf_uram = reinterpret_cast<DayanSSMConvPerf *>(uram_address);
+    perf_uram->magic             = kDayanSSMConvPerfMagic;
+    perf_uram->cycles            = read_cycle() - start_cycle;
+    configure_ssm_lsu<0>(1, 1, 0, 0, 0, 0, sizeof(*perf), sizeof(*perf));
+    __tx_lsu_dma_u2d<0>(reinterpret_cast<uint64_t>(perf), uram_address);
+    dayan_wait_lsu();
 }
 
 }  // namespace ggml_dayan_matmul_detail

@@ -2,8 +2,7 @@
 
 #if defined(__DAYAN_DEVICE__)
 
-#    define _NPU_ALIAS_HPP_
-#    include <npu_instruction.hpp>
+#    include <dayan_intrinsics.h>
 #    include <stdint.h>
 
 namespace ggml_dayan_vec_detail {

@@ -18,10 +18,10 @@ The attention operator package provides dedicated BF16 and FP16 QG, K, and V pro
 
 For Qwen3.5 linear-attention layers, `SSM_CONV` followed by SiLU uses one dedicated device function. LSU gathers the F32 channel-major input and depthwise weights into tap-major URAM tiles. VEC performs one elementwise multiply per tap, accumulates the taps in F32, and optionally applies the common SiLU implementation before one output writeback. The kernel does not construct diagonal matrices or use MAT convolution. It supports kernel widths up to 63 and uses 64-token tiles. The convolution remains a separate operator from the delta-net core.
 
-Configure the source SDK and instruction headers explicitly:
+Configure the firmware SDK explicitly:
 
 ```sh
-cmake -S . -B build-dayan -DGGML_DAYAN=ON -DDAYAN_ROOT=/path/to/npu-firmware -DDAYAN_NPU_KERNELS_DIR=/path/to/npu-kernels
+cmake -S . -B build-dayan -DGGML_DAYAN=ON -DDAYAN_ROOT=/path/to/npu-firmware
 cmake --build build-dayan --target test-backend-ops -j
 ```
 

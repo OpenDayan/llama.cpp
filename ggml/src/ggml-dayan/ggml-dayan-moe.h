@@ -1,10 +1,20 @@
 #pragma once
 
-#include "ggml-dayan-elementwise.h"
+#include "ggml-dayan-memory.h"
 
 #if defined(__DAYAN_DEVICE__)
 
 namespace ggml_dayan_matmul_detail {
+
+struct SortUramLayout {
+    enum : uint64_t {
+        kValues  = 0,
+        kIndices = kValues + (uint64_t) kDayanSortMaxWidth * sizeof(float),
+        kTotal   = kIndices + (uint64_t) kDayanSortMaxWidth * sizeof(int32_t),
+    };
+};
+
+static_assert(SortUramLayout::kTotal <= DAYAN_SORT_TASK_URAM_BYTES, "Sort URAM layout is too large");
 
 static inline bool moe_allocation_fits(uint64_t element_size, uint64_t ne0, uint64_t ne1, uint64_t ne2) {
     uint64_t       size          = element_size;
@@ -16,6 +26,14 @@ static inline bool moe_allocation_fits(uint64_t element_size, uint64_t ne0, uint
         size *= dimensions[index];
     }
     return true;
+}
+
+static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
+    const uint64_t scratch = (uint64_t) (uintptr_t) dayan_uram_base();
+    if (scratch == 0 || dayan_uram_size() < sizeof(int32_t)) {
+        dayan_proc_exit(-12);
+    }
+    return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
 }
 
 template <typename Format>
@@ -47,7 +65,7 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
-            const int32_t expert = ids[(uint64_t) token * config->experts_used + used];
+            const int32_t expert = moe_read_expert(ids, (uint64_t) token * config->experts_used + used);
             if (expert < 0 || expert >= (int32_t) config->experts) {
                 DAYAN_PARAMS_ERROR();
             }
@@ -99,7 +117,7 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
-            const int32_t expert = ids[(uint64_t) token * config->experts_used + used];
+            const int32_t expert = moe_read_expert(ids, (uint64_t) token * config->experts_used + used);
             if (expert < 0 || expert >= (int32_t) config->experts) {
                 DAYAN_PARAMS_ERROR();
             }
@@ -142,7 +160,7 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     for (uint64_t row = task; row < rows; row += tasks) {
         const uint32_t used   = (uint32_t) (row % config->experts_used);
         const uint32_t token  = (uint32_t) (row / config->experts_used);
-        const int32_t  expert = ids[(uint64_t) token * config->experts_used + used];
+        const int32_t  expert = moe_read_expert(ids, (uint64_t) token * config->experts_used + used);
         if (expert < 0 || expert >= (int32_t) config->experts) {
             DAYAN_PARAMS_ERROR();
         }
@@ -161,15 +179,23 @@ static inline void run_add_id(const DayanAddIdConfig * config,
 template <bool TopK> static void run_sort(const DayanSortConfig * config, const float * input, int32_t * output) {
     memory_validate(config);
     if (input == nullptr || output == nullptr || config->width == 0 || config->rows == 0 || config->output_width == 0 ||
-        config->output_width > config->width || config->order > 1U || (TopK && config->order != kDayanSortOrderDesc)) {
+        config->width > kDayanSortMaxWidth || config->output_width > config->width || config->order > 1U ||
+        (TopK && config->order != kDayanSortOrderDesc)) {
         DAYAN_PARAMS_ERROR();
+    }
+
+    if (dayan_uram_base() == nullptr || dayan_uram_size() < SortUramLayout::kTotal) {
+        dayan_proc_exit(-12);
     }
 
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
+    const uint64_t uram  = (uint64_t) (uintptr_t) dayan_uram_base();
     for (uint32_t row = task; row < config->rows; row += tasks) {
-        const float * values  = input + (uint64_t) row * config->width;
-        int32_t *     indices = output + (uint64_t) row * config->output_width;
+        memory_load_bytes(uram + SortUramLayout::kValues, input + (uint64_t) row * config->width,
+                          (uint64_t) config->width * sizeof(float));
+        const float * values  = (const float *) (uintptr_t) (uram + SortUramLayout::kValues);
+        int32_t *     indices = (int32_t *) (uintptr_t) (uram + SortUramLayout::kIndices);
         for (uint32_t index = 0; index < config->width; ++index) {
             const uint32_t count    = index < config->output_width ? index : config->output_width;
             uint32_t       position = count;
@@ -196,6 +222,8 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
                 indices[1]          = first;
             }
         }
+        memory_store_bytes(output + (uint64_t) row * config->output_width, uram + SortUramLayout::kIndices,
+                           (uint64_t) config->output_width * sizeof(int32_t));
     }
 }
 

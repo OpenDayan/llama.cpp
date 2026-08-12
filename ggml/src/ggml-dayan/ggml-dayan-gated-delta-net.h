@@ -1,10 +1,7 @@
 #pragma once
 
-#include "npu_instruction.hpp"
-#include "npu_kernel.h"
-#include "npu_lsu_csr.hpp"
-
-#include <npu_cache.h>
+#include <dayan_intrinsics.h>
+#include <dayan_sys.h>
 #include <stdint.h>
 
 namespace ggml_dayan_gdn_detail {
@@ -286,15 +283,6 @@ static inline const float * gdn_row(const float *  base,
                                            (uint64_t) token * nb[2] + (uint64_t) sequence * nb[3]);
 }
 
-static inline size_t gdn_span(const uint64_t nb[4],
-                              uint32_t       width,
-                              uint32_t       heads,
-                              uint32_t       tokens,
-                              uint32_t       sequences) {
-    return (size_t) ((uint64_t) (width - 1U) * nb[0] + (uint64_t) (heads - 1U) * nb[1] +
-                     (uint64_t) (tokens - 1U) * nb[2] + (uint64_t) (sequences - 1U) * nb[3] + sizeof(float));
-}
-
 template <long LsuGroup>
 static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * config,
                                             const float *                    q,
@@ -326,12 +314,6 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
     const uint64_t attn_count       = vector_count * kHeadDim;
     const uint64_t state_slot_count = state_count;
 
-    cache_inval_range(q, gdn_span(config->q_nb, kHeadDim, config->q_heads, config->tokens, config->q_sequences));
-    cache_inval_range(k, gdn_span(config->k_nb, kHeadDim, config->k_heads, config->tokens, config->k_sequences));
-    cache_inval_range(v, gdn_span(config->v_nb, kHeadDim, config->heads, config->tokens, config->sequences));
-    cache_inval_range(g, gdn_span(config->g_nb, config->gate_width, config->heads, config->tokens, config->sequences));
-    cache_inval_range(beta, gdn_span(config->beta_nb, 1, config->heads, config->tokens, config->sequences));
-    cache_inval_range(state, (size_t) state_count * sizeof(float));
     *uram_pointer<float>(kUramLog2E) = 1.4426950408889634f;
 
     *uram_pointer<float>(kUramScale) = bits_to_float(config->scale_bits);
@@ -429,7 +411,6 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
         }
     }
 
-    cache_bypass_flush();
     return 0;
 }
 

@@ -47,16 +47,14 @@ static inline void softmax_load_logits(const DayanSoftmaxConfig * config,
                                        uint32_t                   elements,
                                        float                      slope,
                                        uint64_t                   logits_uram,
-                                       uint64_t                   mask_uram,
                                        uint64_t                   mask_f32_uram) {
     normalization_load(logits_uram, input + input_row * config->width + offset, elements);
     configure_normalization_macro<0>(elements);
     elementwise_scalar_mul<0>(logits_uram, normalization_bits_float(config->scale_bits), logits_uram);
     if ((config->flags & kDayanSoftmaxHasMask) != 0U) {
         const uint32_t mask_bytes = memory_type_bytes(config->mask_type);
-        memory_load(mask_uram, (const char *) mask + (mask_row * config->width + offset) * mask_bytes, elements,
-                    config->mask_type);
-        memory_convert_to_f32(mask_f32_uram, mask_uram, elements, config->mask_type);
+        memory_load_f32(mask_f32_uram, (const char *) mask + (mask_row * config->width + offset) * mask_bytes, elements,
+                        config->mask_type);
         elementwise_scalar_mul<0>(mask_f32_uram, slope, mask_f32_uram);
         __tx_macro_elemwise_add_fp32<0, 0>((void *) logits_uram, (void *) logits_uram, (void *) mask_f32_uram);
     }
@@ -82,7 +80,6 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
     configure_normalization_lsu();
     const uint64_t uram          = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t logits_uram   = uram + NormalizationLayout::kInput;
-    const uint64_t mask_uram     = uram + NormalizationLayout::kAux;
     const uint64_t mask_f32_uram = uram + NormalizationLayout::kValue;
     const uint64_t exp_uram      = uram + NormalizationLayout::kSquare;
     float *        scratch       = (float *) (uintptr_t) (uram + NormalizationLayout::kScalar);
@@ -100,11 +97,16 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
         const float    slope = softmax_slope(head, config->heads, max_bias, scratch + 4);
         const uint64_t mask_row =
             (config->flags & kDayanSoftmaxHasMask) != 0U ? softmax_mask_row(config, row, head, batch) : 0U;
+        float sink = 0.0f;
+        if ((config->flags & kDayanSoftmaxHasSinks) != 0U) {
+            memory_load((uint64_t) (uintptr_t) (scratch + 6), sinks + head, 1, kDayanDataTypeF32);
+            sink = scratch[6];
+        }
         float maximum = -3.402823466e+38f;
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             softmax_load_logits(config, input, mask, input_row, mask_row, offset, elements, slope, logits_uram,
-                                mask_uram, mask_f32_uram);
+                                mask_f32_uram);
             configure_normalization_macro<0>(elements);
             __tx_macro_reduce_max_fp32<0, 0>(scratch, (void *) logits_uram, (void *) 0);
             dayan_wait_macro();
@@ -112,15 +114,15 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
                 maximum = scratch[0];
             }
         }
-        if ((config->flags & kDayanSoftmaxHasSinks) != 0U && sinks[head] > maximum) {
-            maximum = sinks[head];
+        if ((config->flags & kDayanSoftmaxHasSinks) != 0U && sink > maximum) {
+            maximum = sink;
         }
 
         float sum = 0.0f;
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             softmax_load_logits(config, input, mask, input_row, mask_row, offset, elements, slope, logits_uram,
-                                mask_uram, mask_f32_uram);
+                                mask_f32_uram);
             configure_normalization_macro<0>(elements);
             elementwise_scalar_add<0>(logits_uram, -maximum, logits_uram);
             elementwise_scalar_mul<0>(logits_uram, kDayanLog2E, logits_uram);
@@ -132,7 +134,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
             dayan_wait_lsu();
         }
         if ((config->flags & kDayanSoftmaxHasSinks) != 0U) {
-            sum += softmax_exp2_scalar((sinks[head] - maximum) * kDayanLog2E, scratch + 4);
+            sum += softmax_exp2_scalar((sink - maximum) * kDayanLog2E, scratch + 4);
         }
 
         scratch[0] = sum;

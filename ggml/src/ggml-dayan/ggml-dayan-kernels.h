@@ -15,6 +15,10 @@
 #    define DAYAN_NATIVE_TASK_URAM_BYTES (8U * 1024U)
 #endif
 
+#ifndef DAYAN_SORT_TASK_URAM_BYTES
+#    define DAYAN_SORT_TASK_URAM_BYTES (32U * 1024U)
+#endif
+
 #ifndef DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES
 #    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (120U * 1024U)
 #endif
@@ -238,6 +242,7 @@ struct DayanSortConfig {
 };
 
 enum : uint32_t {
+    kDayanSortMaxWidth = 4096,
     kDayanSortOrderAsc  = 0,
     kDayanSortOrderDesc = 1,
 };

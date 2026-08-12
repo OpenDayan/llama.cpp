@@ -4,15 +4,8 @@
 
 #if defined(__DAYAN_DEVICE__)
 
+#    include <dayan_intrinsics.h>
 #    include <dayan_sys.h>
-
-#    define _NPU_ALIAS_HPP_
-#    include <npu_instruction.hpp>
-#    include <npu_lsu_csr.hpp>
-#    include <npu_macro_csr.hpp>
-#    include <npu_mat_csr.hpp>
-
-__asm__(".globl z\n.set z, 0");
 
 namespace ggml_dayan_matmul_detail {
 
@@ -993,12 +986,18 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
     const uint64_t pipeline_end = read_cycle();
     const uint64_t kernel_end   = read_cycle();
 
-    perf->magic           = kDayanMatmulPerfMagic;
-    perf->m               = config->m;
-    perf->n               = config->n;
-    perf->k               = config->k;
-    perf->kernel_cycles   = kernel_end - kernel_begin;
-    perf->pipeline_cycles = pipeline_end - pipeline_begin;
+    DayanMatmulPerf * perf_uram = (DayanMatmulPerf *) (uintptr_t) uram_address;
+    perf_uram->magic            = kDayanMatmulPerfMagic;
+    perf_uram->m                = config->m;
+    perf_uram->n                = config->n;
+    perf_uram->k                = config->k;
+    perf_uram->kernel_cycles    = kernel_end - kernel_begin;
+    perf_uram->pipeline_cycles  = pipeline_end - pipeline_begin;
+
+    long checksum = 0;
+    set_lsu_matrix<0>(checksum, 1, 64, 64, 64);
+    store_matrix<0>(sizeof(*perf_uram), 1, 64, 1, uram_address, (uint64_t) (uintptr_t) perf);
+    dayan_wait_lsu();
 }
 
 }  // namespace ggml_dayan_matmul_detail

@@ -29,22 +29,25 @@ struct RopeUramLayout {
 static_assert(RopeUramLayout::kTotal <= DAYAN_NATIVE_TASK_URAM_BYTES, "RoPE URAM layout is too large");
 
 template <long Group>
-static inline void configure_rope_lsu(uint32_t dim0,
-                                      uint64_t input_stride,
-                                      uint64_t output_stride,
-                                      uint32_t read_bytes,
-                                      uint32_t write_bytes) {
+static inline void configure_rope_lsu_2d(uint32_t dim0,
+                                         uint64_t input_dim0_stride,
+                                         uint64_t output_dim0_stride,
+                                         uint32_t dim1,
+                                         uint64_t input_dim1_stride,
+                                         uint64_t output_dim1_stride,
+                                         uint32_t read_bytes,
+                                         uint32_t write_bytes) {
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(dim0 - 1U);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(dim1 - 1U);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(input_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(input_dim0_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(input_dim1_stride);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(output_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(output_dim0_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(output_dim1_stride);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(6);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(0);
@@ -55,6 +58,15 @@ static inline void configure_rope_lsu(uint32_t dim0,
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(write_bytes - 1U);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESIZE>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(64);
+}
+
+template <long Group>
+static inline void configure_rope_lsu(uint32_t dim0,
+                                      uint64_t input_stride,
+                                      uint64_t output_stride,
+                                      uint32_t read_bytes,
+                                      uint32_t write_bytes) {
+    configure_rope_lsu_2d<Group>(dim0, input_stride, output_stride, 1, 0, 0, read_bytes, write_bytes);
 }
 
 static inline void rope_load_linear(uint64_t output, uint64_t input, uint32_t bytes) {
@@ -107,11 +119,23 @@ static inline void rope_load_strided(uint64_t output,
     __tx_lsu_dma_d2u<0>(output, input);
 }
 
-static inline void rope_store_strided(uint64_t output,
-                                      uint64_t input,
-                                      uint32_t count,
-                                      uint64_t output_stride) {
-    configure_rope_lsu<0>(count, sizeof(uint32_t), output_stride, sizeof(uint32_t), sizeof(uint32_t));
+static inline void rope_load_pair(uint64_t output,
+                                  uint64_t input,
+                                  uint32_t count,
+                                  uint64_t input_stride,
+                                  uint64_t input_pair_stride) {
+    configure_rope_lsu_2d<0>(count, input_stride, sizeof(float), 2, input_pair_stride, Constants::kVecBytes,
+                             sizeof(float), sizeof(float));
+    __tx_lsu_dma_d2u<0>(output, input);
+}
+
+static inline void rope_store_pair(uint64_t output,
+                                   uint64_t input,
+                                   uint32_t count,
+                                   uint64_t output_stride,
+                                   uint64_t output_pair_stride) {
+    configure_rope_lsu_2d<0>(count, sizeof(float), output_stride, 2, Constants::kVecBytes, output_pair_stride,
+                             sizeof(float), sizeof(float));
     __tx_lsu_dma_u2d<0>(output, input);
 }
 
@@ -240,11 +264,7 @@ static inline void run_rope_f32(const DayanRopeConfig * config,
         dayan_proc_exit(-12);
     }
 
-    const uint64_t elements      = (uint64_t) config->width * config->heads * config->tokens * config->batches;
     const uint32_t position_axes = (config->mode & 8U) != 0U ? 4U : 1U;
-    cache_inval_range(input, (size_t) elements * sizeof(float));
-    cache_inval_range(positions, (size_t) position_axes * config->tokens * sizeof(int32_t));
-    cache_inval_range(freq_factors, (size_t) config->n_dims / 2U * sizeof(float));
 
     const uint64_t uram        = reinterpret_cast<uint64_t>(dayan_uram_base());
     const uint64_t x0          = uram + RopeUramLayout::kX0;
@@ -290,13 +310,11 @@ static inline void run_rope_f32(const DayanRopeConfig * config,
             rope_load_linear(multiplier, reinterpret_cast<uint64_t>(config->multipliers + pair_base), pair_bytes);
             rope_load_linear(factors, reinterpret_cast<uint64_t>(freq_factors + pair_base), pair_bytes);
             if (config->mode == 0U) {
-                rope_load_strided(x0, reinterpret_cast<uint64_t>(source + 2U * pair_base), pair_count,
-                                  2U * sizeof(float));
-                rope_load_strided(x1, reinterpret_cast<uint64_t>(source + 2U * pair_base + 1U), pair_count,
-                                  2U * sizeof(float));
+                rope_load_pair(x0, reinterpret_cast<uint64_t>(source + 2U * pair_base), pair_count,
+                               2U * sizeof(float), sizeof(float));
             } else {
-                rope_load_linear(x0, reinterpret_cast<uint64_t>(source + pair_base), pair_bytes);
-                rope_load_linear(x1, reinterpret_cast<uint64_t>(source + half + pair_base), pair_bytes);
+                rope_load_pair(x0, reinterpret_cast<uint64_t>(source + pair_base), pair_count, sizeof(float),
+                               (uint64_t) half * sizeof(float));
             }
             dayan_wait_lsu();
 
@@ -310,13 +328,11 @@ static inline void run_rope_f32(const DayanRopeConfig * config,
             dayan_wait_vec();
 
             if (config->mode == 0U) {
-                rope_store_strided(reinterpret_cast<uint64_t>(destination + 2U * pair_base), output0, pair_count,
-                                   2U * sizeof(float));
-                rope_store_strided(reinterpret_cast<uint64_t>(destination + 2U * pair_base + 1U), output1, pair_count,
-                                   2U * sizeof(float));
+                rope_store_pair(reinterpret_cast<uint64_t>(destination + 2U * pair_base), output0, pair_count,
+                                2U * sizeof(float), sizeof(float));
             } else {
-                rope_store_linear(reinterpret_cast<uint64_t>(destination + pair_base), output0, pair_bytes);
-                rope_store_linear(reinterpret_cast<uint64_t>(destination + half + pair_base), output1, pair_bytes);
+                rope_store_pair(reinterpret_cast<uint64_t>(destination + pair_base), output0, pair_count,
+                                sizeof(float), (uint64_t) half * sizeof(float));
             }
             dayan_wait_lsu();
         }
@@ -328,7 +344,6 @@ static inline void run_rope_f32(const DayanRopeConfig * config,
             dayan_wait_lsu();
         }
     }
-    cache_bypass_flush();
 }
 
 }  // namespace ggml_dayan_matmul_detail

@@ -157,7 +157,7 @@ bool ggml_backend_dayan_supports_add_id(const ggml_tensor * op) {
 
 static bool ggml_backend_dayan_supports_sort(const ggml_tensor * op, enum ggml_op kind) {
     if (op == nullptr || op->op != kind || op->src[0] == nullptr || op->src[0]->type != GGML_TYPE_F32 ||
-        op->type != GGML_TYPE_I32 || op->src[0]->ne[0] <= 0 || op->src[0]->ne[0] > 4096 || op->ne[0] <= 0 ||
+        op->type != GGML_TYPE_I32 || op->src[0]->ne[0] <= 0 || op->src[0]->ne[0] > kDayanSortMaxWidth || op->ne[0] <= 0 ||
         op->ne[0] > op->src[0]->ne[0] || ggml_nrows(op->src[0]) <= 0 || ggml_nrows(op->src[0]) > UINT32_MAX ||
         !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) {
         return false;

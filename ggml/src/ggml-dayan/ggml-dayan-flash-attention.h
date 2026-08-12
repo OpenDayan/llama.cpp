@@ -2,21 +2,16 @@
 
 // Single-core FlashAttention for contiguous BF16 or FP16 Q/K/V tensors.
 //
-// A shared KV producer feeds three fixed Q-slice consumers, following the coroutine pipeline in
-// kernel_bf16_matmul_os.cpp. The two matrix products use one 16-bit type and accumulate to FP32:
+// A root KV producer feeds three fixed Q-slice child procs. The two matrix products use one
+// 16-bit type and accumulate to FP32:
 //   S  = Q_lowp * K_lowp^T
 //   PV = P_lowp * V_lowp
 // Online-softmax state (m, l, O) stays in FP32.  Scores are never materialized in DRAM.
 
 #include "ggml-dayan-activation.h"
 
-#include "npu_instruction.hpp"
-#include "npu_kernel.h"
-#include "npu_lsu_csr.hpp"
-#include "npu_macro_csr.hpp"
-#include "npu_mat_csr.hpp"
-#include "npu_task.hpp"
-
+#include <dayan_intrinsics.h>
+#include <dayan_sys.h>
 #include <stdint.h>
 
 namespace {
@@ -92,10 +87,6 @@ static inline uint64_t uram_addr(long byte_offset) {
 
 static inline long min_long(long a, long b) {
     return a < b ? a : b;
-}
-
-static inline long kv_k_base(long buffer_id) {
-    return buffer_id == 0 ? kUramK0 : kUramK1;
 }
 
 // Copy a row-major matrix whose row size is a multiple of 64 bytes.  BlockTranspose=6 is the
@@ -562,97 +553,65 @@ static inline bool ranges_overlap(uint64_t a, uint64_t a_bytes, uint64_t b, uint
 constexpr long kKvVtOffset = kUramVt0 - kUramK0;
 static_assert(kUramVt1 - kUramK1 == kKvVtOffset, "Both KV pipeline buffers must use the same internal layout");
 
-// A fast consumer can reach generation g+2 while another consumer still owns g in the same
-// parity slot.  The generation tag prevents that consumer from mistaking the old READY tile for
-// the new tile, matching the sequenced double buffer in kernel_bf16_matmul_os.cpp.
-class NPUSequencedURAM : public NPUURAM {
-  private:
-    uint64_t generation = ~uint64_t{ 0 };
-
-  public:
-    explicit NPUSequencedURAM(uint64_t uram_base) : NPUURAM(uram_base) {}
-
-    inline bool ready_for(uint64_t expected_generation) { return state == READY && generation == expected_generation; }
-
-    inline int wait_ready_for(NPUTask * cur, NPUScheduler * sched, uint64_t expected_generation) {
-        if (ready_for(expected_generation)) {
-            return 0;
-        }
-        if (state == READY) {
-            return wait_free(cur, sched);
-        }
-        return wait_ready(cur, sched);
-    }
-
-    inline void produce(NPUScheduler * sched, uint64_t produced_generation) {
-        generation = produced_generation;
-        NPUURAM::produce(sched);
-    }
+struct FlashAttentionBuffer {
+    dayan_resource_t  resource;
+    volatile uint64_t generation;
+    long              k_offset;
 };
 
-#define NPUWaitReadyFor(res, expected_generation)                          \
-    do {                                                                   \
-        while (!(res)->ready_for(expected_generation)) {                   \
-            if ((res)->wait_ready_for(this, sched, expected_generation)) { \
-                _state = &&CONCAT_LINE(_lb_);                              \
-                return 0;                                                  \
-                CONCAT_LINE(_lb_) :;                                       \
-            }                                                              \
-        }                                                                  \
-    } while (0)
+struct FlashAttentionState {
+    const uint64_t q_base;
+    const uint64_t k_base;
+    const uint64_t v_base;
+    const uint64_t out_base;
+    const uint64_t q_row_stride;
+    const uint64_t q_head_stride;
+    const uint64_t q_batch_stride;
+    const uint64_t k_row_stride;
+    const uint64_t k_head_stride;
+    const uint64_t k_batch_stride;
+    const uint64_t v_row_stride;
+    const uint64_t v_head_stride;
+    const uint64_t v_batch_stride;
+    const uint64_t out_batch_bytes;
+    const uint32_t batch;
+    const uint32_t q_heads;
+    const uint32_t kv_heads;
+    const uint32_t q_len;
+    const uint32_t kv_len;
+    const uint32_t head_dim;
+    const uint32_t q_per_kv;
+    const long     q_tiles;
+    const long     q_groups;
+    const long     kv_tiles;
+    const uint32_t causal_offset;
+    const bool     causal;
+    FlashAttentionBuffer buffers[2];
+    volatile int          status;
+    volatile uint32_t     start;
+    volatile uint32_t     abort;
 
-class FlashAttentionState {
-  public:
-    const uint64_t     q_base;
-    const uint64_t     k_base;
-    const uint64_t     v_base;
-    const uint64_t     out_base;
-    const uint64_t     q_row_stride;
-    const uint64_t     q_head_stride;
-    const uint64_t     q_batch_stride;
-    const uint64_t     k_row_stride;
-    const uint64_t     k_head_stride;
-    const uint64_t     k_batch_stride;
-    const uint64_t     v_row_stride;
-    const uint64_t     v_head_stride;
-    const uint64_t     v_batch_stride;
-    const uint64_t     out_batch_bytes;
-    const uint32_t     batch;
-    const uint32_t     q_heads;
-    const uint32_t     kv_heads;
-    const uint32_t     q_len;
-    const uint32_t     kv_len;
-    const uint32_t     head_dim;
-    const uint32_t     q_per_kv;
-    const long         q_tiles;
-    const long         q_groups;
-    const long         kv_tiles;
-    const uint32_t     causal_offset;
-    const bool         causal;
-    NPUSequencedURAM * kv_buffers;
-
-    FlashAttentionState(uint64_t           q_base_arg,
-                        uint64_t           k_base_arg,
-                        uint64_t           v_base_arg,
-                        uint64_t           out_base_arg,
-                        uint32_t           batch_arg,
-                        uint32_t           q_heads_arg,
-                        uint32_t           kv_heads_arg,
-                        uint32_t           q_len_arg,
-                        uint32_t           kv_len_arg,
-                        uint32_t           head_dim_arg,
-                        uint32_t           causal_offset_arg,
-                        bool               causal_arg,
-                        uint64_t           q_row_stride_arg,
-                        uint64_t           q_head_stride_arg,
-                        uint64_t           q_batch_stride_arg,
-                        uint64_t           k_row_stride_arg,
-                        uint64_t           k_head_stride_arg,
-                        uint64_t           k_batch_stride_arg,
-                        uint64_t           v_row_stride_arg,
-                        uint64_t           v_head_stride_arg,
-                        uint64_t           v_batch_stride_arg,
-                        NPUSequencedURAM * kv_buffers_arg) :
+    FlashAttentionState(uint64_t q_base_arg,
+                        uint64_t k_base_arg,
+                        uint64_t v_base_arg,
+                        uint64_t out_base_arg,
+                        uint32_t batch_arg,
+                        uint32_t q_heads_arg,
+                        uint32_t kv_heads_arg,
+                        uint32_t q_len_arg,
+                        uint32_t kv_len_arg,
+                        uint32_t head_dim_arg,
+                        uint32_t causal_offset_arg,
+                        bool     causal_arg,
+                        uint64_t q_row_stride_arg,
+                        uint64_t q_head_stride_arg,
+                        uint64_t q_batch_stride_arg,
+                        uint64_t k_row_stride_arg,
+                        uint64_t k_head_stride_arg,
+                        uint64_t k_batch_stride_arg,
+                        uint64_t v_row_stride_arg,
+                        uint64_t v_head_stride_arg,
+                        uint64_t v_batch_stride_arg) :
         q_base(q_base_arg),
         k_base(k_base_arg),
         v_base(v_base_arg),
@@ -679,7 +638,14 @@ class FlashAttentionState {
         kv_tiles((static_cast<uint64_t>(kv_len_arg) + kBc - 1) / kBc),
         causal_offset(causal_offset_arg),
         causal(causal_arg),
-        kv_buffers(kv_buffers_arg) {}
+        status(0),
+        start(0),
+        abort(0) {
+        buffers[0].generation = ~uint64_t{ 0 };
+        buffers[0].k_offset   = kUramK0;
+        buffers[1].generation = ~uint64_t{ 0 };
+        buffers[1].k_offset   = kUramK1;
+    }
 
     inline uint32_t kv_head_for(uint32_t q_head) const { return q_head / q_per_kv; }
 
@@ -740,73 +706,33 @@ class FlashAttentionState {
     }
 };
 
-// Producer coroutine: pretranspose K/V tiles once for a super-group of up to three Q tiles.  A
-// buffer remains READY until every consumer that uses that causal prefix has completed PV.
-class FlashAttentionKvProducerTask : public NPUTask {
-  private:
-    FlashAttentionState * s;
-    uint32_t              b             = 0;
-    uint32_t              qh            = 0;
-    long                  q_group       = 0;
-    long                  ki            = 0;
-    long                  producer_keys = 0;
-    long                  k_row         = 0;
-    long                  cols          = 0;
-    int                   users         = 0;
-    uint64_t              generation    = 0;
-    uint64_t              k_tile        = 0;
-    uint64_t              v_tile        = 0;
-    NPUSequencedURAM *    kv            = nullptr;
+static inline int remember_error(FlashAttentionState * state, int status) {
+    if (status < 0 && state->status == 0) {
+        state->status = status;
+    }
+    return status;
+}
 
-  public:
-    explicit FlashAttentionKvProducerTask(FlashAttentionState * state) : NPUTask(wrapper), s(state) {}
-
-    int32_t execute(int * err) {
-        (void) err;
-        NPUBegin;
-        for (b = 0; b < s->batch; ++b) {
-            for (qh = 0; qh < s->q_heads; ++qh) {
-                for (q_group = 0; q_group < s->q_groups; ++q_group) {
-                    producer_keys = s->producer_key_tile_count(q_group);
-                    for (ki = 0; ki < producer_keys; ++ki) {
-                        kv    = &s->kv_buffers[generation & 1];
-                        users = s->users_for_key_tile(q_group, ki);
-                        do {
-                            NPUWaitFree(kv);
-                        } while (kv->allocate(sched, 1, users));
-
-                        k_row  = ki * kBc;
-                        cols   = min_long(kBc, static_cast<long>(s->kv_len) - k_row);
-                        k_tile = s->k_row_address(b, qh, k_row);
-                        v_tile = s->v_row_address(b, qh, k_row);
-
-                        configure_lsu_rows<kLsuK>(cols, s->head_dim * sizeof(uint16_t), s->k_row_stride,
-                                                  s->head_dim * sizeof(uint16_t));
-                        __tx_lsu_dma_d2u<kLsuK>(uram_addr(kv->uram), k_tile);
-                        load_v_transposed(v_tile, kv->uram + kKvVtOffset, cols, s->head_dim, s->v_row_stride);
-                        NPUDMABar(0);
-
-                        kv->produce(sched, generation);
-                        ++generation;
-                        NPUYield(0);
-                    }
-                }
-            }
+static inline int wait_for_generation(FlashAttentionBuffer * buffer, uint64_t expected_generation) {
+    for (;;) {
+        if (buffer->generation == expected_generation) {
+            return dayan_resource_wait_ready(&buffer->resource);
         }
-        NPUFinish(-1);
-    }
 
-    static int32_t wrapper(NPUTask * task, int * err) {
-        return static_cast<FlashAttentionKvProducerTask *>(task)->execute(err);
+        const int status = dayan_resource_wait_free(&buffer->resource);
+        if (status < 0) {
+            return status;
+        }
+        dayan_yield();
     }
-};
+}
 
 // Three fixed consumers own disjoint URAM contexts and unit configuration groups. Each handles
 // one 64-row Q tile in a 192-row super-group, allowing LSU, MAT, and VEC phases from different Q
 // tiles to cover one another's latency. The current RVTNG target stays below each completion FIFO
 // limit; FlexVec additionally has exactly three of its four block slots in flight.
-template <typename Format, long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
-  private:
+template <typename Format, long FIXED_SLICE>
+static void flash_attention_consumer(void * argument) {
     static_assert(FIXED_SLICE >= 0 && FIXED_SLICE < kConsumerCount, "FlashAttention consumer slice is out of range");
     static constexpr long kCtxBase     = context_base(FIXED_SLICE);
     static constexpr long kLsuQGroup   = 2 + FIXED_SLICE * 2;
@@ -816,98 +742,164 @@ template <typename Format, long FIXED_SLICE> class FlashAttentionComputeTask : p
     static_assert(kLsuOutGroup < 8 && kMatPVGroup < 8,
                   "FlashAttention unit group allocation exceeds the target TCSR file");
 
-    FlashAttentionState * s;
-    uint32_t              b                    = 0;
-    uint32_t              qh                   = 0;
-    long                  q_group              = 0;
-    long                  qi                   = 0;
-    long                  ki                   = 0;
-    long                  q_row                = 0;
-    long                  k_row                = 0;
-    long                  rows                 = 0;
-    long                  cols                 = 0;
-    long                  producer_keys        = 0;
-    long                  slice_keys           = 0;
-    long                  threshold_row_stride = 0;
-    bool                  mask_scores          = true;
-    uint64_t              generation_base      = 0;
-    uint64_t              expected_generation  = 0;
-    NPUSequencedURAM *    kv                   = nullptr;
+    FlashAttentionState * state = static_cast<FlashAttentionState *>(argument);
+    uint64_t              generation_base = 0;
 
-  public:
-    explicit FlashAttentionComputeTask(FlashAttentionState * state) : NPUTask(wrapper), s(state) {}
+    while (!state->start) {
+        dayan_yield();
+    }
+    if (state->abort) {
+        return;
+    }
 
-    int32_t execute(int * err) {
-        (void) err;
-        NPUBegin;
-        for (b = 0; b < s->batch; ++b) {
-            for (qh = 0; qh < s->q_heads; ++qh) {
-                for (q_group = 0; q_group < s->q_groups; ++q_group) {
-                    producer_keys = s->producer_key_tile_count(q_group);
-                    qi            = s->q_tile_for(q_group, FIXED_SLICE);
-                    q_row         = qi * kBr;
-                    rows          = s->rows_for_slice(q_group, FIXED_SLICE);
-                    slice_keys    = s->slice_key_tile_count(q_group, FIXED_SLICE);
-                    if (rows != 0) {
-                        // Q needs no initialization: load it directly.  Initialize the independent
-                        // online state on the output LSU group so both DMA streams can run in
-                        // parallel; the existing barrier waits for both groups.
-                        configure_lsu_rows<kLsuQGroup>(rows, s->head_dim * sizeof(uint16_t), s->q_row_stride,
-                                                       s->head_dim * sizeof(uint16_t));
-                        __tx_lsu_dma_d2u<kLsuQGroup>(uram_addr(kCtxBase + kCtxQ), s->q_row_address(b, qh, q_row));
-                        issue_initialize_online_state<kLsuOutGroup>(kCtxBase, rows, s->head_dim);
-                        NPUDMABar(0);
+    for (uint32_t b = 0; b < state->batch; ++b) {
+        for (uint32_t qh = 0; qh < state->q_heads; ++qh) {
+            for (long q_group = 0; q_group < state->q_groups; ++q_group) {
+                const long producer_keys = state->producer_key_tile_count(q_group);
+                const long qi            = state->q_tile_for(q_group, FIXED_SLICE);
+                const long q_row         = qi * kBr;
+                const long rows          = state->rows_for_slice(q_group, FIXED_SLICE);
+                const long slice_keys    = state->slice_key_tile_count(q_group, FIXED_SLICE);
 
-                        for (ki = 0; ki < slice_keys; ++ki) {
-                            expected_generation = generation_base + static_cast<uint64_t>(ki);
-                            kv                  = &s->kv_buffers[expected_generation & 1];
-                            NPUWaitReadyFor(kv, expected_generation);
+                if (rows != 0) {
+                    configure_lsu_rows<kLsuQGroup>(rows, state->head_dim * sizeof(uint16_t), state->q_row_stride,
+                                                   state->head_dim * sizeof(uint16_t));
+                    __tx_lsu_dma_d2u<kLsuQGroup>(uram_addr(kCtxBase + kCtxQ), state->q_row_address(b, qh, q_row));
+                    issue_initialize_online_state<kLsuOutGroup>(kCtxBase, rows, state->head_dim);
+                    dayan_wait_lsu();
 
-                            k_row = ki * kBc;
-                            cols  = min_long(kBc, static_cast<long>(s->kv_len) - k_row);
-                            issue_qk<Format, kMatQKGroup>(kCtxBase, rows, cols, s->head_dim, kv->uram);
-                            // Threshold preparation touches a disjoint URAM region and can run on
-                            // the scalar core while QK is executing.
-                            mask_scores = prepare_softmax_mask(kCtxBase, rows, cols, q_row + s->causal_offset, k_row,
-                                                               s->causal, &threshold_row_stride);
-                            NPUMatBar(0);
-
-                            issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
-                            NPUVecBar(0);
-
-                            issue_p_to_lowp<Format>(kCtxBase, rows);
-                            NPUVecBar(0);
-
-                            issue_pv<Format, kMatPVGroup>(kCtxBase, rows, s->head_dim, kv->uram + kKvVtOffset);
-                            NPUMatBar(0);
-
-                            // K/Vt are dead after PV.  Refill may overlap the independent O update.
-                            kv->consume(sched);
-                            issue_update_o(kCtxBase, rows, s->head_dim);
-                            NPUVecBar(0);
+                    for (long ki = 0; ki < slice_keys; ++ki) {
+                        const uint64_t expected_generation = generation_base + static_cast<uint64_t>(ki);
+                        FlashAttentionBuffer * buffer = &state->buffers[expected_generation & 1U];
+                        int status = wait_for_generation(buffer, expected_generation);
+                        if (status < 0) {
+                            remember_error(state, status);
+                            return;
                         }
 
-                        issue_normalize_o(kCtxBase, rows, s->head_dim);
-                        NPUVecBar(0);
+                        const long k_row = ki * kBc;
+                        const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
+                        issue_qk<Format, kMatQKGroup>(kCtxBase, rows, cols, state->head_dim, buffer->k_offset);
+                        long threshold_row_stride;
+                        const bool mask_scores = prepare_softmax_mask(
+                            kCtxBase, rows, cols, q_row + state->causal_offset, k_row, state->causal,
+                            &threshold_row_stride);
+                        dayan_wait_mat();
 
-                        configure_lsu_rows<kLsuOutGroup>(rows, s->head_dim * sizeof(float), s->head_dim * sizeof(float),
-                                                         s->q_heads * s->head_dim * sizeof(float));
-                        __tx_lsu_dma_u2d<kLsuOutGroup>(s->out_row_address(b, qh, q_row), uram_addr(kCtxBase + kCtxO));
-                        NPUDMABar(0);
+                        issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
+                        dayan_wait_vec();
+                        issue_p_to_lowp<Format>(kCtxBase, rows);
+                        dayan_wait_vec();
+                        issue_pv<Format, kMatPVGroup>(
+                            kCtxBase, rows, state->head_dim, buffer->k_offset + kKvVtOffset);
+                        dayan_wait_mat();
+
+                        status = dayan_resource_consume(&buffer->resource);
+                        if (status < 0) {
+                            remember_error(state, status);
+                            return;
+                        }
+                        issue_update_o(kCtxBase, rows, state->head_dim);
+                        dayan_wait_vec();
                     }
-                    // All fixed consumers advance over the producer's full generation range,
-                    // including causal suffixes they did not consume and an inactive tail slice.
-                    generation_base += static_cast<uint64_t>(producer_keys);
+
+                    issue_normalize_o(kCtxBase, rows, state->head_dim);
+                    dayan_wait_vec();
+                    configure_lsu_rows<kLsuOutGroup>(rows, state->head_dim * sizeof(float),
+                                                     state->head_dim * sizeof(float),
+                                                     state->q_heads * state->head_dim * sizeof(float));
+                    __tx_lsu_dma_u2d<kLsuOutGroup>(
+                        state->out_row_address(b, qh, q_row), uram_addr(kCtxBase + kCtxO));
+                    dayan_wait_lsu();
                 }
+                generation_base += static_cast<uint64_t>(producer_keys);
             }
         }
-        NPUFinish(-1);
+    }
+}
+
+template <typename Format>
+static int run_flash_attention_pipeline(FlashAttentionState * state) {
+    for (long index = 0; index < 2; ++index) {
+        const int status = dayan_resource_init(&state->buffers[index].resource);
+        if (status < 0) {
+            return status;
+        }
     }
 
-    static int32_t wrapper(NPUTask * task, int * err) {
-        return static_cast<FlashAttentionComputeTask<Format, FIXED_SLICE> *>(task)->execute(err);
+    int status = dayan_create_proc("fa-consumer-0", flash_attention_consumer<Format, 0>, state);
+    if (status >= 0) {
+        status = dayan_create_proc("fa-consumer-1", flash_attention_consumer<Format, 1>, state);
     }
-};
+    if (status >= 0) {
+        status = dayan_create_proc("fa-consumer-2", flash_attention_consumer<Format, 2>, state);
+    }
+    if (status < 0) {
+        state->status = status;
+        state->abort  = 1;
+        state->start  = 1;
+        (void) dayan_join_all();
+        return status;
+    }
+
+    state->start = 1;
+    uint64_t generation = 0;
+    for (uint32_t b = 0; b < state->batch; ++b) {
+        for (uint32_t qh = 0; qh < state->q_heads; ++qh) {
+            for (long q_group = 0; q_group < state->q_groups; ++q_group) {
+                const long producer_keys = state->producer_key_tile_count(q_group);
+                for (long ki = 0; ki < producer_keys; ++ki) {
+                    FlashAttentionBuffer * buffer = &state->buffers[generation & 1U];
+                    status = dayan_resource_wait_free(&buffer->resource);
+                    if (status < 0) {
+                        remember_error(state, status);
+                        break;
+                    }
+                    status = dayan_resource_alloc(
+                        &buffer->resource, 1, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)));
+                    if (status < 0) {
+                        remember_error(state, status);
+                        break;
+                    }
+
+                    buffer->generation = generation;
+                    const long k_row = ki * kBc;
+                    const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
+                    configure_lsu_rows<kLsuK>(cols, state->head_dim * sizeof(uint16_t), state->k_row_stride,
+                                              state->head_dim * sizeof(uint16_t));
+                    __tx_lsu_dma_d2u<kLsuK>(
+                        uram_addr(buffer->k_offset), state->k_row_address(b, qh, k_row));
+                    load_v_transposed(state->v_row_address(b, qh, k_row), buffer->k_offset + kKvVtOffset,
+                                      cols, state->head_dim, state->v_row_stride);
+                    dayan_wait_lsu();
+
+                    status = dayan_resource_produce(&buffer->resource);
+                    if (status < 0) {
+                        remember_error(state, status);
+                        break;
+                    }
+                    ++generation;
+                    dayan_yield();
+                }
+                if (status < 0) {
+                    break;
+                }
+            }
+            if (status < 0) {
+                break;
+            }
+        }
+        if (status < 0) {
+            break;
+        }
+    }
+
+    status = dayan_join_all();
+    if (status < 0 && state->status == 0) {
+        state->status = status;
+    }
+    return state->status;
+}
 
 }  // namespace
 
@@ -1002,22 +994,14 @@ static __device__ long flash_attention_lowp_f32(void *   q,
         ranges_overlap(out_base_addr, out_bytes, v_base_addr, v_span)) {
         return FA_OUTPUT_ALIAS;
     }
+    if (!dayan_uram_base() || dayan_uram_size() < kUramBytes) {
+        return FA_INVALID_ARGUMENT;
+    }
 
-    NPUSequencedURAM    kv_buffers[2] = { NPUSequencedURAM(kv_k_base(0)), NPUSequencedURAM(kv_k_base(1)) };
     FlashAttentionState state(q_base_addr, k_base_addr, v_base_addr, out_base_addr, batch, q_heads, kv_heads, q_len,
                               kv_len, head_dim, causal_offset, (flags & kFlagCausal) != 0, q_row_stride, q_head_stride,
                               q_batch_stride, k_row_stride, k_head_stride, k_batch_stride, v_row_stride, v_head_stride,
-                              v_batch_stride, kv_buffers);
+                              v_batch_stride);
     initialize_constants(scale_log2e);
-    FlashAttentionKvProducerTask         producer(&state);
-    FlashAttentionComputeTask<Format, 0> consumer0(&state);
-    FlashAttentionComputeTask<Format, 1> consumer1(&state);
-    FlashAttentionComputeTask<Format, 2> consumer2(&state);
-    NPUTask *                            tasks[4] = { &producer, &consumer0, &consumer1, &consumer2 };
-    NPUScheduler                         scheduler(4, tasks);
-    for (NPUTask * task : tasks) {
-        task->sched = &scheduler;
-    }
-    scheduler.scheduler();
-    return 0;
+    return run_flash_attention_pipeline<Format>(&state);
 }
