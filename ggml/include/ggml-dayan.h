@@ -12,7 +12,7 @@ extern "C" {
 #define GGML_DAYAN_NAME "DAYAN"
 
 #define GGML_DAYAN_SLOT_TRACE_MAX_NODES   5
-#define GGML_DAYAN_SLOT_TRACE_MAX_OUTPUTS 2
+#define GGML_DAYAN_SLOT_TRACE_MAX_OUTPUTS 4
 
 struct ggml_backend_dayan_slot_trace_event {
     uint32_t                   version;
@@ -25,6 +25,7 @@ struct ggml_backend_dayan_slot_trace_event {
     bool                       executed;
     int32_t                    status;
     int64_t                    elapsed_us;
+    uint32_t                   output_mask;
 };
 
 typedef void (*ggml_backend_dayan_slot_trace_callback)(const struct ggml_backend_dayan_slot_trace_event * event,

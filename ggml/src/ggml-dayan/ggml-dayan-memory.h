@@ -403,6 +403,10 @@ static inline void memory_validate(const void * config) {
     }
 }
 
+static inline uint64_t memory_tile_count(uint64_t elements) {
+    return (elements + NormalizationLayout::kTileElements - 1U) / NormalizationLayout::kTileElements;
+}
+
 static inline void memory_copy_uram(uint64_t destination, uint64_t source, uint32_t bytes) {
     const uint32_t full = bytes / 64U;
     const uint32_t tail = bytes % 64U;
@@ -609,7 +613,13 @@ static inline void run_get_rows(const DayanRowsConfig * config,
     configure_normalization_lsu();
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t out_uram   = uram + NormalizationLayout::kValue;
-    for (uint32_t row = task; row < config->rows; row += tasks) {
+    const uint64_t tiles      = memory_tile_count(config->row_elements);
+    const uint64_t work_items = (uint64_t) config->rows * tiles;
+    for (uint64_t work = task; work < work_items; work += tasks) {
+        const uint32_t row      = (uint32_t) (work / tiles);
+        const uint32_t offset   = (uint32_t) (work % tiles) * NormalizationLayout::kTileElements;
+        const uint32_t elements = min_int((int) (config->row_elements - offset),
+                                          (int) NormalizationLayout::kTileElements);
         uint32_t       linear   = row / config->index_ne[0];
         const uint32_t index1   = linear % config->index_ne[1];
         const uint32_t index2   = linear / config->index_ne[1];
@@ -621,14 +631,10 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         }
         const char * source_row = (const char *) source + source_index * row_bytes;
         float *      output_row = output + (uint64_t) row * config->row_elements;
-        for (uint32_t offset = 0; offset < config->row_elements; offset += NormalizationLayout::kTileElements) {
-            const uint32_t elements =
-                min_int((int) (config->row_elements - offset), (int) NormalizationLayout::kTileElements);
-            memory_load_f32(out_uram, source_row + (uint64_t) offset * memory_type_bytes(config->source_type), elements,
-                            config->source_type);
-            normalization_store_f32(output_row + offset, out_uram, elements);
-            dayan_wait_lsu();
-        }
+        memory_load_f32(out_uram, source_row + (uint64_t) offset * memory_type_bytes(config->source_type), elements,
+                        config->source_type);
+        normalization_store_f32(output_row + offset, out_uram, elements);
+        dayan_wait_lsu();
     }
 }
 
@@ -653,7 +659,13 @@ static inline void run_set_rows(const DayanRowsConfig * config,
     const uint64_t row_bytes  = (uint64_t) config->row_elements * memory_type_bytes(config->destination_type);
     const uint32_t task       = dayan_native_task_id();
     const uint32_t tasks      = dayan_native_task_count();
-    for (uint32_t row = task; row < config->rows; row += tasks) {
+    const uint64_t tiles      = memory_tile_count(config->row_elements);
+    const uint64_t work_items = (uint64_t) config->rows * tiles;
+    for (uint64_t work = task; work < work_items; work += tasks) {
+        const uint32_t row      = (uint32_t) (work / tiles);
+        const uint32_t offset   = (uint32_t) (work % tiles) * NormalizationLayout::kTileElements;
+        const uint32_t elements = min_int((int) (config->row_elements - offset),
+                                          (int) NormalizationLayout::kTileElements);
         uint32_t       linear  = row;
         const uint32_t source1 = linear % config->source_ne[0];
         linear /= config->source_ne[0];
@@ -670,14 +682,10 @@ static inline void run_set_rows(const DayanRowsConfig * config,
         }
         const float * source_row      = source + (uint64_t) row * config->row_elements;
         char *        destination_row = (char *) destination + destination_index * row_bytes;
-        for (uint32_t offset = 0; offset < config->row_elements; offset += NormalizationLayout::kTileElements) {
-            const uint32_t elements =
-                min_int((int) (config->row_elements - offset), (int) NormalizationLayout::kTileElements);
-            normalization_load(input_uram, source_row + offset, elements);
-            memory_convert_from_f32(out_uram, input_uram, elements, config->destination_type);
-            memory_store(destination_row + (uint64_t) offset * memory_type_bytes(config->destination_type), out_uram,
-                         elements, config->destination_type);
-        }
+        normalization_load(input_uram, source_row + offset, elements);
+        memory_convert_from_f32(out_uram, input_uram, elements, config->destination_type);
+        memory_store(destination_row + (uint64_t) offset * memory_type_bytes(config->destination_type), out_uram,
+                     elements, config->destination_type);
     }
 }
 
@@ -738,8 +746,12 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
     const uint64_t value_uram = uram + NormalizationLayout::kValue;
     const uint64_t out_uram =
         config->destination_type == kDayanDataTypeF32 ? value_uram : uram + NormalizationLayout::kLowp;
-    const uint64_t source_rows       = config->elements / config->source_ne[0];
-    for (uint64_t row = task; row < source_rows; row += tasks) {
+    const uint64_t source_rows = config->elements / config->source_ne[0];
+    const uint64_t tiles       = memory_tile_count(config->source_ne[0]);
+    const uint64_t work_items  = source_rows * tiles;
+    for (uint64_t work = task; work < work_items; work += tasks) {
+        const uint64_t row    = work / tiles;
+        const uint32_t offset = (uint32_t) (work % tiles) * NormalizationLayout::kTileElements;
         uint64_t       index  = row;
         const uint32_t index1 = (uint32_t) (index % config->source_ne[1]);
         index /= config->source_ne[1];
@@ -748,40 +760,38 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
         const char *   source_row = (const char *) source + (uint64_t) index1 * config->source_nb[1] +
                                     (uint64_t) index2 * config->source_nb[2] + (uint64_t) index3 * config->source_nb[3];
         const uint64_t output_row = row * config->source_ne[0];
-        for (uint32_t offset = 0; offset < config->source_ne[0]; offset += NormalizationLayout::kTileElements) {
-            const uint32_t elements =
-                min_int((int) (config->source_ne[0] - offset), (int) NormalizationLayout::kTileElements);
-            const uint64_t output_offset = output_row + offset;
-            if (config->source_type == config->destination_type) {
-                if (config->source_nb[0] == source_bytes) {
-                    memory_load(input_uram, source_row + (uint64_t) offset * source_bytes, elements,
-                                config->source_type);
-                } else {
-                    configure_memory_lsu<1>(elements, config->source_nb[0], source_bytes, source_bytes, source_bytes);
-                    __tx_lsu_dma_d2u<1>((long) input_uram,
-                                        (long) (source_row + (uint64_t) offset * config->source_nb[0]));
-                    dayan_wait_lsu();
-                }
-                memory_store((char *) destination + output_offset * destination_bytes, input_uram, elements,
-                             config->destination_type);
-                continue;
-            }
+        const uint32_t elements = min_int((int) (config->source_ne[0] - offset),
+                                          (int) NormalizationLayout::kTileElements);
+        const uint64_t output_offset = output_row + offset;
+        if (config->source_type == config->destination_type) {
             if (config->source_nb[0] == source_bytes) {
-                memory_load_f32(value_uram, source_row + (uint64_t) offset * source_bytes, elements,
-                                config->source_type);
+                memory_load(input_uram, source_row + (uint64_t) offset * source_bytes, elements,
+                            config->source_type);
             } else {
-                configure_memory_lsu<1>(elements, config->source_nb[0], sizeof(float), source_bytes, sizeof(float));
-                __tx_lsu_dma_d2u<1>((long) value_uram,
+                configure_memory_lsu<1>(elements, config->source_nb[0], source_bytes, source_bytes, source_bytes);
+                __tx_lsu_dma_d2u<1>((long) input_uram,
                                     (long) (source_row + (uint64_t) offset * config->source_nb[0]));
                 dayan_wait_lsu();
-                if (config->source_type != kDayanDataTypeF32) {
-                    memory_convert_lowp_to_f32(value_uram, elements, config->source_type);
-                }
             }
-            memory_convert_from_f32(out_uram, value_uram, elements, config->destination_type);
-            memory_store((char *) destination + output_offset * destination_bytes, out_uram, elements,
+            memory_store((char *) destination + output_offset * destination_bytes, input_uram, elements,
                          config->destination_type);
+            continue;
         }
+        if (config->source_nb[0] == source_bytes) {
+            memory_load_f32(value_uram, source_row + (uint64_t) offset * source_bytes, elements,
+                            config->source_type);
+        } else {
+            configure_memory_lsu<1>(elements, config->source_nb[0], sizeof(float), source_bytes, sizeof(float));
+            __tx_lsu_dma_d2u<1>((long) value_uram,
+                                (long) (source_row + (uint64_t) offset * config->source_nb[0]));
+            dayan_wait_lsu();
+            if (config->source_type != kDayanDataTypeF32) {
+                memory_convert_lowp_to_f32(value_uram, elements, config->source_type);
+            }
+        }
+        memory_convert_from_f32(out_uram, value_uram, elements, config->destination_type);
+        memory_store((char *) destination + output_offset * destination_bytes, out_uram, elements,
+                     config->destination_type);
     }
 }
 

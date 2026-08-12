@@ -1211,6 +1211,28 @@ static bool ggml_backend_dayan_can_elide_glu_intermediates(const ggml_cgraph * c
            ggml_node_has_n_uses(cgraph, glu_index, 1);
 }
 
+static void ggml_backend_dayan_set_norm_pipeline_outputs(const ggml_cgraph *             cgraph,
+                                                         ggml_backend_dayan_graph_slot * slot,
+                                                         int                             add_index,
+                                                         int                             rms_index,
+                                                         int                             scale_index,
+                                                         int                             cast_index) {
+    if (add_index >= 0 && !ggml_node_has_n_uses(cgraph, add_index, 1)) {
+        slot->output_mask |= kDayanNormSlotOutputResidual;
+    }
+    if (!ggml_node_has_n_uses(cgraph, rms_index, 1)) {
+        slot->output_mask |= kDayanNormSlotOutputRms;
+    }
+    if (cast_index >= 0) {
+        if (!ggml_node_has_n_uses(cgraph, scale_index, 1)) {
+            slot->output_mask |= kDayanNormSlotOutputScaled;
+        }
+        slot->output_mask |= kDayanNormSlotOutputLowp;
+    } else {
+        slot->output_mask |= kDayanNormSlotOutputScaled;
+    }
+}
+
 bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
                                       ggml_backend_dayan_graph_plan * plan,
                                       const ggml_tensor **            unsupported) {
@@ -1258,6 +1280,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             continue;
         }
         if (ggml_backend_dayan_supports_residual_add(node)) {
+            const int                     add_index = i;
             ggml_backend_dayan_graph_slot slot;
             slot.kind       = ggml_backend_dayan_slot_kind::residual_add;
             slot.nodes[0]   = node;
@@ -1278,14 +1301,18 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
                 slot.node_count = 3;
                 i               = scale_index + 1;
 
-                const int cast_index = ggml_backend_dayan_next_compute(cgraph, i);
+                int cast_index = ggml_backend_dayan_next_compute(cgraph, i);
                 if (cast_index < cgraph->n_nodes &&
                     ggml_backend_dayan_supports_quantized_rms_norm(cgraph->nodes[cast_index]) &&
                     cgraph->nodes[cast_index]->src[0] == cgraph->nodes[scale_index]) {
                     slot.nodes[3]   = cgraph->nodes[cast_index];
                     slot.node_count = 4;
                     i               = cast_index + 1;
+                } else {
+                    cast_index = -1;
                 }
+                ggml_backend_dayan_set_norm_pipeline_outputs(cgraph, &slot, add_index, rms_index, scale_index,
+                                                             cast_index);
                 ++plan->rms_norm_slots;
             } else {
                 ++i;
@@ -1295,6 +1322,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             continue;
         }
         if (ggml_backend_dayan_supports_rms_norm(node)) {
+            const int                     rms_index = i;
             ggml_backend_dayan_graph_slot slot;
             slot.kind       = ggml_backend_dayan_slot_kind::rms_norm;
             slot.nodes[0]   = node;
@@ -1311,14 +1339,17 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
                 slot.node_count = 2;
                 i               = scale_index + 1;
 
-                const int cast_index = ggml_backend_dayan_next_compute(cgraph, i);
+                int cast_index = ggml_backend_dayan_next_compute(cgraph, i);
                 if (cast_index < cgraph->n_nodes &&
                     ggml_backend_dayan_supports_quantized_rms_norm(cgraph->nodes[cast_index]) &&
                     cgraph->nodes[cast_index]->src[0] == cgraph->nodes[scale_index]) {
                     slot.nodes[3]   = cgraph->nodes[cast_index];
                     slot.node_count = 3;
                     i               = cast_index + 1;
+                } else {
+                    cast_index = -1;
                 }
+                ggml_backend_dayan_set_norm_pipeline_outputs(cgraph, &slot, -1, rms_index, scale_index, cast_index);
             } else {
                 ++i;
             }

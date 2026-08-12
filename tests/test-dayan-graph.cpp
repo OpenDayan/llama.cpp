@@ -385,6 +385,11 @@ static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64
     ggml_set_name(rms, "rms");
     ggml_set_name(scaled, "scaled");
     ggml_set_name(output, "norm_matmul");
+    if (has_residual) {
+        ggml_set_output(residual);
+    }
+    ggml_set_output(rms);
+    ggml_set_output(scaled);
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
     ggml_build_forward_expand(graph, output);

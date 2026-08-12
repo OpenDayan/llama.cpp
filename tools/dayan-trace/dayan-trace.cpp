@@ -185,6 +185,9 @@ static json make_signature(const ggml_backend_dayan_slot_trace_event * event) {
     json signature;
     signature["kind"]       = event->kind;
     signature["node_count"] = event->node_count;
+    if (event->output_mask != 0U) {
+        signature["output_mask"] = event->output_mask;
+    }
     signature["nodes"]      = json::array();
     for (size_t i = 0; i < GGML_DAYAN_SLOT_TRACE_MAX_NODES; ++i) {
         const ggml_tensor * node = event->nodes[i];
@@ -252,7 +255,7 @@ class trace_collector {
 
   private:
     void record(const ggml_backend_dayan_slot_trace_event * event) {
-        if (event->version != 2) {
+        if (event->version != 3) {
             throw std::runtime_error("unsupported Dayan slot trace event version");
         }
 

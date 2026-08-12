@@ -60,10 +60,18 @@ enum class ggml_backend_dayan_slot_kind {
     ssm_conv_silu,
 };
 
+enum : uint32_t {
+    kDayanNormSlotOutputResidual = 1U << 0,
+    kDayanNormSlotOutputRms      = 1U << 1,
+    kDayanNormSlotOutputScaled   = 1U << 2,
+    kDayanNormSlotOutputLowp     = 1U << 3,
+};
+
 struct ggml_backend_dayan_graph_slot {
     ggml_backend_dayan_slot_kind kind       = ggml_backend_dayan_slot_kind::mul_mat;
     std::array<ggml_tensor *, 5> nodes      = { nullptr, nullptr, nullptr, nullptr, nullptr };
-    size_t                       node_count = 0;
+    size_t                       node_count  = 0;
+    uint32_t                     output_mask = 0;
 };
 
 struct ggml_backend_dayan_graph_plan {

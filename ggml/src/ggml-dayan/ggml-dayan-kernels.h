@@ -15,8 +15,19 @@
 #    define DAYAN_NATIVE_TASK_URAM_BYTES (8U * 1024U)
 #endif
 
+enum : uint32_t {
+    kDayanNativeTaskTileElements = 256U,
+    kDayanNativeMaxTasks         = 16U,
+    kDayanNativeTasksPerCore     = 4U,
+    kDayanSSMConvMaxTasks        = 4U,
+};
+
 #ifndef DAYAN_SORT_TASK_URAM_BYTES
 #    define DAYAN_SORT_TASK_URAM_BYTES (32U * 1024U)
+#endif
+
+#ifndef DAYAN_SSM_CONV_TASK_URAM_BYTES
+#    define DAYAN_SSM_CONV_TASK_URAM_BYTES (256U * 1024U)
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES

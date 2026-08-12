@@ -188,8 +188,9 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
                     config->kernel_size > kDayanSSMConvMaxKernelSize ||
                     (uint64_t) config->input_length != (uint64_t) config->kernel_size - 1U + config->tokens ||
                     (config->flags & ~1U) != 0 || dayan_task_mode() != 1U ||
-                    dayan_task_dim(DAYAN_TASK_X) != 1U || dayan_task_dim(DAYAN_TASK_Y) != 1U ||
-                    dayan_task_dim(DAYAN_TASK_Z) != 1U) {
+                    dayan_task_dim(DAYAN_TASK_X) == 0U || dayan_task_dim(DAYAN_TASK_X) > kDayanSSMConvMaxTasks ||
+                    dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
+                    dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         DAYAN_PARAMS_ERROR();
     }
 
@@ -198,21 +199,28 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
         dayan_proc_exit(-12);
     }
 
+    const uint32_t task         = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t tasks        = dayan_task_dim(DAYAN_TASK_X);
     const uint64_t start_cycle  = read_cycle();
     const uint32_t token_tile   = config->tokens < kSSMConvTokenTile ? config->tokens : kSSMConvTokenTile;
     const uint64_t uram_size    = dayan_uram_size();
     const uint64_t uram_address = (uint64_t) (uintptr_t) uram;
-    const uint32_t channel_tile =
+    const uint32_t max_channel_tile =
         ssm_conv_channel_tile(uram_size, token_tile, config->kernel_size, config->channels);
-    if (channel_tile == 0) {
+    if (max_channel_tile == 0) {
         dayan_proc_exit(-12);
     }
+    const uint32_t balanced_channels = (config->channels + tasks - 1U) / tasks;
+    const uint32_t channel_tile = min_int((int) max_channel_tile,
+                                          (int) align_up(balanced_channels, Constants::kVecLanes));
 
     load_ssm_constants(uram_address, config);
     dayan_wait_lsu();
 
     const uint32_t token_tiles = (config->tokens + token_tile - 1U) / token_tile;
-    for (uint32_t channel_base = 0; channel_base < config->channels; channel_base += channel_tile) {
+    const uint64_t channel_tiles = (config->channels + channel_tile - 1U) / channel_tile;
+    for (uint64_t channel_work = task; channel_work < channel_tiles; channel_work += tasks) {
+        const uint32_t channel_base = (uint32_t) (channel_work * channel_tile);
         const uint32_t channel_count =
             config->channels - channel_base < channel_tile ? config->channels - channel_base : channel_tile;
         const uint32_t          tile_elements = (uint32_t) align_up(channel_count, Constants::kVecLanes);
@@ -250,12 +258,14 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
         }
     }
 
-    DayanSSMConvPerf * perf_uram = reinterpret_cast<DayanSSMConvPerf *>(uram_address);
-    perf_uram->magic             = kDayanSSMConvPerfMagic;
-    perf_uram->cycles            = read_cycle() - start_cycle;
-    configure_ssm_lsu<0>(1, 1, 0, 0, 0, 0, sizeof(*perf), sizeof(*perf));
-    __tx_lsu_dma_u2d<0>(reinterpret_cast<uint64_t>(perf), uram_address);
-    dayan_wait_lsu();
+    if (task == 0U) {
+        DayanSSMConvPerf * perf_uram = reinterpret_cast<DayanSSMConvPerf *>(uram_address);
+        perf_uram->magic             = kDayanSSMConvPerfMagic;
+        perf_uram->cycles            = read_cycle() - start_cycle;
+        configure_ssm_lsu<0>(1, 1, 0, 0, 0, 0, sizeof(*perf), sizeof(*perf));
+        __tx_lsu_dma_u2d<0>(reinterpret_cast<uint64_t>(perf), uram_address);
+        dayan_wait_lsu();
+    }
 }
 
 }  // namespace ggml_dayan_matmul_detail
