@@ -124,16 +124,47 @@ static inline uint64_t memory_convert_from_f32(uint64_t output, uint64_t input, 
         return output;
     }
 
-    configure_normalization_macro<0>(elements);
     if (type == kDayanDataTypeBF16) {
-        __tx_macro_convert_fp32_bf16<0>((void *) output, (void *) input);
+        ggml_dayan_vec_detail::issue_f32_to_lowp<BaseNPUInstBuilder::DT_BF16>(
+            { input, (long) elements * (long) sizeof(float) },
+            { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
     } else if (type == kDayanDataTypeF16) {
-        __tx_macro_convert_fp32_fp16<0>((void *) output, (void *) input);
+        ggml_dayan_vec_detail::issue_f32_to_lowp<BaseNPUInstBuilder::DT_FP16>(
+            { input, (long) elements * (long) sizeof(float) },
+            { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
     } else {
         DAYAN_PARAMS_ERROR();
     }
-    dayan_wait_macro();
+    dayan_wait_vec();
     return output;
+}
+
+template <long Group>
+static inline void configure_memory_d2d_lsu(uint32_t transactions,
+                                            uint64_t input_stride,
+                                            uint64_t output_stride,
+                                            uint32_t transaction_bytes) {
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(transactions - 1U);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(input_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(output_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(6);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(transaction_bytes - 1U);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(transaction_bytes - 1U);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_PADDINGVALUE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESIZE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(0);
 }
 
 static inline void run_get_rows(const DayanRowsConfig * config,
@@ -146,13 +177,66 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         DAYAN_PARAMS_ERROR();
     }
 
+    const uint64_t row_bytes  = (uint64_t) config->row_elements * memory_type_bytes(config->source_type);
+    const uint32_t task       = dayan_native_task_id();
+    const uint32_t tasks      = dayan_native_task_count();
+    const uint64_t source_address = (uint64_t) (uintptr_t) source;
+    const uint64_t output_address = (uint64_t) (uintptr_t) output;
+    const uint64_t source_bytes   = config->source_rows * row_bytes;
+    const uint64_t output_bytes   = (uint64_t) config->rows * row_bytes;
+    const bool disjoint = source_address < output_address ? output_address - source_address >= source_bytes :
+                                                              source_address - output_address >= output_bytes;
+    const uint64_t full_transactions = row_bytes / 64U;
+    if (config->source_type == kDayanDataTypeF32 && disjoint &&
+        full_transactions <= (uint64_t) tasks * (1U << 24)) {
+        const uint64_t first_transaction = full_transactions * task / tasks;
+        const uint64_t end_transaction   = full_transactions * (task + 1U) / tasks;
+        bool issued = false;
+        if (first_transaction < end_transaction) {
+            configure_memory_d2d_lsu<0>((uint32_t) (end_transaction - first_transaction), 64, 64, 64);
+            for (uint32_t row = 0; row < config->rows; ++row) {
+                uint32_t       linear   = row / config->index_ne[0];
+                const uint32_t index1   = linear % config->index_ne[1];
+                const uint32_t index2   = linear / config->index_ne[1];
+                const uint64_t selected = memory_read_index(indices, row, config->index_type);
+                const uint64_t source_index =
+                    selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
+                if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                __tx_lsu_dma_d2d<0>((long) ((char *) output + (uint64_t) row * row_bytes + first_transaction * 64U),
+                                    (long) ((const char *) source + source_index * row_bytes + first_transaction * 64U));
+            }
+            issued = true;
+        }
+        const uint32_t tail_bytes = (uint32_t) (row_bytes % 64U);
+        if (task + 1U == tasks && tail_bytes != 0U) {
+            configure_memory_d2d_lsu<0>(1, 0, 0, tail_bytes);
+            for (uint32_t row = 0; row < config->rows; ++row) {
+                uint32_t       linear   = row / config->index_ne[0];
+                const uint32_t index1   = linear % config->index_ne[1];
+                const uint32_t index2   = linear / config->index_ne[1];
+                const uint64_t selected = memory_read_index(indices, row, config->index_type);
+                const uint64_t source_index =
+                    selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
+                if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                __tx_lsu_dma_d2d<0>((long) ((char *) output + (uint64_t) row * row_bytes + full_transactions * 64U),
+                                    (long) ((const char *) source + source_index * row_bytes + full_transactions * 64U));
+            }
+            issued = true;
+        }
+        if (issued) {
+            dayan_wait_lsu();
+        }
+        return;
+    }
+
     configure_normalization_lsu();
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t out_uram   = uram + NormalizationLayout::kValue;
-    const uint64_t row_bytes  = (uint64_t) config->row_elements * memory_type_bytes(config->source_type);
-    const uint32_t task       = dayan_native_task_id();
-    const uint32_t tasks      = dayan_native_task_count();
     for (uint32_t row = task; row < config->rows; row += tasks) {
         uint32_t       linear   = row / config->index_ne[0];
         const uint32_t index1   = linear % config->index_ne[1];
@@ -245,16 +329,67 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
         DAYAN_PARAMS_ERROR();
     }
 
+    const uint32_t source_bytes      = memory_type_bytes(config->source_type);
+    const uint32_t destination_bytes = memory_type_bytes(config->destination_type);
+    const uint32_t task              = dayan_native_task_id();
+    const uint32_t tasks             = dayan_native_task_count();
+    const uint64_t row_bytes         = (uint64_t) config->source_ne[0] * source_bytes;
+    const uint64_t total_bytes       = config->elements * source_bytes;
+    const uint64_t source_address    = (uint64_t) (uintptr_t) source;
+    const uint64_t destination_address = (uint64_t) (uintptr_t) destination;
+    bool source_contiguous = config->source_nb[0] == source_bytes;
+    uint64_t expected_stride = source_bytes;
+    for (uint32_t dimension = 1; dimension < 4; ++dimension) {
+        expected_stride *= config->source_ne[dimension - 1U];
+        source_contiguous = source_contiguous && config->source_nb[dimension] == expected_stride;
+    }
+    const uint64_t source_span = source_contiguous ? total_bytes :
+                                                       (uint64_t) (config->source_ne[1] - 1U) * config->source_nb[1] +
+                                                           row_bytes;
+    const bool disjoint = source_address < destination_address ? destination_address - source_address >= source_span :
+                                                                   source_address - destination_address >= total_bytes;
+    const uint64_t full_rows = total_bytes / 64U;
+    if (config->source_type == config->destination_type && source_contiguous && disjoint &&
+        full_rows <= (uint64_t) tasks * (1U << 24)) {
+        const uint64_t first_row   = full_rows * task / tasks;
+        const uint64_t end_row     = full_rows * (task + 1U) / tasks;
+        bool issued                = false;
+        if (first_row < end_row) {
+            configure_memory_d2d_lsu<0>((uint32_t) (end_row - first_row), 64, 64, 64);
+            __tx_lsu_dma_d2d<0>((long) ((char *) destination + first_row * 64U),
+                                (long) ((const char *) source + first_row * 64U));
+            issued = true;
+        }
+        const uint32_t tail_bytes = (uint32_t) (total_bytes % 64U);
+        if (task + 1U == tasks && tail_bytes != 0U) {
+            configure_memory_d2d_lsu<0>(1, 0, 0, tail_bytes);
+            __tx_lsu_dma_d2d<0>((long) ((char *) destination + full_rows * 64U),
+                                (long) ((const char *) source + full_rows * 64U));
+            issued = true;
+        }
+        if (issued) {
+            dayan_wait_lsu();
+        }
+        return;
+    }
+    if (config->source_type == config->destination_type && config->source_ne[2] == 1U &&
+        config->source_ne[3] == 1U && config->source_nb[0] == source_bytes && row_bytes <= 64U &&
+        config->source_nb[1] <= ((1ULL << 28) - 1U) / tasks &&
+        config->source_ne[1] <= (uint64_t) tasks * (1U << 24) && disjoint && task < config->source_ne[1]) {
+        const uint32_t rows = (config->source_ne[1] - task + tasks - 1U) / tasks;
+        configure_memory_d2d_lsu<0>(rows, config->source_nb[1] * tasks, row_bytes * tasks, (uint32_t) row_bytes);
+        __tx_lsu_dma_d2d<0>((long) ((char *) destination + (uint64_t) task * row_bytes),
+                            (long) ((const char *) source + (uint64_t) task * config->source_nb[1]));
+        dayan_wait_lsu();
+        return;
+    }
+
     configure_normalization_lsu();
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t value_uram = uram + NormalizationLayout::kValue;
     const uint64_t out_uram =
         config->destination_type == kDayanDataTypeF32 ? value_uram : uram + NormalizationLayout::kLowp;
-    const uint32_t source_bytes      = memory_type_bytes(config->source_type);
-    const uint32_t destination_bytes = memory_type_bytes(config->destination_type);
-    const uint32_t task              = dayan_native_task_id();
-    const uint32_t tasks             = dayan_native_task_count();
     const uint64_t source_rows       = config->elements / config->source_ne[0];
     for (uint64_t row = task; row < source_rows; row += tasks) {
         uint64_t       index  = row;

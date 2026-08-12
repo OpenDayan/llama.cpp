@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@ struct trace_options {
     std::string replay_path;
     int32_t     prefill     = 128;
     bool        prefill_set = false;
+    bool        decode      = false;
     bool        check       = false;
 };
 
@@ -41,19 +43,22 @@ struct slot_sample {
     std::string                signature_key;
     int64_t                    elapsed_us = 0;
     int32_t                    status     = 0;
+    bool                       executed   = false;
     std::vector<output_digest> outputs;
 };
 
 struct trace_round {
     std::string              name;
     std::vector<slot_sample> samples;
+    int64_t                  setup_us      = 0;
     int64_t                  wall_us       = 0;
+    int32_t                  setup_status  = 0;
     int32_t                  decode_status = 0;
     std::string              callback_error;
 };
 
 static void print_usage(const char * argv0) {
-    std::cout << "usage: " << argv0 << " -m MODEL --trace FILE [--prefill 128] [--check]\n"
+    std::cout << "usage: " << argv0 << " -m MODEL --trace FILE [--prefill 128] [--decode] [--check]\n"
               << "       " << argv0 << " [-m MODEL] --replay FILE [--trace FILE] [--check]\n";
 }
 
@@ -76,6 +81,10 @@ static trace_options parse_options(int argc, char ** argv) {
         }
         if (argument == "--check") {
             options.check = true;
+            continue;
+        }
+        if (argument == "--decode") {
+            options.decode = true;
             continue;
         }
         if (i + 1 >= argc) {
@@ -243,7 +252,7 @@ class trace_collector {
 
   private:
     void record(const ggml_backend_dayan_slot_trace_event * event) {
-        if (event->version != 1) {
+        if (event->version != 2) {
             throw std::runtime_error("unsupported Dayan slot trace event version");
         }
 
@@ -252,8 +261,9 @@ class trace_collector {
         sample.signature_key = sample.signature.dump();
         sample.elapsed_us    = event->elapsed_us;
         sample.status        = event->status;
+        sample.executed      = event->executed;
 
-        if (check_outputs_ && event->status == 0) {
+        if (check_outputs_ && event->executed && event->status == 0) {
             for (size_t i = 0; i < event->output_count; ++i) {
                 const ggml_tensor * output = event->outputs[i];
                 if (output == nullptr || output->buffer == nullptr) {
@@ -273,12 +283,50 @@ class trace_collector {
     std::vector<uint8_t> scratch_;
 };
 
+class trace_filter {
+  public:
+    enum class mode {
+        skip_all,
+        unique,
+    };
+
+    void reset(mode value) {
+        mode_ = value;
+        seen_.clear();
+        error_.clear();
+    }
+
+    const std::string & error() const { return error_; }
+
+    static bool callback(const ggml_backend_dayan_slot_trace_event * event, void * user_data) {
+        trace_filter * filter = (trace_filter *) user_data;
+        if (filter->mode_ == mode::skip_all || !filter->error_.empty()) {
+            return false;
+        }
+        try {
+            return filter->seen_.insert(make_signature(event).dump()).second;
+        } catch (const std::exception & error) {
+            filter->error_ = error.what();
+            return false;
+        }
+    }
+
+  private:
+    mode                            mode_ = mode::skip_all;
+    std::unordered_set<std::string> seen_;
+    std::string                     error_;
+};
+
 struct callback_guard {
     ggml_backend_dayan_set_slot_trace_callback_t setter = nullptr;
+    ggml_backend_dayan_set_slot_filter_callback_t filter_setter = nullptr;
 
     ~callback_guard() {
         if (setter != nullptr) {
             setter(nullptr, nullptr);
+        }
+        if (filter_setter != nullptr) {
+            filter_setter(nullptr, nullptr);
         }
     }
 };
@@ -296,19 +344,43 @@ static std::vector<llama_token> make_tokens(const llama_model * model, int32_t p
     return tokens;
 }
 
-static trace_round run_round(llama_context *            ctx,
-                             std::vector<llama_token> & tokens,
-                             const std::string &        name,
-                             trace_collector *          collector) {
+static trace_round run_round(llama_context *                  ctx,
+                             const std::vector<llama_token> & tokens,
+                             const trace_options &            options,
+                             const std::string &              name,
+                             trace_collector *                collector,
+                             trace_filter *                   filter) {
     trace_round round;
     round.name = name;
     llama_memory_clear(llama_get_memory(ctx), true);
+
+    if (options.decode) {
+        filter->reset(trace_filter::mode::skip_all);
+        const int64_t setup_start_us = ggml_time_us();
+        round.setup_status = llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(tokens.data()), options.prefill));
+        llama_synchronize(ctx);
+        round.setup_us = ggml_time_us() - setup_start_us;
+        if (round.setup_status != 0) {
+            return round;
+        }
+    }
+
+    llama_token * trace_tokens = const_cast<llama_token *>(tokens.data());
+    int32_t       trace_count  = options.prefill;
+    if (options.decode) {
+        trace_tokens += options.prefill;
+        trace_count = 1;
+    }
+    filter->reset(trace_filter::mode::unique);
     collector->begin(&round);
     const int64_t start_us = ggml_time_us();
-    round.decode_status    = llama_decode(ctx, llama_batch_get_one(tokens.data(), (int32_t) tokens.size()));
+    round.decode_status    = llama_decode(ctx, llama_batch_get_one(trace_tokens, trace_count));
     llama_synchronize(ctx);
     round.wall_us = ggml_time_us() - start_us;
     collector->end();
+    if (!filter->error().empty()) {
+        round.callback_error = "slot filter: " + filter->error();
+    }
     return round;
 }
 
@@ -520,7 +592,9 @@ static json build_report(const trace_options &            options,
     }
     for (size_t round_index = 0; round_index < 2; ++round_index) {
         for (const slot_sample & sample : rounds[round_index].samples) {
-            aggregates.at(aggregate_indices.at(sample.signature_key)).rounds[round_index].push_back(&sample);
+            if (sample.executed) {
+                aggregates.at(aggregate_indices.at(sample.signature_key)).rounds[round_index].push_back(&sample);
+            }
         }
     }
 
@@ -533,7 +607,9 @@ static json build_report(const trace_options &            options,
     report["model_path"]        = options.model_path;
     report["model_description"] = model_description;
     report["model_parameters"]  = llama_model_n_params(model);
-    report["prefill_size"]      = tokens.size();
+    report["phase"]             = options.decode ? "decode" : "prefill";
+    report["prefill_size"]      = options.prefill;
+    report["trace_token_count"] = options.decode ? 1 : options.prefill;
     report["tokens"]            = tokens;
     report["check_outputs"]     = options.check;
     report["check_scope"]       = "exact cold/warm fused-slot output hashes; not an independent CPU reference";
@@ -580,7 +656,10 @@ static json build_report(const trace_options &            options,
     for (size_t round_index = 0; round_index < 2; ++round_index) {
         int64_t slot_total_us      = 0;
         double  estimated_total_us = 0.0;
+        size_t  executed_slots     = 0;
+        bool    all_sampled        = true;
         for (const slot_aggregate & aggregate : aggregates) {
+            executed_slots += aggregate.rounds[round_index].size();
             for (const slot_sample * sample : aggregate.rounds[round_index]) {
                 slot_total_us += sample->elapsed_us;
             }
@@ -590,24 +669,32 @@ static json build_report(const trace_options &            options,
                     total += sample->elapsed_us;
                 }
                 estimated_total_us += (double) total / aggregate.rounds[round_index].size() * aggregate.trace_count;
+            } else if (aggregate.trace_count != 0) {
+                all_sampled = false;
             }
         }
         const bool counts_match                    = same_counts(round_counts[round_index], target_counts);
         const bool order_matches                   = round_sequences[round_index] == target_sequence;
         const bool callback_ok                     = rounds[round_index].callback_error.empty();
+        const bool setup_ok                        = rounds[round_index].setup_status == 0;
         const bool decode_ok                       = rounds[round_index].decode_status == 0;
         report["rounds"][rounds[round_index].name] = {
-            { "actual_end_to_end_us",        rounds[round_index].wall_us                 },
+            { "setup_us",                    rounds[round_index].setup_us                   },
+            { "unique_replay_wall_us",       rounds[round_index].wall_us                 },
             { "observed_slots",              rounds[round_index].samples.size()          },
+            { "executed_unique_slots",       executed_slots                              },
+            { "skipped_duplicate_slots",     rounds[round_index].samples.size() - executed_slots },
             { "measured_slot_total_us",      slot_total_us                               },
             { "estimated_operator_total_us", estimated_total_us                          },
             { "unaccounted_us",              rounds[round_index].wall_us - slot_total_us },
+            { "setup_status",                rounds[round_index].setup_status             },
             { "decode_status",               rounds[round_index].decode_status           },
             { "callback_error",              rounds[round_index].callback_error          },
             { "counts_match",                counts_match                                },
             { "order_matches",               order_matches                               },
+            { "all_signatures_executed",     all_sampled                                 },
         };
-        *valid = *valid && counts_match && order_matches && callback_ok && decode_ok;
+        *valid = *valid && counts_match && order_matches && all_sampled && callback_ok && setup_ok && decode_ok;
     }
     report["validation_pass"] = *valid;
     return report;
@@ -628,9 +715,11 @@ static void print_report(const json & report) {
     for (const char * name : { "cold", "warm" }) {
         const json & round = report.at("rounds").at(name);
         std::cout << name << " slots=" << round.at("observed_slots").get<size_t>()
+                  << " executed_unique=" << round.at("executed_unique_slots").get<size_t>()
+                  << " skipped_duplicate=" << round.at("skipped_duplicate_slots").get<size_t>()
                   << " measured_slot_total_ms=" << round.at("measured_slot_total_us").get<int64_t>() / 1000.0
                   << " estimated_operator_total_ms=" << round.at("estimated_operator_total_us").get<double>() / 1000.0
-                  << " actual_end_to_end_ms=" << round.at("actual_end_to_end_us").get<int64_t>() / 1000.0
+                  << " unique_replay_wall_ms=" << round.at("unique_replay_wall_us").get<int64_t>() / 1000.0
                   << " unaccounted_ms=" << round.at("unaccounted_us").get<int64_t>() / 1000.0
                   << " counts_match=" << round.at("counts_match").get<bool>()
                   << " order_matches=" << round.at("order_matches").get<bool>() << '\n';
@@ -647,6 +736,14 @@ int main(int argc, char ** argv) {
         if (!options.replay_path.empty()) {
             replay_document              = read_json(options.replay_path);
             reference                    = load_reference(replay_document);
+            const std::string phase      = replay_document.value("phase", "prefill");
+            if (phase != "prefill" && phase != "decode") {
+                throw std::runtime_error("unsupported trace phase: " + phase);
+            }
+            if (options.decode && phase != "decode") {
+                throw std::runtime_error("--decode does not match the replay trace phase");
+            }
+            options.decode               = phase == "decode";
             const int32_t traced_prefill = replay_document.at("prefill_size").get<int32_t>();
             if (options.prefill_set && options.prefill != traced_prefill) {
                 throw std::runtime_error("--prefill does not match the replay trace");
@@ -667,8 +764,13 @@ int main(int argc, char ** argv) {
         ggml_backend_reg_t dayan_reg = ggml_backend_dev_backend_reg(dayan_device);
         auto               setter    = (ggml_backend_dayan_set_slot_trace_callback_t) ggml_backend_reg_get_proc_address(
             dayan_reg, "ggml_backend_dayan_set_slot_trace_callback");
+        auto filter_setter = (ggml_backend_dayan_set_slot_filter_callback_t) ggml_backend_reg_get_proc_address(
+            dayan_reg, "ggml_backend_dayan_set_slot_filter_callback");
         if (setter == nullptr) {
             throw std::runtime_error("DAYAN backend does not provide fused slot tracing");
+        }
+        if (filter_setter == nullptr) {
+            throw std::runtime_error("DAYAN backend does not provide fused slot filtering");
         }
 
         ggml_backend_dev_t devices[]    = { dayan_device, nullptr };
@@ -682,7 +784,7 @@ int main(int argc, char ** argv) {
         }
 
         llama_context_params context_params = llama_context_default_params();
-        context_params.n_ctx                = options.prefill;
+        context_params.n_ctx                = options.prefill + (options.decode ? 1 : 0);
         context_params.n_batch              = options.prefill;
         context_params.n_ubatch             = options.prefill;
         context_params.n_seq_max            = 1;
@@ -695,21 +797,26 @@ int main(int argc, char ** argv) {
         }
 
         if (tokens.empty()) {
-            tokens = make_tokens(model.get(), options.prefill);
+            tokens = make_tokens(model.get(), options.prefill + (options.decode ? 1 : 0));
         }
-        if ((int32_t) tokens.size() != options.prefill) {
-            throw std::runtime_error("trace token count does not match prefill_size");
+        const int32_t expected_tokens = options.prefill + (options.decode ? 1 : 0);
+        if ((int32_t) tokens.size() != expected_tokens) {
+            throw std::runtime_error("trace token count does not match the trace phase");
         }
 
         trace_collector collector(options.check);
-        callback_guard  guard{ setter };
+        trace_filter    filter;
+        callback_guard  guard{ setter, filter_setter };
         setter(trace_collector::callback, &collector);
+        filter_setter(trace_filter::callback, &filter);
         trace_round rounds[2] = {
-            run_round(context.get(), tokens, "cold", &collector),
-            run_round(context.get(), tokens, "warm", &collector),
+            run_round(context.get(), tokens, options, "cold", &collector, &filter),
+            run_round(context.get(), tokens, options, "warm", &collector, &filter),
         };
         setter(nullptr, nullptr);
+        filter_setter(nullptr, nullptr);
         guard.setter = nullptr;
+        guard.filter_setter = nullptr;
 
         bool       valid  = false;
         const json report = build_report(options, model.get(), tokens, rounds, reference, &valid);

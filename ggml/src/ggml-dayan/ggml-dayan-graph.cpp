@@ -774,6 +774,7 @@ bool ggml_backend_dayan_supports_ssm_conv(const ggml_tensor * op) {
     const ggml_tensor * input  = op->src[0];
     const ggml_tensor * weight = op->src[1];
     return input->ne[0] > 0 && input->ne[1] > 0 && input->ne[2] > 0 && input->ne[3] == 1 && weight->ne[0] > 0 &&
+           weight->ne[0] <= kDayanSSMConvMaxKernelSize &&
            weight->ne[1] == input->ne[1] && weight->ne[2] == 1 && weight->ne[3] == 1 &&
            input->ne[0] == weight->ne[0] - 1 + op->ne[1] && op->ne[0] == input->ne[1] && op->ne[2] == input->ne[2] &&
            op->ne[3] == 1 && input->ne[0] <= UINT32_MAX && input->ne[1] <= UINT32_MAX && input->ne[2] <= UINT32_MAX &&

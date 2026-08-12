@@ -67,11 +67,19 @@ static std::vector<ggml_backend_dayan_buffer_context *> ggml_backend_dayan_buffe
 static std::mutex                                       ggml_backend_dayan_trace_mutex;
 static ggml_backend_dayan_slot_trace_callback           ggml_backend_dayan_trace_callback;
 static void *                                           ggml_backend_dayan_trace_user_data;
+static ggml_backend_dayan_slot_filter_callback          ggml_backend_dayan_filter_callback;
+static void *                                           ggml_backend_dayan_filter_user_data;
 
 void ggml_backend_dayan_set_slot_trace_callback(ggml_backend_dayan_slot_trace_callback callback, void * user_data) {
     std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
     ggml_backend_dayan_trace_callback  = callback;
     ggml_backend_dayan_trace_user_data = user_data;
+}
+
+void ggml_backend_dayan_set_slot_filter_callback(ggml_backend_dayan_slot_filter_callback callback, void * user_data) {
+    std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
+    ggml_backend_dayan_filter_callback  = callback;
+    ggml_backend_dayan_filter_user_data = user_data;
 }
 
 static const char * ggml_backend_dayan_slot_kind_name(ggml_backend_dayan_slot_kind kind) {
@@ -216,8 +224,39 @@ static size_t ggml_backend_dayan_slot_outputs(const ggml_backend_dayan_graph_slo
     }
 }
 
+static ggml_backend_dayan_slot_trace_event ggml_backend_dayan_slot_event(const ggml_backend_dayan_graph_slot & slot,
+                                                                         size_t                                slot_index) {
+    ggml_backend_dayan_slot_trace_event event = {};
+    event.version                             = 2;
+    event.kind                                = ggml_backend_dayan_slot_kind_name(slot.kind);
+    event.slot_index                          = slot_index;
+    event.node_count                          = slot.node_count;
+    for (size_t i = 0; i < slot.nodes.size(); ++i) {
+        event.nodes[i] = slot.nodes[i];
+    }
+    event.output_count = ggml_backend_dayan_slot_outputs(slot, event.outputs);
+    return event;
+}
+
+static bool ggml_backend_dayan_filter_slot(const ggml_backend_dayan_graph_slot & slot, size_t slot_index) {
+    ggml_backend_dayan_slot_filter_callback callback  = nullptr;
+    void *                                  user_data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
+        callback  = ggml_backend_dayan_filter_callback;
+        user_data = ggml_backend_dayan_filter_user_data;
+    }
+    if (callback == nullptr) {
+        return true;
+    }
+
+    const ggml_backend_dayan_slot_trace_event event = ggml_backend_dayan_slot_event(slot, slot_index);
+    return callback(&event, user_data);
+}
+
 static void ggml_backend_dayan_trace_slot(const ggml_backend_dayan_graph_slot & slot,
                                           size_t                                slot_index,
+                                          bool                                  executed,
                                           int                                   status,
                                           int64_t                               elapsed_us) {
     ggml_backend_dayan_slot_trace_callback callback  = nullptr;
@@ -231,17 +270,10 @@ static void ggml_backend_dayan_trace_slot(const ggml_backend_dayan_graph_slot & 
         return;
     }
 
-    ggml_backend_dayan_slot_trace_event event = {};
-    event.version                             = 1;
-    event.kind                                = ggml_backend_dayan_slot_kind_name(slot.kind);
-    event.slot_index                          = slot_index;
-    event.node_count                          = slot.node_count;
+    ggml_backend_dayan_slot_trace_event event = ggml_backend_dayan_slot_event(slot, slot_index);
+    event.executed                            = executed;
     event.status                              = status;
     event.elapsed_us                          = elapsed_us;
-    for (size_t i = 0; i < slot.nodes.size(); ++i) {
-        event.nodes[i] = slot.nodes[i];
-    }
-    event.output_count = ggml_backend_dayan_slot_outputs(slot, event.outputs);
     callback(&event, user_data);
 }
 
@@ -1964,12 +1996,10 @@ static int ggml_backend_dayan_ssm_conv(ggml_backend_dayan_context * ctx, const g
     DayanSSMConvConfig config = {
         (uint32_t) input->ne[0],  (uint32_t) input->ne[1],
         (uint32_t) output->ne[1], (uint32_t) input->ne[2],
-        (uint32_t) weight->ne[0], slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu ? 1U : 0U, 0, 0, 0,
+        (uint32_t) weight->ne[0], slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu ? 1U : 0U, 0, 0,
     };
-    const float zero      = 0.0f;
     const float neg_log2e = -1.4426950408889634f;
     const float one       = 1.0f;
-    std::memcpy(&config.zero_bits, &zero, sizeof(zero));
     std::memcpy(&config.neg_log2e_bits, &neg_log2e, sizeof(neg_log2e));
     std::memcpy(&config.one_bits, &one, sizeof(one));
     ggml_backend_dayan_buffers buffers;
@@ -2253,6 +2283,10 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
     for (size_t slot_index = 0; slot_index < plan.slots.size(); ++slot_index) {
         ctx->active_slot                                    = slot_index;
         const ggml_backend_dayan_graph_slot & slot          = plan.slots[slot_index];
+        if (!ggml_backend_dayan_filter_slot(slot, slot_index)) {
+            ggml_backend_dayan_trace_slot(slot, slot_index, false, 0, 0);
+            continue;
+        }
         const int64_t                         slot_start_us = ggml_time_us();
         switch (slot.kind) {
             case ggml_backend_dayan_slot_kind::mul_mat:
@@ -2402,7 +2436,7 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
                 status = ggml_backend_dayan_ssm_conv(ctx, slot);
                 break;
         }
-        ggml_backend_dayan_trace_slot(slot, slot_index, status, ggml_time_us() - slot_start_us);
+        ggml_backend_dayan_trace_slot(slot, slot_index, true, status, ggml_time_us() - slot_start_us);
         if (status < 0) {
             GGML_LOG_ERROR("%s: slot %zu (%s, %s) failed with status %d\n", __func__, slot_index,
                            ggml_op_desc(slot.nodes[0]), slot.nodes[0]->name, status);
@@ -2674,6 +2708,9 @@ static void * ggml_backend_dayan_reg_get_proc_address(ggml_backend_reg_t reg, co
     }
     if (strcmp(name, "ggml_backend_dayan_set_slot_trace_callback") == 0) {
         return (void *) ggml_backend_dayan_set_slot_trace_callback;
+    }
+    if (strcmp(name, "ggml_backend_dayan_set_slot_filter_callback") == 0) {
+        return (void *) ggml_backend_dayan_set_slot_filter_callback;
     }
     return nullptr;
 }

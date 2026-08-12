@@ -22,6 +22,7 @@ struct ggml_backend_dayan_slot_trace_event {
     size_t                     node_count;
     const struct ggml_tensor * outputs[GGML_DAYAN_SLOT_TRACE_MAX_OUTPUTS];
     size_t                     output_count;
+    bool                       executed;
     int32_t                    status;
     int64_t                    elapsed_us;
 };
@@ -29,8 +30,14 @@ struct ggml_backend_dayan_slot_trace_event {
 typedef void (*ggml_backend_dayan_slot_trace_callback)(const struct ggml_backend_dayan_slot_trace_event * event,
                                                        void *                                             user_data);
 
+typedef bool (*ggml_backend_dayan_slot_filter_callback)(const struct ggml_backend_dayan_slot_trace_event * event,
+                                                        void *                                             user_data);
+
 typedef void (*ggml_backend_dayan_set_slot_trace_callback_t)(ggml_backend_dayan_slot_trace_callback callback,
                                                              void *                                 user_data);
+
+typedef void (*ggml_backend_dayan_set_slot_filter_callback_t)(ggml_backend_dayan_slot_filter_callback callback,
+                                                              void *                                  user_data);
 
 GGML_BACKEND_API ggml_backend_t     ggml_backend_dayan_init(void);
 GGML_BACKEND_API bool               ggml_backend_is_dayan(ggml_backend_t backend);
@@ -40,6 +47,8 @@ GGML_BACKEND_API bool               ggml_backend_dayan_graph_rewrite(ggml_backen
                                                                      struct ggml_cgraph *  cgraph);
 GGML_BACKEND_API void ggml_backend_dayan_set_slot_trace_callback(ggml_backend_dayan_slot_trace_callback callback,
                                                                  void *                                 user_data);
+GGML_BACKEND_API void ggml_backend_dayan_set_slot_filter_callback(ggml_backend_dayan_slot_filter_callback callback,
+                                                                  void *                                  user_data);
 
 #ifdef __cplusplus
 }

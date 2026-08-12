@@ -33,6 +33,11 @@ struct F32Tensor {
     long     row_stride;
 };
 
+struct LowpTensor {
+    uint64_t address;
+    long     row_stride;
+};
+
 struct ActivationConstants {
     uint64_t neg_log2e;
     uint64_t one;
@@ -96,6 +101,37 @@ static inline void configure_activation(const F32Tensor & input0,
     configure_vec_iterator<kVecV1Base>(0, 0, kVecBytes, input1.row_stride);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, output.row_stride);
+}
+
+template <long MatDataType>
+static inline void issue_f32_to_lowp(const F32Tensor & input,
+                                     const LowpTensor & output,
+                                     long               rows,
+                                     long               columns) {
+    enum : long {
+        kInstructions = 6,
+        kLowpBytes    = kVecLanes * sizeof(uint16_t),
+    };
+
+    const long chunks = (columns + kVecLanes - 1) / kVecLanes;
+    configure_vec_grid(chunks, rows);
+    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, input.row_stride);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, kLowpBytes, output.row_stride);
+    begin_vec_block(kInstructions);
+    __tx_vec_s_bitwise<0, 3, 0, 3, 0>();
+    __tx_vec_s_int32_add<0, 1, 0>();
+    __tx_vec_lsu_u2v<0, 0>(input.address);
+    if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+    } else {
+        static_assert(MatDataType == BaseNPUInstBuilder::DT_FP16, "Unsupported low-precision VEC type");
+        __tx_vec_cvt_fp16_fp32<0, 0, 0>();
+    }
+    __tx_vec_shuffle_compress<0, 0>(1);
+    __tx_vec_lsu_v2u_mask<3, 0, 0>(output.address);
+    start_vec_block(kInstructions);
 }
 
 static inline void issue_sigmoid_mul(const F32Tensor &            gate,

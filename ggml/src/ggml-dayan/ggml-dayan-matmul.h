@@ -430,72 +430,53 @@ static inline void issue_geglu(const MatmulEpilogueArgs * args) {
         activation_constants(args), args->rows, args->cols);
 }
 
-template <long GroupBase> static inline void configure_quantize(const MatmulEpilogueArgs * args) {
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DIM0>(args->cols - 1);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DIM1>(args->rows - 1);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DIM2>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DIM3>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC0DIM1STRIDE>(args->row_stride * (int) sizeof(float));
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC0DIM2STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC0DIM3STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC1DIM1STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC1DIM2STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC1DIM3STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DSTDIM1STRIDE>(args->row_stride * (int) sizeof(uint16_t));
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DSTDIM2STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DSTDIM3STRIDE>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC0SWIZZLEMBS>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_SRC1SWIZZLEMBS>(0);
-    __tx_macro_tcsr_write<GroupBase * MACRO_GROUPSZ + MACRO_DSTSWIZZLEMBS>(0);
+template <long MatDataType> static inline void issue_quantize(const MatmulEpilogueArgs * args) {
+    ggml_dayan_vec_detail::issue_f32_to_lowp<MatDataType>(
+        { args->accumulator[0], args->row_stride * (int) sizeof(float) },
+        { args->output, args->row_stride * (int) sizeof(uint16_t) }, args->rows, args->cols);
 }
 
-template <long GroupBase> static uint64_t epilogue_swiglu_bf16(const MatmulEpilogueArgs * args) {
+template <long> static uint64_t epilogue_swiglu_bf16(const MatmulEpilogueArgs * args) {
     issue_swiglu(args);
     dayan_wait_vec();
-    configure_quantize<GroupBase>(args);
-    __tx_macro_convert_fp32_bf16<GroupBase>((void *) args->output, (void *) args->accumulator[0]);
-    dayan_wait_macro();
+    issue_quantize<BaseNPUInstBuilder::DT_BF16>(args);
+    dayan_wait_vec();
     return args->output;
 }
 
-template <long GroupBase> static uint64_t epilogue_swiglu_fp16(const MatmulEpilogueArgs * args) {
+template <long> static uint64_t epilogue_swiglu_fp16(const MatmulEpilogueArgs * args) {
     issue_swiglu(args);
     dayan_wait_vec();
-    configure_quantize<GroupBase>(args);
-    __tx_macro_convert_fp32_fp16<GroupBase>((void *) args->output, (void *) args->accumulator[0]);
-    dayan_wait_macro();
+    issue_quantize<BaseNPUInstBuilder::DT_FP16>(args);
+    dayan_wait_vec();
     return args->output;
 }
 
-template <long GroupBase> static uint64_t epilogue_geglu_bf16(const MatmulEpilogueArgs * args) {
+template <long> static uint64_t epilogue_geglu_bf16(const MatmulEpilogueArgs * args) {
     issue_geglu(args);
     dayan_wait_vec();
-    configure_quantize<GroupBase>(args);
-    __tx_macro_convert_fp32_bf16<GroupBase>((void *) args->output, (void *) args->accumulator[0]);
-    dayan_wait_macro();
+    issue_quantize<BaseNPUInstBuilder::DT_BF16>(args);
+    dayan_wait_vec();
     return args->output;
 }
 
-template <long GroupBase> static uint64_t epilogue_geglu_fp16(const MatmulEpilogueArgs * args) {
+template <long> static uint64_t epilogue_geglu_fp16(const MatmulEpilogueArgs * args) {
     issue_geglu(args);
     dayan_wait_vec();
-    configure_quantize<GroupBase>(args);
-    __tx_macro_convert_fp32_fp16<GroupBase>((void *) args->output, (void *) args->accumulator[0]);
-    dayan_wait_macro();
+    issue_quantize<BaseNPUInstBuilder::DT_FP16>(args);
+    dayan_wait_vec();
     return args->output;
 }
 
-template <long GroupBase> static uint64_t epilogue_identity_bf16(const MatmulEpilogueArgs * args) {
-    configure_quantize<GroupBase>(args);
-    __tx_macro_convert_fp32_bf16<GroupBase>((void *) args->output, (void *) args->accumulator[0]);
-    dayan_wait_macro();
+template <long> static uint64_t epilogue_identity_bf16(const MatmulEpilogueArgs * args) {
+    issue_quantize<BaseNPUInstBuilder::DT_BF16>(args);
+    dayan_wait_vec();
     return args->output;
 }
 
-template <long GroupBase> static uint64_t epilogue_identity_fp16(const MatmulEpilogueArgs * args) {
-    configure_quantize<GroupBase>(args);
-    __tx_macro_convert_fp32_fp16<GroupBase>((void *) args->output, (void *) args->accumulator[0]);
-    dayan_wait_macro();
+template <long> static uint64_t epilogue_identity_fp16(const MatmulEpilogueArgs * args) {
+    issue_quantize<BaseNPUInstBuilder::DT_FP16>(args);
+    dayan_wait_vec();
     return args->output;
 }
 

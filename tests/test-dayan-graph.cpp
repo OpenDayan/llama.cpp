@@ -1265,6 +1265,140 @@ static int run_empty_memory_case(ggml_backend_t dayan) {
     return 0;
 }
 
+static int run_copy_fast_path_case(ggml_backend_t dayan) {
+    constexpr int64_t contiguous_width  = 128;
+    constexpr int64_t contiguous_rows   = 128;
+    constexpr int64_t contiguous_slices = 16;
+    constexpr int64_t narrow_width      = 3;
+    constexpr int64_t narrow_rows       = 6144;
+    constexpr int64_t narrow_stride     = 4;
+    constexpr int     graph_size        = 16;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the copy fast path context");
+    }
+
+    ggml_tensor * contiguous_source =
+        ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, contiguous_width, contiguous_rows, contiguous_slices);
+    ggml_tensor * contiguous_destination =
+        ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, contiguous_width, contiguous_rows, contiguous_slices);
+    ggml_tensor * contiguous_copy = ggml_cpy(ctx.get(), contiguous_source, contiguous_destination);
+
+    ggml_tensor * narrow_storage = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, narrow_stride * narrow_rows);
+    ggml_tensor * narrow_source =
+        ggml_view_2d(ctx.get(), narrow_storage, narrow_width, narrow_rows, narrow_stride * sizeof(float), 0);
+    ggml_tensor * narrow_destination = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, narrow_width, narrow_rows);
+    ggml_tensor * narrow_copy        = ggml_cpy(ctx.get(), narrow_source, narrow_destination);
+
+    ggml_set_input(contiguous_source);
+    ggml_set_input(contiguous_destination);
+    ggml_set_input(narrow_storage);
+    ggml_set_input(narrow_destination);
+    ggml_set_name(contiguous_copy, "copy_contiguous");
+    ggml_set_name(narrow_copy, "copy_narrow_padded");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, contiguous_copy);
+    ggml_build_forward_expand(graph, narrow_copy);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) {
+        return fail("cannot allocate copy fast path tensors");
+    }
+
+    std::vector<float> contiguous_data((size_t) ggml_nelements(contiguous_source));
+    std::vector<float> narrow_data((size_t) ggml_nelements(narrow_storage));
+    for (size_t index = 0; index < contiguous_data.size(); ++index) {
+        contiguous_data[index] = ((int) (index % 257) - 128) / 64.0f;
+    }
+    for (size_t index = 0; index < narrow_data.size(); ++index) {
+        narrow_data[index] = ((int) (index % 127) - 63) / 32.0f;
+    }
+    ggml_backend_tensor_set(contiguous_source, contiguous_data.data(), 0, ggml_nbytes(contiguous_source));
+    ggml_backend_tensor_set(narrow_storage, narrow_data.data(), 0, ggml_nbytes(narrow_storage));
+
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN copy fast path graph failed");
+    }
+
+    std::vector<float> contiguous_result(contiguous_data.size());
+    std::vector<float> narrow_result((size_t) ggml_nelements(narrow_copy));
+    ggml_backend_tensor_get(contiguous_copy, contiguous_result.data(), 0, ggml_nbytes(contiguous_copy));
+    ggml_backend_tensor_get(narrow_copy, narrow_result.data(), 0, ggml_nbytes(narrow_copy));
+    if (contiguous_result != contiguous_data) {
+        return fail("contiguous D2D copy comparison failed");
+    }
+    for (int64_t row = 0; row < narrow_rows; ++row) {
+        for (int64_t column = 0; column < narrow_width; ++column) {
+            const float expected = narrow_data[(size_t) row * narrow_stride + column];
+            const float actual   = narrow_result[(size_t) row * narrow_width + column];
+            if (actual != expected) {
+                return fail("narrow padded D2D copy comparison failed");
+            }
+        }
+    }
+
+    std::puts("copy contiguous=PASS narrow-padded=PASS");
+    return 0;
+}
+
+static int run_get_rows_fast_path_case(ggml_backend_t dayan) {
+    constexpr int64_t width       = 262144;
+    constexpr int64_t source_rows = 3;
+    constexpr int     graph_size  = 8;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the GET_ROWS fast path context");
+    }
+
+    ggml_tensor * source  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, source_rows);
+    ggml_tensor * row_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    ggml_tensor * output  = ggml_get_rows(ctx.get(), source, row_ids);
+    ggml_set_input(source);
+    ggml_set_input(row_ids);
+    ggml_set_name(output, "get_rows_f32_wide");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) {
+        return fail("cannot allocate GET_ROWS fast path tensors");
+    }
+
+    std::vector<float> source_data((size_t) ggml_nelements(source));
+    for (size_t index = 0; index < source_data.size(); ++index) {
+        source_data[index] = (float) ((int) (index % 1021) - 510) / 128.0f;
+    }
+    const int32_t selected_row = 2;
+    ggml_backend_tensor_set(source, source_data.data(), 0, ggml_nbytes(source));
+    ggml_backend_tensor_set(row_ids, &selected_row, 0, sizeof(selected_row));
+
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN GET_ROWS fast path graph failed");
+    }
+
+    std::vector<float> result((size_t) width);
+    ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
+    const float * expected = source_data.data() + selected_row * width;
+    if (!std::equal(result.begin(), result.end(), expected)) {
+        return fail("GET_ROWS F32 D2D comparison failed");
+    }
+
+    std::puts("get_rows f32-wide=PASS");
+    return 0;
+}
+
 static int run_gated_output_case(ggml_backend_t dayan, enum ggml_type type) {
     constexpr int64_t tokens     = 3;
     constexpr int64_t embd       = 64;
@@ -1885,8 +2019,17 @@ int main(int argc, char ** argv) {
                    1 :
                    0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "copy") == 0) {
+        return run_copy_fast_path_case(dayan.get());
+    }
+    if (argc == 2 && std::strcmp(argv[1], "get-rows") == 0) {
+        return run_get_rows_fast_path_case(dayan.get());
+    }
+    if (argc == 2 && std::strcmp(argv[1], "memory") == 0) {
+        return run_memory_case(dayan.get());
+    }
     if (argc != 1) {
-        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output]");
+        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output|copy|get-rows|memory]");
     }
 
     if (run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 256, false) != 0 ||
@@ -1903,6 +2046,7 @@ int main(int argc, char ** argv) {
         run_math_case(dayan.get()) != 0 || run_reduction_norm_case(dayan.get()) != 0 ||
         run_strided_rms_case(dayan.get()) != 0 || run_rope_cases(dayan.get(), cpu.get()) != 0 ||
         run_memory_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
+        run_copy_fast_path_case(dayan.get()) != 0 || run_get_rows_fast_path_case(dayan.get()) != 0 ||
         run_layout_case(dayan.get()) != 0 || run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
         run_softmax_clamp_case(dayan.get()) != 0 ||
         run_fused_case(dayan.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 16, 256) != 0 ||

@@ -123,9 +123,12 @@ struct DayanSSMConvConfig {
     uint32_t sequences;
     uint32_t kernel_size;
     uint32_t flags;
-    uint32_t zero_bits;
     uint32_t neg_log2e_bits;
     uint32_t one_bits;
+};
+
+enum : uint32_t {
+    kDayanSSMConvMaxKernelSize = 63,
 };
 
 enum : uint64_t {

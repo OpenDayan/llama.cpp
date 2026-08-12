@@ -8,6 +8,8 @@
 //   PV = P_lowp * V_lowp
 // Online-softmax state (m, l, O) stays in FP32.  Scores are never materialized in DRAM.
 
+#include "ggml-dayan-activation.h"
+
 #include "npu_instruction.hpp"
 #include "npu_kernel.h"
 #include "npu_lsu_csr.hpp"
@@ -202,30 +204,10 @@ static inline void issue_qk(long ctx_base, long rows, long cols, long head_dim, 
     __tx_mat_mm<GROUP>(ctx_base + kCtxScore, ctx_base + kCtxQ, k_base);
 }
 
-template <typename Format, long GROUP> static inline void issue_p_to_lowp(long ctx_base, long rows) {
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM0>(kBc - 1);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM1>(rows - 1);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM2>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DIM3>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC0DIM1STRIDE>(kBc * sizeof(float));
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC0DIM2STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC0DIM3STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC1DIM1STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC1DIM2STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC1DIM3STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DSTDIM1STRIDE>(kBc * sizeof(uint16_t));
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DSTDIM2STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DSTDIM3STRIDE>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC0SWIZZLEMBS>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_SRC1SWIZZLEMBS>(0);
-    __tx_macro_tcsr_write<GROUP * MACRO_GROUPSZ + MACRO_DSTSWIZZLEMBS>(0);
-    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        __tx_macro_convert_fp32_bf16<GROUP>(reinterpret_cast<void *>(uram_addr(ctx_base + kCtxP)),
-                                            reinterpret_cast<void *>(uram_addr(ctx_base + kCtxScore)));
-    } else {
-        __tx_macro_convert_fp32_fp16<GROUP>(reinterpret_cast<void *>(uram_addr(ctx_base + kCtxP)),
-                                            reinterpret_cast<void *>(uram_addr(ctx_base + kCtxScore)));
-    }
+template <typename Format> static inline void issue_p_to_lowp(long ctx_base, long rows) {
+    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
+        { uram_addr(ctx_base + kCtxScore), kBc * (long) sizeof(float) },
+        { uram_addr(ctx_base + kCtxP), kBc * (long) sizeof(uint16_t) }, rows, kBc);
 }
 
 template <typename Format, long GROUP>
@@ -819,11 +801,10 @@ class FlashAttentionKvProducerTask : public NPUTask {
     }
 };
 
-// Three fixed consumers own disjoint URAM contexts and unit configuration groups.  Each handles
-// one 64-row Q tile in a 192-row super-group, allowing LSU, MAT, VEC, and MACRO phases belonging
-// to different Q tiles to cover one another's latency.  On the current RVTNG target this creates
-// at most four outstanding LSU Produce markers and three on every other unit, below each 8-entry
-// completion FIFO; FlexVec additionally has exactly three of its four block slots in flight.
+// Three fixed consumers own disjoint URAM contexts and unit configuration groups. Each handles
+// one 64-row Q tile in a 192-row super-group, allowing LSU, MAT, and VEC phases from different Q
+// tiles to cover one another's latency. The current RVTNG target stays below each completion FIFO
+// limit; FlexVec additionally has exactly three of its four block slots in flight.
 template <typename Format, long FIXED_SLICE> class FlashAttentionComputeTask : public NPUTask {
   private:
     static_assert(FIXED_SLICE >= 0 && FIXED_SLICE < kConsumerCount, "FlashAttention consumer slice is out of range");
@@ -832,8 +813,7 @@ template <typename Format, long FIXED_SLICE> class FlashAttentionComputeTask : p
     static constexpr long kLsuOutGroup = kLsuQGroup + 1;
     static constexpr long kMatQKGroup  = FIXED_SLICE * 2;
     static constexpr long kMatPVGroup  = FIXED_SLICE * 2 + 1;
-    static constexpr long kMacroGroup  = FIXED_SLICE;
-    static_assert(kLsuOutGroup < 8 && kMatPVGroup < 8 && kMacroGroup < 8,
+    static_assert(kLsuOutGroup < 8 && kMatPVGroup < 8,
                   "FlashAttention unit group allocation exceeds the target TCSR file");
 
     FlashAttentionState * s;
@@ -895,8 +875,8 @@ template <typename Format, long FIXED_SLICE> class FlashAttentionComputeTask : p
                             issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
                             NPUVecBar(0);
 
-                            issue_p_to_lowp<Format, kMacroGroup>(kCtxBase, rows);
-                            NPUMACROBar(0);
+                            issue_p_to_lowp<Format>(kCtxBase, rows);
+                            NPUVecBar(0);
 
                             issue_pv<Format, kMatPVGroup>(kCtxBase, rows, s->head_dim, kv->uram + kKvVtOffset);
                             NPUMatBar(0);

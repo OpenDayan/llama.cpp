@@ -97,6 +97,20 @@ static operator_graph build_ssm_conv() {
     return graph;
 }
 
+static operator_graph build_ssm_decode(bool silu) {
+    constexpr int64_t kernel   = 4;
+    constexpr int64_t channels = 6144;
+    constexpr int64_t tokens   = 1;
+
+    operator_graph graph  = make_graph_context();
+    ggml_tensor *  input  = add_input(&graph, GGML_TYPE_F32, kernel - 1 + tokens, channels, 1, 1);
+    ggml_tensor *  weight = add_input(&graph, GGML_TYPE_F32, kernel, channels);
+    ggml_tensor *  conv   = ggml_ssm_conv(graph.ctx.get(), input, weight);
+    graph.output          = silu ? ggml_silu(graph.ctx.get(), conv) : conv;
+    finish_graph(&graph);
+    return graph;
+}
+
 static operator_graph build_gdn() {
     constexpr int64_t head_dim = 128;
     constexpr int64_t heads    = 1;
@@ -175,6 +189,12 @@ static operator_graph build_operator(const std::string & name) {
     if (name == "ssm-conv") {
         return build_ssm_conv();
     }
+    if (name == "ssm-decode") {
+        return build_ssm_decode(true);
+    }
+    if (name == "ssm-decode-raw") {
+        return build_ssm_decode(false);
+    }
     if (name == "gdn") {
         return build_gdn();
     }
@@ -186,7 +206,7 @@ static operator_graph build_operator(const std::string & name) {
 
 int main(int argc, char ** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: %s rope|ssm-conv|gdn|gated-output\n", argv[0]);
+        std::fprintf(stderr, "usage: %s rope|ssm-conv|ssm-decode|ssm-decode-raw|gdn|gated-output\n", argv[0]);
         return 2;
     }
 

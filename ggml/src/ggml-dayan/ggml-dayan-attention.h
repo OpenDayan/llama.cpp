@@ -525,27 +525,9 @@ template <typename Format> static inline void issue_gated_lowp_to_f32(uint64_t i
 
 template <typename Format>
 static inline void issue_gated_f32_to_lowp(uint64_t input, uint64_t output, long rows, long cols) {
-    __tx_macro_tcsr_write<MACRO_DIM0>(cols - 1);
-    __tx_macro_tcsr_write<MACRO_DIM1>(rows - 1);
-    __tx_macro_tcsr_write<MACRO_DIM2>(0);
-    __tx_macro_tcsr_write<MACRO_DIM3>(0);
-    __tx_macro_tcsr_write<MACRO_SRC0DIM1STRIDE>(Constants::kTileK * sizeof(float));
-    __tx_macro_tcsr_write<MACRO_SRC0DIM2STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_SRC0DIM3STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_SRC1DIM1STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_SRC1DIM2STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_SRC1DIM3STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_DSTDIM1STRIDE>(Constants::kTileK * sizeof(uint16_t));
-    __tx_macro_tcsr_write<MACRO_DSTDIM2STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_DSTDIM3STRIDE>(0);
-    __tx_macro_tcsr_write<MACRO_SRC0SWIZZLEMBS>(0);
-    __tx_macro_tcsr_write<MACRO_SRC1SWIZZLEMBS>(0);
-    __tx_macro_tcsr_write<MACRO_DSTSWIZZLEMBS>(0);
-    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        __tx_macro_convert_fp32_bf16<0>((void *) output, (void *) input);
-    } else {
-        __tx_macro_convert_fp32_fp16<0>((void *) output, (void *) input);
-    }
+    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
+        { input, Constants::kTileK * (int) sizeof(float) },
+        { output, Constants::kTileK * (int) sizeof(uint16_t) }, rows, cols);
 }
 
 struct GatedInputContext {
@@ -601,7 +583,7 @@ template <typename Format> static int load_gated_input(const MatmulInputArgs * a
                                              args->cols);
     dayan_wait_vec();
     issue_gated_f32_to_lowp<Format>(attention_uram, args->output, args->rows, args->cols);
-    dayan_wait_macro();
+    dayan_wait_vec();
     return 0;
 }
 

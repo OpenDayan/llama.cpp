@@ -109,14 +109,11 @@ static inline void normalization_vec_add(uint64_t left, uint64_t right, uint64_t
     __tx_vec_sb_bar(done);
 }
 
-template <typename Format> static inline void normalization_quantize(uint64_t output, uint64_t input);
-
-template <> inline void normalization_quantize<Bf16Format>(uint64_t output, uint64_t input) {
-    __tx_macro_convert_fp32_bf16<0>((void *) output, (void *) input);
-}
-
-template <> inline void normalization_quantize<Fp16Format>(uint64_t output, uint64_t input) {
-    __tx_macro_convert_fp32_fp16<0>((void *) output, (void *) input);
+template <typename Format>
+static inline void normalization_quantize(uint64_t output, uint64_t input, uint32_t elements) {
+    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
+        { input, (long) elements * (long) sizeof(float) },
+        { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
 }
 
 static inline void normalization_validate(const DayanNormConfig * config) {
@@ -227,10 +224,11 @@ static void run_rms_norm_scale(const DayanNormConfig * config,
             configure_normalization_macro<0>(elements);
             __tx_macro_elemwise_mul_fp32<0, 1>((void *) rms_uram, inverse_uram, (void *) value);
             __tx_macro_elemwise_mul_fp32<0, 0>((void *) scaled_uram, (void *) rms_uram, (void *) aux);
-            if constexpr (Quantize) {
-                normalization_quantize<Format>(lowp_uram, scaled_uram);
-            }
             dayan_wait_macro();
+            if constexpr (Quantize) {
+                normalization_quantize<Format>(lowp_uram, scaled_uram, elements);
+                dayan_wait_vec();
+            }
 
             normalization_store_f32(rms + row_offset + offset, rms_uram, elements);
             normalization_store_f32(scaled + row_offset + offset, scaled_uram, elements);
