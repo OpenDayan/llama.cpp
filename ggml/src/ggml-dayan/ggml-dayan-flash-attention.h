@@ -580,6 +580,8 @@ struct FlashAttentionState {
     const uint32_t q_len;
     const uint32_t kv_len;
     const uint32_t head_dim;
+    const uint32_t task;
+    const uint32_t tasks;
     const uint32_t q_per_kv;
     const long     q_tiles;
     const long     q_groups;
@@ -611,7 +613,9 @@ struct FlashAttentionState {
                         uint64_t k_batch_stride_arg,
                         uint64_t v_row_stride_arg,
                         uint64_t v_head_stride_arg,
-                        uint64_t v_batch_stride_arg) :
+                        uint64_t v_batch_stride_arg,
+                        uint32_t task_arg,
+                        uint32_t tasks_arg) :
         q_base(q_base_arg),
         k_base(k_base_arg),
         v_base(v_base_arg),
@@ -632,6 +636,8 @@ struct FlashAttentionState {
         q_len(q_len_arg),
         kv_len(kv_len_arg),
         head_dim(head_dim_arg),
+        task(task_arg),
+        tasks(tasks_arg),
         q_per_kv(q_heads_arg / kv_heads_arg),
         q_tiles((static_cast<uint64_t>(q_len_arg) + kBr - 1) / kBr),
         q_groups((q_tiles + kConsumerCount - 1) / kConsumerCount),
@@ -752,68 +758,67 @@ static void flash_attention_consumer(void * argument) {
         return;
     }
 
-    for (uint32_t b = 0; b < state->batch; ++b) {
-        for (uint32_t qh = 0; qh < state->q_heads; ++qh) {
-            for (long q_group = 0; q_group < state->q_groups; ++q_group) {
-                const long producer_keys = state->producer_key_tile_count(q_group);
-                const long qi            = state->q_tile_for(q_group, FIXED_SLICE);
-                const long q_row         = qi * kBr;
-                const long rows          = state->rows_for_slice(q_group, FIXED_SLICE);
-                const long slice_keys    = state->slice_key_tile_count(q_group, FIXED_SLICE);
+    const uint64_t work_items = static_cast<uint64_t>(state->batch) * state->q_heads;
+    for (uint64_t work = state->task; work < work_items; work += state->tasks) {
+        const uint32_t b  = static_cast<uint32_t>(work / state->q_heads);
+        const uint32_t qh = static_cast<uint32_t>(work % state->q_heads);
+        for (long q_group = 0; q_group < state->q_groups; ++q_group) {
+            const long producer_keys = state->producer_key_tile_count(q_group);
+            const long qi            = state->q_tile_for(q_group, FIXED_SLICE);
+            const long q_row         = qi * kBr;
+            const long rows          = state->rows_for_slice(q_group, FIXED_SLICE);
+            const long slice_keys    = state->slice_key_tile_count(q_group, FIXED_SLICE);
 
-                if (rows != 0) {
-                    configure_lsu_rows<kLsuQGroup>(rows, state->head_dim * sizeof(uint16_t), state->q_row_stride,
-                                                   state->head_dim * sizeof(uint16_t));
-                    __tx_lsu_dma_d2u<kLsuQGroup>(uram_addr(kCtxBase + kCtxQ), state->q_row_address(b, qh, q_row));
-                    issue_initialize_online_state<kLsuOutGroup>(kCtxBase, rows, state->head_dim);
-                    dayan_wait_lsu();
+            if (rows != 0) {
+                configure_lsu_rows<kLsuQGroup>(rows, state->head_dim * sizeof(uint16_t), state->q_row_stride,
+                                               state->head_dim * sizeof(uint16_t));
+                __tx_lsu_dma_d2u<kLsuQGroup>(uram_addr(kCtxBase + kCtxQ), state->q_row_address(b, qh, q_row));
+                issue_initialize_online_state<kLsuOutGroup>(kCtxBase, rows, state->head_dim);
+                dayan_wait_lsu();
 
-                    for (long ki = 0; ki < slice_keys; ++ki) {
-                        const uint64_t expected_generation = generation_base + static_cast<uint64_t>(ki);
-                        FlashAttentionBuffer * buffer = &state->buffers[expected_generation & 1U];
-                        int status = wait_for_generation(buffer, expected_generation);
-                        if (status < 0) {
-                            remember_error(state, status);
-                            return;
-                        }
-
-                        const long k_row = ki * kBc;
-                        const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
-                        issue_qk<Format, kMatQKGroup>(kCtxBase, rows, cols, state->head_dim, buffer->k_offset);
-                        long threshold_row_stride;
-                        const bool mask_scores = prepare_softmax_mask(
-                            kCtxBase, rows, cols, q_row + state->causal_offset, k_row, state->causal,
-                            &threshold_row_stride);
-                        dayan_wait_mat();
-
-                        issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
-                        dayan_wait_vec();
-                        issue_p_to_lowp<Format>(kCtxBase, rows);
-                        dayan_wait_vec();
-                        issue_pv<Format, kMatPVGroup>(
-                            kCtxBase, rows, state->head_dim, buffer->k_offset + kKvVtOffset);
-                        dayan_wait_mat();
-
-                        status = dayan_resource_consume(&buffer->resource);
-                        if (status < 0) {
-                            remember_error(state, status);
-                            return;
-                        }
-                        issue_update_o(kCtxBase, rows, state->head_dim);
-                        dayan_wait_vec();
+                for (long ki = 0; ki < slice_keys; ++ki) {
+                    const uint64_t expected_generation = generation_base + static_cast<uint64_t>(ki);
+                    FlashAttentionBuffer * buffer = &state->buffers[expected_generation & 1U];
+                    int status = wait_for_generation(buffer, expected_generation);
+                    if (status < 0) {
+                        remember_error(state, status);
+                        return;
                     }
 
-                    issue_normalize_o(kCtxBase, rows, state->head_dim);
+                    const long k_row = ki * kBc;
+                    const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
+                    issue_qk<Format, kMatQKGroup>(kCtxBase, rows, cols, state->head_dim, buffer->k_offset);
+                    long threshold_row_stride;
+                    const bool mask_scores = prepare_softmax_mask(
+                        kCtxBase, rows, cols, q_row + state->causal_offset, k_row, state->causal,
+                        &threshold_row_stride);
+                    dayan_wait_mat();
+
+                    issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
                     dayan_wait_vec();
-                    configure_lsu_rows<kLsuOutGroup>(rows, state->head_dim * sizeof(float),
-                                                     state->head_dim * sizeof(float),
-                                                     state->q_heads * state->head_dim * sizeof(float));
-                    __tx_lsu_dma_u2d<kLsuOutGroup>(
-                        state->out_row_address(b, qh, q_row), uram_addr(kCtxBase + kCtxO));
-                    dayan_wait_lsu();
+                    issue_p_to_lowp<Format>(kCtxBase, rows);
+                    dayan_wait_vec();
+                    issue_pv<Format, kMatPVGroup>(kCtxBase, rows, state->head_dim, buffer->k_offset + kKvVtOffset);
+                    dayan_wait_mat();
+
+                    status = dayan_resource_consume(&buffer->resource);
+                    if (status < 0) {
+                        remember_error(state, status);
+                        return;
+                    }
+                    issue_update_o(kCtxBase, rows, state->head_dim);
+                    dayan_wait_vec();
                 }
-                generation_base += static_cast<uint64_t>(producer_keys);
+
+                issue_normalize_o(kCtxBase, rows, state->head_dim);
+                dayan_wait_vec();
+                configure_lsu_rows<kLsuOutGroup>(rows, state->head_dim * sizeof(float),
+                                                 state->head_dim * sizeof(float),
+                                                 state->q_heads * state->head_dim * sizeof(float));
+                __tx_lsu_dma_u2d<kLsuOutGroup>(state->out_row_address(b, qh, q_row), uram_addr(kCtxBase + kCtxO));
+                dayan_wait_lsu();
             }
+            generation_base += static_cast<uint64_t>(producer_keys);
         }
     }
 }
@@ -844,46 +849,43 @@ static int run_flash_attention_pipeline(FlashAttentionState * state) {
 
     state->start = 1;
     uint64_t generation = 0;
-    for (uint32_t b = 0; b < state->batch; ++b) {
-        for (uint32_t qh = 0; qh < state->q_heads; ++qh) {
-            for (long q_group = 0; q_group < state->q_groups; ++q_group) {
-                const long producer_keys = state->producer_key_tile_count(q_group);
-                for (long ki = 0; ki < producer_keys; ++ki) {
-                    FlashAttentionBuffer * buffer = &state->buffers[generation & 1U];
-                    status = dayan_resource_wait_free(&buffer->resource);
-                    if (status < 0) {
-                        remember_error(state, status);
-                        break;
-                    }
-                    status = dayan_resource_alloc(
-                        &buffer->resource, 1, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)));
-                    if (status < 0) {
-                        remember_error(state, status);
-                        break;
-                    }
-
-                    buffer->generation = generation;
-                    const long k_row = ki * kBc;
-                    const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
-                    configure_lsu_rows<kLsuK>(cols, state->head_dim * sizeof(uint16_t), state->k_row_stride,
-                                              state->head_dim * sizeof(uint16_t));
-                    __tx_lsu_dma_d2u<kLsuK>(
-                        uram_addr(buffer->k_offset), state->k_row_address(b, qh, k_row));
-                    load_v_transposed(state->v_row_address(b, qh, k_row), buffer->k_offset + kKvVtOffset,
-                                      cols, state->head_dim, state->v_row_stride);
-                    dayan_wait_lsu();
-
-                    status = dayan_resource_produce(&buffer->resource);
-                    if (status < 0) {
-                        remember_error(state, status);
-                        break;
-                    }
-                    ++generation;
-                    dayan_yield();
-                }
+    const uint64_t work_items = static_cast<uint64_t>(state->batch) * state->q_heads;
+    for (uint64_t work = state->task; work < work_items; work += state->tasks) {
+        const uint32_t b  = static_cast<uint32_t>(work / state->q_heads);
+        const uint32_t qh = static_cast<uint32_t>(work % state->q_heads);
+        for (long q_group = 0; q_group < state->q_groups; ++q_group) {
+            const long producer_keys = state->producer_key_tile_count(q_group);
+            for (long ki = 0; ki < producer_keys; ++ki) {
+                FlashAttentionBuffer * buffer = &state->buffers[generation & 1U];
+                status = dayan_resource_wait_free(&buffer->resource);
                 if (status < 0) {
+                    remember_error(state, status);
                     break;
                 }
+                status = dayan_resource_alloc(
+                    &buffer->resource, 1, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)));
+                if (status < 0) {
+                    remember_error(state, status);
+                    break;
+                }
+
+                buffer->generation = generation;
+                const long k_row = ki * kBc;
+                const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
+                configure_lsu_rows<kLsuK>(cols, state->head_dim * sizeof(uint16_t), state->k_row_stride,
+                                          state->head_dim * sizeof(uint16_t));
+                __tx_lsu_dma_d2u<kLsuK>(uram_addr(buffer->k_offset), state->k_row_address(b, qh, k_row));
+                load_v_transposed(state->v_row_address(b, qh, k_row), buffer->k_offset + kKvVtOffset, cols,
+                                  state->head_dim, state->v_row_stride);
+                dayan_wait_lsu();
+
+                status = dayan_resource_produce(&buffer->resource);
+                if (status < 0) {
+                    remember_error(state, status);
+                    break;
+                }
+                ++generation;
+                dayan_yield();
             }
             if (status < 0) {
                 break;
@@ -934,11 +936,15 @@ static __device__ long flash_attention_lowp_f32(void *   q,
                                                 uint64_t v_row_stride,
                                                 uint64_t v_head_stride,
                                                 uint64_t v_batch_stride) {
+    const uint32_t task  = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
     const uint32_t scale_magnitude = scale_bits & 0x7fffffffu;
     if (!q || !k || !v || !out || batch == 0 || q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 ||
         (flags & ~kFlagCausal) != 0 || ((flags & kFlagCausal) == 0 && causal_offset != 0) ||
         ((flags & kFlagCausal) != 0 && static_cast<uint64_t>(causal_offset) + q_len > kv_len) ||
-        (scale_bits & 0x7f800000u) == 0x7f800000u || ((scale_bits & 0x80000000u) != 0 && scale_magnitude != 0)) {
+        (scale_bits & 0x7f800000u) == 0x7f800000u || ((scale_bits & 0x80000000u) != 0 && scale_magnitude != 0) ||
+        dayan_task_mode() != 1U || tasks == 0U || tasks > kDayanNativeMaxTasks || task >= tasks ||
+        dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         return FA_INVALID_ARGUMENT;
     }
     if (head_dim == 0 || head_dim > kMaxHeadDim || (head_dim % kVecLanes) != 0) {
@@ -1001,7 +1007,7 @@ static __device__ long flash_attention_lowp_f32(void *   q,
     FlashAttentionState state(q_base_addr, k_base_addr, v_base_addr, out_base_addr, batch, q_heads, kv_heads, q_len,
                               kv_len, head_dim, causal_offset, (flags & kFlagCausal) != 0, q_row_stride, q_head_stride,
                               q_batch_stride, k_row_stride, k_head_stride, k_batch_stride, v_row_stride, v_head_stride,
-                              v_batch_stride);
+                              v_batch_stride, task, tasks);
     initialize_constants(scale_log2e);
     return run_flash_attention_pipeline<Format>(&state);
 }

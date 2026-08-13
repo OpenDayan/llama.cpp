@@ -70,6 +70,7 @@ add_custom_command(
         ggml-dayan-gated-delta-net.h
         ggml-dayan-layout.h
         ggml-dayan-matmul.h
+        ggml-dayan-matmul-4c.h
         ggml-dayan-memory.h
         ggml-dayan-moe.h
         ggml-dayan-normalization.h
@@ -102,6 +103,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-gated-delta-net.h
     ggml-dayan-layout.h
     ggml-dayan-matmul.h
+    ggml-dayan-matmul-4c.h
     ggml-dayan-memory.h
     ggml-dayan-moe.h
     ggml-dayan-normalization.h

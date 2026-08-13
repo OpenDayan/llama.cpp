@@ -8,6 +8,7 @@
 #include "ggml-dayan-matmul.h"
 #include "ggml-dayan-memory.h"
 #include "ggml-dayan-moe.h"
+#include "ggml-dayan-matmul-4c.h"
 #include "ggml-dayan-normalization.h"
 #include "ggml-dayan-rope.h"
 #include "ggml-dayan-softmax.h"
@@ -63,6 +64,58 @@ __kernel__ void matmul_fp16_1c(const DayanMatmulConfig * config,
                       epilogue_identity, epilogue_identity, epilogue_identity>(config, a, bt, nullptr, output, perf);
 }
 
+__kernel__ void matmul_bf16_4c(const DayanMatmulConfig * config,
+                               const uint16_t *          a,
+                               const uint16_t *          bt,
+                               float *                   output,
+                               DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, a, bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_fp16_4c(const DayanMatmulConfig * config,
+                               const uint16_t *          a,
+                               const uint16_t *          bt,
+                               float *                   output,
+                               DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, a, bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_pair_bf16_4c(const DayanMatmulPairConfig * config,
+                                    const uint16_t *              a,
+                                    const uint16_t *              first_bt,
+                                    const uint16_t *              second_bt,
+                                    float *                       first,
+                                    float *                       second,
+                                    DayanMatmulPerf *             perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, a, first_bt, second_bt, first, second, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_pair_fp16_4c(const DayanMatmulPairConfig * config,
+                                    const uint16_t *              a,
+                                    const uint16_t *              first_bt,
+                                    const uint16_t *              second_bt,
+                                    float *                       first,
+                                    float *                       second,
+                                    DayanMatmulPerf *             perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, a, first_bt, second_bt, first, second, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void matmul_quantized_bf16_1c(const DayanMatmulConfig * config,
                                          const uint16_t *          a,
                                          const uint16_t *          bt,
@@ -85,6 +138,30 @@ __kernel__ void matmul_quantized_fp16_1c(const DayanMatmulConfig * config,
     run_matmul_kernel<Fp16Format, 1, sizeof(uint16_t), true, epilogue_identity_fp16<0>, epilogue_identity_fp16<4>,
                       epilogue_identity_fp16<2>, epilogue_identity_fp16<0>, epilogue_identity_fp16<4>,
                       epilogue_identity_fp16<2>>(config, a, bt, nullptr, output, perf);
+}
+
+__kernel__ void matmul_quantized_bf16_4c(const DayanMatmulConfig * config,
+                                         const uint16_t *          a,
+                                         const uint16_t *          bt,
+                                         uint16_t *                output,
+                                         DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, a, bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_quantized_fp16_4c(const DayanMatmulConfig * config,
+                                         const uint16_t *          a,
+                                         const uint16_t *          bt,
+                                         uint16_t *                output,
+                                         DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, a, bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
 }
 
 __kernel__ void matmul_swiglu_bf16_1c(const DayanMatmulConfig * config,
@@ -139,6 +216,58 @@ __kernel__ void matmul_geglu_fp16_1c(const DayanMatmulConfig * config,
         config, a, gate_bt, up_bt, output, perf);
 }
 
+__kernel__ void matmul_swiglu_bf16_4c(const DayanMatmulConfig * config,
+                                      const uint16_t *          a,
+                                      const uint16_t *          gate_bt,
+                                      const uint16_t *          up_bt,
+                                      uint16_t *                output,
+                                      DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, false>(
+        config, a, gate_bt, up_bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_swiglu_fp16_4c(const DayanMatmulConfig * config,
+                                      const uint16_t *          a,
+                                      const uint16_t *          gate_bt,
+                                      const uint16_t *          up_bt,
+                                      uint16_t *                output,
+                                      DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Fp16Format, false>(
+        config, a, gate_bt, up_bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_geglu_bf16_4c(const DayanMatmulConfig * config,
+                                     const uint16_t *          a,
+                                     const uint16_t *          gate_bt,
+                                     const uint16_t *          up_bt,
+                                     uint16_t *                output,
+                                     DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, true>(
+        config, a, gate_bt, up_bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void matmul_geglu_fp16_4c(const DayanMatmulConfig * config,
+                                     const uint16_t *          a,
+                                     const uint16_t *          gate_bt,
+                                     const uint16_t *          up_bt,
+                                     uint16_t *                output,
+                                     DayanMatmulPerf *         perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Fp16Format, true>(
+        config, a, gate_bt, up_bt, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void mul_mat_id_bf16_1c(const DayanMulMatIdConfig * config,
                                    const uint16_t *            activation,
                                    const uint16_t *            weight,
@@ -157,6 +286,62 @@ __kernel__ void mul_mat_id_fp16_1c(const DayanMulMatIdConfig * config,
                                    DayanMatmulPerf *           perf) {
     using namespace ggml_dayan_matmul_detail;
     run_mul_mat_id<Fp16Format>(config, activation, weight, ids, output, perf);
+}
+
+__kernel__ void mul_mat_id_bf16_4c(const DayanMulMatIdConfig * config,
+                                   const uint16_t *            activation,
+                                   const uint16_t *            weight,
+                                   const int32_t *             ids,
+                                   float *                     output,
+                                   DayanMatmulPerf *           perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, activation, weight, ids, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void mul_mat_id_fp16_4c(const DayanMulMatIdConfig * config,
+                                   const uint16_t *            activation,
+                                   const uint16_t *            weight,
+                                   const int32_t *             ids,
+                                   float *                     output,
+                                   DayanMatmulPerf *           perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, activation, weight, ids, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void mul_mat_id_pair_bf16_4c(const DayanMulMatIdPairConfig * config,
+                                        const uint16_t *                activation,
+                                        const uint16_t *                first_weight,
+                                        const uint16_t *                second_weight,
+                                        const int32_t *                 ids,
+                                        float *                         first_output,
+                                        float *                         second_output,
+                                        DayanMatmulPerf *               perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, activation, first_weight, second_weight, ids, first_output, second_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void mul_mat_id_pair_fp16_4c(const DayanMulMatIdPairConfig * config,
+                                        const uint16_t *                activation,
+                                        const uint16_t *                first_weight,
+                                        const uint16_t *                second_weight,
+                                        const int32_t *                 ids,
+                                        float *                         first_output,
+                                        float *                         second_output,
+                                        DayanMatmulPerf *               perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_pair_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, activation, first_weight, second_weight, ids, first_output, second_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
 }
 
 __kernel__ void mul_mat_id_swiglu_bf16_1c(const DayanMulMatIdConfig * config,
@@ -211,6 +396,66 @@ __kernel__ void mul_mat_id_geglu_fp16_1c(const DayanMulMatIdConfig * config,
         config, activation, gate_weight, up_weight, ids, output, perf);
 }
 
+__kernel__ void mul_mat_id_swiglu_bf16_4c(const DayanMulMatIdConfig * config,
+                                          const uint16_t *            activation,
+                                          const uint16_t *            gate_weight,
+                                          const uint16_t *            up_weight,
+                                          const int32_t *             ids,
+                                          uint16_t *                  output,
+                                          DayanMatmulPerf *           perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
+        ggml_dayan_matmul_detail::Bf16Format, false>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void mul_mat_id_swiglu_fp16_4c(const DayanMulMatIdConfig * config,
+                                          const uint16_t *            activation,
+                                          const uint16_t *            gate_weight,
+                                          const uint16_t *            up_weight,
+                                          const int32_t *             ids,
+                                          uint16_t *                  output,
+                                          DayanMatmulPerf *           perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
+        ggml_dayan_matmul_detail::Fp16Format, false>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void mul_mat_id_geglu_bf16_4c(const DayanMulMatIdConfig * config,
+                                         const uint16_t *            activation,
+                                         const uint16_t *            gate_weight,
+                                         const uint16_t *            up_weight,
+                                         const int32_t *             ids,
+                                         uint16_t *                  output,
+                                         DayanMatmulPerf *           perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
+        ggml_dayan_matmul_detail::Bf16Format, true>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void mul_mat_id_geglu_fp16_4c(const DayanMulMatIdConfig * config,
+                                         const uint16_t *            activation,
+                                         const uint16_t *            gate_weight,
+                                         const uint16_t *            up_weight,
+                                         const int32_t *             ids,
+                                         uint16_t *                  output,
+                                         DayanMatmulPerf *           perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
+        ggml_dayan_matmul_detail::Fp16Format, true>(
+        config, activation, gate_weight, up_weight, ids, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config,
                                         const uint16_t *                  q,
                                         const uint16_t *                  k,
@@ -237,7 +482,9 @@ __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config
     if (status < 0) {
         dayan_proc_exit(status);
     }
-    *result = status;
+    if (dayan_task_id(DAYAN_TASK_X) == 0U) {
+        *result = status;
+    }
 #else
     (void) config;
     (void) q;
@@ -274,7 +521,9 @@ __kernel__ void flash_attention_fp16_1c(const DayanFlashAttentionConfig * config
     if (status < 0) {
         dayan_proc_exit(status);
     }
-    *result = status;
+    if (dayan_task_id(DAYAN_TASK_X) == 0U) {
+        *result = status;
+    }
 #else
     (void) config;
     (void) q;
@@ -334,6 +583,38 @@ __kernel__ void project_qg_fp16_1c(const DayanAttentionProjectionConfig * config
     run_attention_projection<Fp16Format, true>(config, activation, weight, norm, positions, qg_output, q_output, perf);
 }
 
+__kernel__ void project_qg_bf16_4c(const DayanAttentionProjectionConfig * config,
+                                   const uint16_t *                       activation,
+                                   const uint16_t *                       weight,
+                                   const float *                          norm,
+                                   const int32_t *                        positions,
+                                   uint16_t *                             qg_output,
+                                   uint16_t *                             q_output,
+                                   DayanMatmulPerf *                      perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
+        ggml_dayan_matmul_detail::Bf16Format, true>(
+        config, activation, weight, norm, positions, qg_output, q_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void project_qg_fp16_4c(const DayanAttentionProjectionConfig * config,
+                                   const uint16_t *                       activation,
+                                   const uint16_t *                       weight,
+                                   const float *                          norm,
+                                   const int32_t *                        positions,
+                                   uint16_t *                             qg_output,
+                                   uint16_t *                             q_output,
+                                   DayanMatmulPerf *                      perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
+        ggml_dayan_matmul_detail::Fp16Format, true>(
+        config, activation, weight, norm, positions, qg_output, q_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void project_k_bf16_1c(const DayanAttentionProjectionConfig * config,
                                   const uint16_t *                       activation,
                                   const uint16_t *                       weight,
@@ -360,6 +641,38 @@ __kernel__ void project_k_fp16_1c(const DayanAttentionProjectionConfig * config,
                                                 perf);
 }
 
+__kernel__ void project_k_bf16_4c(const DayanAttentionProjectionConfig * config,
+                                  const uint16_t *                       activation,
+                                  const uint16_t *                       weight,
+                                  const float *                          norm,
+                                  const int32_t *                        positions,
+                                  uint16_t *                             raw_output,
+                                  uint16_t *                             k_output,
+                                  DayanMatmulPerf *                      perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
+        ggml_dayan_matmul_detail::Bf16Format, false>(
+        config, activation, weight, norm, positions, raw_output, k_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void project_k_fp16_4c(const DayanAttentionProjectionConfig * config,
+                                  const uint16_t *                       activation,
+                                  const uint16_t *                       weight,
+                                  const float *                          norm,
+                                  const int32_t *                        positions,
+                                  uint16_t *                             raw_output,
+                                  uint16_t *                             k_output,
+                                  DayanMatmulPerf *                      perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
+        ggml_dayan_matmul_detail::Fp16Format, false>(
+        config, activation, weight, norm, positions, raw_output, k_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void project_v_bf16_1c(const DayanAttentionProjectionConfig * config,
                                   const uint16_t *                       activation,
                                   const uint16_t *                       weight,
@@ -378,6 +691,32 @@ __kernel__ void project_v_fp16_1c(const DayanAttentionProjectionConfig * config,
                                   DayanMatmulPerf *                      perf) {
     using namespace ggml_dayan_matmul_detail;
     run_value_projection<Fp16Format>(config, activation, weight, raw_output, v_output, perf);
+}
+
+__kernel__ void project_v_bf16_4c(const DayanAttentionProjectionConfig * config,
+                                  const uint16_t *                       activation,
+                                  const uint16_t *                       weight,
+                                  uint16_t *                             raw_output,
+                                  uint16_t *                             v_output,
+                                  DayanMatmulPerf *                      perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_value_projection_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, activation, weight, raw_output, v_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void project_v_fp16_4c(const DayanAttentionProjectionConfig * config,
+                                  const uint16_t *                       activation,
+                                  const uint16_t *                       weight,
+                                  uint16_t *                             raw_output,
+                                  uint16_t *                             v_output,
+                                  DayanMatmulPerf *                      perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_value_projection_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, activation, weight, raw_output, v_output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
 }
 
 __kernel__ void project_k_cache_bf16_1c(const DayanKVProjectionConfig * config,
@@ -404,6 +743,36 @@ __kernel__ void project_k_cache_fp16_1c(const DayanKVProjectionConfig * config,
     run_k_cache_projection<Fp16Format>(config, activation, weight, norm, positions_indices, workspace, cache, perf);
 }
 
+__kernel__ void project_k_cache_bf16_4c(const DayanKVProjectionConfig * config,
+                                        const uint16_t *                activation,
+                                        const uint16_t *                weight,
+                                        const float *                   norm,
+                                        const int32_t *                 positions_indices,
+                                        uint16_t *                      workspace,
+                                        uint16_t *                      cache,
+                                        DayanMatmulPerf *               perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_k_cache_projection_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, activation, weight, norm, positions_indices, workspace, cache, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void project_k_cache_fp16_4c(const DayanKVProjectionConfig * config,
+                                        const uint16_t *                activation,
+                                        const uint16_t *                weight,
+                                        const float *                   norm,
+                                        const int32_t *                 positions_indices,
+                                        uint16_t *                      workspace,
+                                        uint16_t *                      cache,
+                                        DayanMatmulPerf *               perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_k_cache_projection_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, activation, weight, norm, positions_indices, workspace, cache, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void project_v_cache_bf16_1c(const DayanKVProjectionConfig * config,
                                         const uint16_t *                activation,
                                         const uint16_t *                weight,
@@ -426,6 +795,34 @@ __kernel__ void project_v_cache_fp16_1c(const DayanKVProjectionConfig * config,
     run_v_cache_projection<Fp16Format>(config, activation, weight, indices, workspace, cache, perf);
 }
 
+__kernel__ void project_v_cache_bf16_4c(const DayanKVProjectionConfig * config,
+                                        const uint16_t *                activation,
+                                        const uint16_t *                weight,
+                                        const int32_t *                 indices,
+                                        uint16_t *                      workspace,
+                                        uint16_t *                      cache,
+                                        DayanMatmulPerf *               perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_v_cache_projection_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        config, activation, weight, indices, workspace, cache, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void project_v_cache_fp16_4c(const DayanKVProjectionConfig * config,
+                                        const uint16_t *                activation,
+                                        const uint16_t *                weight,
+                                        const int32_t *                 indices,
+                                        uint16_t *                      workspace,
+                                        uint16_t *                      cache,
+                                        DayanMatmulPerf *               perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_v_cache_projection_4c<ggml_dayan_matmul_detail::Fp16Format>(
+        config, activation, weight, indices, workspace, cache, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
 __kernel__ void project_gated_output_bf16_1c(const DayanGatedProjectionConfig * config,
                                              const float *                      attention,
                                              const uint16_t *                   gate,
@@ -444,6 +841,32 @@ __kernel__ void project_gated_output_fp16_1c(const DayanGatedProjectionConfig * 
                                              DayanMatmulPerf *                  perf) {
     using namespace ggml_dayan_matmul_detail;
     run_gated_output_projection<Fp16Format>(config, attention, gate, weight, output, perf);
+}
+
+__kernel__ void project_gated_output_bf16_4c(const DayanGatedProjectionConfig * config,
+                                             const float *                      attention,
+                                             const uint16_t *                   gate,
+                                             const uint16_t *                   weight,
+                                             float *                            output,
+                                             DayanMatmulPerf *                  perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_gated_output_projection_4c<
+        ggml_dayan_matmul_detail::Bf16Format>(config, attention, gate, weight, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
+}
+
+__kernel__ void project_gated_output_fp16_4c(const DayanGatedProjectionConfig * config,
+                                             const float *                      attention,
+                                             const uint16_t *                   gate,
+                                             const uint16_t *                   weight,
+                                             float *                            output,
+                                             DayanMatmulPerf *                  perf) {
+    const int status = ggml_dayan_matmul_4c_detail::run_gated_output_projection_4c<
+        ggml_dayan_matmul_detail::Fp16Format>(config, attention, gate, weight, output, perf);
+    if (status < 0) {
+        dayan_proc_exit(status);
+    }
 }
 
 __kernel__ void ssm_conv_f32_1c(const DayanSSMConvConfig * config,
@@ -732,38 +1155,98 @@ __kernel__ void rms_norm_pipeline_1c(const DayanNormPipelineConfig * config,
     run_rms_norm_pipeline(config, left, right, scale, residual, rms, scaled, lowp);
 }
 
-DAYAN_KERNEL_DESC(matmul_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_quantized_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_quantized_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_swiglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(matmul_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mul_mat_id_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mul_mat_id_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mul_mat_id_swiglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mul_mat_id_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mul_mat_id_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(mul_mat_id_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(flash_attention_bf16_1c, 3, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(flash_attention_fp16_1c, 3, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 2, 0, 0, DAYAN_GATED_DELTA_NET_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_qg_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_qg_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_k_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_k_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_v_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_v_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_k_cache_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_k_cache_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_v_cache_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_v_cache_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_gated_output_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(project_gated_output_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
-DAYAN_KERNEL_DESC(ssm_conv_f32_1c, 0, 0, DAYAN_SSM_CONV_TASK_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_pair_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_pair_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_quantized_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_quantized_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_quantized_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_quantized_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_swiglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(matmul_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_swiglu_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_swiglu_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_geglu_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(matmul_geglu_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(mul_mat_id_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(mul_mat_id_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_pair_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_pair_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(mul_mat_id_swiglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(mul_mat_id_swiglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(mul_mat_id_geglu_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(mul_mat_id_geglu_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_swiglu_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_swiglu_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_geglu_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(mul_mat_id_geglu_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(flash_attention_bf16_1c, 3, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(flash_attention_fp16_1c, 3, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(gated_delta_net_f32_1c, 0, 0, DAYAN_GATED_DELTA_NET_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_qg_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_qg_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_qg_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_qg_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_k_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_k_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_k_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_k_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_v_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_v_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_v_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_v_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_k_cache_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_k_cache_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_k_cache_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_k_cache_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_v_cache_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_v_cache_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_v_cache_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_v_cache_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_gated_output_bf16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(project_gated_output_fp16_1c, MATMUL_DAYAN_1C_SLICES, 0, MATMUL_DAYAN_1C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_gated_output_bf16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_DESC(project_gated_output_fp16_4c, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,
+                  MATMUL_DAYAN_4C_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(ssm_conv_f32_1c, 0, 0, DAYAN_SSM_CONV_TASK_URAM_BYTES);
 #define DAYAN_NATIVE_KERNEL_DESC(kernel) \
-    DAYAN_KERNEL_TASK_DESC(kernel, kDayanNativeTasksPerCore, 0, 0, DAYAN_NATIVE_TASK_URAM_BYTES)
+    DAYAN_KERNEL_LOCKED_TASK_DESC(kernel, 0, 0, DAYAN_NATIVE_TASK_URAM_BYTES)
 
 DAYAN_NATIVE_KERNEL_DESC(residual_add_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(elementwise_add_f32_1c);
@@ -814,5 +1297,5 @@ DAYAN_NATIVE_KERNEL_DESC(rms_norm_pipeline_1c);
 
 #undef DAYAN_NATIVE_KERNEL_DESC
 
-DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, kDayanNativeTasksPerCore, 0, 0, DAYAN_SORT_TASK_URAM_BYTES);
-DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, kDayanNativeTasksPerCore, 0, 0, DAYAN_SORT_TASK_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(argsort_f32_1c, 0, 0, DAYAN_SORT_TASK_URAM_BYTES);
+DAYAN_KERNEL_LOCKED_TASK_DESC(top_k_f32_1c, 0, 0, DAYAN_SORT_TASK_URAM_BYTES);

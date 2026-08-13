@@ -40,12 +40,11 @@ enum VecTcsr {
 };
 
 static inline uint64_t uram_address(long offset) {
-    const uint64_t task_offset = (uint64_t) dayan_task_id(DAYAN_TASK_X) * DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES;
-    return reinterpret_cast<uint64_t>(static_cast<char *>(dayan_uram_base()) + task_offset + offset);
+    return reinterpret_cast<uint64_t>(static_cast<char *>(dayan_uram_base()) + offset);
 }
 
 static inline long mat_address(long offset) {
-    return (long) dayan_task_id(DAYAN_TASK_X) * DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES + offset;
+    return offset;
 }
 
 template <typename T> static inline T * uram_pointer(long offset) {
@@ -263,12 +262,11 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
                     config->heads % config->k_heads != 0 || config->q_sequences == 0 || config->k_sequences == 0 ||
                     config->sequences % config->q_sequences != 0 || config->sequences % config->k_sequences != 0 ||
                     dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) == 0U ||
-                    dayan_task_dim(DAYAN_TASK_X) > 2U ||
+                    dayan_task_dim(DAYAN_TASK_X) > kDayanNativeMaxTasks ||
                     dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U ||
                     dayan_uram_base() == nullptr ||
-                    dayan_uram_size() <
-                        (uint64_t) dayan_task_dim(DAYAN_TASK_X) * DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES) {
+                    dayan_uram_size() < DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES) {
         return -22;
     }
 
@@ -376,8 +374,7 @@ static inline long run_gated_delta_net(const DayanGatedDeltaNetConfig * config,
                                        const float *                    beta,
                                        const float *                    state,
                                        float *                          output) {
-    return dayan_task_id(DAYAN_TASK_X) == 0 ? run_gated_delta_net_task<0>(config, q, k, v, g, beta, state, output) :
-                                             run_gated_delta_net_task<1>(config, q, k, v, g, beta, state, output);
+    return run_gated_delta_net_task<0>(config, q, k, v, g, beta, state, output);
 }
 
 }  // namespace ggml_dayan_gdn_detail
