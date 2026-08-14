@@ -23,6 +23,15 @@ struct NormalizationLayout {
 };
 
 static_assert(NormalizationLayout::kTotalBytes <= DAYAN_NATIVE_TASK_URAM_BYTES, "Native Task URAM layout is too large");
+static_assert((NormalizationLayout::kScalar & 63U) == 0U, "Normalization scalar storage must be cache-line aligned");
+
+static inline void normalization_scalar_acquire(const void * scalar) {
+    dayan_cache_invalidate(scalar, 64);
+}
+
+static inline void normalization_scalar_release(const void * scalar) {
+    dayan_cache_flush(scalar, 64);
+}
 
 static inline uint32_t dayan_native_task_id() {
     const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
@@ -110,9 +119,10 @@ static inline void normalization_vec_add(uint64_t left, uint64_t right, uint64_t
 }
 
 template <typename Format>
-static inline void normalization_quantize(uint64_t output, uint64_t input, uint32_t elements) {
-    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
+static inline void normalization_quantize(uint64_t output, uint64_t input, uint64_t scratch, uint32_t elements) {
+    ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, 0>(
         { input, (long) elements * (long) sizeof(float) },
+        { scratch, (long) elements * (long) sizeof(float) },
         { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
 }
 
@@ -172,15 +182,18 @@ static float normalization_inverse_rms(const DayanNormConfig * config,
         __tx_macro_elemwise_mul_fp32<0, 0>((void *) square, (void *) value, (void *) value);
         __tx_macro_reduce_add_fp32<0>(partial, (void *) square);
         dayan_wait_macro();
+        normalization_scalar_acquire(partial);
         sum += *partial;
     }
 
     float * mean    = partial;
     float * inverse = partial + 1;
     *mean           = sum / (float) config->width + normalization_bits_float(config->epsilon_bits);
+    normalization_scalar_release(partial);
     configure_normalization_macro<1>(1);
     __tx_macro_sfu_rsqrt_fp32<1>(inverse, mean);
     dayan_wait_macro();
+    normalization_scalar_acquire(partial);
     return *inverse;
 }
 
@@ -222,6 +235,7 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
         const uint64_t lowp_uram    = uram + NormalizationLayout::kLowp;
         float *        inverse_uram = (float *) (uintptr_t) (uram + NormalizationLayout::kScalar + sizeof(float));
         *inverse_uram               = inverse;
+        normalization_scalar_release((void *) (uintptr_t) (uram + NormalizationLayout::kScalar));
 
         for (uint32_t offset = 0; offset < norm->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (norm->width - offset), (int) NormalizationLayout::kTileElements);
@@ -243,8 +257,8 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
             __tx_macro_elemwise_mul_fp32<0, 0>((void *) scaled_uram, (void *) rms_uram, (void *) aux);
             dayan_wait_macro();
             if constexpr (Quantize) {
-                normalization_quantize<Format>(lowp_uram, scaled_uram, elements);
-                dayan_wait_vec();
+                normalization_quantize<Format>(lowp_uram, scaled_uram, input, elements);
+                configure_normalization_lsu();
             }
 
             bool issued_store = false;
@@ -283,6 +297,7 @@ static inline void run_rms_norm(const DayanNormConfig * config, const float * in
         const uint64_t rms_uram     = uram + NormalizationLayout::kRms;
         float *        inverse_uram = (float *) (uintptr_t) (uram + NormalizationLayout::kScalar + sizeof(float));
         *inverse_uram               = inverse;
+        normalization_scalar_release((void *) (uintptr_t) (uram + NormalizationLayout::kScalar));
 
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
@@ -313,11 +328,13 @@ static inline void normalization_centered(const float * input, float * output, u
         configure_normalization_macro<0>(count);
         __tx_macro_reduce_add_fp32<0>(scalar, (void *) input_uram);
         dayan_wait_macro();
+        normalization_scalar_acquire(scalar);
         sum += scalar[0];
     }
 
     float * mean   = scalar + 1;
     *mean          = sum / (float) elements;
+    normalization_scalar_release(scalar);
     float variance = 0.0f;
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
@@ -329,16 +346,20 @@ static inline void normalization_centered(const float * input, float * output, u
         __tx_macro_elemwise_mul_fp32<0, 0>((void *) square, (void *) centered, (void *) centered);
         __tx_macro_reduce_add_fp32<0>(scalar, (void *) square);
         dayan_wait_macro();
+        normalization_scalar_acquire(scalar);
         variance += scalar[0];
     }
 
     float * variance_uram = scalar + 2;
     float * inverse       = scalar + 3;
     *variance_uram        = variance / (float) elements + epsilon;
+    normalization_scalar_release(scalar);
     configure_normalization_macro<1>(1);
     __tx_macro_sfu_rsqrt_fp32<1>(inverse, variance_uram);
     dayan_wait_macro();
+    normalization_scalar_acquire(scalar);
     *inverse = -*inverse;
+    normalization_scalar_release(scalar);
 
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =

@@ -204,6 +204,7 @@ static inline void attention_reset_scratch() {
     for (uint32_t index = 0; index < 16; ++index) {
         zero[index] = 0;
     }
+    dayan_cache_flush(zero, 64);
     configure_attention_lsu<0>(kAttentionEnd / 64U, 0, 64, 64, 64);
     __tx_lsu_dma_u2u<0>(attention_uram(kAttentionRaw), attention_uram(kAttentionRaw));
     dayan_wait_lsu();
@@ -239,6 +240,9 @@ static inline void attention_initialize_constants(const DayanAttentionProjection
         }
         axes[pair] = axis;
     }
+    dayan_cache_flush(lane, Constants::kVecBytes);
+    dayan_cache_flush(axes, kAttentionPairBytes);
+    dayan_cache_flush(constants, Constants::kVecBytes);
 }
 
 template <typename Format> static inline void issue_attention_lowp_to_f32(uint64_t input, uint32_t chunks) {
@@ -338,6 +342,7 @@ static inline void issue_attention_factors(uint64_t output, uint32_t pair_base) 
     constexpr long instructions = 11;
     float *        constants    = attention_uram_pointer<float>(kAttentionConstants);
     constants[kAttentionPairBase] = (float) pair_base;
+    dayan_cache_flush(constants, Constants::kVecBytes);
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
@@ -575,11 +580,13 @@ static inline void postprocess_attention_head(const DayanAttentionProjectionConf
                             attention_uram(kAttentionNormalized) + (uint64_t) config->n_rot * sizeof(float),
                             config->head_dim - config->n_rot, sizeof(float), sizeof(float));
     }
-    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
-        { attention_uram(kAttentionRotated), (long) config->head_dim * (long) sizeof(float) },
+    const ggml_dayan_vec_detail::F32Tensor rotated = {
+        attention_uram(kAttentionRotated), (long) config->head_dim * (long) sizeof(float)
+    };
+    ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, 0>(
+        rotated, rotated,
         { attention_uram(kAttentionLowp), (long) config->head_dim * (long) sizeof(uint16_t) }, 1,
         config->head_dim);
-    dayan_wait_vec();
     attention_store_bytes(destination, attention_uram(kAttentionLowp), config->head_dim * sizeof(uint16_t));
 }
 
@@ -697,6 +704,7 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
     const uint32_t cache_width = projection->heads * projection->head_dim;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         attention_load_i32(attention_uram(kAttentionPositions), indices + token, 1, sizeof(int32_t));
+        dayan_cache_invalidate(attention_uram_pointer<int32_t>(kAttentionPositions), 64);
         const int32_t cache_row = *attention_uram_pointer<int32_t>(kAttentionPositions);
         if (cache_row < 0 || (uint32_t) cache_row >= config->cache_rows) {
             DAYAN_PARAMS_ERROR();
@@ -731,6 +739,7 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
     const uint32_t cache_width = projection->heads * projection->head_dim;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         attention_load_i32(attention_uram(kAttentionPositions), indices + token, 1, sizeof(int32_t));
+        dayan_cache_invalidate(attention_uram_pointer<int32_t>(kAttentionPositions), 64);
         const int32_t cache_row = *attention_uram_pointer<int32_t>(kAttentionPositions);
         if (cache_row < 0 || (uint32_t) cache_row >= config->cache_rows) {
             DAYAN_PARAMS_ERROR();
@@ -799,9 +808,12 @@ template <typename Format> static inline void issue_gated_lowp_to_f32(uint64_t i
 }
 
 template <typename Format>
-static inline void issue_gated_f32_to_lowp(uint64_t input, uint64_t output, long rows, long cols) {
-    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
-        { input, Constants::kTileK * (int) sizeof(float) },
+static inline void convert_gated_f32_to_lowp(uint64_t input, uint64_t output, long rows, long cols) {
+    const ggml_dayan_vec_detail::F32Tensor tile = {
+        input, Constants::kTileK * (int) sizeof(float)
+    };
+    ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, Constants::kLsuShared>(
+        tile, tile,
         { output, Constants::kTileK * (int) sizeof(uint16_t) }, rows, cols);
 }
 
@@ -857,8 +869,7 @@ template <typename Format> static int load_gated_input(const MatmulInputArgs * a
                                              { constants, constants + sizeof(float), 0, 0, 0, 0, 0 }, args->rows,
                                              args->cols);
     dayan_wait_vec();
-    issue_gated_f32_to_lowp<Format>(attention_uram, args->output, args->rows, args->cols);
-    dayan_wait_vec();
+    convert_gated_f32_to_lowp<Format>(attention_uram, args->output, args->rows, args->cols);
     return 0;
 }
 

@@ -195,9 +195,12 @@ static inline void issue_qk(long ctx_base, long rows, long cols, long head_dim, 
     __tx_mat_mm<GROUP>(ctx_base + kCtxScore, ctx_base + kCtxQ, k_base);
 }
 
-template <typename Format> static inline void issue_p_to_lowp(long ctx_base, long rows) {
-    ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
-        { uram_addr(ctx_base + kCtxScore), kBc * (long) sizeof(float) },
+template <typename Format, long GROUP> static inline void convert_p_to_lowp(long ctx_base, long rows) {
+    const ggml_dayan_vec_detail::F32Tensor score = {
+        uram_addr(ctx_base + kCtxScore), kBc * (long) sizeof(float)
+    };
+    ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, GROUP>(
+        score, score,
         { uram_addr(ctx_base + kCtxP), kBc * (long) sizeof(uint16_t) }, rows, kBc);
 }
 
@@ -442,6 +445,10 @@ static inline void initialize_constants(float scale_log2e) {
         floor_vec[i] = finite_floor;
         zero_vec[i]  = 0.0f;
     }
+    dayan_cache_flush(lane, kVecBytes);
+    dayan_cache_flush(scale_vec, kVecBytes);
+    dayan_cache_flush(floor_vec, kVecBytes);
+    dayan_cache_flush(zero_vec, kVecBytes);
 }
 
 // Initialize only the online-softmax state: m=-FLT_MAX, l=0, and O=0.  Q is loaded directly, while
@@ -792,12 +799,16 @@ static void flash_attention_consumer(void * argument) {
                     const bool mask_scores = prepare_softmax_mask(
                         kCtxBase, rows, cols, q_row + state->causal_offset, k_row, state->causal,
                         &threshold_row_stride);
+                    if (mask_scores) {
+                        const size_t threshold_bytes = threshold_row_stride == 0 ? sizeof(int32_t) :
+                                                                               (size_t) rows * sizeof(int32_t);
+                        dayan_cache_flush(uram_ptr<int32_t>(kCtxBase + kCtxThreshold), threshold_bytes);
+                    }
                     dayan_wait_mat();
 
                     issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
                     dayan_wait_vec();
-                    issue_p_to_lowp<Format>(kCtxBase, rows);
-                    dayan_wait_vec();
+                    convert_p_to_lowp<Format, kLsuQGroup>(kCtxBase, rows);
                     issue_pv<Format, kMatPVGroup>(kCtxBase, rows, state->head_dim, buffer->k_offset + kKvVtOffset);
                     dayan_wait_mat();
 

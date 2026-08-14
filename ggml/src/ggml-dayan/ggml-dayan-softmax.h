@@ -8,9 +8,11 @@ namespace ggml_dayan_matmul_detail {
 
 static inline float softmax_exp2_scalar(float value, float * scratch) {
     scratch[0] = value;
+    normalization_scalar_release((void *) ((uintptr_t) scratch & ~(uintptr_t) 63U));
     configure_normalization_macro<1>(1);
     __tx_macro_sfu_exp2_fp32<1>(scratch + 1, scratch);
     dayan_wait_macro();
+    normalization_scalar_acquire((void *) ((uintptr_t) scratch & ~(uintptr_t) 63U));
     return scratch[1];
 }
 
@@ -100,6 +102,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
         float sink = 0.0f;
         if ((config->flags & kDayanSoftmaxHasSinks) != 0U) {
             memory_load((uint64_t) (uintptr_t) (scratch + 6), sinks + head, 1, kDayanDataTypeF32);
+            normalization_scalar_acquire(scratch);
             sink = scratch[6];
         }
         float maximum = -3.402823466e+38f;
@@ -110,6 +113,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
             configure_normalization_macro<0>(elements);
             __tx_macro_reduce_max_fp32<0, 0>(scratch, (void *) logits_uram, (void *) 0);
             dayan_wait_macro();
+            normalization_scalar_acquire(scratch);
             if (scratch[0] > maximum) {
                 maximum = scratch[0];
             }
@@ -129,6 +133,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
             __tx_macro_sfu_exp2_fp32<0>((void *) exp_uram, (void *) logits_uram);
             __tx_macro_reduce_add_fp32<0>(scratch + 1, (void *) exp_uram);
             dayan_wait_macro();
+            normalization_scalar_acquire(scratch);
             sum += scratch[1];
             normalization_store_f32(output + input_row * config->width + offset, exp_uram, elements);
             dayan_wait_lsu();
@@ -138,9 +143,11 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
         }
 
         scratch[0] = sum;
+        normalization_scalar_release(scratch);
         configure_normalization_macro<1>(1);
         __tx_macro_sfu_recip_fp32<1>(scratch + 1, scratch);
         dayan_wait_macro();
+        normalization_scalar_acquire(scratch);
         const float inverse_sum = scratch[1];
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);

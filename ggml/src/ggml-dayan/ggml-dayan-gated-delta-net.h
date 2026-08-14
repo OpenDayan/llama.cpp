@@ -278,6 +278,8 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
     *uram_pointer<float>(kUramLog2E) = 1.4426950408889634f;
 
     *uram_pointer<float>(kUramScale) = bits_to_float(config->scale_bits);
+    dayan_cache_flush(uram_pointer<float>(kUramScale), 64);
+    dayan_cache_flush(uram_pointer<float>(kUramLog2E), 64);
 
     configure_lsu_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
                                  kHeadDim * sizeof(float));

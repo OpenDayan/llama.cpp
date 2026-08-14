@@ -423,53 +423,50 @@ static inline void issue_geglu(const MatmulEpilogueArgs * args) {
         activation_constants(args), args->rows, args->cols);
 }
 
-template <long MatDataType> static inline void issue_quantize(const MatmulEpilogueArgs * args) {
-    ggml_dayan_vec_detail::issue_f32_to_lowp<MatDataType>(
-        { args->accumulator[0], args->row_stride * (int) sizeof(float) },
+template <long MatDataType, long LsuGroup> static inline void quantize(const MatmulEpilogueArgs * args) {
+    const ggml_dayan_vec_detail::F32Tensor accumulator = {
+        args->accumulator[0], args->row_stride * (int) sizeof(float)
+    };
+    ggml_dayan_vec_detail::convert_f32_to_lowp<MatDataType, LsuGroup>(
+        accumulator, accumulator,
         { args->output, args->row_stride * (int) sizeof(uint16_t) }, args->rows, args->cols);
 }
 
-template <long> static uint64_t epilogue_swiglu_bf16(const MatmulEpilogueArgs * args) {
+template <long GroupBase> static uint64_t epilogue_swiglu_bf16(const MatmulEpilogueArgs * args) {
     issue_swiglu(args);
     dayan_wait_vec();
-    issue_quantize<BaseNPUInstBuilder::DT_BF16>(args);
-    dayan_wait_vec();
+    quantize<BaseNPUInstBuilder::DT_BF16, GroupBase + Constants::kLsuLocal>(args);
     return args->output;
 }
 
-template <long> static uint64_t epilogue_swiglu_fp16(const MatmulEpilogueArgs * args) {
+template <long GroupBase> static uint64_t epilogue_swiglu_fp16(const MatmulEpilogueArgs * args) {
     issue_swiglu(args);
     dayan_wait_vec();
-    issue_quantize<BaseNPUInstBuilder::DT_FP16>(args);
-    dayan_wait_vec();
+    quantize<BaseNPUInstBuilder::DT_FP16, GroupBase + Constants::kLsuLocal>(args);
     return args->output;
 }
 
-template <long> static uint64_t epilogue_geglu_bf16(const MatmulEpilogueArgs * args) {
+template <long GroupBase> static uint64_t epilogue_geglu_bf16(const MatmulEpilogueArgs * args) {
     issue_geglu(args);
     dayan_wait_vec();
-    issue_quantize<BaseNPUInstBuilder::DT_BF16>(args);
-    dayan_wait_vec();
+    quantize<BaseNPUInstBuilder::DT_BF16, GroupBase + Constants::kLsuLocal>(args);
     return args->output;
 }
 
-template <long> static uint64_t epilogue_geglu_fp16(const MatmulEpilogueArgs * args) {
+template <long GroupBase> static uint64_t epilogue_geglu_fp16(const MatmulEpilogueArgs * args) {
     issue_geglu(args);
     dayan_wait_vec();
-    issue_quantize<BaseNPUInstBuilder::DT_FP16>(args);
-    dayan_wait_vec();
+    quantize<BaseNPUInstBuilder::DT_FP16, GroupBase + Constants::kLsuLocal>(args);
     return args->output;
 }
 
-template <long> static uint64_t epilogue_identity_bf16(const MatmulEpilogueArgs * args) {
-    issue_quantize<BaseNPUInstBuilder::DT_BF16>(args);
-    dayan_wait_vec();
+template <long GroupBase> static uint64_t epilogue_identity_bf16(const MatmulEpilogueArgs * args) {
+    quantize<BaseNPUInstBuilder::DT_BF16, GroupBase + Constants::kLsuLocal>(args);
     return args->output;
 }
 
-template <long> static uint64_t epilogue_identity_fp16(const MatmulEpilogueArgs * args) {
-    issue_quantize<BaseNPUInstBuilder::DT_FP16>(args);
-    dayan_wait_vec();
+template <long GroupBase> static uint64_t epilogue_identity_fp16(const MatmulEpilogueArgs * args) {
+    quantize<BaseNPUInstBuilder::DT_FP16, GroupBase + Constants::kLsuLocal>(args);
     return args->output;
 }
 
@@ -649,6 +646,16 @@ static void consume_slice(MatmulState * state) {
                     args.cols                  = real_cols;
                     args.row_stride            = max_cols;
                     const uint64_t output_uram = Epilogue(&args);
+                    if constexpr (HasEpilogue) {
+                        long checksum = 0;
+                        constexpr uint64_t swizzle = MAT_BATCH_SWIZZLE(5, 3, 5);
+                        set_lsu_matrix<GroupBase + Constants::kLsuLocal>(
+                            checksum, local_rows, Constants::kTileK * (int) sizeof(uint16_t),
+                            (long) (ProducerLoadsA ? state->bt_stride : state->a_stride),
+                            Constants::kTileK * (int) sizeof(uint16_t));
+                        __tx_lsu_tcsr_write<
+                            (GroupBase + Constants::kLsuLocal) * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(swizzle);
+                    }
                     const uint64_t output_dram =
                         state->output_base +
                         ((uint64_t) tile_n * Constants::kTileN + (ProducerLoadsA ? slice_offset : 0)) *

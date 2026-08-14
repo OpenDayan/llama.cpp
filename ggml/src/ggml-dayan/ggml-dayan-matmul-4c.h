@@ -1265,19 +1265,29 @@ static int run_matmul_pipeline_4c(const DayanMatmulConfig *config,
 {
     const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
 
-    if (!config_valid(config) || !a || !bt || !c ||
-        dayan_task_mode() != 4U ||
-        dayan_task_dim(DAYAN_TASK_X) != 4U ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1U ||
-        dayan_task_dim(DAYAN_TASK_Z) != 1U || lane >= 4U || !shared)
-        return -22;
+    if (!config_valid(config))
+        return -101;
+    if (!a || !bt || !c)
+        return -102;
+    if (dayan_task_mode() != 4U)
+        return -103;
+    if (dayan_task_dim(DAYAN_TASK_X) != 4U)
+        return -104;
+    if (dayan_task_dim(DAYAN_TASK_Y) != 1U)
+        return -105;
+    if (dayan_task_dim(DAYAN_TASK_Z) != 1U)
+        return -106;
+    if (lane >= 4U)
+        return -107;
+    if (!shared)
+        return -108;
 
     void *uram = dayan_uram_base();
     const bool producer_loads_a = config->m < config->n;
     const uint64_t required_uram = producer_loads_a ?
         AProducerLayout::total_bytes() : BProducerLayout::total_bytes();
     if (!uram || dayan_uram_size() < required_uram)
-        return -12;
+        return -120;
 
     const uint64_t physical_uram = (uint64_t)(uintptr_t)uram;
     const uint64_t expected_window = Constants::kUramWindowBase +
@@ -1285,7 +1295,7 @@ static int run_matmul_pipeline_4c(const DayanMatmulConfig *config,
     if (physical_uram < expected_window ||
         physical_uram - expected_window >
             Constants::kUramWindowStride - required_uram)
-        return -22;
+        return -109;
 
     return producer_loads_a ?
         run_pipeline<Format, true>(config, a, bt, c, lane, physical_uram) :
@@ -1359,6 +1369,7 @@ static int read_selected_expert_4c(const DayanMulMatIdConfig *config,
                 sizeof(int32_t), 1, 64, 1, scratch,
                 (uint64_t)(uintptr_t)(ids + index));
             dayan_wait_lsu();
+            dayan_cache_invalidate((void *)(uintptr_t)scratch, 64);
             cluster.selected_expert = *(const int32_t *)(uintptr_t)scratch;
             if (cluster.selected_expert < 0 ||
                 (uint32_t)cluster.selected_expert >= config->experts)
@@ -1414,6 +1425,7 @@ static int write_perf_4c(const DayanMatmulConfig *config,
     perf_uram->k = config->k;
     perf_uram->kernel_cycles = kernel_end - kernel_begin;
     perf_uram->pipeline_cycles = kernel_end - kernel_begin;
+    dayan_cache_flush(perf_uram, 64);
 
     long checksum = 0;
     set_lsu_matrix<0>(checksum, 1, 64, 64, 64);
@@ -1477,6 +1489,8 @@ static inline void initialize_postprocess_constants()
     *(volatile float *)(uintptr_t)(base + 4U * stride) = -2.8853900817779268f;
     *(volatile float *)(uintptr_t)(base + 5U * stride) = 2.0f;
     *(volatile float *)(uintptr_t)(base + 6U * stride) = 0.5f;
+    dayan_cache_flush((void *)(uintptr_t)base,
+                      ggml_dayan_matmul_detail::Constants::kConstantCount * stride);
 }
 
 static inline ggml_dayan_vec_detail::ActivationConstants postprocess_constants()
@@ -1604,13 +1618,15 @@ static int quantize_matrix_4c(const DayanMatmulConfig *config,
             input + (uint64_t)row_base * config->n + column_base,
             rows, columns);
         dayan_wait_lsu();
-        ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
-            {postprocess_uram(PostprocessLayout::kInput0),
-             (long)PostprocessLayout::kColumns * (long)sizeof(float)},
+        const ggml_dayan_vec_detail::F32Tensor input_tile = {
+            postprocess_uram(PostprocessLayout::kInput0),
+            (long)PostprocessLayout::kColumns * (long)sizeof(float)};
+        ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, 0>(
+            input_tile, input_tile,
             {postprocess_uram(PostprocessLayout::kOutput),
              (long)PostprocessLayout::kColumns * (long)sizeof(uint16_t)},
             rows, columns);
-        dayan_wait_vec();
+        configure_postprocess_load(0, config->n * sizeof(float));
         store_postprocess_tile(
             (uint16_t *)((char *)output + (uint64_t)row_base *
                          config->output_stride) + column_base,
@@ -1668,12 +1684,12 @@ static int glu_matrix_4c(const DayanMatmulConfig *config,
                 rows, columns);
         }
         dayan_wait_vec();
-        ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
-            gate_tile,
+        ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, 0>(
+            gate_tile, gate_tile,
             {postprocess_uram(PostprocessLayout::kOutput),
              (long)PostprocessLayout::kColumns * (long)sizeof(uint16_t)},
             rows, columns);
-        dayan_wait_vec();
+        configure_postprocess_load(0, config->n * sizeof(float));
         store_postprocess_tile(
             (uint16_t *)((char *)output + (uint64_t)row_base *
                          config->output_stride) + column_base,
@@ -2201,13 +2217,15 @@ static int gate_attention_input_4c(
              (long)PostprocessLayout::kColumns * (long)sizeof(float)},
             postprocess_constants(), rows, columns);
         dayan_wait_vec();
-        ggml_dayan_vec_detail::issue_f32_to_lowp<Format::kMatDataType>(
-            {postprocess_uram(PostprocessLayout::kInput0),
-             (long)PostprocessLayout::kColumns * (long)sizeof(float)},
+        const ggml_dayan_vec_detail::F32Tensor attention_tile = {
+            postprocess_uram(PostprocessLayout::kInput0),
+            (long)PostprocessLayout::kColumns * (long)sizeof(float)};
+        ggml_dayan_vec_detail::convert_f32_to_lowp<Format::kMatDataType, 0>(
+            attention_tile, attention_tile,
             {postprocess_uram(PostprocessLayout::kOutput),
              (long)PostprocessLayout::kColumns * (long)sizeof(uint16_t)},
             rows, columns);
-        dayan_wait_vec();
+        configure_postprocess_load(0, (uint64_t)width * sizeof(float));
         store_postprocess_tile(
             output + (uint64_t)row_base * width +
                 (uint64_t)head_base * config->head_dim,

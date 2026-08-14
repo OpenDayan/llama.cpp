@@ -3,6 +3,7 @@
 #if defined(__DAYAN_DEVICE__)
 
 #    include <dayan_intrinsics.h>
+#    include <dayan_sys.h>
 #    include <stdint.h>
 
 namespace ggml_dayan_vec_detail {
@@ -102,14 +103,53 @@ static inline void configure_activation(const F32Tensor & input0,
     configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, output.row_stride);
 }
 
-template <long MatDataType>
-static inline void issue_f32_to_lowp(const F32Tensor & input,
-                                     const LowpTensor & output,
-                                     long               rows,
-                                     long               columns) {
+template <long Group>
+static inline void copy_packed_lowp(const F32Tensor & scratch,
+                                    const LowpTensor & output,
+                                    long               rows,
+                                    long               chunks) {
     enum : long {
-        kInstructions = 6,
-        kLowpBytes    = kVecLanes * sizeof(uint16_t),
+        kLowpBytes = kVecLanes * sizeof(uint16_t),
+    };
+
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(kLowpBytes / 64 - 1);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(64);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(64);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(6);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_PADDINGVALUE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESIZE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(64);
+    for (long row = 0; row < rows; ++row) {
+        for (long chunk = 0; chunk < chunks; ++chunk) {
+            __tx_lsu_dma_u2u<Group>(output.address + row * output.row_stride + chunk * kLowpBytes,
+                                    scratch.address + row * scratch.row_stride + chunk * kVecBytes);
+            dayan_wait_lsu();
+        }
+    }
+}
+
+template <long MatDataType, long LsuGroup>
+static inline void convert_f32_to_lowp(const F32Tensor & input,
+                                       const F32Tensor & scratch,
+                                       const LowpTensor & output,
+                                       long               rows,
+                                       long               columns) {
+    enum : long {
+        kInstructions = 4,
     };
 
     const long chunks = (columns + kVecLanes - 1) / kVecLanes;
@@ -117,10 +157,8 @@ static inline void issue_f32_to_lowp(const F32Tensor & input,
     configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, input.row_stride);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kLowpBytes, output.row_stride);
+    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, scratch.row_stride);
     begin_vec_block(kInstructions);
-    __tx_vec_s_bitwise<0, 3, 0, 3, 0>();
-    __tx_vec_s_int32_add<0, 1, 0>();
     __tx_vec_lsu_u2v<0, 0>(input.address);
     if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
         __tx_vec_cvt_bf16_fp32<0, 0, 0>();
@@ -129,8 +167,10 @@ static inline void issue_f32_to_lowp(const F32Tensor & input,
         __tx_vec_cvt_fp16_fp32<0, 0, 0>();
     }
     __tx_vec_shuffle_compress<0, 0>(1);
-    __tx_vec_lsu_v2u_mask<3, 0, 0>(output.address);
+    __tx_vec_lsu_v2u<3, 0>(scratch.address);
     start_vec_block(kInstructions);
+    dayan_wait_vec();
+    copy_packed_lowp<LsuGroup>(scratch, output, rows, chunks);
 }
 
 static inline void issue_sigmoid_mul(const F32Tensor &            gate,

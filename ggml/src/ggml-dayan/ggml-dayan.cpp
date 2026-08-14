@@ -781,6 +781,10 @@ static int ggml_backend_dayan_mul_mat(ggml_backend_dayan_context * ctx,
     ggml_backend_dayan_buffers buffers;
     int                        status =
         ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
+    GGML_LOG_ERROR("DBG-mm: m=%llu n=%llu k=%llu prepare=%d actbuf=%d wbuf=%d dstbuf=%d perf=%d\n",
+        (unsigned long long) m, (unsigned long long) n, (unsigned long long) k, status,
+        activation_buffer ? 1 : 0, ggml_backend_dayan_tensor_buffer(weight) ? 1 : 0,
+        ggml_backend_dayan_tensor_buffer(dst) ? 1 : 0, buffers.perf ? 1 : 0);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_matmul_launch_attrs(ctx, "ggml-mul-mat", &attrs);
@@ -789,6 +793,7 @@ static int ggml_backend_dayan_mul_mat(ggml_backend_dayan_context * ctx,
                                     ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs) :
                      matmul_fp16_4c(buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
                                     ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
+        GGML_LOG_ERROR("DBG-mm: matmul_4c status=%d\n", status);
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
 

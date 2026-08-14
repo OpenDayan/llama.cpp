@@ -275,9 +275,11 @@ static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const f
             configure_normalization_macro<0>(elements);
             __tx_macro_reduce_add_fp32<0>(partial, (void *) input_uram);
             dayan_wait_macro();
+            normalization_scalar_acquire(partial);
             sum += partial[0];
         }
         partial[0] = sum * scale;
+        normalization_scalar_release(partial);
         normalization_store_f32(output + row, (uint64_t) (uintptr_t) partial, 1);
         dayan_wait_lsu();
     }
@@ -371,16 +373,19 @@ static inline void run_l2_norm(const DayanNormConfig * config, const float * inp
             __tx_macro_elemwise_mul_fp32<0, 0>((void *) square, (void *) input_uram, (void *) input_uram);
             __tx_macro_reduce_add_fp32<0>(scalar, (void *) square);
             dayan_wait_macro();
+            normalization_scalar_acquire(scalar);
             sum += scalar[0];
         }
 
         const float epsilon = normalization_bits_float(config->epsilon_bits);
         scalar[0]           = sum;
         scalar[1]           = epsilon * epsilon;
+        normalization_scalar_release(scalar);
         configure_normalization_macro<1>(1);
         __tx_macro_elemwise_max_fp32<1, 0>(scalar + 2, scalar, scalar + 1);
         __tx_macro_sfu_rsqrt_fp32<1>(scalar + 3, scalar + 2);
         dayan_wait_macro();
+        normalization_scalar_acquire(scalar);
 
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);

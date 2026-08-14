@@ -495,6 +495,7 @@ static inline uint64_t memory_read_index(const void * indices, uint32_t index, u
     configure_memory_lsu<1>(1, 0, 0, bytes, bytes);
     __tx_lsu_dma_d2u<1>((long) scratch, (long) ((const char *) indices + (uint64_t) index * bytes));
     dayan_wait_lsu();
+    normalization_scalar_acquire((void *) (uintptr_t) scratch);
     if (type == kDayanDataTypeI32) {
         const int32_t value = *(const int32_t *) (uintptr_t) scratch;
         if (value < 0) {
@@ -554,17 +555,18 @@ static inline uint64_t memory_convert_from_f32(uint64_t output, uint64_t input, 
     }
 
     if (type == kDayanDataTypeBF16) {
-        ggml_dayan_vec_detail::issue_f32_to_lowp<BaseNPUInstBuilder::DT_BF16>(
+        ggml_dayan_vec_detail::convert_f32_to_lowp<BaseNPUInstBuilder::DT_BF16, 1>(
+            { input, (long) elements * (long) sizeof(float) },
             { input, (long) elements * (long) sizeof(float) },
             { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
     } else if (type == kDayanDataTypeF16) {
-        ggml_dayan_vec_detail::issue_f32_to_lowp<BaseNPUInstBuilder::DT_FP16>(
+        ggml_dayan_vec_detail::convert_f32_to_lowp<BaseNPUInstBuilder::DT_FP16, 1>(
+            { input, (long) elements * (long) sizeof(float) },
             { input, (long) elements * (long) sizeof(float) },
             { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
     } else {
         DAYAN_PARAMS_ERROR();
     }
-    dayan_wait_vec();
     return output;
 }
 
