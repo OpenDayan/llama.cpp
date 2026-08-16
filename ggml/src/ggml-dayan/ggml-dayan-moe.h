@@ -169,7 +169,6 @@ static inline void run_add_id(const DayanAddIdConfig * config,
             normalization_load(input_uram, input + row * config->width + offset, elements);
             normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements);
             elementwise_add_tile(out_uram, input_uram, bias_uram, elements);
-            dayan_wait_macro();
             normalization_store_f32(output + row * config->width + offset, out_uram, elements);
             dayan_wait_lsu();
         }

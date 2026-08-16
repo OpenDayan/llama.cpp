@@ -146,8 +146,8 @@ static inline void issue_gate(uint64_t gate_input, bool scalar_gate) {
     }
     __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramLog2E));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
-    __tx_vec_lsu_v2u<3, 0>(uram_address(kUramGate));
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramGate));
     start_vec_block(instructions);
 }
 
@@ -183,7 +183,7 @@ static inline void issue_update_state(long half) {
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_u2v<1, 2>(uram_address(kUramState + half_offset));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<2, 0>(uram_address(kUramState + half_offset));
+    __tx_vec_lsu_v2u<0, 2>(uram_address(kUramState + half_offset));
     start_vec_block(instructions);
 }
 
@@ -199,7 +199,7 @@ static inline void issue_output() {
     __tx_vec_lsu_u2v<0, 0>(uram_address(kUramDot));
     __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramScale));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(uram_address(kUramDot));
+    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramDot));
     start_vec_block(instructions);
 }
 
@@ -214,10 +214,10 @@ static inline void issue_delta() {
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(uram_address(kUramV));
     __tx_vec_lsu_u2v<1, 0>(uram_address(kUramDot));
-    __tx_vec_vv_fp32_sub<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
     __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_address(kUramBeta));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(uram_address(kUramDelta));
+    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramDelta));
     start_vec_block(instructions);
 }
 

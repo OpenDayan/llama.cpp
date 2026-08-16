@@ -2142,10 +2142,10 @@ static inline void issue_gated_lowp_to_f32_4c(uint64_t input, int rows,
     ggml_dayan_matmul_detail::begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(input);
     if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16)
-        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
     else
-        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(input);
+        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
+    __tx_vec_lsu_v2u<0, 3>(input);
     ggml_dayan_matmul_detail::start_vec_block(instructions);
 }
 

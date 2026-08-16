@@ -55,7 +55,7 @@ static inline void layout_make_constant(uint32_t bits) {
     configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, 0);
     begin_vec_block(2);
     __tx_vec_lsu_u2v_broadcast32<0, 0>((long) (uintptr_t) scalar);
-    __tx_vec_lsu_v2u<3, 0>((long) scratch);
+    __tx_vec_lsu_v2u<0, 3>((long) scratch);
     start_vec_block(2);
     dayan_wait_vec();
 }

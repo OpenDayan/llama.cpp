@@ -275,8 +275,8 @@ static inline void start_vec_block(long instructions) {
 static inline void emit_max_stage(long xor_mask) {
     // Q0 latest is x.  Shuffle writes Q1; cmp writes predicate s0; mux writes max(x, peer) to Q0.
     __tx_vec_shuffle_xor<1, 0>(xor_mask);
-    __tx_vec_vv_fp32_cmp<16, 0, 0, 0b100>();
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
 }
 
 static inline void emit_sum_stage(long xor_mask) {
@@ -313,9 +313,9 @@ static inline void issue_online_softmax_impl(long ctx_base, long rows, long thre
         // s0 = lane <= per-row threshold.  pred bits are ordered <, =, >, so 0b110 is <=.
         __tx_vec_lsu_u2v<1, 1>(uram_addr(kUramLane));
         __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(ctx_base + kCtxThreshold));
-        __tx_vec_vv_int32_cmp<16, 17, 0, 0b110>();
+        __tx_vec_vv_int32_cmp<17, 16, 0, 0b110>();
         __tx_vec_lsu_u2v<1, 1>(uram_addr(kUramFloor));
-        __tx_vec_vv_mux2<0, 0, 16, 0>();  // valid -> score, invalid -> finite floor
+        __tx_vec_vv_mux2<0, 16, 0, 0>();  // valid -> score, invalid -> finite floor
     }
     __tx_vec_lsu_v2u<0, 0>(uram_addr(ctx_base + kCtxScore));
 
@@ -328,27 +328,27 @@ static inline void issue_online_softmax_impl(long ctx_base, long rows, long thre
 
     // m_new = max(m_old, rowmax(score)).
     __tx_vec_lsu_u2v<1, 3>(uram_addr(ctx_base + kCtxM));
-    __tx_vec_vv_fp32_cmp<16, 0, 0, 0b100>();
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(uram_addr(ctx_base + kCtxNewM));
+    __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>(uram_addr(ctx_base + kCtxNewM));
 
     // P = 2^(score_log2 - m_new); the masked path explicitly clears invalid lanes after the SFU.
     __tx_vec_lsu_u2v<0, 0>(uram_addr(ctx_base + kCtxScore));
     __tx_vec_lsu_u2v<1, 3>(uram_addr(ctx_base + kCtxNewM));
-    __tx_vec_vv_fp32_sub<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
     // Clamp before SFU so no correctness argument depends on implementation-defined exp2(-inf).
     __tx_vec_lsu_u2v<1, 1>(uram_addr(kUramFloor));
-    __tx_vec_vv_fp32_cmp<16, 0, 0, 0b100>();
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
+    __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
     if constexpr (MASK_SCORES) {
         // The finite mask floor can exponentiate to a nonzero value when the valid row maximum is
         // equally small.  Recreate the predicate and explicitly zero every invalid probability.
         __tx_vec_lsu_u2v<1, 1>(uram_addr(kUramLane));
         __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(ctx_base + kCtxThreshold));
-        __tx_vec_vv_int32_cmp<16, 17, 0, 0b110>();
+        __tx_vec_vv_int32_cmp<17, 16, 0, 0b110>();
         __tx_vec_lsu_u2v<1, 1>(uram_addr(kUramZero));
-        __tx_vec_vv_mux2<0, 0, 16, 0>();
+        __tx_vec_vv_mux2<0, 16, 0, 0>();
     }
     __tx_vec_lsu_v2u<0, 0>(uram_addr(ctx_base + kCtxScore));
 
@@ -358,17 +358,17 @@ static inline void issue_online_softmax_impl(long ctx_base, long rows, long thre
     emit_sum_stage(4);
     emit_sum_stage(2);
     emit_sum_stage(1);
-    __tx_vec_lsu_v2u<3, 0>(uram_addr(ctx_base + kCtxTileSum));
+    __tx_vec_lsu_v2u<0, 3>(uram_addr(ctx_base + kCtxTileSum));
 
     // alpha = 2^(m_old - m_new).
     __tx_vec_lsu_u2v<0, 3>(uram_addr(ctx_base + kCtxM));
     __tx_vec_lsu_u2v<1, 3>(uram_addr(ctx_base + kCtxNewM));
-    __tx_vec_vv_fp32_sub<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
     __tx_vec_lsu_u2v<1, 1>(uram_addr(kUramFloor));
-    __tx_vec_vv_fp32_cmp<16, 0, 0, 0b100>();
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
-    __tx_vec_lsu_v2u<3, 0>(uram_addr(ctx_base + kCtxAlpha));
+    __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_v2u<0, 3>(uram_addr(ctx_base + kCtxAlpha));
 
     // l_new = alpha * l_old + rowsum(P).
     __tx_vec_lsu_u2v<0, 3>(uram_addr(ctx_base + kCtxAlpha));
@@ -376,10 +376,10 @@ static inline void issue_online_softmax_impl(long ctx_base, long rows, long thre
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_u2v<1, 3>(uram_addr(ctx_base + kCtxTileSum));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(uram_addr(ctx_base + kCtxL));
+    __tx_vec_lsu_v2u<0, 3>(uram_addr(ctx_base + kCtxL));
 
     __tx_vec_lsu_u2v<0, 3>(uram_addr(ctx_base + kCtxNewM));
-    __tx_vec_lsu_v2u<3, 0>(uram_addr(ctx_base + kCtxM));
+    __tx_vec_lsu_v2u<0, 3>(uram_addr(ctx_base + kCtxM));
 
     start_vec_block(instructions);
 }
@@ -426,7 +426,7 @@ static inline void issue_normalize_o(long ctx_base, long rows, long head_dim) {
 
     __tx_vec_lsu_u2v<0, 0>(uram_addr(ctx_base + kCtxO));
     __tx_vec_lsu_u2v<1, 1>(uram_addr(ctx_base + kCtxL));
-    __tx_vec_v_fp32_sfu<1, 5, 16>();
+    __tx_vec_v_fp32_sfu<1, 16, 5>();
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_v2u<0, 0>(uram_addr(ctx_base + kCtxO));
 

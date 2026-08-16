@@ -256,11 +256,11 @@ template <typename Format> static inline void issue_attention_lowp_to_f32(uint64
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(input);
     if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
     } else {
-        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
     }
-    __tx_vec_lsu_v2u<3, 0>(input);
+    __tx_vec_lsu_v2u<0, 3>(input);
     start_vec_block(instructions);
 }
 
@@ -287,7 +287,7 @@ static inline void issue_attention_square_sum(uint64_t input, uint64_t partial, 
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     __tx_vec_shuffle_xor<1, 0>(1);
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(partial);
+    __tx_vec_lsu_v2u<0, 3>(partial);
     start_vec_block(instructions);
 }
 
@@ -311,8 +311,8 @@ static inline void issue_attention_inverse_rms(uint64_t partial, uint64_t invers
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionEpsilon * sizeof(uint32_t));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 4, 0>();
-    __tx_vec_lsu_v2u<3, 0>(inverse);
+    __tx_vec_v_fp32_sfu<0, 0, 4>();
+    __tx_vec_lsu_v2u<0, 3>(inverse);
     start_vec_block(instructions);
 }
 
@@ -334,7 +334,7 @@ static inline void issue_attention_normalize(uint64_t input,
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_u2v_broadcast32<1, 2>(inverse);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output);
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 
@@ -351,19 +351,19 @@ static inline void issue_attention_factors(uint64_t output, uint32_t pair_base) 
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(attention_uram(kAttentionLane));
-    __tx_vec_cvt_fp32_int32<0, 0, 0>();
+    ggml_dayan_vec_detail::vec_cvt_fp32_int32<0, 0, 0>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionPairBase * sizeof(uint32_t));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionThetaScale * sizeof(uint32_t));
-    __tx_vec_v_fp32_sfu<1, 0, 16>();
+    __tx_vec_v_fp32_sfu<1, 16, 0>();
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 1, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionFreqScale * sizeof(uint32_t));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output);
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 
@@ -372,7 +372,7 @@ static inline void emit_attention_axis_select(uint64_t axes, uint64_t axis_value
     __tx_vec_lsu_u2v_broadcast32<1, 1>(axis_value);
     __tx_vec_vv_int32_cmp<16, 17, 0, 0b010>();
     __tx_vec_lsu_u2v_broadcast32<1, 2>(position);
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
 }
 
 static inline void issue_attention_position(uint64_t axes,
@@ -401,8 +401,8 @@ static inline void issue_attention_position(uint64_t axes,
     } else {
         __tx_vec_lsu_u2v_broadcast32<0, 0>(positions);
     }
-    __tx_vec_cvt_fp32_int32<0, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output);
+    ggml_dayan_vec_detail::vec_cvt_fp32_int32<0, 0, 0>();
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 
@@ -418,7 +418,7 @@ static inline void issue_attention_theta(uint64_t position, uint64_t factors, ui
     __tx_vec_lsu_u2v<0, 0>(position);
     __tx_vec_lsu_u2v<1, 1>(factors);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output);
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 
@@ -432,17 +432,17 @@ static inline void issue_attention_sincos(uint64_t theta, uint64_t sine, uint64_
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(theta);
-    __tx_vec_v_fp32_sfu<0, 2, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 2>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionFactor * sizeof(uint32_t));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(sine);
+    __tx_vec_lsu_v2u<0, 3>(sine);
     __tx_vec_lsu_u2v<0, 0>(theta);
-    __tx_vec_v_fp32_sfu<0, 3, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 3>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionFactor * sizeof(uint32_t));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(cosine);
+    __tx_vec_lsu_v2u<0, 3>(cosine);
     start_vec_block(instructions);
 }
 
@@ -466,8 +466,8 @@ static inline void issue_attention_rotation(uint64_t x0,
     __tx_vec_lsu_u2v<1, 1>(x1);
     __tx_vec_lsu_u2v<1, 1>(sine);
     __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
-    __tx_vec_vv_fp32_sub<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output0);
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>(output0);
     __tx_vec_lsu_u2v<0, 0>(x0);
     __tx_vec_lsu_u2v<1, 1>(sine);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
@@ -475,7 +475,7 @@ static inline void issue_attention_rotation(uint64_t x0,
     __tx_vec_lsu_u2v<1, 1>(cosine);
     __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output1);
+    __tx_vec_lsu_v2u<0, 3>(output1);
     start_vec_block(instructions);
 }
 
@@ -799,11 +799,11 @@ template <typename Format> static inline void issue_gated_lowp_to_f32(uint64_t i
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(input);
     if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
     } else {
-        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
     }
-    __tx_vec_lsu_v2u<3, 0>(input);
+    __tx_vec_lsu_v2u<0, 3>(input);
     start_vec_block(instructions);
 }
 

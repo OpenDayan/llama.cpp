@@ -524,11 +524,11 @@ static inline void memory_convert_lowp_to_f32(uint64_t output, uint32_t elements
     begin_vec_block(3);
     __tx_vec_lsu_u2v<0, 0>(output);
     if (type == kDayanDataTypeBF16) {
-        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
     } else {
-        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
     }
-    __tx_vec_lsu_v2u<3, 0>(output);
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(3);
     dayan_wait_vec();
 }

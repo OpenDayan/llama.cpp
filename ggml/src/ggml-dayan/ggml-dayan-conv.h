@@ -143,7 +143,7 @@ static inline void issue_ssm_depthwise_f32(uint64_t input,
         __tx_vec_vv_fp32_mul<1, 16, 0, 0>();
         __tx_vec_vv_fp32_add<0, 16, 1, 0>();
     }
-    __tx_vec_lsu_v2u<3, 0>(output);
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 

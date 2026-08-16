@@ -144,7 +144,7 @@ static inline void emit_rope_axis_select(uint64_t axes, uint64_t axis_value, uin
     __tx_vec_lsu_u2v_broadcast32<1, 1>(axis_value);
     __tx_vec_vv_int32_cmp<16, 17, 0, 0b010>();
     __tx_vec_lsu_u2v_broadcast32<1, 2>(position);
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
 }
 
 static inline void issue_rope_position(uint64_t axes,
@@ -163,8 +163,8 @@ static inline void issue_rope_position(uint64_t axes,
     emit_rope_axis_select(axes, axis_values + 2U * sizeof(uint32_t), positions + 2U * sizeof(int32_t));
     emit_rope_axis_select(axes, axis_values + sizeof(uint32_t), positions + sizeof(int32_t));
     emit_rope_axis_select(axes, axis_values, positions);
-    __tx_vec_cvt_fp32_int32<0, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output);
+    ggml_dayan_vec_detail::vec_cvt_fp32_int32<0, 0, 0>();
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 
@@ -184,9 +184,9 @@ static inline void issue_rope_theta(uint64_t position,
     __tx_vec_lsu_u2v<1, 1>(multiplier);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_u2v<1, 1>(factors);
-    __tx_vec_v_fp32_sfu<1, 5, 16>();
+    __tx_vec_v_fp32_sfu<1, 16, 5>();
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output);
+    __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
 
@@ -203,15 +203,15 @@ static inline void issue_rope_sincos(uint64_t theta,
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(theta);
-    __tx_vec_v_fp32_sfu<0, 2, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 2>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(mscale);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(sine);
+    __tx_vec_lsu_v2u<0, 3>(sine);
     __tx_vec_lsu_u2v<0, 0>(theta);
-    __tx_vec_v_fp32_sfu<0, 3, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 3>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(mscale);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(cosine);
+    __tx_vec_lsu_v2u<0, 3>(cosine);
     start_vec_block(instructions);
 }
 
@@ -235,8 +235,8 @@ static inline void issue_rope_rotation(uint64_t x0,
     __tx_vec_lsu_u2v<1, 1>(x1);
     __tx_vec_lsu_u2v<1, 1>(sine);
     __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
-    __tx_vec_vv_fp32_sub<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output0);
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>(output0);
     __tx_vec_lsu_u2v<0, 0>(x0);
     __tx_vec_lsu_u2v<1, 1>(sine);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
@@ -244,7 +244,7 @@ static inline void issue_rope_rotation(uint64_t x0,
     __tx_vec_lsu_u2v<1, 1>(cosine);
     __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<3, 0>(output1);
+    __tx_vec_lsu_v2u<0, 3>(output1);
     start_vec_block(instructions);
 }
 
