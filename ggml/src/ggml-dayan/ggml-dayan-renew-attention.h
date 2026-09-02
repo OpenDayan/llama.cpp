@@ -401,10 +401,10 @@ static inline void issue_online_softmax(long ctx_base, uint32_t scale_bits) {
     __tx_vec_lsu_v2u_mask<stored_m_offset, 2, 6>(uram_addr(ctx_base + kCtxM));
 
     ConvertP0();
-    __tx_vec_shuffle_compress<0, 0>(1);
+    __tx_vec_shuffle_compress<0, 0>(0);
     __tx_vec_lsu_v2u_mask<0, 1, 7>(uram_addr(ctx_base + kCtxP));
     ConvertP1();
-    __tx_vec_shuffle_compress<1, 16>(1);
+    __tx_vec_shuffle_compress<1, 16>(0);
     __tx_vec_lsu_v2u_mask<16, 1, 7>(uram_addr(ctx_base + kCtxP + kLowpChunkBytes));
 
     emit_sum_q0<5>();

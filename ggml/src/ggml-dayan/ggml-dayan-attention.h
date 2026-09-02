@@ -29,8 +29,7 @@ enum : uint64_t {
     kAttentionCosine     = kAttentionSine + kAttentionPairBytes,
     kAttentionOutput0    = kAttentionCosine + kAttentionPairBytes,
     kAttentionOutput1    = kAttentionOutput0 + kAttentionPairBytes,
-    kAttentionLane       = kAttentionOutput1 + kAttentionPairBytes,
-    kAttentionAxes       = kAttentionLane + Constants::kVecBytes,
+    kAttentionAxes       = kAttentionOutput1 + kAttentionPairBytes,
     kAttentionPartial    = kAttentionAxes + kAttentionPairBytes,
     kAttentionPositions  = kAttentionPartial + kAttentionFloatBytes,
     kAttentionConstants  = kAttentionPositions + Constants::kVecBytes,
@@ -39,14 +38,9 @@ enum : uint64_t {
 
 enum AttentionConstant : uint32_t {
     kAttentionEpsilon,
-    kAttentionInvHeadDim,
     kAttentionThetaScale,
     kAttentionFreqScale,
     kAttentionFactor,
-    kAttentionPairBase,
-    kAttentionAxis0,
-    kAttentionAxis1,
-    kAttentionAxis2,
 };
 
 static_assert(kAttentionEnd <= MATMUL_DAYAN_1C_URAM_BYTES, "Attention scratch exceeds kernel URAM");
@@ -218,15 +212,6 @@ static inline void attention_initialize_constants(const DayanAttentionProjection
     constants[kAttentionThetaScale] = config->theta_scale_bits;
     constants[kAttentionFreqScale]  = config->freq_scale_bits;
     constants[kAttentionFactor]     = config->attn_factor_bits;
-    values[kAttentionInvHeadDim]    = 1.0f / (float) config->head_dim;
-    constants[kAttentionAxis0]      = 0;
-    constants[kAttentionAxis1]      = 1;
-    constants[kAttentionAxis2]      = 2;
-
-    int32_t * lane = attention_uram_pointer<int32_t>(kAttentionLane);
-    for (uint32_t index = 0; index < Constants::kVecLanes; ++index) {
-        lane[index] = (int32_t) index;
-    }
 
     const int32_t section_count = config->sections[0] + config->sections[1] + config->sections[2] + config->sections[3];
     int32_t *     axes          = attention_uram_pointer<int32_t>(kAttentionAxes);
@@ -240,80 +225,42 @@ static inline void attention_initialize_constants(const DayanAttentionProjection
         }
         axes[pair] = axis;
     }
-    dayan_cache_flush(lane, Constants::kVecBytes);
+    float * factors      = attention_uram_pointer<float>(kAttentionFactors);
+    float   theta_factor = 1.0f;
+    for (uint32_t pair = 0; pair < config->n_rot / 2U; ++pair) {
+        factors[pair] = theta_factor * values[kAttentionFreqScale];
+        theta_factor *= values[kAttentionThetaScale];
+    }
     dayan_cache_flush(axes, kAttentionPairBytes);
+    dayan_cache_flush(factors, kAttentionPairBytes);
     dayan_cache_flush(constants, Constants::kVecBytes);
 }
 
-template <typename Format> static inline void issue_attention_lowp_to_f32(uint64_t input, uint32_t chunks) {
-    constexpr long instructions = 3;
-
-    ggml_dayan_vec_detail::configure_vec_grid(chunks);
-    configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(input);
+template <typename Format>
+static inline void issue_attention_lowp_to_f32(uint64_t output, uint64_t input, uint32_t elements) {
+    ggml_dayan_vec_detail::configure_f32_iterators();
     if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
+        ggml_dayan_vec_detail::issue_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(output, input, elements);
     } else {
-        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+        ggml_dayan_vec_detail::issue_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(output, input, elements);
     }
-    __tx_vec_lsu_v2u<0, 3>(input);
-    start_vec_block(instructions);
 }
 
-static inline void issue_attention_square_sum(uint64_t input, uint64_t partial, uint32_t chunks) {
-    constexpr long instructions = 15;
-
-    ggml_dayan_vec_detail::configure_vec_grid(chunks);
-    configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(input);
-    __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
-    __tx_vec_shuffle_xor<1, 0>(32);
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_shuffle_xor<1, 0>(16);
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_shuffle_xor<1, 0>(8);
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_shuffle_xor<1, 0>(4);
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_shuffle_xor<1, 0>(2);
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_shuffle_xor<1, 0>(1);
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(partial);
-    start_vec_block(instructions);
+static inline void issue_attention_square_sum(uint64_t input, uint64_t square, uint64_t partial, uint32_t chunks) {
+    const uint32_t elements = chunks * Constants::kVecLanes;
+    ggml_dayan_vec_detail::f32_mul(square, input, input, elements);
+    ggml_dayan_vec_detail::f32_reduce_sum(partial, square, elements);
 }
 
-static inline void issue_attention_inverse_rms(uint64_t partial, uint64_t inverse, uint32_t chunks) {
-    const long instructions = 7 + 2 * (chunks - 1U);
-
-    ggml_dayan_vec_detail::configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(partial);
-    for (uint32_t chunk = 1; chunk < chunks; ++chunk) {
-        __tx_vec_lsu_u2v<1, 1>(partial + (uint64_t) chunk * Constants::kVecBytes);
-        __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    }
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionInvHeadDim * sizeof(uint32_t));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionEpsilon * sizeof(uint32_t));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 0, 4>();
-    __tx_vec_lsu_v2u<0, 3>(inverse);
-    start_vec_block(instructions);
+static inline void issue_attention_inverse_rms(uint64_t partial, uint64_t inverse, uint32_t head_dim) {
+    const uint64_t divisor = attention_uram(kAttentionPosition);
+    ggml_dayan_vec_detail::f32_int32_scalar(divisor, head_dim);
+    ggml_dayan_vec_detail::f32_div(inverse, partial, divisor, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_scalar_add_bits(
+        inverse, attention_uram_pointer<uint32_t>(kAttentionConstants)[kAttentionEpsilon], inverse,
+        Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 4>>(
+        inverse, inverse, Constants::kVecLanes);
 }
 
 static inline void issue_attention_normalize(uint64_t input,
@@ -338,72 +285,21 @@ static inline void issue_attention_normalize(uint64_t input,
     start_vec_block(instructions);
 }
 
-static inline void issue_attention_factors(uint64_t output, uint32_t pair_base) {
-    constexpr long instructions = 11;
-    float *        constants    = attention_uram_pointer<float>(kAttentionConstants);
-    constants[kAttentionPairBase] = (float) pair_base;
-    dayan_cache_flush(constants, Constants::kVecBytes);
-
-    ggml_dayan_vec_detail::configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(attention_uram(kAttentionLane));
-    __tx_vec_cvt_fp32_int32<0, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionPairBase * sizeof(uint32_t));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionThetaScale * sizeof(uint32_t));
-    __tx_vec_v_fp32_sfu<1, 16, 0>();
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 0, 1>();
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionFreqScale * sizeof(uint32_t));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(output);
-    start_vec_block(instructions);
-}
-
-static inline void emit_attention_axis_select(uint64_t axes, uint64_t axis_value, uint64_t position) {
-    __tx_vec_lsu_u2v<1, 0>(axes);
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(axis_value);
-    __tx_vec_vv_int32_cmp<16, 17, 0, 0b010>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(position);
-    __tx_vec_vv_mux2<0, 0, 16, 0>();
-}
-
-static inline void issue_attention_position(uint64_t axes,
-                                            uint64_t positions,
-                                            uint64_t output,
-                                            bool mrope) {
-    const long instructions = mrope ? 18 : 3;
-
-    ggml_dayan_vec_detail::configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
-    begin_vec_block(instructions);
-    if (mrope) {
-        __tx_vec_lsu_u2v_broadcast32<0, 0>(positions + 3U * sizeof(int32_t));
-        emit_attention_axis_select(axes, attention_uram(kAttentionConstants) +
-                                             kAttentionAxis2 * sizeof(uint32_t),
-                                   positions + 2U * sizeof(int32_t));
-        emit_attention_axis_select(axes, attention_uram(kAttentionConstants) +
-                                             kAttentionAxis1 * sizeof(uint32_t),
-                                   positions + sizeof(int32_t));
-        emit_attention_axis_select(axes, attention_uram(kAttentionConstants) +
-                                             kAttentionAxis0 * sizeof(uint32_t),
-                                   positions);
-    } else {
-        __tx_vec_lsu_u2v_broadcast32<0, 0>(positions);
+static inline void attention_select_positions(const DayanAttentionProjectionConfig * config,
+                                              uint32_t                               pair_base,
+                                              uint32_t                               pair_count) {
+    const int32_t * axes      = attention_uram_pointer<int32_t>(kAttentionAxes);
+    const int32_t * positions = attention_uram_pointer<int32_t>(kAttentionPositions);
+    float *         output    = attention_uram_pointer<float>(kAttentionPosition);
+    dayan_cache_invalidate(positions, Constants::kVecBytes);
+    for (uint32_t pair = 0; pair < pair_count; ++pair) {
+        const uint32_t axis = config->rope_mode == 8U ? (uint32_t) axes[pair_base + pair] : 0U;
+        output[pair]        = (float) positions[axis];
     }
-    __tx_vec_cvt_fp32_int32<0, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(output);
-    start_vec_block(instructions);
+    for (uint32_t pair = pair_count; pair < Constants::kVecLanes; ++pair) {
+        output[pair] = 0.0f;
+    }
+    dayan_cache_flush(output, Constants::kVecBytes);
 }
 
 static inline void issue_attention_theta(uint64_t position, uint64_t factors, uint64_t output) {
@@ -423,27 +319,11 @@ static inline void issue_attention_theta(uint64_t position, uint64_t factors, ui
 }
 
 static inline void issue_attention_sincos(uint64_t theta, uint64_t sine, uint64_t cosine) {
-    constexpr long instructions = 10;
-
-    ggml_dayan_vec_detail::configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(theta);
-    __tx_vec_v_fp32_sfu<0, 0, 2>();
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionFactor * sizeof(uint32_t));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(sine);
-    __tx_vec_lsu_u2v<0, 0>(theta);
-    __tx_vec_v_fp32_sfu<0, 0, 3>();
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
-                                        kAttentionFactor * sizeof(uint32_t));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(cosine);
-    start_vec_block(instructions);
+    const uint32_t factor_bits = attention_uram_pointer<uint32_t>(kAttentionConstants)[kAttentionFactor];
+    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 2>>(sine, theta, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_scalar_mul_bits(sine, factor_bits, sine, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 3>>(cosine, theta, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_scalar_mul_bits(cosine, factor_bits, cosine, Constants::kVecLanes);
 }
 
 static inline void issue_attention_rotation(uint64_t x0,
@@ -517,35 +397,25 @@ static inline void postprocess_attention_head(const DayanAttentionProjectionConf
                                               const uint16_t *                       source,
                                               uint16_t *                             destination) {
     const uint32_t chunks = (config->head_dim + Constants::kVecLanes - 1U) / Constants::kVecLanes;
-    configure_attention_lsu<0>(config->head_dim, sizeof(uint16_t), sizeof(float), sizeof(uint16_t), sizeof(float));
-    __tx_lsu_dma_d2u<0>(attention_uram(kAttentionRaw), reinterpret_cast<uint64_t>(source));
-    dayan_wait_lsu();
-    issue_attention_lowp_to_f32<Format>(attention_uram(kAttentionRaw), chunks);
-    dayan_wait_vec();
-    issue_attention_square_sum(attention_uram(kAttentionRaw), attention_uram(kAttentionPartial), chunks);
-    dayan_wait_vec();
-    issue_attention_inverse_rms(attention_uram(kAttentionPartial), attention_uram(kAttentionPartial), chunks);
-    dayan_wait_vec();
+    attention_load_bytes(attention_uram(kAttentionLowp), source, config->head_dim * sizeof(uint16_t));
+    issue_attention_lowp_to_f32<Format>(attention_uram(kAttentionRaw), attention_uram(kAttentionLowp), config->head_dim);
+    issue_attention_square_sum(attention_uram(kAttentionRaw), attention_uram(kAttentionNormalized),
+                               attention_uram(kAttentionPartial), chunks);
+    issue_attention_inverse_rms(attention_uram(kAttentionPartial), attention_uram(kAttentionPartial), config->head_dim);
     issue_attention_normalize(attention_uram(kAttentionRaw), attention_uram(kAttentionNorm),
                               attention_uram(kAttentionPartial), attention_uram(kAttentionNormalized), chunks);
     dayan_wait_vec();
-
     const uint32_t half = config->n_rot / 2U;
     for (uint32_t pair_base = 0; pair_base < half; pair_base += Constants::kVecLanes) {
         const uint32_t pair_count =
             half - pair_base < Constants::kVecLanes ? half - pair_base : Constants::kVecLanes;
-        issue_attention_factors(attention_uram(kAttentionFactors), pair_base);
-        dayan_wait_vec();
-        issue_attention_position(attention_uram(kAttentionAxes) + (uint64_t) pair_base * sizeof(int32_t),
-                                 attention_uram(kAttentionPositions), attention_uram(kAttentionPosition),
-                                 config->rope_mode == 8U);
-        dayan_wait_vec();
-        issue_attention_theta(attention_uram(kAttentionPosition), attention_uram(kAttentionFactors),
+        attention_select_positions(config, pair_base, pair_count);
+        issue_attention_theta(attention_uram(kAttentionPosition),
+                              attention_uram(kAttentionFactors) + (uint64_t) pair_base * sizeof(float),
                               attention_uram(kAttentionTheta));
         dayan_wait_vec();
         issue_attention_sincos(attention_uram(kAttentionTheta), attention_uram(kAttentionSine),
                                attention_uram(kAttentionCosine));
-        dayan_wait_vec();
 
         if (config->rope_mode == 0U) {
             attention_copy_uram_pair(attention_uram(kAttentionX0),
@@ -844,15 +714,35 @@ struct GatedInputContext {
 
 enum : uint64_t {
     kGatedInputMatrixBytes  = Constants::kTileM * Constants::kTileK * sizeof(float),
-    kGatedInputScratchBytes = 2 * kGatedInputMatrixBytes + Constants::kConstantStride,
+    kGatedInputScratchBytes = 2 * kGatedInputMatrixBytes,
 };
+
+static inline void issue_gated_sigmoid_mul(const ggml_dayan_vec_detail::F32Tensor & gate,
+                                           const ggml_dayan_vec_detail::F32Tensor & value,
+                                           const ggml_dayan_vec_detail::F32Tensor & output,
+                                           long                                     rows,
+                                           long                                     columns) {
+    constexpr long instructions = 10;
+    ggml_dayan_vec_detail::configure_activation(gate, value, output, rows, columns);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>(gate.address);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) ggml_dayan_vec_detail::f32_bits(-1.4426950408889634f));
+    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) ggml_dayan_vec_detail::f32_bits(1.0f));
+    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 5>();
+    __tx_vec_lsu_u2v<1, 1>(value.address);
+    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_lsu_v2u<0, 3>(output.address);
+    start_vec_block(instructions);
+}
 
 template <typename Format, void (*Convert)()> static int load_gated_input(const MatmulInputArgs * args) {
     const GatedInputContext *          context        = (const GatedInputContext *) args->context;
     const DayanGatedProjectionConfig * config         = context->config;
     const uint64_t                     attention_uram = args->scratch;
     const uint64_t                     gate_uram      = attention_uram + kGatedInputMatrixBytes;
-    const uint64_t                     constants      = gate_uram + kGatedInputMatrixBytes;
     const uint64_t                     packed_gate    = args->output;
     const uint32_t                     width          = config->heads * config->head_dim;
     const uint32_t                     heads          = args->cols / config->head_dim;
@@ -860,9 +750,6 @@ template <typename Format, void (*Convert)()> static int load_gated_input(const 
     const uint64_t                     attention_base = (uint64_t) args->row_base * width + args->k_base;
     const uint64_t                     gate_base =
         (uint64_t) args->row_base * 2U * width + first_head * 2U * config->head_dim + config->head_dim;
-
-    *(volatile float *) (uintptr_t) constants                   = -1.4426950408889634f;
-    *(volatile float *) (uintptr_t) (constants + sizeof(float)) = 1.0f;
 
     long checksum = 0;
     set_lsu_matrix<Constants::kLsuShared>(checksum, Constants::kTileM, Constants::kTileK * (int) sizeof(float),
@@ -879,11 +766,9 @@ template <typename Format, void (*Convert)()> static int load_gated_input(const 
     configure_gated_packed_to_f32(Constants::kTileK * sizeof(uint16_t), Constants::kTileK * sizeof(float));
     issue_gated_packed_to_f32<Convert>(gate_uram, packed_gate, args->rows, args->cols);
     dayan_wait_vec();
-    ggml_dayan_vec_detail::issue_sigmoid_mul({ gate_uram, Constants::kTileK * (int) sizeof(float) },
-                                             { attention_uram, Constants::kTileK * (int) sizeof(float) },
-                                             { attention_uram, Constants::kTileK * (int) sizeof(float) },
-                                             { constants, constants + sizeof(float), 0, 0, 0, 0, 0 }, args->rows,
-                                             args->cols);
+    issue_gated_sigmoid_mul({ gate_uram, Constants::kTileK * (int) sizeof(float) },
+                            { attention_uram, Constants::kTileK * (int) sizeof(float) },
+                            { attention_uram, Constants::kTileK * (int) sizeof(float) }, args->rows, args->cols);
     dayan_wait_vec();
     convert_gated_f32_to_lowp<Format>(attention_uram, args->output, args->rows, args->cols);
     return 0;

@@ -253,8 +253,8 @@ static inline void issue_rope_interleaved(uint64_t values,
     constexpr long instructions = 39;
     begin_vec_block(instructions);
     emit_rope_common(axes, positions, multiplier, factors, mscale_bits);
-    __tx_vec_shuffle_compress<0, 0>(33);
-    __tx_vec_shuffle_compress<1, 16>(33);
+    __tx_vec_shuffle_compress<0, 0>(32);
+    __tx_vec_shuffle_compress<1, 16>(32);
     __tx_vec_lsu_u2v<0, 0>(values);
     __tx_vec_shuffle_xor<1, 0>(1);
     __tx_vec_vv_fp32_mul<0, 0, 17, 0>();

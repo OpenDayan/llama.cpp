@@ -615,7 +615,7 @@ static inline void convert_f32_to_lowp(const F32Tensor &  input,
         static_assert(MatDataType == BaseNPUInstBuilder::DT_FP16, "Unsupported low-precision VEC type");
         __tx_vec_cvt_fp16_fp32<0, 0, 0>();
     }
-    __tx_vec_shuffle_compress<0, 0>(1);
+    __tx_vec_shuffle_compress<0, 0>(0);
     __tx_vec_lsu_v2u<0, 1>(scratch.address);
     start_vec_block(kInstructions);
     dayan_wait_vec();

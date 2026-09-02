@@ -1,6 +1,6 @@
 # Dayan backend
 
-The backend supports contiguous two-dimensional `GGML_OP_MUL_MAT` with BF16 or FP16 weights. Activations are stored with the same type as the weights, matrix accumulation uses F32, and an unfused matrix multiplication returns the F32 result required by ggml.
+The backend supports contiguous `GGML_OP_MUL_MAT` with BF16 or FP16 weights, including broadcastable `ne2` and `ne3` batches. Activations are stored with the same type as the weights, matrix accumulation uses F32, and an unfused matrix multiplication returns the F32 result required by ggml.
 
 Before scheduling a llama graph, the backend rewrite inserts one matching BF16 or FP16 `CPY` for each unique F32 activation used by an eligible matrix multiplication. Matrix multiplications that share an activation and storage type also share the cast tensor. Direct ggml users that do not run the rewrite can still provide F32 activations; the Dayan graph executor converts each unique activation once.
 
@@ -69,4 +69,4 @@ The MoE smoke test covers 512 experts, a narrow `ARGSORT` view, `TOP_K`, fused B
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-moe
 ```
 
-The current matrix kernel uses one consumer slice because repeated fused launches can deadlock with the three-slice cmodel pipeline. It also requires the weight row count to be a multiple of 16. Batched ordinary matrix multiplication, arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention has native BF16 and FP16 entries and requires Q/K/V to share one storage type. Full-model inference requires enough Device memory for all persistent weights and graph arenas; `run_cmodel_server.sh` defaults to a 4096 MiB memory window. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.
+The current matrix kernel uses one consumer slice because repeated fused launches can deadlock with the three-slice cmodel pipeline. It also requires the weight row count to be a multiple of 16. Arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention has native BF16 and FP16 entries and requires Q/K/V to share one storage type. Full-model inference requires enough Device memory for all persistent weights and graph arenas; `run_cmodel_server.sh` defaults to a 4096 MiB memory window. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.

@@ -233,6 +233,485 @@ static size_t ggml_backend_dayan_slot_outputs(const ggml_backend_dayan_graph_slo
     }
 }
 
+struct ggml_backend_dayan_slot_implementation {
+    const char * executor;
+    const char * launch_name;
+    const char * kernel;
+    const char * task_mode;
+    uint32_t     task_dim_x;
+};
+
+static ggml_backend_dayan_slot_implementation
+ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot & slot) {
+    const bool four_core = slot.kind == ggml_backend_dayan_slot_kind::mul_mat ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_silu ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_quantized ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_pair ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_swiglu ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_geglu ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_pair ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_swiglu ||
+                           slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_geglu ||
+                           slot.kind == ggml_backend_dayan_slot_kind::gated_output_projection;
+    ggml_backend_dayan_slot_implementation result = {
+        "unknown", "unknown", "unknown", four_core ? "four-core" : "single-core",
+        four_core ? 4U : kDayanNativeMaxTasks,
+    };
+    const ggml_tensor * node = slot.nodes[0];
+
+    switch (slot.kind) {
+        case ggml_backend_dayan_slot_kind::mul_mat:
+        case ggml_backend_dayan_slot_kind::mul_mat_silu: {
+            const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
+            const bool silu = slot.kind == ggml_backend_dayan_slot_kind::mul_mat_silu;
+            result.executor = "ggml_backend_dayan_mul_mat";
+            result.launch_name = silu ? "ggml-mm-silu" : "ggml-mul-mat";
+            result.kernel = silu ? (bf16 ? "matmul_silu_bf16_4c" : "matmul_silu_fp16_4c") :
+                                   (bf16 ? "matmul_bf16_4c" : "matmul_fp16_4c");
+        } break;
+        case ggml_backend_dayan_slot_kind::mul_mat_quantized: {
+            const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
+            result.executor    = "ggml_backend_dayan_mul_mat_quantized";
+            result.launch_name = "ggml-mm-lowp";
+            result.kernel      = bf16 ? "matmul_quantized_bf16_4c" : "matmul_quantized_fp16_4c";
+        } break;
+        case ggml_backend_dayan_slot_kind::mul_mat_pair: {
+            const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
+            result.executor    = "ggml_backend_dayan_mul_mat_pair";
+            result.launch_name = "ggml-mm-pair";
+            result.kernel      = bf16 ? "matmul_pair_bf16_4c" : "matmul_pair_fp16_4c";
+        } break;
+        case ggml_backend_dayan_slot_kind::mul_mat_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_geglu: {
+            const bool bf16    = node->src[0]->type == GGML_TYPE_BF16;
+            const bool swiglu  = slot.kind == ggml_backend_dayan_slot_kind::mul_mat_swiglu;
+            result.executor    = "ggml_backend_dayan_mul_mat_glu";
+            result.launch_name = swiglu ? "ggml-swiglu" : "ggml-geglu";
+            result.kernel      = swiglu ? (bf16 ? "matmul_swiglu_bf16_4c" : "matmul_swiglu_fp16_4c") :
+                                          (bf16 ? "matmul_geglu_bf16_4c" : "matmul_geglu_fp16_4c");
+        } break;
+        case ggml_backend_dayan_slot_kind::mul_mat_id: {
+            const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
+            result.executor    = "ggml_backend_dayan_mul_mat_id";
+            result.launch_name = "ggml-mul-mat-id";
+            result.kernel      = bf16 ? "mul_mat_id_bf16_4c" : "mul_mat_id_fp16_4c";
+        } break;
+        case ggml_backend_dayan_slot_kind::mul_mat_id_pair: {
+            const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
+            result.executor    = "ggml_backend_dayan_mul_mat_id_pair";
+            result.launch_name = "ggml-moe-pair";
+            result.kernel      = bf16 ? "mul_mat_id_pair_bf16_4c" : "mul_mat_id_pair_fp16_4c";
+        } break;
+        case ggml_backend_dayan_slot_kind::mul_mat_id_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_geglu: {
+            const bool bf16    = node->src[0]->type == GGML_TYPE_BF16;
+            const bool swiglu  = slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_swiglu;
+            result.executor    = "ggml_backend_dayan_mul_mat_id_glu";
+            result.launch_name = swiglu ? "ggml-moe-swiglu" : "ggml-moe-geglu";
+            result.kernel      = swiglu ? (bf16 ? "mul_mat_id_swiglu_bf16_4c" : "mul_mat_id_swiglu_fp16_4c") :
+                                          (bf16 ? "mul_mat_id_geglu_bf16_4c" : "mul_mat_id_geglu_fp16_4c");
+        } break;
+        case ggml_backend_dayan_slot_kind::add_id:
+            result = { "ggml_backend_dayan_add_id", "ggml-add-id", "add_id_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::argsort:
+            result = { "ggml_backend_dayan_sort", "ggml-argsort", "argsort_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::top_k:
+            result = { "ggml_backend_dayan_sort", "ggml-top-k", "top_k_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::elementwise_add:
+            result = { "ggml_backend_dayan_elementwise_binary", "elementwise-add", "elementwise_add_f32_1c",
+                       "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::elementwise_mul:
+            result = { "ggml_backend_dayan_elementwise_binary", "elementwise-mul", "elementwise_mul_f32_1c",
+                       "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::elementwise_sub:
+            result = { "ggml_backend_dayan_elementwise_binary", "elementwise-sub", "elementwise_sub_f32_1c",
+                       "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::elementwise_div:
+            result = { "ggml_backend_dayan_elementwise_binary", "elementwise-div", "elementwise_div_f32_1c",
+                       "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::scale:
+            result = { "ggml_backend_dayan_scale", "scale", "scale_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::sigmoid:
+            result = { "ggml_backend_dayan_unary", "sigmoid", "sigmoid_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::silu:
+            result = { "ggml_backend_dayan_unary", "silu", "silu_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::softplus:
+            result = { "ggml_backend_dayan_unary", "softplus", "softplus_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::unary_math:
+            result.executor = "ggml_backend_dayan_unary";
+            if (node->op == GGML_OP_SQR) {
+                result.launch_name = "square";
+                result.kernel      = "square_f32_1c";
+            } else if (node->op == GGML_OP_SQRT) {
+                result.launch_name = "sqrt";
+                result.kernel      = "sqrt_f32_1c";
+            } else if (node->op == GGML_OP_LOG) {
+                result.launch_name = "log";
+                result.kernel      = "log_f32_1c";
+            } else if (node->op == GGML_OP_SIN) {
+                result.launch_name = "sin";
+                result.kernel      = "sin_f32_1c";
+            } else if (node->op == GGML_OP_COS) {
+                result.launch_name = "cos";
+                result.kernel      = "cos_f32_1c";
+            } else if (node->op == GGML_OP_UNARY) {
+                switch (ggml_get_unary_op(node)) {
+                    case GGML_UNARY_OP_ABS:
+                        result.launch_name = "abs";
+                        result.kernel      = "abs_f32_1c";
+                        break;
+                    case GGML_UNARY_OP_NEG:
+                        result.launch_name = "neg";
+                        result.kernel      = "neg_f32_1c";
+                        break;
+                    case GGML_UNARY_OP_TANH:
+                        result.launch_name = "tanh";
+                        result.kernel      = "tanh_f32_1c";
+                        break;
+                    case GGML_UNARY_OP_RELU:
+                        result.launch_name = "relu";
+                        result.kernel      = "relu_f32_1c";
+                        break;
+                    case GGML_UNARY_OP_GELU:
+                        result.launch_name = "gelu";
+                        result.kernel      = "gelu_f32_1c";
+                        break;
+                    case GGML_UNARY_OP_GELU_QUICK:
+                        result.launch_name = "gelu-quick";
+                        result.kernel      = "gelu_quick_f32_1c";
+                        break;
+                    case GGML_UNARY_OP_EXP:
+                        result.launch_name = "exp";
+                        result.kernel      = "exp_f32_1c";
+                        break;
+                    default:
+                        break;
+                }
+            }
+            break;
+        case ggml_backend_dayan_slot_kind::sum:
+            result = { "ggml_backend_dayan_reduce", "sum", "sum_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::sum_rows:
+            result = { "ggml_backend_dayan_reduce", "sum-rows", "sum_rows_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::mean:
+            result = { "ggml_backend_dayan_reduce", "mean", "mean_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::l2_norm:
+            result = { "ggml_backend_dayan_l2_norm", "l2-norm", "l2_norm_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::get_rows:
+            result = { "ggml_backend_dayan_get_rows", "get-rows", "get_rows_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::set_rows:
+            result = { "ggml_backend_dayan_set_rows", "set-rows", "set_rows_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::copy:
+            result = { "ggml_backend_dayan_copy_tensor", "copy", "copy_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::repeat:
+            result = { "ggml_backend_dayan_repeat", "repeat", "repeat_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::set:
+            result = { "ggml_backend_dayan_set", "set", "set_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::diag:
+            result = { "ggml_backend_dayan_layout", "diag", "diag_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::diag_mask_inf:
+            result = { "ggml_backend_dayan_layout", "diag-mask-inf", "diag_mask_inf_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::diag_mask_zero:
+            result = { "ggml_backend_dayan_layout", "diag-mask-zero", "diag_mask_zero_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::pad:
+            result = { "ggml_backend_dayan_layout", "pad", "pad_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::pad_circular:
+            result = { "ggml_backend_dayan_layout", "pad-circular", "pad_circular_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::pad_reflect_1d:
+            result = { "ggml_backend_dayan_layout", "pad-reflect-1d", "pad_reflect_1d_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::roll:
+            result = { "ggml_backend_dayan_layout", "roll", "roll_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::clamp:
+            result = { "ggml_backend_dayan_clamp", "clamp", "clamp_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::softmax:
+            result = { "ggml_backend_dayan_softmax", "softmax", "softmax_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::concat:
+            result = { "ggml_backend_dayan_concat", "concat", "concat_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::rope:
+            result = { "ggml_backend_dayan_rope", "rope", "rope_f32_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::residual_add:
+            result.executor    = "ggml_backend_dayan_residual_add";
+            result.launch_name = "residual-add";
+            result.kernel      = node->type == GGML_TYPE_F32 ? "residual_add_f32_1c" :
+                                 node->type == GGML_TYPE_BF16 ? "residual_add_bf16_1c" :
+                                                               "residual_add_fp16_1c";
+            break;
+        case ggml_backend_dayan_slot_kind::rms_norm:
+            result = { "ggml_backend_dayan_norm_raw", "rms-norm", "rms_norm_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::norm:
+            result = { "ggml_backend_dayan_norm_raw", "norm", "norm_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::group_norm:
+            result = { "ggml_backend_dayan_group_norm", "group-norm", "group_norm_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::norm_pipeline:
+            result = { "ggml_backend_dayan_norm_pipeline", slot.nodes[0] != nullptr ? "add-rms" : "rms-scale",
+                       "rms_norm_pipeline_1c", "single-core", kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::flash_attention: {
+            const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
+            result = { "ggml_backend_dayan_flash_attention", bf16 ? "renew-attn-bf16" : "renew-attn-fp16",
+                       bf16 ? "renew_attention_bf16_1c" : "renew_attention_fp16_1c", "single-core",
+                       kDayanNativeMaxTasks };
+        } break;
+        case ggml_backend_dayan_slot_kind::gated_delta_net:
+            result = { "ggml_backend_dayan_gated_delta_net", "ggml-gdn", "gated_delta_net_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+        case ggml_backend_dayan_slot_kind::gated_output_projection: {
+            const ggml_tensor * projection = slot.nodes[2];
+            const ggml_tensor * qg         = slot.nodes[3];
+            const bool          bf16       = projection->src[0]->type == GGML_TYPE_BF16;
+            result.executor                 = "ggml_backend_dayan_gated_output_projection";
+            result.launch_name              = "gate-out";
+            if (qg->type == GGML_TYPE_F32) {
+                result.kernel = bf16 ? "project_gated_output_f32_gate_bf16_4c" :
+                                       "project_gated_output_f32_gate_fp16_4c";
+            } else {
+                result.kernel = bf16 ? "project_gated_output_bf16_4c" : "project_gated_output_fp16_4c";
+            }
+        } break;
+        case ggml_backend_dayan_slot_kind::ssm_conv:
+        case ggml_backend_dayan_slot_kind::ssm_conv_silu:
+            result = { "ggml_backend_dayan_ssm_conv", "ssm-conv", "ssm_conv_f32_1c", "single-core",
+                       kDayanNativeMaxTasks };
+            break;
+    }
+    return result;
+}
+
+static void ggml_backend_dayan_plan_add_input(ggml_backend_dayan_graph_plan_slot * result,
+                                               const ggml_tensor *                  tensor,
+                                               const char *                         role) {
+    if (tensor == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < result->input_count; ++i) {
+        if (result->inputs[i] == tensor) {
+            return;
+        }
+    }
+    GGML_ASSERT(result->input_count < GGML_DAYAN_GRAPH_PLAN_MAX_INPUTS);
+    result->inputs[result->input_count]      = tensor;
+    result->input_roles[result->input_count] = role;
+    ++result->input_count;
+}
+
+static const ggml_tensor * ggml_backend_dayan_norm_scale(const ggml_tensor * mul, const ggml_tensor * rms);
+
+static void ggml_backend_dayan_slot_inputs(const ggml_backend_dayan_graph_slot & slot,
+                                           ggml_backend_dayan_graph_plan_slot *   result) {
+    ggml_tensor * node = slot.nodes[0];
+    switch (slot.kind) {
+        case ggml_backend_dayan_slot_kind::mul_mat:
+        case ggml_backend_dayan_slot_kind::mul_mat_silu:
+        case ggml_backend_dayan_slot_kind::mul_mat_quantized:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "weight");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "activation");
+            break;
+        case ggml_backend_dayan_slot_kind::mul_mat_pair:
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[0], "weight-0");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[1]->src[0], "weight-1");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[1], "activation");
+            break;
+        case ggml_backend_dayan_slot_kind::mul_mat_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_geglu:
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[0], "gate-weight");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[1]->src[0], "up-weight");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[1], "activation");
+            break;
+        case ggml_backend_dayan_slot_kind::mul_mat_id:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "weight");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "activation");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "expert-ids");
+            break;
+        case ggml_backend_dayan_slot_kind::mul_mat_id_pair:
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[0], "weight-0");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[1]->src[0], "weight-1");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[1], "activation");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[2], "expert-ids");
+            break;
+        case ggml_backend_dayan_slot_kind::mul_mat_id_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_geglu:
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[0], "gate-weight");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[1]->src[0], "up-weight");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[1], "activation");
+            ggml_backend_dayan_plan_add_input(result, slot.nodes[0]->src[2], "expert-ids");
+            break;
+        case ggml_backend_dayan_slot_kind::add_id:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "bias");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "expert-ids");
+            break;
+        case ggml_backend_dayan_slot_kind::elementwise_add:
+        case ggml_backend_dayan_slot_kind::elementwise_mul:
+        case ggml_backend_dayan_slot_kind::elementwise_sub:
+        case ggml_backend_dayan_slot_kind::elementwise_div:
+        case ggml_backend_dayan_slot_kind::concat:
+        case ggml_backend_dayan_slot_kind::residual_add:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "left");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "right");
+            break;
+        case ggml_backend_dayan_slot_kind::get_rows:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "source");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "indices");
+            break;
+        case ggml_backend_dayan_slot_kind::set_rows:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "source");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "indices");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "base");
+            break;
+        case ggml_backend_dayan_slot_kind::set:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "base");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "source");
+            break;
+        case ggml_backend_dayan_slot_kind::softmax:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "mask");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "sinks");
+            break;
+        case ggml_backend_dayan_slot_kind::rope:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "positions");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "factors");
+            break;
+        case ggml_backend_dayan_slot_kind::norm_pipeline: {
+            ggml_tensor * add    = slot.nodes[0];
+            ggml_tensor * rms    = slot.nodes[1];
+            ggml_tensor * scaled = slot.nodes[2];
+            if (add != nullptr) {
+                ggml_backend_dayan_plan_add_input(result, add->src[0], "input");
+                ggml_backend_dayan_plan_add_input(result, add->src[1], "residual");
+            } else {
+                ggml_backend_dayan_plan_add_input(result, rms->src[0], "input");
+            }
+            ggml_backend_dayan_plan_add_input(result, ggml_backend_dayan_norm_scale(scaled, rms), "scale");
+        } break;
+        case ggml_backend_dayan_slot_kind::flash_attention:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "query");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "key");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "value");
+            break;
+        case ggml_backend_dayan_slot_kind::gated_delta_net:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "query");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "key");
+            ggml_backend_dayan_plan_add_input(result, node->src[2], "value");
+            ggml_backend_dayan_plan_add_input(result, node->src[3], "gate");
+            ggml_backend_dayan_plan_add_input(result, node->src[4], "beta");
+            ggml_backend_dayan_plan_add_input(result, node->src[5], "state");
+            break;
+        case ggml_backend_dayan_slot_kind::gated_output_projection: {
+            ggml_tensor * sigmoid   = slot.nodes[0];
+            ggml_tensor * gated     = slot.nodes[1];
+            ggml_tensor * project   = slot.nodes[2];
+            ggml_tensor * qg        = slot.nodes[3];
+            ggml_tensor * attention = gated->src[0] == sigmoid ? gated->src[1] : gated->src[0];
+            ggml_backend_dayan_plan_add_input(result, attention, "attention");
+            ggml_backend_dayan_plan_add_input(result, qg, "gate");
+            ggml_backend_dayan_plan_add_input(result, project->src[0], "weight");
+        } break;
+        case ggml_backend_dayan_slot_kind::ssm_conv:
+        case ggml_backend_dayan_slot_kind::ssm_conv_silu:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            ggml_backend_dayan_plan_add_input(result, node->src[1], "weight");
+            break;
+        default:
+            ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            break;
+    }
+}
+
+bool ggml_backend_dayan_get_graph_plan(const ggml_cgraph *             graph,
+                                       ggml_backend_dayan_graph_plan_callback callback,
+                                       void *                                 user_data) {
+    if (graph == nullptr || callback == nullptr) {
+        return false;
+    }
+
+    ggml_backend_dayan_graph_plan plan;
+    const ggml_tensor *           unsupported = nullptr;
+    if (!ggml_backend_dayan_compile_graph(graph, &plan, &unsupported)) {
+        return false;
+    }
+
+    for (size_t slot_index = 0; slot_index < plan.slots.size(); ++slot_index) {
+        const ggml_backend_dayan_graph_slot & slot = plan.slots[slot_index];
+        const ggml_backend_dayan_slot_implementation implementation =
+            ggml_backend_dayan_slot_implementation_info(slot);
+        ggml_backend_dayan_graph_plan_slot result = {};
+        result.version                            = 1;
+        result.kind                               = ggml_backend_dayan_slot_kind_name(slot.kind);
+        result.executor                           = implementation.executor;
+        result.launch_name                        = implementation.launch_name;
+        result.kernel                             = implementation.kernel;
+        result.task_mode                          = implementation.task_mode;
+        result.task_dim_x                         = implementation.task_dim_x;
+        result.slot_index                         = slot_index;
+        result.node_count                         = slot.node_count;
+        for (size_t i = 0; i < slot.nodes.size(); ++i) {
+            result.nodes[i] = slot.nodes[i];
+        }
+        ggml_backend_dayan_slot_inputs(slot, &result);
+        result.output_count = ggml_backend_dayan_slot_outputs(slot, result.outputs);
+        result.output_mask  = slot.output_mask;
+        callback(&result, user_data);
+    }
+    return true;
+}
+
 static ggml_backend_dayan_slot_trace_event ggml_backend_dayan_slot_event(const ggml_backend_dayan_graph_slot & slot,
                                                                          size_t                                slot_index) {
     ggml_backend_dayan_slot_trace_event event = {};
@@ -3041,6 +3520,9 @@ static void * ggml_backend_dayan_reg_get_proc_address(ggml_backend_reg_t reg, co
     }
     if (strcmp(name, "ggml_backend_dayan_set_slot_filter_callback") == 0) {
         return (void *) ggml_backend_dayan_set_slot_filter_callback;
+    }
+    if (strcmp(name, "ggml_backend_dayan_get_graph_plan") == 0) {
+        return (void *) ggml_backend_dayan_get_graph_plan;
     }
     return nullptr;
 }

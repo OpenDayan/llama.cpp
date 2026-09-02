@@ -16,6 +16,18 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// Split a new compute graph without reserving compute buffers. It is valid until the next graph reserve call.
+LLAMA_API struct ggml_cgraph * llama_graph_reserve_split(
+        struct llama_context * ctx,
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs);
+
+// Get the scheduler backend assigned by the last split graph call.
+LLAMA_API const char * llama_graph_tensor_backend_name(
+        const struct llama_context * ctx,
+        const struct ggml_tensor * tensor);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

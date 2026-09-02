@@ -3958,6 +3958,27 @@ struct ggml_cgraph * llama_graph_reserve(
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 }
 
+struct ggml_cgraph * llama_graph_reserve_split(
+        struct llama_context * ctx,
+        uint32_t n_tokens,
+        uint32_t n_seqs,
+        uint32_t n_outputs) {
+    auto memory = ctx->get_memory();
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+    }
+    return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get(), true);
+}
+
+const char * llama_graph_tensor_backend_name(
+        const struct llama_context * ctx,
+        const struct ggml_tensor * tensor) {
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(
+        ctx->get_sched(), const_cast<ggml_tensor *>(tensor));
+    return backend == nullptr ? nullptr : ggml_backend_name(backend);
+}
+
 // llama adapter API
 
 int32_t llama_set_adapters_lora(
