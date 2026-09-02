@@ -18,27 +18,13 @@ static inline void elementwise_validate(uint64_t elements, const void * input, v
     }
     (void) dayan_native_task_id();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 }
 
-static inline void elementwise_add_tile(uint64_t output, uint64_t left, uint64_t right, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_add(output, left, right, elements);
-}
+using BinaryOperation = void (*)(uint64_t, uint64_t, uint64_t);
 
-static inline void elementwise_mul_tile(uint64_t output, uint64_t left, uint64_t right, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_mul(output, left, right, elements);
-}
-
-static inline void elementwise_sub_tile(uint64_t output, uint64_t left, uint64_t right, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_sub(output, left, right, elements);
-}
-
-static inline void elementwise_div_tile(uint64_t output, uint64_t left, uint64_t right, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_div(output, left, right, elements);
-}
-
-template <void (*Operation)(uint64_t, uint64_t, uint64_t, uint32_t)>
+template <BinaryOperation Operation>
 static void run_binary_f32(const DayanElementwiseConfig * config,
                            const float *                  left,
                            const float *                  right,
@@ -48,6 +34,7 @@ static void run_binary_f32(const DayanElementwiseConfig * config,
     }
     elementwise_validate(config->elements, left, output);
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
 
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t left_uram  = uram + NormalizationLayout::kInput;
@@ -55,16 +42,21 @@ static void run_binary_f32(const DayanElementwiseConfig * config,
     const uint64_t out_uram   = uram + NormalizationLayout::kValue;
     const uint32_t task       = dayan_native_task_id();
     const uint32_t tasks      = dayan_native_task_count();
+    ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements);
     for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
          offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
         const uint64_t remaining = config->elements - offset;
         const uint32_t elements  = remaining < NormalizationLayout::kTileElements ?
                                        (uint32_t) remaining :
                                        (uint32_t) NormalizationLayout::kTileElements;
-        normalization_load(left_uram, left + offset, elements);
-        normalization_load(right_uram, right + offset, elements);
-        Operation(out_uram, left_uram, right_uram, elements);
-        normalization_store_f32(output + offset, out_uram, elements);
+        load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
+                       (uint64_t) (uintptr_t) (left + offset));
+        load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                       (uint64_t) (uintptr_t) (right + offset));
+        dayan_wait_lsu();
+        Operation(out_uram, left_uram, right_uram);
+        store_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
+                        (uint64_t) (uintptr_t) (output + offset));
         dayan_wait_lsu();
     }
 }
@@ -72,122 +64,164 @@ static void run_binary_f32(const DayanElementwiseConfig * config,
 static inline void sigmoid_tile(uint64_t output,
                                 uint64_t input,
                                 uint64_t temporary,
-                                uint64_t auxiliary,
-                                uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, -kDayanLog2E, input, elements);
-    ggml_dayan_vec_detail::f32_sfu<1>(auxiliary, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_add(temporary, 1.0f, auxiliary, elements);
-    ggml_dayan_vec_detail::f32_sfu<5>(output, temporary, elements);
+                                uint64_t auxiliary) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(-kDayanLog2E), input);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(auxiliary, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(1.0f), auxiliary);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 5>>(output, temporary);
 }
 
 static inline void silu_tile(uint64_t output,
                              uint64_t input,
                              uint64_t temporary,
-                             uint64_t auxiliary,
-                             uint32_t elements) {
-    sigmoid_tile(output, input, temporary, auxiliary, elements);
-    ggml_dayan_vec_detail::f32_mul(output, input, output, elements);
+                             uint64_t auxiliary) {
+    sigmoid_tile(output, input, temporary, auxiliary);
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, input, output);
 }
 
 static inline void softplus_tile(uint64_t output,
                                  uint64_t input,
                                  uint64_t temporary,
-                                 uint64_t auxiliary,
-                                 uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, -1.0f, input, elements);
-    ggml_dayan_vec_detail::f32_min(temporary, input, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, kDayanLog2E, temporary, elements);
-    ggml_dayan_vec_detail::f32_sfu<1>(temporary, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_add(temporary, 1.0f, temporary, elements);
-    ggml_dayan_vec_detail::f32_sfu<0>(temporary, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, kDayanLn2, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_max(auxiliary, 0.0f, input, elements);
-    ggml_dayan_vec_detail::f32_add(output, auxiliary, temporary, elements);
+                                 uint64_t auxiliary) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(-1.0f), input);
+    ggml_dayan_vec_detail::issue_f32_extreme<__tx_vec_vv_mux2<0, 16, 0, 0>>(
+        temporary, input, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(kDayanLog2E), temporary);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(temporary, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(1.0f), temporary);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 0>>(temporary, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(kDayanLn2), temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 0, 16, 0>>(
+        auxiliary, ggml_dayan_vec_detail::f32_bits(0.0f), input);
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        output, auxiliary, temporary);
 }
 
-static inline void square_tile(uint64_t output, uint64_t input, uint64_t, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_mul(output, input, input, elements);
+static inline void square_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, input, input);
 }
 
-static inline void sqrt_tile(uint64_t output, uint64_t input, uint64_t temporary, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_sqrt(output, input, elements);
-    (void) temporary;
+static inline void sqrt_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_sqrt(output, input);
 }
 
-static inline void log_tile(uint64_t output, uint64_t input, uint64_t, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_sfu<0>(output, input, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(output, kDayanLn2, output, elements);
+static inline void log_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 0>>(output, input);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(kDayanLn2), output);
 }
 
-static inline void sin_tile(uint64_t output, uint64_t input, uint64_t, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_sfu<2>(output, input, elements);
+static inline void sin_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 2>>(output, input);
 }
 
-static inline void cos_tile(uint64_t output, uint64_t input, uint64_t, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_sfu<3>(output, input, elements);
+static inline void cos_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 3>>(output, input);
 }
 
-static inline void abs_tile(uint64_t output, uint64_t input, uint64_t temporary, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, -1.0f, input, elements);
-    ggml_dayan_vec_detail::f32_max(output, input, temporary, elements);
+static inline void abs_tile(uint64_t output,
+                            uint64_t input,
+                            uint64_t temporary,
+                            uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(-1.0f), input);
+    ggml_dayan_vec_detail::issue_f32_extreme<__tx_vec_vv_mux2<0, 0, 16, 0>>(
+        output, input, temporary);
 }
 
-static inline void neg_tile(uint64_t output, uint64_t input, uint64_t, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(output, -1.0f, input, elements);
+static inline void neg_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(-1.0f), input);
 }
 
-static inline void relu_tile(uint64_t output, uint64_t input, uint64_t, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_max(output, 0.0f, input, elements);
+static inline void relu_tile(uint64_t output, uint64_t input, uint64_t, uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(0.0f), input);
 }
 
-static inline void exp_tile(uint64_t output, uint64_t input, uint64_t temporary, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, kDayanLog2E, input, elements);
-    ggml_dayan_vec_detail::f32_sfu<1>(output, temporary, elements);
+static inline void exp_tile(uint64_t output,
+                            uint64_t input,
+                            uint64_t temporary,
+                            uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(kDayanLog2E), input);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(output, temporary);
 }
 
-static inline void tanh_tile(uint64_t output, uint64_t input, uint64_t temporary, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, -2.0f * kDayanLog2E, input, elements);
-    ggml_dayan_vec_detail::f32_sfu<1>(output, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_add(output, 1.0f, output, elements);
-    ggml_dayan_vec_detail::f32_sfu<5>(output, output, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(output, 2.0f, output, elements);
-    ggml_dayan_vec_detail::f32_scalar_add(output, -1.0f, output, elements);
-}
-
-static inline void gelu_tile(uint64_t output,
+static inline void tanh_tile(uint64_t output,
                              uint64_t input,
                              uint64_t temporary,
-                             uint64_t auxiliary,
-                             uint32_t elements) {
-    ggml_dayan_vec_detail::f32_mul(auxiliary, input, input, elements);
-    ggml_dayan_vec_detail::f32_mul(auxiliary, auxiliary, input, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(auxiliary, kDayanGeluA, auxiliary, elements);
-    ggml_dayan_vec_detail::f32_add(temporary, input, auxiliary, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, -2.0f * kDayanLog2E * kDayanSqrt2OverPi, temporary,
-                                          elements);
-    ggml_dayan_vec_detail::f32_sfu<1>(output, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_add(output, 1.0f, output, elements);
-    ggml_dayan_vec_detail::f32_sfu<5>(output, output, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(output, 2.0f, output, elements);
-    ggml_dayan_vec_detail::f32_scalar_mul(output, 0.5f, output, elements);
-    ggml_dayan_vec_detail::f32_mul(output, input, output, elements);
+                             uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(-2.0f * kDayanLog2E), input);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(output, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(1.0f), output);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 5>>(output, output);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(2.0f), output);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(-1.0f), output);
 }
 
-static inline void gelu_quick_tile(uint64_t output, uint64_t input, uint64_t temporary, uint64_t, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_scalar_mul(temporary, -kDayanGeluQuick * kDayanLog2E, input, elements);
-    ggml_dayan_vec_detail::f32_sfu<1>(output, temporary, elements);
-    ggml_dayan_vec_detail::f32_scalar_add(output, 1.0f, output, elements);
-    ggml_dayan_vec_detail::f32_sfu<5>(output, output, elements);
-    ggml_dayan_vec_detail::f32_mul(output, input, output, elements);
+static inline void gelu_tile(uint64_t                               output,
+                             uint64_t                               input,
+                             uint64_t                               temporary,
+                             uint64_t                               auxiliary) {
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        auxiliary, input, input);
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        auxiliary, auxiliary, input);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        auxiliary, ggml_dayan_vec_detail::f32_bits(kDayanGeluA), auxiliary);
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        temporary, input, auxiliary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(-2.0f * kDayanLog2E * kDayanSqrt2OverPi), temporary);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(output, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(1.0f), output);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 5>>(output, output);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(2.0f), output);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(0.5f), output);
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, input, output);
 }
 
-template <void (*Operation)(uint64_t, uint64_t, uint64_t, uint64_t, uint32_t)>
+static inline void gelu_quick_tile(uint64_t output,
+                                   uint64_t input,
+                                   uint64_t temporary,
+                                   uint64_t) {
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        temporary, ggml_dayan_vec_detail::f32_bits(-kDayanGeluQuick * kDayanLog2E), input);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(output, temporary);
+    ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+        output, ggml_dayan_vec_detail::f32_bits(1.0f), output);
+    ggml_dayan_vec_detail::issue_f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 5>>(output, output);
+    ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        output, input, output);
+}
+
+using UnaryOperation = void (*)(uint64_t, uint64_t, uint64_t, uint64_t);
+
+template <UnaryOperation Operation>
 static void run_unary_f32(const DayanElementwiseConfig * config, const float * input, float * output) {
     if (config == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
 
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
@@ -203,7 +237,8 @@ static void run_unary_f32(const DayanElementwiseConfig * config, const float * i
                                        (uint32_t) remaining :
                                        (uint32_t) NormalizationLayout::kTileElements;
         normalization_load(input_uram, input + offset, elements);
-        Operation(out_uram, input_uram, temporary, auxiliary, elements);
+        ggml_dayan_vec_detail::configure_vec_grid(ggml_dayan_vec_detail::f32_chunks(elements));
+        Operation(out_uram, input_uram, temporary, auxiliary);
         normalization_store_f32(output + offset, out_uram, elements);
         dayan_wait_lsu();
     }
@@ -216,10 +251,11 @@ static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const f
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     const uint64_t uram        = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram  = uram + NormalizationLayout::kInput;
     const uint64_t accumulator = uram + NormalizationLayout::kVectorScalar;
@@ -245,6 +281,7 @@ static inline void run_scale_f32(const DayanScaleConfig * config, const float * 
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
 
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
@@ -258,9 +295,12 @@ static inline void run_scale_f32(const DayanScaleConfig * config, const float * 
                                        (uint32_t) remaining :
                                        (uint32_t) NormalizationLayout::kTileElements;
         normalization_load(input_uram, input + offset, elements);
-        ggml_dayan_vec_detail::f32_scalar_mul_bits(out_uram, config->scale_bits, input_uram, elements);
+        ggml_dayan_vec_detail::configure_vec_grid(ggml_dayan_vec_detail::f32_chunks(elements));
+        ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+            out_uram, config->scale_bits, input_uram);
         if ((config->bias_bits & 0x7fffffffU) != 0U) {
-            ggml_dayan_vec_detail::f32_scalar_add_bits(out_uram, config->bias_bits, out_uram, elements);
+            ggml_dayan_vec_detail::issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+                out_uram, config->bias_bits, out_uram);
         }
         normalization_store_f32(output + offset, out_uram, elements);
         dayan_wait_lsu();
@@ -273,6 +313,7 @@ static inline void run_clamp_f32(const DayanClampConfig * config, const float * 
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
 
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
@@ -286,20 +327,52 @@ static inline void run_clamp_f32(const DayanClampConfig * config, const float * 
                                        (uint32_t) remaining :
                                        (uint32_t) NormalizationLayout::kTileElements;
         normalization_load(input_uram, input + offset, elements);
-        ggml_dayan_vec_detail::f32_scalar_max_bits(out_uram, config->min_bits, input_uram, elements);
-        ggml_dayan_vec_detail::f32_scalar_min_bits(out_uram, config->max_bits, out_uram, elements);
+        ggml_dayan_vec_detail::configure_vec_grid(ggml_dayan_vec_detail::f32_chunks(elements));
+        ggml_dayan_vec_detail::issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 0, 16, 0>>(
+            out_uram, config->min_bits, input_uram);
+        ggml_dayan_vec_detail::issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 16, 0, 0>>(
+            out_uram, config->max_bits, out_uram);
         normalization_store_f32(output + offset, out_uram, elements);
         dayan_wait_lsu();
     }
 }
 
-static inline void run_l2_norm(const DayanNormConfig * config, const float * input, float * output) {
-    normalization_validate(config);
-    if (input == nullptr || output == nullptr) {
-        DAYAN_PARAMS_ERROR();
-    }
+static inline void l2_norm_fused(uint64_t input, uint64_t output, uint32_t elements, uint32_t epsilon_bits) {
+    const long     chunks = ggml_dayan_vec_detail::f32_chunks(elements);
+    const uint32_t tail   = elements % Constants::kVecLanes;
+    const long     instructions = 6 + 18 * chunks + (tail == 0 ? 0 : 2);
 
-    configure_normalization_lsu();
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
+    for (long chunk = 0; chunk < chunks; ++chunk) {
+        const uint64_t chunk_input = input + (uint64_t) chunk * Constants::kVecBytes;
+        if (tail != 0 && chunk + 1 == chunks) {
+            __tx_vec_lsu_g2v_broadcast32<0, 0>(0);
+            __tx_vec_lsu_g2s<0>((long) ((uint64_t{ 1 } << tail) - 1U));
+            __tx_vec_lsu_u2v_mask<0, 0, 0>((long) chunk_input);
+        } else {
+            __tx_vec_lsu_u2v<0, 0>((long) chunk_input);
+        }
+        __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
+        ggml_dayan_vec_detail::emit_f32_sum_stages();
+        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
+    }
+    __tx_vec_lsu_g2v_broadcast32<0, 0>((long) epsilon_bits);
+    __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
+    __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
+    __tx_vec_vv_mux2<1, 0, 16, 0>();
+    __tx_vec_v_fp32_sfu<1, 16, 4>();
+    for (long chunk = 0; chunk < chunks; ++chunk) {
+        const uint64_t offset = (uint64_t) chunk * Constants::kVecBytes;
+        __tx_vec_lsu_u2v<0, 0>((long) (input + offset));
+        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+        __tx_vec_lsu_v2u<0, 0>((long) (output + offset));
+    }
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void run_l2_norm_generic(const DayanNormConfig * config, const float * input, float * output) {
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t square     = uram + NormalizationLayout::kSquare;
@@ -309,7 +382,7 @@ static inline void run_l2_norm(const DayanNormConfig * config, const float * inp
 
     for (uint32_t row = dayan_native_task_id(); row < config->rows; row += dayan_native_task_count()) {
         const uint64_t row_offset = (uint64_t) row * config->width;
-        const float *  input_row  = normalization_input_row(config, input, row);
+        const float *  input_row  = (const float *) normalization_input_row(config, input, row);
         ggml_dayan_vec_detail::f32_fill_bits(scalar, 0U, Constants::kVecLanes);
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
@@ -322,7 +395,8 @@ static inline void run_l2_norm(const DayanNormConfig * config, const float * inp
         ggml_dayan_vec_detail::f32_fill_bits(reduce, config->epsilon_bits, Constants::kVecLanes);
         ggml_dayan_vec_detail::f32_mul(reduce, reduce, reduce, Constants::kVecLanes);
         ggml_dayan_vec_detail::f32_max(scalar, scalar, reduce, Constants::kVecLanes);
-        ggml_dayan_vec_detail::f32_sfu<4>(scalar, scalar, Constants::kVecLanes);
+        ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 4>>(
+            scalar, scalar, Constants::kVecLanes);
 
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
@@ -331,6 +405,70 @@ static inline void run_l2_norm(const DayanNormConfig * config, const float * inp
             normalization_store_f32(output + row_offset + offset, out_uram, elements);
             dayan_wait_lsu();
         }
+    }
+}
+
+static inline void run_l2_norm(const DayanNormConfig * config, const float * input, float * output) {
+    normalization_validate<kDayanDataTypeF32>(config);
+    if (input == nullptr || output == nullptr) {
+        DAYAN_PARAMS_ERROR();
+    }
+
+    configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
+    if (config->width > 4U * Constants::kVecLanes) {
+        run_l2_norm_generic(config, input, output);
+        return;
+    }
+
+    const uint64_t uram        = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t input_uram  = uram + NormalizationLayout::kInput;
+    if ((config->width % Constants::kVecLanes) == 0U) {
+        const uint32_t row_bytes     = config->width * sizeof(float);
+        const uint32_t rows_per_tile = DAYAN_NATIVE_TASK_URAM_BYTES / (2U * row_bytes);
+        const uint64_t output_uram   = uram + (uint64_t) rows_per_tile * row_bytes;
+        configure_vec_iterator<kVecV0Base>(0, 0, 0, row_bytes);
+        configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+        configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+        configure_vec_iterator<kVecV3Base>(0, 0, 0, row_bytes);
+
+        const uint32_t task  = dayan_native_task_id();
+        const uint32_t tasks = dayan_native_task_count();
+        for (uint64_t row_base = (uint64_t) task * rows_per_tile; row_base < config->rows;
+             row_base += (uint64_t) tasks * rows_per_tile) {
+            const uint32_t rows = min_int((int) (config->rows - row_base), (int) rows_per_tile);
+            for (uint32_t row = 0; row < rows; ++row) {
+                const float * input_row = (const float *) normalization_input_row(config, input, row_base + row);
+                load_matrix<0>(row_bytes, 1, row_bytes, 1, input_uram + (uint64_t) row * row_bytes,
+                               (uint64_t) (uintptr_t) input_row);
+            }
+            dayan_wait_lsu();
+            ggml_dayan_vec_detail::configure_vec_grid(1, rows);
+            l2_norm_fused(input_uram, output_uram, config->width, config->epsilon_bits);
+            for (uint32_t row = 0; row < rows; ++row) {
+                store_matrix<0>(row_bytes, 1, row_bytes, 1, output_uram + (uint64_t) row * row_bytes,
+                                (uint64_t) (uintptr_t) (output + (row_base + row) * config->width));
+            }
+            dayan_wait_lsu();
+        }
+        return;
+    }
+
+    const uint64_t output_uram = uram + NormalizationLayout::kValue;
+    ggml_dayan_vec_detail::configure_vec_grid(1);
+    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+    for (uint32_t row = dayan_native_task_id(); row < config->rows; row += dayan_native_task_count()) {
+        const uint64_t row_offset = (uint64_t) row * config->width;
+        const float *  input_row  = (const float *) normalization_input_row(config, input, row);
+        load_matrix<0>((uint64_t) config->width * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, input_uram,
+                       (uint64_t) (uintptr_t) input_row);
+        dayan_wait_lsu();
+        l2_norm_fused(input_uram, output_uram, config->width, config->epsilon_bits);
+        normalization_store_f32(output + row_offset, output_uram, config->width);
+        dayan_wait_lsu();
     }
 }
 

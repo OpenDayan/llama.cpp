@@ -29,6 +29,15 @@ static bool ggml_backend_dayan_3d_size_fits(size_t element_size, uint64_t ne0, u
     return true;
 }
 
+static bool ggml_backend_dayan_4d_size_fits(
+    size_t element_size, uint64_t ne0, uint64_t ne1, uint64_t ne2, uint64_t ne3) {
+    if (!ggml_backend_dayan_3d_size_fits(element_size, ne0, ne1, ne2)) {
+        return false;
+    }
+    const size_t size = element_size * (size_t) ne0 * (size_t) ne1 * (size_t) ne2;
+    return ne3 > 0 && ne3 <= SIZE_MAX / size;
+}
+
 static bool ggml_backend_dayan_is_flash_type(enum ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_BF16 || type == GGML_TYPE_F16;
 }
@@ -42,14 +51,40 @@ bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op) {
     const ggml_tensor * activation      = op->src[1];
     const int64_t       dimension_limit = 0x7ffff000LL;
 
-    return weight != nullptr && activation != nullptr && ggml_backend_dayan_is_storage_type(weight->type) &&
-           (activation->type == GGML_TYPE_F32 || activation->type == weight->type) && op->type == GGML_TYPE_F32 &&
-           weight->ne[0] == activation->ne[0] && op->ne[0] == weight->ne[1] && op->ne[1] == activation->ne[1] &&
-           weight->ne[0] > 0 && weight->ne[0] <= dimension_limit && weight->ne[1] > 0 &&
-           weight->ne[1] <= dimension_limit && activation->ne[1] > 0 && activation->ne[1] <= dimension_limit &&
-           weight->ne[1] % 16 == 0 && weight->ne[2] == 1 && weight->ne[3] == 1 && activation->ne[2] == 1 &&
-           activation->ne[3] == 1 && op->ne[2] == 1 && op->ne[3] == 1 && ggml_is_contiguous(weight) &&
-           ggml_is_contiguous(activation) && ggml_is_contiguous(op);
+    if (weight == nullptr || activation == nullptr || !ggml_backend_dayan_is_storage_type(weight->type) ||
+        (activation->type != GGML_TYPE_F32 && activation->type != weight->type) || op->type != GGML_TYPE_F32 ||
+        weight->ne[0] != activation->ne[0] || op->ne[0] != weight->ne[1] || op->ne[1] != activation->ne[1] ||
+        op->ne[2] != activation->ne[2] || op->ne[3] != activation->ne[3] || weight->ne[0] <= 0 ||
+        weight->ne[0] > dimension_limit || weight->ne[1] <= 0 || weight->ne[1] > dimension_limit ||
+        activation->ne[1] <= 0 || activation->ne[1] > dimension_limit || weight->ne[1] % 16 != 0 ||
+        weight->ne[2] <= 0 || weight->ne[3] <= 0 || activation->ne[2] <= 0 || activation->ne[3] <= 0 ||
+        activation->ne[2] % weight->ne[2] != 0 || activation->ne[3] % weight->ne[3] != 0 ||
+        !ggml_is_contiguous(weight) || !ggml_is_contiguous(activation) || !ggml_is_contiguous(op) ||
+        !ggml_backend_dayan_4d_size_fits(
+            sizeof(uint16_t), weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3]) ||
+        !ggml_backend_dayan_4d_size_fits(
+            sizeof(uint16_t), activation->ne[0], activation->ne[1], activation->ne[2], activation->ne[3]) ||
+        !ggml_backend_dayan_4d_size_fits(
+            sizeof(float), op->ne[0], op->ne[1], op->ne[2], op->ne[3])) {
+        return false;
+    }
+
+    if (weight->ne[2] == 1 && weight->ne[3] == 1) {
+        const uint64_t batches = (uint64_t) activation->ne[2] * (uint64_t) activation->ne[3];
+        return batches <= (uint64_t) dimension_limit / (uint64_t) activation->ne[1];
+    }
+    return true;
+}
+
+static bool ggml_backend_dayan_mul_mat_has_single_batch(const ggml_tensor * op) {
+    return op != nullptr && op->src[0] != nullptr && op->src[1] != nullptr && op->src[0]->ne[2] == 1 &&
+           op->src[0]->ne[3] == 1 && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1;
+}
+
+bool ggml_backend_dayan_supports_mul_mat_silu(const ggml_tensor * op) {
+    return op != nullptr && op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SILU &&
+           op->src[0] != nullptr && ggml_backend_dayan_supports_mul_mat(op->src[0]) && op->type == GGML_TYPE_F32 &&
+           ggml_is_contiguous(op) && ggml_are_same_shape(op, op->src[0]);
 }
 
 bool ggml_backend_dayan_supports_mul_mat_id(const ggml_tensor * op) {
@@ -94,7 +129,9 @@ bool ggml_backend_dayan_supports_glu(const ggml_tensor * op) {
 
     return (glu == GGML_GLU_OP_SWIGLU || glu == GGML_GLU_OP_GEGLU) && ggml_backend_dayan_supports_mul_mat(gate) &&
            ggml_backend_dayan_supports_mul_mat(up) && gate->src[1] == up->src[1] &&
-           gate->src[0]->type == up->src[0]->type && ggml_are_same_shape(gate, up) && ggml_are_same_shape(op, gate);
+           ggml_backend_dayan_mul_mat_has_single_batch(gate) &&
+           ggml_backend_dayan_mul_mat_has_single_batch(up) && gate->src[0]->type == up->src[0]->type &&
+           ggml_are_same_shape(gate, up) && ggml_are_same_shape(op, gate);
 }
 
 bool ggml_backend_dayan_supports_mul_mat_id_glu(const ggml_tensor * op) {
@@ -115,7 +152,8 @@ bool ggml_backend_dayan_supports_mul_mat_id_glu(const ggml_tensor * op) {
 
 bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_CPY || op->src[0] == nullptr ||
-        !ggml_backend_dayan_supports_mul_mat(op->src[0]) || !ggml_is_contiguous(op)) {
+        !ggml_backend_dayan_supports_mul_mat(op->src[0]) ||
+        !ggml_backend_dayan_mul_mat_has_single_batch(op->src[0]) || !ggml_is_contiguous(op)) {
         return false;
     }
 
@@ -180,7 +218,8 @@ bool ggml_backend_dayan_supports_top_k(const ggml_tensor * op) {
 
 bool ggml_backend_dayan_supports_residual_add(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_ADD || op->src[0] == nullptr || op->src[1] == nullptr ||
-        op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
+        (op->type != GGML_TYPE_F32 && !ggml_backend_dayan_is_storage_type(op->type)) ||
+        op->src[0]->type != op->type || op->src[1]->type != op->type ||
         !ggml_are_same_shape(op, op->src[0]) || !ggml_are_same_shape(op, op->src[1])) {
         return false;
     }
@@ -307,9 +346,11 @@ static bool ggml_backend_dayan_is_copy_type(enum ggml_type type) {
 
 bool ggml_backend_dayan_supports_get_rows(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_GET_ROWS || op->src[0] == nullptr || op->src[1] == nullptr ||
-        op->type != GGML_TYPE_F32 || (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_BF16) ||
+        !ggml_backend_dayan_is_copy_type(op->src[0]->type) ||
+        (op->type != GGML_TYPE_F32 && op->type != op->src[0]->type) ||
         (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64) || op->ne[0] != op->src[0]->ne[0] ||
-        op->ne[1] != op->src[1]->ne[0] || op->ne[2] != op->src[1]->ne[1] || op->ne[3] != op->src[1]->ne[2]) {
+        op->ne[1] != op->src[1]->ne[0] || op->ne[2] != op->src[1]->ne[1] || op->ne[3] != op->src[1]->ne[2] ||
+        !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) || !ggml_is_contiguous(op)) {
         return false;
     }
 
@@ -538,7 +579,8 @@ bool ggml_backend_dayan_supports_rope(const ggml_tensor * op) {
 
 bool ggml_backend_dayan_supports_rms_norm(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_RMS_NORM || op->src[0] == nullptr || op->type != GGML_TYPE_F32 ||
-        op->src[0]->type != GGML_TYPE_F32 || !ggml_are_same_shape(op, op->src[0]) || op->ne[0] <= 0 ||
+        (op->src[0]->type != GGML_TYPE_F32 && !ggml_backend_dayan_is_storage_type(op->src[0]->type)) ||
+        !ggml_are_same_shape(op, op->src[0]) || op->ne[0] <= 0 ||
         op->ne[0] > UINT32_MAX || ggml_nrows(op) <= 0 || ggml_nrows(op) > UINT32_MAX || !ggml_is_contiguous(op) ||
         !ggml_is_contiguous_rows(op->src[0])) {
         return false;
@@ -731,23 +773,30 @@ bool ggml_backend_dayan_supports_gated_delta_net(const ggml_tensor * op) {
 }
 
 bool ggml_backend_dayan_supports_gate_cont(const ggml_tensor * op) {
-    if (op == nullptr || op->op != GGML_OP_CONT || op->src[0] == nullptr || op->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(op) || op->ne[2] != 1 || op->ne[3] != 1) {
+    if (op == nullptr || op->op != GGML_OP_CONT || op->src[0] == nullptr ||
+        (op->type != GGML_TYPE_F32 && !ggml_backend_dayan_is_storage_type(op->type)) || !ggml_is_contiguous(op) ||
+        op->ne[2] != 1 || op->ne[3] != 1) {
         return false;
     }
 
     const ggml_tensor * view = op->src[0];
-    const ggml_tensor * qg   = view->view_src != nullptr ? view->view_src : view->src[0];
-    return view->op == GGML_OP_VIEW && qg != nullptr && ggml_backend_dayan_supports_mul_mat(qg) &&
-           view->type == GGML_TYPE_F32 && view->ne[0] > 0 && view->ne[1] > 0 && view->ne[2] == qg->ne[1] &&
+    const ggml_tensor * packed_qg = view->view_src != nullptr ? view->view_src : view->src[0];
+    const ggml_tensor * qg = packed_qg != nullptr && ggml_backend_dayan_supports_quantized_mul_mat(packed_qg) ?
+                                 packed_qg->src[0] :
+                                 packed_qg;
+    const size_t element_size = ggml_type_size(op->type);
+    return view->op == GGML_OP_VIEW && packed_qg != nullptr && packed_qg->type == op->type && qg != nullptr &&
+           ggml_backend_dayan_supports_mul_mat(qg) &&
+           ggml_backend_dayan_mul_mat_has_single_batch(qg) &&
+           view->type == op->type && view->ne[0] > 0 && view->ne[1] > 0 && view->ne[2] == qg->ne[1] &&
            view->ne[3] == 1 && op->ne[0] == view->ne[0] * view->ne[1] && op->ne[1] == view->ne[2] &&
-           qg->ne[0] == 2 * op->ne[0] && view->nb[1] == 2 * view->ne[0] * sizeof(float) &&
-           view->nb[2] == 2 * op->ne[0] * sizeof(float) && view->view_offs == view->ne[0] * sizeof(float);
+           qg->ne[0] == 2 * op->ne[0] && view->nb[1] == 2 * view->ne[0] * element_size &&
+           view->nb[2] == 2 * op->ne[0] * element_size && view->view_offs == view->ne[0] * element_size;
 }
 
 bool ggml_backend_dayan_supports_gate_sigmoid(const ggml_tensor * op) {
     return op != nullptr && op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID &&
-           op->src[0] != nullptr && op->type == GGML_TYPE_F32 && ggml_is_contiguous(op) &&
+           op->src[0] != nullptr && op->type == op->src[0]->type && ggml_is_contiguous(op) &&
            ggml_backend_dayan_supports_gate_cont(op->src[0]) && ggml_are_same_shape(op, op->src[0]);
 }
 
@@ -813,6 +862,23 @@ struct ggml_backend_dayan_cast_hoist {
     std::vector<ggml_tensor *>  layouts;
 };
 
+struct ggml_backend_dayan_gated_cast {
+    ggml_backend_dayan_cast_key key;
+    ggml_tensor *               projection;
+    ggml_tensor *               qg;
+    ggml_tensor *               gate_view;
+    ggml_tensor *               gate_cont;
+    ggml_tensor *               gate_sigmoid;
+    ggml_tensor *               gated;
+    ggml_tensor *               attention;
+};
+
+struct ggml_backend_dayan_residual_cast {
+    ggml_tensor *               add;
+    int                         source;
+    ggml_backend_dayan_cast_key key;
+};
+
 struct ggml_backend_dayan_tensor_use {
     ggml_tensor * node;
     int           source;
@@ -859,6 +925,187 @@ static bool ggml_backend_dayan_layout_can_change_type(const ggml_tensor * tensor
             return false;
         }
     }
+    return true;
+}
+
+static void ggml_backend_dayan_change_layout_type(ggml_tensor * tensor, enum ggml_type type) {
+    const size_t scale = ggml_type_size(tensor->type) / ggml_type_size(type);
+    tensor->type       = type;
+    tensor->view_offs /= scale;
+    for (size_t & stride : tensor->nb) {
+        stride /= scale;
+    }
+    if (tensor->op == GGML_OP_VIEW) {
+        size_t offset;
+        std::memcpy(&offset, tensor->op_params, sizeof(offset));
+        offset /= scale;
+        std::memcpy(tensor->op_params, &offset, sizeof(offset));
+    }
+}
+
+static bool ggml_backend_dayan_has_single_use(const ggml_backend_dayan_use_map & uses,
+                                              const ggml_tensor *                tensor,
+                                              const ggml_tensor *                user,
+                                              int                                source) {
+    const auto found = uses.find(const_cast<ggml_tensor *>(tensor));
+    return found != uses.end() && found->second.size() == 1 && found->second[0].node == user &&
+           found->second[0].source == source;
+}
+
+static bool ggml_backend_dayan_norm_storage_type(const ggml_tensor *                rms,
+                                                 const ggml_backend_dayan_use_map & uses,
+                                                 enum ggml_type *                   type) {
+    if (!ggml_backend_dayan_supports_rms_norm(rms) || type == nullptr) {
+        return false;
+    }
+
+    const auto scale_use = uses.find(const_cast<ggml_tensor *>(rms));
+    if (scale_use == uses.end() || scale_use->second.size() != 1 ||
+        !ggml_backend_dayan_supports_rms_norm_scale(scale_use->second[0].node)) {
+        return false;
+    }
+
+    const ggml_tensor * scale = scale_use->second[0].node;
+    const auto          consumers = uses.find(const_cast<ggml_tensor *>(scale));
+    if (consumers == uses.end() || consumers->second.empty()) {
+        return false;
+    }
+
+    enum ggml_type storage_type = GGML_TYPE_COUNT;
+    for (const ggml_backend_dayan_tensor_use & use : consumers->second) {
+        if (use.source != 1 ||
+            (!ggml_backend_dayan_supports_mul_mat(use.node) && !ggml_backend_dayan_supports_mul_mat_id(use.node))) {
+            return false;
+        }
+        const enum ggml_type weight_type = use.node->src[0]->type;
+        if (!ggml_backend_dayan_is_storage_type(weight_type) ||
+            (storage_type != GGML_TYPE_COUNT && storage_type != weight_type)) {
+            return false;
+        }
+        storage_type = weight_type;
+    }
+    *type = storage_type;
+    return true;
+}
+
+static bool ggml_backend_dayan_activation_storage_type(const ggml_tensor *                activation,
+                                                       const ggml_backend_dayan_use_map & uses,
+                                                       enum ggml_type *                   type) {
+    const auto consumers = uses.find(const_cast<ggml_tensor *>(activation));
+    if (consumers == uses.end()) {
+        return false;
+    }
+    for (const ggml_backend_dayan_tensor_use & use : consumers->second) {
+        if (use.source == 0 && ggml_backend_dayan_norm_storage_type(use.node, uses, type)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+using ggml_backend_dayan_residual_type_map = std::unordered_map<ggml_tensor *, enum ggml_type>;
+
+static bool ggml_backend_dayan_residual_uses_are_compatible(
+    const ggml_tensor *                         activation,
+    enum ggml_type                              type,
+    const ggml_backend_dayan_use_map &           uses,
+    const ggml_backend_dayan_residual_type_map & residual_types) {
+    const auto consumers = uses.find(const_cast<ggml_tensor *>(activation));
+    if (consumers == uses.end() || consumers->second.empty()) {
+        return false;
+    }
+    for (const ggml_backend_dayan_tensor_use & use : consumers->second) {
+        enum ggml_type norm_type;
+        if (use.source == 0 && ggml_backend_dayan_supports_rms_norm(use.node)) {
+            if (!ggml_backend_dayan_norm_storage_type(use.node, uses, &norm_type) || norm_type == type) {
+                continue;
+            }
+        }
+        const auto residual = residual_types.find(use.node);
+        if (use.source < 2 && residual != residual_types.end() && residual->second == type) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool ggml_backend_dayan_residual_source_storage_type(
+    const ggml_tensor *                         input,
+    const ggml_backend_dayan_residual_type_map & residual_types,
+    enum ggml_type *                            type) {
+    const auto residual = residual_types.find(const_cast<ggml_tensor *>(input));
+    if (residual != residual_types.end()) {
+        *type = residual->second;
+        return true;
+    }
+    if (ggml_backend_dayan_is_storage_type(input->type)) {
+        *type = input->type;
+        return true;
+    }
+    if (ggml_backend_dayan_supports_mul_mat(input) || ggml_backend_dayan_supports_mul_mat_id(input)) {
+        *type = input->src[0]->type;
+        return true;
+    }
+    return false;
+}
+
+static size_t ggml_backend_dayan_rewrite_get_rows_activation(
+    ggml_tensor *                                    node,
+    const ggml_backend_dayan_use_map &               uses,
+    const ggml_backend_dayan_residual_type_map &     residual_types) {
+    if (!ggml_backend_dayan_supports_get_rows(node) || node->type != GGML_TYPE_F32 ||
+        !ggml_backend_dayan_is_storage_type(node->src[0]->type) || node->view_src != nullptr || node->view_offs != 0 ||
+        !ggml_backend_dayan_layout_can_change_type(node, node->src[0]->type)) {
+        return 0;
+    }
+
+    enum ggml_type type;
+    if (!ggml_backend_dayan_activation_storage_type(node, uses, &type)) {
+        return 0;
+    }
+    if (type != node->src[0]->type ||
+        !ggml_backend_dayan_residual_uses_are_compatible(node, type, uses, residual_types)) {
+        return 0;
+    }
+
+    ggml_backend_dayan_change_layout_type(node, type);
+    return 1;
+}
+
+static bool ggml_backend_dayan_find_gated_cast(ggml_tensor *                      projection,
+                                               const ggml_backend_dayan_use_map & uses,
+                                               ggml_backend_dayan_gated_cast *    rewrite) {
+    if (!ggml_backend_dayan_supports_mul_mat(projection) ||
+        !ggml_backend_dayan_supports_gated_attention(projection->src[1])) {
+        return false;
+    }
+
+    ggml_tensor * gated        = projection->src[1];
+    const bool    left_gate    = ggml_backend_dayan_supports_gate_sigmoid(gated->src[0]);
+    const int     gate_source  = left_gate ? 0 : 1;
+    ggml_tensor * gate_sigmoid = gated->src[gate_source];
+    ggml_tensor * attention    = gated->src[1 - gate_source];
+    ggml_tensor * gate_cont    = gate_sigmoid->src[0];
+    ggml_tensor * gate_view    = gate_cont->src[0];
+    ggml_tensor * qg           = gate_view->view_src != nullptr ? gate_view->view_src : gate_view->src[0];
+    const enum ggml_type type  = projection->src[0]->type;
+    const bool view_can_change_type = ggml_backend_dayan_layout_can_change_type(gate_view, type);
+
+    if (qg == nullptr || qg->src[0] == nullptr || qg->src[0]->type != type ||
+        !view_can_change_type ||
+        (qg->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || (gate_view->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (gate_cont->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        (gate_sigmoid->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || (gated->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+        !ggml_backend_dayan_has_single_use(uses, qg, gate_view, 0) ||
+        !ggml_backend_dayan_has_single_use(uses, gate_view, gate_cont, 0) ||
+        !ggml_backend_dayan_has_single_use(uses, gate_cont, gate_sigmoid, 0) ||
+        !ggml_backend_dayan_has_single_use(uses, gate_sigmoid, gated, gate_source) ||
+        !ggml_backend_dayan_has_single_use(uses, gated, projection, 1)) {
+        return false;
+    }
+
+    *rewrite = { { qg, type }, projection, qg, gate_view, gate_cont, gate_sigmoid, gated, attention };
     return true;
 }
 
@@ -939,6 +1186,27 @@ static ggml_tensor * ggml_backend_dayan_apply_cast_hoist(ggml_context *         
         source = replacement;
     }
     return source;
+}
+
+static void ggml_backend_dayan_apply_gated_cast(ggml_context *                       ctx,
+                                                const ggml_backend_dayan_gated_cast & rewrite,
+                                                ggml_tensor *                        cast,
+                                                std::unordered_set<ggml_tensor *> *   elided_nodes) {
+    ggml_backend_dayan_cast_hoist hoist = { rewrite.key, { rewrite.gate_view } };
+    ggml_tensor * gate_view = ggml_backend_dayan_apply_cast_hoist(ctx, hoist, cast);
+    ggml_tensor * gate_cont = ggml_cont_4d(ctx, gate_view, rewrite.gate_cont->ne[0], rewrite.gate_cont->ne[1],
+                                          rewrite.gate_cont->ne[2], rewrite.gate_cont->ne[3]);
+    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx, gate_cont);
+    ggml_tensor * gated        = ggml_mul(ctx, rewrite.attention, gate_sigmoid);
+    ggml_set_name(gate_cont, rewrite.gate_cont->name);
+    ggml_set_name(gate_sigmoid, rewrite.gate_sigmoid->name);
+    ggml_set_name(gated, rewrite.gated->name);
+    rewrite.projection->src[1] = gated;
+
+    elided_nodes->insert(rewrite.gate_view);
+    elided_nodes->insert(rewrite.gate_cont);
+    elided_nodes->insert(rewrite.gate_sigmoid);
+    elided_nodes->insert(rewrite.gated);
 }
 
 static bool ggml_backend_dayan_flash_rewrite_type(const ggml_tensor * op, enum ggml_type * type) {
@@ -1052,6 +1320,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     std::vector<ggml_tensor *> nodes(cgraph->nodes, cgraph->nodes + cgraph->n_nodes);
     std::vector<std::pair<ggml_tensor *, ggml_backend_dayan_cast_key>>                               matmuls;
     std::vector<ggml_backend_dayan_cast_input>                                                       flash_inputs;
+    std::vector<ggml_backend_dayan_residual_cast>                                                    residual_inputs;
+    std::vector<ggml_backend_dayan_gated_cast>                                                       gated_casts;
     std::vector<ggml_backend_dayan_cast_key>                                                         cast_keys;
     std::unordered_map<ggml_backend_dayan_cast_key, ggml_tensor *, ggml_backend_dayan_cast_key_hash> casts;
     ggml_backend_dayan_use_map                                                                       uses;
@@ -1060,6 +1330,9 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     std::unordered_map<ggml_tensor *, ggml_backend_dayan_cast_hoist> hoists;
     std::unordered_map<ggml_tensor *, ggml_tensor *>                 hoisted_replacements;
     std::unordered_set<ggml_tensor *>                                elided_layouts;
+    size_t                                                           gated_f32 = 0;
+    size_t                                                           embedding_lowp = 0;
+    size_t                                                           residual_lowp = 0;
 
     for (ggml_tensor * node : nodes) {
         for (int source = 0; source < GGML_MAX_SRC; ++source) {
@@ -1067,6 +1340,80 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
                 uses[node->src[source]].push_back({ node, source });
             }
         }
+    }
+
+    ggml_backend_dayan_residual_type_map residual_types;
+    for (ggml_tensor * node : nodes) {
+        enum ggml_type type;
+        if (ggml_backend_dayan_supports_residual_add(node) &&
+            ggml_backend_dayan_activation_storage_type(node, uses, &type) &&
+            ggml_backend_dayan_layout_can_change_type(node, type)) {
+            residual_types.emplace(node, type);
+        }
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (ggml_tensor * node : nodes) {
+            if (!ggml_backend_dayan_supports_residual_add(node) || residual_types.count(node) != 0) {
+                continue;
+            }
+            enum ggml_type type = GGML_TYPE_COUNT;
+            for (int source = 0; source < 2; ++source) {
+                enum ggml_type source_type;
+                if (ggml_backend_dayan_residual_source_storage_type(
+                        node->src[source], residual_types, &source_type)) {
+                    if (type != GGML_TYPE_COUNT && type != source_type) {
+                        type = GGML_TYPE_COUNT;
+                        break;
+                    }
+                    type = source_type;
+                }
+            }
+            if (ggml_backend_dayan_is_storage_type(type) && ggml_backend_dayan_layout_can_change_type(node, type)) {
+                residual_types.emplace(node, type);
+                changed = true;
+            }
+        }
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto residual = residual_types.begin(); residual != residual_types.end();) {
+            if (!ggml_backend_dayan_residual_uses_are_compatible(
+                    residual->first, residual->second, uses, residual_types)) {
+                residual = residual_types.erase(residual);
+                changed  = true;
+            } else {
+                ++residual;
+            }
+        }
+    }
+    for (ggml_tensor * node : nodes) {
+        embedding_lowp += ggml_backend_dayan_rewrite_get_rows_activation(node, uses, residual_types);
+    }
+    for (const auto & residual : residual_types) {
+        ggml_tensor *       add  = residual.first;
+        const enum ggml_type type = residual.second;
+        ggml_backend_dayan_change_layout_type(add, type);
+        ++residual_lowp;
+    }
+    for (const auto & residual : residual_types) {
+        ggml_tensor * add  = residual.first;
+        const enum ggml_type type = residual.second;
+        if (add->type != type) {
+            continue;
+        }
+        for (int source = 0; source < 2; ++source) {
+            if (add->src[source]->type == type) {
+                continue;
+            }
+            const ggml_backend_dayan_cast_key key = { add->src[source], type };
+            residual_inputs.push_back({ add, source, key });
+            if (casts.emplace(key, nullptr).second) {
+                cast_keys.push_back(key);
+            }
+        }
+    }
+    for (ggml_tensor * node : nodes) {
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
             node->src[1]->type == GGML_TYPE_F32 && !ggml_backend_dayan_supports_gated_attention(node->src[1])) {
             auto inserted = activation_types.emplace(node->src[1], node->src[0]->type);
@@ -1088,6 +1435,15 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
             node->src[1]->type == GGML_TYPE_F32) {
             if (ggml_backend_dayan_supports_gated_attention(node->src[1])) {
+                ggml_backend_dayan_gated_cast rewrite;
+                if (ggml_backend_dayan_find_gated_cast(node, uses, &rewrite)) {
+                    gated_casts.push_back(rewrite);
+                    if (casts.emplace(rewrite.key, nullptr).second) {
+                        cast_keys.push_back(rewrite.key);
+                    }
+                } else {
+                    ++gated_f32;
+                }
                 continue;
             }
             const auto                        hoist = hoists.find(node->src[1]);
@@ -1120,7 +1476,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
 
     if (cast_keys.empty()) {
         const bool success = ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph);
-        GGML_LOG_DEBUG("%s: no activation casts, time=%.3f ms\n", __func__,
+        GGML_LOG_DEBUG("%s: no activation casts, embedding-lowp=%zu, residual-lowp=%zu, gated-f32=%zu, time=%.3f ms\n",
+                       __func__, embedding_lowp, residual_lowp, gated_f32,
                        (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
         return success;
     }
@@ -1146,6 +1503,9 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
         hoisted_replacements.emplace(hoist.first, replacement);
         elided_layouts.insert(hoist.second.layouts.begin(), hoist.second.layouts.end());
     }
+    for (const ggml_backend_dayan_gated_cast & rewrite : gated_casts) {
+        ggml_backend_dayan_apply_gated_cast(ctx, rewrite, casts.at(rewrite.key), &elided_layouts);
+    }
 
     for (const auto & matmul : matmuls) {
         const auto replacement = hoisted_replacements.find(matmul.first->src[1]);
@@ -1154,6 +1514,9 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
         } else {
             matmul.first->src[1] = replacement->second;
         }
+    }
+    for (const ggml_backend_dayan_residual_cast & input : residual_inputs) {
+        input.add->src[input.source] = casts.at(input.key);
     }
     for (const ggml_backend_dayan_cast_input & input : flash_inputs) {
         input.op->src[input.source] = casts.at(input.key);
@@ -1171,10 +1534,12 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     }
 
     GGML_LOG_DEBUG(
-        "%s: rewrote %zu matrix multiplications and %zu FlashAttention inputs with %zu low-precision casts, "
-        "hoisted=%zu, time=%.3f ms\n",
-        __func__, matmuls.size(), flash_inputs.size(), cast_keys.size(), hoists.size(),
-        (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
+        "%s: rewrote %zu embedding paths, %zu residual paths, %zu matrix multiplications, %zu gated QG paths, kept %zu gated QG paths "
+        "in F32, and %zu "
+        "FlashAttention inputs with %zu "
+        "low-precision casts, hoisted=%zu, time=%.3f ms\n",
+        __func__, embedding_lowp, residual_lowp, matmuls.size(), gated_casts.size(), gated_f32, flash_inputs.size(),
+        cast_keys.size(), hoists.size(), (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
     return true;
 }
 
@@ -1752,8 +2117,23 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             continue;
         }
 
+        const int silu_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
+        if (silu_index < cgraph->n_nodes && ggml_backend_dayan_supports_mul_mat_silu(cgraph->nodes[silu_index]) &&
+            cgraph->nodes[silu_index]->src[0] == node && ggml_node_has_n_uses(cgraph, i, 1) &&
+            (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_silu;
+            slot.nodes[1]   = cgraph->nodes[silu_index];
+            slot.node_count = 2;
+            ++plan->fused_mul_mat_slots;
+            i = silu_index + 1;
+            plan->slots.push_back(slot);
+            continue;
+        }
+
         const int pair_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
-        if (pair_index < cgraph->n_nodes && ggml_backend_dayan_supports_mul_mat(cgraph->nodes[pair_index]) &&
+        if (ggml_backend_dayan_mul_mat_has_single_batch(node) && pair_index < cgraph->n_nodes &&
+            ggml_backend_dayan_supports_mul_mat(cgraph->nodes[pair_index]) &&
+            ggml_backend_dayan_mul_mat_has_single_batch(cgraph->nodes[pair_index]) &&
             node->src[1] == cgraph->nodes[pair_index]->src[1] &&
             node->src[0]->type == cgraph->nodes[pair_index]->src[0]->type) {
             ggml_tensor * pair       = cgraph->nodes[pair_index];

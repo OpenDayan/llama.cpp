@@ -60,6 +60,16 @@ struct DayanMatmulConfig {
     uint64_t a_stride;
     uint64_t bt_stride;
     uint64_t output_stride;
+    uint64_t batch_ne2            = 0;
+    uint64_t batch_ne3            = 0;
+    uint64_t weight_ne2           = 0;
+    uint64_t weight_ne3           = 0;
+    uint64_t a_batch_stride2      = 0;
+    uint64_t a_batch_stride3      = 0;
+    uint64_t bt_batch_stride2     = 0;
+    uint64_t bt_batch_stride3     = 0;
+    uint64_t output_batch_stride2 = 0;
+    uint64_t output_batch_stride3 = 0;
 };
 
 struct DayanMatmulPairConfig {
@@ -340,7 +350,7 @@ struct DayanNormConfig {
     uint32_t width;
     uint32_t rows;
     uint32_t epsilon_bits;
-    uint32_t reserved;
+    uint32_t input_type;
     uint32_t input_ne[4];
     uint64_t input_nb[4];
 };
@@ -393,6 +403,18 @@ int matmul_fp16_4c(npu_buffer_t *                    config,
                    npu_buffer_t *                    output,
                    npu_buffer_t *                    perf,
                    const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_bf16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
+                        npu_buffer_t *                    perf,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_fp16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
+                        npu_buffer_t *                    perf,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_pair_bf16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
                         npu_buffer_t *                    first_bt,
@@ -613,6 +635,20 @@ int flash_attention_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    output,
                             npu_buffer_t *                    result,
                             const npu_kernel_launch_attrs_t * launch_attrs);
+int renew_attention_bf16_1c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    q,
+                            npu_buffer_t *                    k,
+                            npu_buffer_t *                    v,
+                            npu_buffer_t *                    output,
+                            npu_buffer_t *                    result,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
+int renew_attention_fp16_1c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    q,
+                            npu_buffer_t *                    k,
+                            npu_buffer_t *                    v,
+                            npu_buffer_t *                    output,
+                            npu_buffer_t *                    result,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
 int gated_delta_net_f32_1c(npu_buffer_t *                    config,
                            npu_buffer_t *                    q,
                            npu_buffer_t *                    k,
@@ -818,6 +854,20 @@ int project_gated_output_fp16_4c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    output,
                                  npu_buffer_t *                    perf,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
+int project_gated_output_f32_gate_bf16_4c(npu_buffer_t *                    config,
+                                          npu_buffer_t *                    attention,
+                                          npu_buffer_t *                    gate,
+                                          npu_buffer_t *                    weight,
+                                          npu_buffer_t *                    output,
+                                          npu_buffer_t *                    perf,
+                                          const npu_kernel_launch_attrs_t * launch_attrs);
+int project_gated_output_f32_gate_fp16_4c(npu_buffer_t *                    config,
+                                          npu_buffer_t *                    attention,
+                                          npu_buffer_t *                    gate,
+                                          npu_buffer_t *                    weight,
+                                          npu_buffer_t *                    output,
+                                          npu_buffer_t *                    perf,
+                                          const npu_kernel_launch_attrs_t * launch_attrs);
 int ssm_conv_f32_1c(npu_buffer_t *                    config,
                     npu_buffer_t *                    input,
                     npu_buffer_t *                    weight,
@@ -829,6 +879,16 @@ int residual_add_f32_1c(npu_buffer_t *                    config,
                         npu_buffer_t *                    right,
                         npu_buffer_t *                    output,
                         const npu_kernel_launch_attrs_t * launch_attrs);
+int residual_add_bf16_1c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    left,
+                         npu_buffer_t *                    right,
+                         npu_buffer_t *                    output,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
+int residual_add_fp16_1c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    left,
+                         npu_buffer_t *                    right,
+                         npu_buffer_t *                    output,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
 int elementwise_add_f32_1c(npu_buffer_t *                    config,
                            npu_buffer_t *                    left,
                            npu_buffer_t *                    right,

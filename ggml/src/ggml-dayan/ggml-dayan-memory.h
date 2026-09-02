@@ -399,7 +399,7 @@ static inline void memory_validate(const void * config) {
     }
     (void) dayan_native_task_id();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 }
 
@@ -514,23 +514,15 @@ static inline uint64_t memory_read_index(const void * indices, uint32_t index, u
     return 0;
 }
 
-static inline void memory_convert_lowp_to_f32(uint64_t output, uint32_t elements, uint32_t type) {
-    const long chunks = (elements + Constants::kVecLanes - 1U) / Constants::kVecLanes;
-    ggml_dayan_vec_detail::configure_vec_grid(chunks);
-    configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, 0);
-    begin_vec_block(3);
-    __tx_vec_lsu_u2v<0, 0>(output);
-    if (type == kDayanDataTypeBF16) {
-        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
-    } else {
-        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
-    }
-    __tx_vec_lsu_v2u<0, 3>(output);
-    start_vec_block(3);
-    dayan_wait_vec();
+static inline uint64_t memory_lowp_staging() {
+    return (uint64_t) (uintptr_t) dayan_uram_base() + NormalizationLayout::kLowp;
+}
+
+template <void (*Convert)()>
+static inline void memory_load_configured_lowp_to_f32(uint64_t output, const void * input, uint32_t elements) {
+    const uint64_t staging = memory_lowp_staging();
+    memory_load_bytes(staging, input, (uint64_t) elements * sizeof(uint16_t));
+    ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(output, staging, elements);
 }
 
 static inline void memory_load_f32(uint64_t output, const void * input, uint32_t elements, uint32_t type) {
@@ -542,15 +534,18 @@ static inline void memory_load_f32(uint64_t output, const void * input, uint32_t
         DAYAN_PARAMS_ERROR();
     }
 
-    configure_memory_lsu<1>(elements, sizeof(uint16_t), sizeof(float), sizeof(uint16_t), sizeof(float));
-    __tx_lsu_dma_d2u<1>((long) output, (long) input);
-    dayan_wait_lsu();
-    memory_convert_lowp_to_f32(output, elements, type);
+    if (type == kDayanDataTypeBF16) {
+        memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(output, input, elements);
+    } else {
+        memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(output, input, elements);
+    }
 }
 
 static inline uint64_t memory_convert_from_f32(uint64_t output, uint64_t input, uint32_t elements, uint32_t type) {
     if (type == kDayanDataTypeF32) {
-        memory_copy_uram(output, input, elements * sizeof(float));
+        if (output != input) {
+            memory_copy_uram(output, input, elements * sizeof(float));
+        }
         return output;
     }
 
@@ -570,27 +565,75 @@ static inline uint64_t memory_convert_from_f32(uint64_t output, uint64_t input, 
     return output;
 }
 
+template <void (*Convert)()>
+static inline void memory_copy_lowp_to_f32(const DayanCopyConfig * config,
+                                           const void *            source,
+                                           float *                 destination) {
+    configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
+
+    const uint32_t task        = dayan_native_task_id();
+    const uint32_t tasks       = dayan_native_task_count();
+    const uint64_t uram        = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t value_uram  = uram + NormalizationLayout::kValue;
+    const uint64_t staging     = memory_lowp_staging();
+    const uint64_t source_rows = config->elements / config->source_ne[0];
+    const uint64_t tiles       = memory_tile_count(config->source_ne[0]);
+    const uint64_t work_items  = source_rows * tiles;
+    for (uint64_t work = task; work < work_items; work += tasks) {
+        const uint64_t row    = work / tiles;
+        const uint32_t offset = (uint32_t) (work % tiles) * NormalizationLayout::kTileElements;
+        uint64_t       index  = row;
+        const uint32_t index1 = (uint32_t) (index % config->source_ne[1]);
+        index /= config->source_ne[1];
+        const uint32_t index2     = (uint32_t) (index % config->source_ne[2]);
+        const uint32_t index3     = (uint32_t) (index / config->source_ne[2]);
+        const char *   source_row = (const char *) source + (uint64_t) index1 * config->source_nb[1] +
+                                  (uint64_t) index2 * config->source_nb[2] +
+                                  (uint64_t) index3 * config->source_nb[3];
+        const uint32_t elements = min_int((int) (config->source_ne[0] - offset),
+                                          (int) NormalizationLayout::kTileElements);
+        if (config->source_nb[0] == sizeof(uint16_t)) {
+            memory_load_bytes(staging, source_row + (uint64_t) offset * sizeof(uint16_t),
+                              (uint64_t) elements * sizeof(uint16_t));
+        } else {
+            configure_memory_lsu<1>(elements, config->source_nb[0], sizeof(uint16_t), sizeof(uint16_t),
+                                    sizeof(uint16_t));
+            __tx_lsu_dma_d2u<1>((long) staging,
+                                (long) (source_row + (uint64_t) offset * config->source_nb[0]));
+            dayan_wait_lsu();
+        }
+        ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(value_uram, staging, elements);
+        normalization_store_f32(destination + row * config->source_ne[0] + offset, value_uram, elements);
+        dayan_wait_lsu();
+    }
+}
+
 static inline void run_get_rows(const DayanRowsConfig * config,
                                 const void *            source,
                                 const void *            indices,
-                                float *                 output) {
+                                void *                  output) {
     memory_validate(config);
     if (source == nullptr || indices == nullptr || output == nullptr || config->row_elements == 0 ||
-        config->rows == 0 || (config->source_type != kDayanDataTypeF32 && config->source_type != kDayanDataTypeBF16)) {
+        config->rows == 0 ||
+        (config->source_type != kDayanDataTypeF32 && config->source_type != kDayanDataTypeBF16 &&
+         config->source_type != kDayanDataTypeF16) ||
+        (config->destination_type != kDayanDataTypeF32 && config->destination_type != config->source_type)) {
         DAYAN_PARAMS_ERROR();
     }
 
-    const uint64_t row_bytes     = (uint64_t) config->row_elements * memory_type_bytes(config->source_type);
-    const uint32_t task          = dayan_native_task_id();
-    const uint32_t tasks         = dayan_native_task_count();
+    const uint64_t source_row_bytes = (uint64_t) config->row_elements * memory_type_bytes(config->source_type);
+    const uint64_t output_row_bytes = (uint64_t) config->row_elements * memory_type_bytes(config->destination_type);
+    const uint32_t task             = dayan_native_task_id();
+    const uint32_t tasks            = dayan_native_task_count();
     const uint64_t source_address = (uint64_t) (uintptr_t) source;
     const uint64_t output_address = (uint64_t) (uintptr_t) output;
-    const uint64_t source_bytes   = config->source_rows * row_bytes;
-    const uint64_t output_bytes   = (uint64_t) config->rows * row_bytes;
+    const uint64_t source_bytes   = config->source_rows * source_row_bytes;
+    const uint64_t output_bytes   = (uint64_t) config->rows * output_row_bytes;
     const uint64_t index_uram     = (uint64_t) (uintptr_t) dayan_uram_base() + NormalizationLayout::kScalar;
     const bool disjoint = source_address < output_address ? output_address - source_address >= source_bytes :
                                                               source_address - output_address >= output_bytes;
-    if (config->source_type == kDayanDataTypeF32 && disjoint) {
+    if (config->source_type == config->destination_type && disjoint) {
         bool issued = false;
         for (uint32_t row = task; row < config->rows; row += tasks) {
             uint32_t       linear   = row / config->index_ne[0];
@@ -602,8 +645,8 @@ static inline void run_get_rows(const DayanRowsConfig * config,
             if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
                 DAYAN_PARAMS_ERROR();
             }
-            issued = memory_issue_linear_copy(output_address + (uint64_t) row * row_bytes,
-                                              source_address + source_index * row_bytes, row_bytes) ||
+            issued = memory_issue_linear_copy(output_address + (uint64_t) row * output_row_bytes,
+                                              source_address + source_index * source_row_bytes, source_row_bytes) ||
                      issued;
         }
         if (issued) {
@@ -611,8 +654,14 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         }
         return;
     }
+    if (config->source_type == config->destination_type) {
+        DAYAN_PARAMS_ERROR();
+    }
 
     configure_normalization_lsu();
+    if (config->source_type != kDayanDataTypeF32) {
+        ggml_dayan_vec_detail::configure_f32_iterators();
+    }
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t out_uram   = uram + NormalizationLayout::kValue;
     const uint64_t tiles      = memory_tile_count(config->row_elements);
@@ -631,10 +680,17 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
             DAYAN_PARAMS_ERROR();
         }
-        const char * source_row = (const char *) source + source_index * row_bytes;
-        float *      output_row = output + (uint64_t) row * config->row_elements;
-        memory_load_f32(out_uram, source_row + (uint64_t) offset * memory_type_bytes(config->source_type), elements,
-                        config->source_type);
+        const char * source_row = (const char *) source + source_index * source_row_bytes;
+        float *      output_row = (float *) output + (uint64_t) row * config->row_elements;
+        if (config->source_type == kDayanDataTypeBF16) {
+            memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(
+                out_uram, source_row + (uint64_t) offset * sizeof(uint16_t), elements);
+        } else if (config->source_type == kDayanDataTypeF16) {
+            memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(
+                out_uram, source_row + (uint64_t) offset * sizeof(uint16_t), elements);
+        } else {
+            memory_load(out_uram, source_row + (uint64_t) offset * sizeof(float), elements, config->source_type);
+        }
         normalization_store_f32(output_row + offset, out_uram, elements);
         dayan_wait_lsu();
     }
@@ -742,7 +798,19 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
         return;
     }
 
+    if (config->destination_type == kDayanDataTypeF32 && config->source_type == kDayanDataTypeBF16) {
+        memory_copy_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(config, source, (float *) destination);
+        return;
+    }
+    if (config->destination_type == kDayanDataTypeF32 && config->source_type == kDayanDataTypeF16) {
+        memory_copy_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(config, source, (float *) destination);
+        return;
+    }
+
     configure_normalization_lsu();
+    if (config->source_type != kDayanDataTypeF32) {
+        ggml_dayan_vec_detail::configure_f32_iterators();
+    }
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t value_uram = uram + NormalizationLayout::kValue;
@@ -783,12 +851,18 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
             memory_load_f32(value_uram, source_row + (uint64_t) offset * source_bytes, elements,
                             config->source_type);
         } else {
-            configure_memory_lsu<1>(elements, config->source_nb[0], sizeof(float), source_bytes, sizeof(float));
-            __tx_lsu_dma_d2u<1>((long) value_uram,
+            const uint64_t staging = config->source_type == kDayanDataTypeF32 ? value_uram :
+                                                                                 memory_lowp_staging();
+            configure_memory_lsu<1>(elements, config->source_nb[0], source_bytes, source_bytes, source_bytes);
+            __tx_lsu_dma_d2u<1>((long) staging,
                                 (long) (source_row + (uint64_t) offset * config->source_nb[0]));
             dayan_wait_lsu();
-            if (config->source_type != kDayanDataTypeF32) {
-                memory_convert_lowp_to_f32(value_uram, elements, config->source_type);
+            if (config->source_type == kDayanDataTypeBF16) {
+                ggml_dayan_vec_detail::issue_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(
+                    value_uram, staging, elements);
+            } else if (config->source_type == kDayanDataTypeF16) {
+                ggml_dayan_vec_detail::issue_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(
+                    value_uram, staging, elements);
             }
         }
         memory_convert_from_f32(out_uram, value_uram, elements, config->destination_type);

@@ -6,33 +6,39 @@
 
 namespace ggml_dayan_gdn_detail {
 
-constexpr uint32_t kHeadDim  = 128;
-constexpr long     kLanes    = 64;
-constexpr long     kVecBytes = kLanes * sizeof(float);
+constexpr uint32_t kHeadDim     = 128;
+constexpr long     kLanes       = 64;
+constexpr long     kVecBytes    = kLanes * sizeof(float);
+constexpr long     kScalarStride = 32;
+constexpr long     kRowsPerGroup = kLanes;
+constexpr long     kRowGroups    = kHeadDim / kRowsPerGroup;
+constexpr long     kMaskGroupBytes = kRowsPerGroup * kScalarStride;
 
-constexpr long kUramState   = 0x00000;
-constexpr long kUramQ       = 0x10000;
-constexpr long kUramK       = 0x10200;
-constexpr long kUramV       = 0x10400;
-constexpr long kUramG       = 0x10600;
-constexpr long kUramGate    = 0x10800;
-constexpr long kUramDot     = 0x10a00;
-constexpr long kUramDelta   = 0x10c00;
-constexpr long kUramBeta    = 0x10e00;
-constexpr long kUramScale   = 0x10e40;
-constexpr long kUramLog2E   = 0x10e80;
-constexpr long kUramEnd     = 0x10ec0;
+constexpr long kUramState       = 0x00000;
+constexpr long kUramQ           = 0x10000;
+constexpr long kUramK           = 0x10200;
+constexpr long kUramV           = 0x10400;
+constexpr long kUramG           = 0x10600;
+constexpr long kUramGate        = 0x10800;
+constexpr long kUramGatedK      = 0x10a00;
+constexpr long kUramMaskTable   = 0x10c00;
+constexpr long kUramOutputPacked = kUramMaskTable + kRowGroups * kMaskGroupBytes;
+constexpr long kUramBeta        = kUramOutputPacked + kMaskGroupBytes + kVecBytes;
+constexpr long kUramLog2E       = kUramBeta + 64;
+constexpr long kUramEnd         = kUramLog2E + 64;
 
 static_assert(kUramEnd <= DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES, "Gated Delta Net URAM layout is too large");
 
 enum VecTcsr {
     kVecControl = 0,
+    kVecSync    = 1,
     kVecDim0    = 2,
     kVecDim1    = 3,
     kVecDim2    = 4,
     kVecDim3    = 5,
     kVecDim4    = 6,
     kVecDim5    = 7,
+    kVecS0Base  = 9,
     kVecV0Base  = 37,
     kVecV1Base  = 44,
     kVecV2Base  = 51,
@@ -41,10 +47,6 @@ enum VecTcsr {
 
 static inline uint64_t uram_address(long offset) {
     return reinterpret_cast<uint64_t>(static_cast<char *>(dayan_uram_base()) + offset);
-}
-
-static inline long mat_address(long offset) {
-    return offset;
 }
 
 template <typename T> static inline T * uram_pointer(long offset) {
@@ -62,18 +64,28 @@ static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, lo
     __tx_vec_tcsr_write<Base + 6>(0);
 }
 
-static inline void configure_vec_dims(long rows) {
-    __tx_vec_tcsr_write<kVecDim0>(0);
-    __tx_vec_tcsr_write<kVecDim1>(0);
-    __tx_vec_tcsr_write<kVecDim2>(rows - 1);
+static inline void configure_vec_recurrence() {
+    __tx_vec_tcsr_write<kVecDim0>(kRowGroups - 1);
+    __tx_vec_tcsr_write<kVecDim1>(kRowsPerGroup - 1);
+    __tx_vec_tcsr_write<kVecDim2>(0);
     __tx_vec_tcsr_write<kVecDim3>(0);
     __tx_vec_tcsr_write<kVecDim4>(0);
     __tx_vec_tcsr_write<kVecDim5>(0);
+
+    configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
+    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(kRowsPerGroup * kHeadDim * sizeof(float),
+                                       kHeadDim * sizeof(float), 0, 0);
+    configure_vec_iterator<kVecV2Base>(kVecBytes, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(kMaskGroupBytes, kScalarStride, 0, 0);
 }
 
-static inline long vec_control(long instructions) {
-    const uint64_t count = static_cast<uint64_t>(instructions) & 0xffU;
-    return static_cast<long>(count | (count << 8) | (count << 16) | (count << 24) | (count << 32));
+static inline long vec_control(long prologue0, long prologue1, long loop, long epilogue1, long epilogue0) {
+    return static_cast<long>((static_cast<uint64_t>(prologue0) & 0xffU) |
+                             ((static_cast<uint64_t>(prologue1) & 0xffU) << 8) |
+                             ((static_cast<uint64_t>(loop) & 0xffU) << 16) |
+                             ((static_cast<uint64_t>(epilogue1) & 0xffU) << 24) |
+                             ((static_cast<uint64_t>(epilogue0) & 0xffU) << 32));
 }
 
 static inline void begin_vec_block(long instructions) {
@@ -83,8 +95,9 @@ static inline void begin_vec_block(long instructions) {
     } while (free_entries < instructions);
 }
 
-static inline void start_vec_block(long instructions) {
-    __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
+static inline void start_vec_block(long prologue0, long prologue1, long loop, long epilogue1, long epilogue0) {
+    __tx_vec_tcsr_write<kVecSync>(0);
+    __tx_vec_tcsr_write<kVecControl>(vec_control(prologue0, prologue1, loop, epilogue1, epilogue0));
 }
 
 template <long Group>
@@ -112,128 +125,144 @@ static inline void configure_lsu_rows(long rows, long row_bytes, long input_stri
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(64);
 }
 
-template <long Group> static inline void configure_mat_recurrence() {
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_M>(0);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_N>(kHeadDim - 1);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_K>(kHeadDim - 1);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_ASTRIDE>(kHeadDim * sizeof(float));
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_BSTRIDE>(kHeadDim * sizeof(float));
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_CSTRIDE>(kHeadDim * sizeof(float));
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_ASWIZZLEMBS>(0);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_BSWIZZLEMBS>(0);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_CSWIZZLEMBS>(0);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_PERSISTENTMODE>(0);
-    __tx_mat_tcsr_write<Group * MAT_GROUPSZ + MAT_DATATYPE>(BaseNPUInstBuilder::DT_FP32);
+static inline void emit_sum_64() {
+    __tx_vec_shuffle_xor<0, 0>(32);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(16);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(8);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(4);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(2);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(1);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
 }
 
-template <long Group> static inline void issue_mat_recurrence(long input) {
-    __tx_mat_mm<Group>(mat_address(kUramDot), mat_address(input), mat_address(kUramState));
+static inline void emit_dot_half(uint64_t input, uint64_t state) {
+    __tx_vec_lsu_u2v<0, 0>(input);
+    __tx_vec_lsu_u2v<0, 1>(state);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    emit_sum_64();
 }
 
-static inline void issue_gate(uint64_t gate_input, bool scalar_gate) {
+template <long Delta>
+static inline void emit_update_half(uint64_t state, uint64_t key, uint64_t query) {
+    __tx_vec_lsu_u2v<0, 1>(state);
+    __tx_vec_lsu_u2v<0, 0>(key);
+    __tx_vec_vv_fp32_mul<0, Delta, 0, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 2, 0>();
+    __tx_vec_lsu_v2u<0, 1>(state);
+    __tx_vec_lsu_u2v<0, 0>(query);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    emit_sum_64();
+}
+
+static inline void configure_vec_outer(long rows, long halves = 1) {
+    __tx_vec_tcsr_write<kVecDim0>(0);
+    __tx_vec_tcsr_write<kVecDim1>(0);
+    __tx_vec_tcsr_write<kVecDim2>(rows - 1);
+    __tx_vec_tcsr_write<kVecDim3>(halves - 1);
+    __tx_vec_tcsr_write<kVecDim4>(0);
+    __tx_vec_tcsr_write<kVecDim5>(0);
+}
+
+static inline void issue_scalar_gate(uint64_t input) {
     constexpr long instructions = 5;
-
-    configure_vec_dims(1);
+    configure_vec_outer(1);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
-    if (scalar_gate) {
-        __tx_vec_lsu_u2v_broadcast32<0, 0>(gate_input);
-    } else {
-        __tx_vec_lsu_u2v<0, 0>(gate_input);
-    }
+    __tx_vec_lsu_u2v_broadcast32<0, 0>(input);
     __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramLog2E));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 1>();
     __tx_vec_lsu_v2u<0, 3>(uram_address(kUramGate));
-    start_vec_block(instructions);
+    start_vec_block(instructions, instructions, instructions, instructions, instructions);
+    dayan_wait_vec();
 }
 
-static inline void issue_scale_state(long half) {
-    constexpr long instructions = 4;
-    const long     half_offset  = half * kVecBytes;
-
-    configure_vec_dims(kHeadDim);
-    configure_vec_iterator<kVecV0Base>(0, 0, kHeadDim * sizeof(float), 0);
+static inline void issue_vector_gate(uint64_t input) {
+    constexpr long instructions = 5;
+    configure_vec_outer(kRowGroups);
+    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kHeadDim * sizeof(float), 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramState + half_offset));
+    __tx_vec_lsu_u2v<0, 0>(input);
+    __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramLog2E));
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramGate));
+    start_vec_block(instructions, instructions, instructions, instructions, instructions);
+    dayan_wait_vec();
+}
+
+template <long GateHalfStride>
+static inline void issue_scale_state() {
+    constexpr long instructions = 4;
+    configure_vec_outer(kHeadDim, kRowGroups);
+    configure_vec_iterator<kVecV0Base>(0, 0, kHeadDim * sizeof(float), kVecBytes);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, GateHalfStride);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, kHeadDim * sizeof(float), kVecBytes);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramState));
     __tx_vec_lsu_u2v<1, 1>(uram_address(kUramGate));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 0>(uram_address(kUramState + half_offset));
-    start_vec_block(instructions);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramState));
+    start_vec_block(instructions, instructions, instructions, instructions, instructions);
+    dayan_wait_vec();
 }
 
-static inline void issue_update_state(long half) {
-    constexpr long instructions = 6;
-    const long     half_offset  = half * kVecBytes;
+static inline void emit_recurrence_row(uint32_t scale_bits) {
+    emit_dot_half(uram_address(kUramK), uram_address(kUramState));
+    __tx_vec_shuffle_xor<1, 0>(0);
+    emit_dot_half(uram_address(kUramK + kVecBytes), uram_address(kUramState + kVecBytes));
+    __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+    __tx_vec_s_iter_gets<0, 0, 0, 0>();
+    __tx_vec_shuffle_broadcast_dyn<0, 17, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
+    __tx_vec_lsu_u2v_broadcast32<0, 0>(uram_address(kUramBeta));
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<1, 0>(0);
 
-    configure_vec_dims(kHeadDim);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, sizeof(float), 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, kHeadDim * sizeof(float), 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramK + half_offset));
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramDelta));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 2>(uram_address(kUramState + half_offset));
+    emit_update_half<16>(uram_address(kUramState), uram_address(kUramK), uram_address(kUramQ));
+    __tx_vec_shuffle_xor<1, 0>(0);
+    emit_update_half<17>(uram_address(kUramState + kVecBytes), uram_address(kUramK + kVecBytes),
+                         uram_address(kUramQ + kVecBytes));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 2>(uram_address(kUramState + half_offset));
-    start_vec_block(instructions);
+    __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_lsu_u2s<0, 3>(uram_address(kUramMaskTable));
+    __tx_vec_vv_mux2<1, 0, 20, 0>();
+    __tx_vec_shuffle_xor<1, 20>(0);
 }
 
-static inline void issue_output() {
-    constexpr long instructions = 4;
+static inline void issue_recurrence(uint32_t scale_bits) {
+    constexpr long prologue0 = 0;
+    constexpr long group_prologue = 2;
+    constexpr long row_instructions = 83;
+    constexpr long group_epilogue = 1;
+    const long prologue1 = prologue0 + group_prologue;
+    const long loop = prologue1 + row_instructions;
+    const long epilogue1 = loop + group_epilogue;
 
-    configure_vec_dims(2);
-    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramDot));
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramScale));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramDot));
-    start_vec_block(instructions);
-}
-
-static inline void issue_delta() {
-    constexpr long instructions = 6;
-
-    configure_vec_dims(2);
-    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, kVecBytes, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
-    begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramV));
-    __tx_vec_lsu_u2v<1, 0>(uram_address(kUramDot));
-    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_address(kUramBeta));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramDelta));
-    start_vec_block(instructions);
+    begin_vec_block(epilogue1);
+    __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
+    __tx_vec_lsu_u2v<1, 2>(uram_address(kUramV));
+    emit_recurrence_row(scale_bits);
+    __tx_vec_lsu_v2u<17, 3>(uram_address(kUramOutputPacked - kMaskGroupBytes));
+    start_vec_block(prologue0, prologue1, loop, epilogue1, epilogue1);
 }
 
 template <long Group> static inline void configure_lsu_scalar() {
     configure_lsu_rows<Group>(1, 64, 64, 64);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(sizeof(float) - 1);
-}
-
-static inline float bits_to_float(uint32_t bits) {
-    union {
-        uint32_t u;
-        float    f;
-    } value;
-
-    value.u = bits;
-    return value.f;
 }
 
 static inline const float * gdn_row(const float *  base,
@@ -277,13 +306,18 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
 
     *uram_pointer<float>(kUramLog2E) = 1.4426950408889634f;
 
-    *uram_pointer<float>(kUramScale) = bits_to_float(config->scale_bits);
-    dayan_cache_flush(uram_pointer<float>(kUramScale), 64);
     dayan_cache_flush(uram_pointer<float>(kUramLog2E), 64);
+
+    for (long group = 0; group < kRowGroups; ++group) {
+        for (long lane = 0; lane < kRowsPerGroup; ++lane) {
+            *uram_pointer<uint64_t>(kUramMaskTable + group * kMaskGroupBytes + lane * kScalarStride) =
+                uint64_t{ 1 } << lane;
+        }
+    }
+    dayan_cache_flush(uram_pointer<void>(kUramMaskTable), kRowGroups * kMaskGroupBytes);
 
     configure_lsu_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
                                  kHeadDim * sizeof(float));
-    configure_mat_recurrence<LsuGroup>();
     const uint32_t task       = dayan_task_id(DAYAN_TASK_X);
     const uint32_t tasks      = dayan_task_dim(DAYAN_TASK_X);
     const uint64_t work_items = (uint64_t) config->sequences * config->heads;
@@ -319,37 +353,19 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
             __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramBeta), reinterpret_cast<uint64_t>(beta_row));
             dayan_wait_lsu();
 
-            if (config->gate_width == 1) {
-                issue_gate(uram_address(kUramG), true);
-                dayan_wait_vec();
-            }
-            for (long half = 0; half < 2; ++half) {
-                if (config->gate_width == kHeadDim) {
-                    issue_gate(uram_address(kUramG + half * kVecBytes), false);
-                    dayan_wait_vec();
-                }
-                issue_scale_state(half);
-                dayan_wait_vec();
-            }
-
-            issue_mat_recurrence<LsuGroup>(kUramK);
-            dayan_wait_mat();
-            issue_delta();
-            dayan_wait_vec();
-
-            for (long half = 0; half < 2; ++half) {
-                issue_update_state(half);
-                dayan_wait_vec();
-            }
-
             float * attn_output = output + value_index;
-            issue_mat_recurrence<LsuGroup>(kUramQ);
-            dayan_wait_mat();
-            issue_output();
+            if (config->gate_width == 1) {
+                issue_scalar_gate(uram_address(kUramG));
+                issue_scale_state<0>();
+            } else {
+                issue_vector_gate(uram_address(kUramG));
+                issue_scale_state<kVecBytes>();
+            }
+            configure_vec_recurrence();
+            issue_recurrence(config->scale_bits);
             dayan_wait_vec();
-            configure_lsu_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
-                                         kHeadDim * sizeof(float));
-            __tx_lsu_dma_u2d<LsuGroup>(reinterpret_cast<uint64_t>(attn_output), uram_address(kUramDot));
+            configure_lsu_rows<LsuGroup>(kRowGroups, kVecBytes, kMaskGroupBytes, kVecBytes);
+            __tx_lsu_dma_u2d<LsuGroup>(reinterpret_cast<uint64_t>(attn_output), uram_address(kUramOutputPacked));
             dayan_wait_lsu();
 
             const int64_t target_slot = (int64_t) config->tokens - 1 - token;

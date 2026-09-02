@@ -68,10 +68,6 @@ static inline void configure_vec_grid(long dim2, long dim3 = 1) {
     __tx_vec_tcsr_write<kVecDim5>(0);
 }
 
-static inline void configure_vec_dims(long rows, long chunks = 1) {
-    configure_vec_grid(rows, chunks);
-}
-
 static inline long vec_control(long instructions) {
     const uint64_t count = (uint64_t) instructions & 0xffU;
     return (long) (count | (count << 8) | (count << 16) | (count << 24) | (count << 32));
@@ -90,40 +86,6 @@ static inline void start_vec_block(long instructions) {
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
 
-template <long Vb, long Vrs1, long Rm, long Operation>
-static inline void emit_vec_convert() {
-    constexpr uint32_t instruction = 0x8024000bU | ((uint32_t) Vb << 25) | ((uint32_t) Operation << 15) |
-                                     ((uint32_t) Rm << 12) | ((uint32_t) Vrs1 << 7);
-
-    // Clang 23 omits the convert subclass bits in tx.vec.cvt encodings.
-    __asm__ volatile(".word %0" : : "i"(instruction));
-}
-
-template <long Vb, long Vrs1, long Rm>
-static inline void vec_cvt_fp32_int32() {
-    emit_vec_convert<Vb, Vrs1, Rm, 0>();
-}
-
-template <long Vb, long Vrs1, long Rm>
-static inline void vec_cvt_fp32_fp16() {
-    emit_vec_convert<Vb, Vrs1, Rm, 2>();
-}
-
-template <long Vb, long Vrs1, long Rm>
-static inline void vec_cvt_fp32_bf16() {
-    emit_vec_convert<Vb, Vrs1, Rm, 3>();
-}
-
-template <long Vb, long Vrs1, long Rm>
-static inline void vec_cvt_fp16_fp32() {
-    emit_vec_convert<Vb, Vrs1, Rm, 4>();
-}
-
-template <long Vb, long Vrs1, long Rm>
-static inline void vec_cvt_bf16_fp32() {
-    emit_vec_convert<Vb, Vrs1, Rm, 5>();
-}
-
 static inline uint32_t f32_bits(float value) {
     union {
         float    f;
@@ -138,93 +100,123 @@ static inline long f32_chunks(long elements) {
     return (elements + kVecLanes - 1) / kVecLanes;
 }
 
-static inline void configure_f32_tile(uint64_t input0,
-                                      uint64_t input1,
-                                      uint64_t output,
-                                      long     elements,
-                                      long     input1_stride = kVecBytes) {
-    configure_vec_grid(f32_chunks(elements));
+static inline void configure_f32_iterators() {
     configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, input1_stride, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, kVecBytes, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
-    (void) input0;
-    (void) input1;
-    (void) output;
 }
 
-template <long Operation>
-static inline void issue_f32_binary(uint64_t output, uint64_t left, uint64_t right, long elements) {
+static inline void configure_f32_tile(long elements, long input1_stride = kVecBytes) {
+    configure_vec_grid(f32_chunks(elements));
+    __tx_vec_tcsr_write<kVecV1Base + 3>(input1_stride);
+}
+
+template <uint64_t LaneMask, long XorMask>
+static inline void swap_vec_lane_bits() {
+    __tx_vec_lsu_g2s<0>((long) LaneMask);
+    __tx_vec_shuffle_xor<1, 0>(XorMask);
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+}
+
+template <void (*Convert)()>
+static inline void issue_lowp_to_f32(uint64_t output, uint64_t input, long elements) {
+    constexpr long instructions = 28;
+    const long     blocks       = (elements + 2 * kVecLanes - 1) / (2 * kVecLanes);
+
+    configure_vec_grid(blocks);
+    __tx_vec_tcsr_write<kVecV3Base + 3>(2 * kVecBytes);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>((long) input);
+    swap_vec_lane_bits<0x0000ffffffff0000ULL, 48>();
+    swap_vec_lane_bits<0x00ffff0000ffff00ULL, 24>();
+    swap_vec_lane_bits<0x0ff00ff00ff00ff0ULL, 12>();
+    swap_vec_lane_bits<0x3c3c3c3c3c3c3c3cULL, 6>();
+    swap_vec_lane_bits<0x6666666666666666ULL, 3>();
+    __tx_vec_shuffle_xor<1, 0>(1);
+    __tx_vec_lsu_g2s<0>((long) 0xaaaaaaaaaaaaaaaaULL);
+
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    __tx_vec_v_int32_srl<1, 0, 16>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    Convert();
+    __tx_vec_lsu_v2u<0, 3>((long) output);
+
+    __tx_vec_vv_mux2<0, 17, 3, 0>();
+    __tx_vec_v_int32_srl<1, 0, 16>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    Convert();
+    __tx_vec_lsu_v2u<0, 3>((long) (output + kVecBytes));
+    start_vec_block(instructions);
+    dayan_wait_vec();
+    __tx_vec_tcsr_write<kVecV3Base + 3>(kVecBytes);
+}
+
+template <void (*Operation)()>
+static inline void issue_f32_binary(uint64_t output, uint64_t left, uint64_t right) {
     constexpr long instructions = 4;
 
-    configure_f32_tile(left, right, output, elements);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) left);
     __tx_vec_lsu_u2v<1, 1>((long) right);
-    if constexpr (Operation == 0) {
-        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
-    } else if constexpr (Operation == 1) {
-        __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
-    } else {
-        static_assert(Operation == 2, "Unsupported FP32 VEC operation");
-        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    }
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
 static inline void f32_add(uint64_t output, uint64_t left, uint64_t right, long elements) {
-    issue_f32_binary<0>(output, left, right, elements);
+    configure_f32_tile(elements);
+    issue_f32_binary<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(output, left, right);
 }
 
 static inline void f32_sub(uint64_t output, uint64_t left, uint64_t right, long elements) {
-    issue_f32_binary<1>(output, left, right, elements);
+    configure_f32_tile(elements);
+    issue_f32_binary<__tx_vec_vv_fp32_sub<0, 0, 16, 0>>(output, left, right);
 }
 
 static inline void f32_mul(uint64_t output, uint64_t left, uint64_t right, long elements) {
-    issue_f32_binary<2>(output, left, right, elements);
+    configure_f32_tile(elements);
+    issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(output, left, right);
 }
 
-template <long Operation>
-static inline void issue_f32_scalar_bits(uint64_t output, uint32_t scalar_bits, uint64_t input, long elements) {
+template <void (*Operation)()>
+static inline void issue_f32_scalar_bits(uint64_t output, uint32_t scalar_bits, uint64_t input) {
     constexpr long instructions = 4;
 
-    configure_f32_tile(input, 0, output, elements, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
     __tx_vec_lsu_g2v_broadcast32<1, 1>((long) scalar_bits);
-    if constexpr (Operation == 0) {
-        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
-    } else {
-        static_assert(Operation == 2, "Unsupported scalar FP32 VEC operation");
-        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    }
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
 static inline void f32_scalar_add(uint64_t output, float scalar, uint64_t input, long elements) {
-    issue_f32_scalar_bits<0>(output, f32_bits(scalar), input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(output, f32_bits(scalar), input);
 }
 
 static inline void f32_scalar_mul(uint64_t output, float scalar, uint64_t input, long elements) {
-    issue_f32_scalar_bits<2>(output, f32_bits(scalar), input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(output, f32_bits(scalar), input);
 }
 
 static inline void f32_scalar_add_bits(uint64_t output, uint32_t scalar_bits, uint64_t input, long elements) {
-    issue_f32_scalar_bits<0>(output, scalar_bits, input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_bits<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(output, scalar_bits, input);
 }
 
 static inline void f32_scalar_mul_bits(uint64_t output, uint32_t scalar_bits, uint64_t input, long elements) {
-    issue_f32_scalar_bits<2>(output, scalar_bits, input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_bits<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(output, scalar_bits, input);
 }
 
 static inline void f32_scalar_sub_left(uint64_t output, float scalar, uint64_t input, long elements) {
     constexpr long instructions = 4;
 
-    configure_f32_tile(input, 0, output, elements, 0);
+    configure_f32_tile(elements);
     begin_vec_block(instructions);
     __tx_vec_lsu_g2v_broadcast32<0, 0>((long) f32_bits(scalar));
     __tx_vec_lsu_u2v<1, 1>((long) input);
@@ -234,105 +226,98 @@ static inline void f32_scalar_sub_left(uint64_t output, float scalar, uint64_t i
     dayan_wait_vec();
 }
 
-template <bool Maximum>
-static inline void issue_f32_extreme(uint64_t output, uint64_t left, uint64_t right, long elements) {
+template <void (*Operation)()>
+static inline void issue_f32_extreme(uint64_t output, uint64_t left, uint64_t right) {
     constexpr long instructions = 5;
 
-    configure_f32_tile(left, right, output, elements);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) left);
     __tx_vec_lsu_u2v<1, 1>((long) right);
     __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
-    if constexpr (Maximum) {
-        __tx_vec_vv_mux2<0, 0, 16, 0>();
-    } else {
-        __tx_vec_vv_mux2<0, 16, 0, 0>();
-    }
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
 static inline void f32_max(uint64_t output, uint64_t left, uint64_t right, long elements) {
-    issue_f32_extreme<true>(output, left, right, elements);
+    configure_f32_tile(elements);
+    issue_f32_extreme<__tx_vec_vv_mux2<0, 0, 16, 0>>(output, left, right);
 }
 
 static inline void f32_min(uint64_t output, uint64_t left, uint64_t right, long elements) {
-    issue_f32_extreme<false>(output, left, right, elements);
+    configure_f32_tile(elements);
+    issue_f32_extreme<__tx_vec_vv_mux2<0, 16, 0, 0>>(output, left, right);
 }
 
-template <bool Maximum>
+template <void (*Operation)()>
 static inline void issue_f32_scalar_extreme_bits(uint64_t output,
                                                  uint32_t scalar_bits,
-                                                 uint64_t input,
-                                                 long     elements) {
+                                                 uint64_t input) {
     constexpr long instructions = 5;
 
-    configure_f32_tile(input, 0, output, elements, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
     __tx_vec_lsu_g2v_broadcast32<1, 1>((long) scalar_bits);
     __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
-    if constexpr (Maximum) {
-        __tx_vec_vv_mux2<0, 0, 16, 0>();
-    } else {
-        __tx_vec_vv_mux2<0, 16, 0, 0>();
-    }
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
 static inline void f32_scalar_max(uint64_t output, float scalar, uint64_t input, long elements) {
-    issue_f32_scalar_extreme_bits<true>(output, f32_bits(scalar), input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 0, 16, 0>>(output, f32_bits(scalar), input);
 }
 
 static inline void f32_scalar_min(uint64_t output, float scalar, uint64_t input, long elements) {
-    issue_f32_scalar_extreme_bits<false>(output, f32_bits(scalar), input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 16, 0, 0>>(output, f32_bits(scalar), input);
 }
 
 static inline void f32_scalar_max_bits(uint64_t output, uint32_t scalar_bits, uint64_t input, long elements) {
-    issue_f32_scalar_extreme_bits<true>(output, scalar_bits, input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 0, 16, 0>>(output, scalar_bits, input);
 }
 
 static inline void f32_scalar_min_bits(uint64_t output, uint32_t scalar_bits, uint64_t input, long elements) {
-    issue_f32_scalar_extreme_bits<false>(output, scalar_bits, input, elements);
+    configure_f32_tile(elements);
+    issue_f32_scalar_extreme_bits<__tx_vec_vv_mux2<0, 16, 0, 0>>(output, scalar_bits, input);
 }
 
-template <long Operation>
-static inline void f32_sfu(uint64_t output, uint64_t input, long elements) {
+template <void (*Operation)()>
+static inline void issue_f32_sfu(uint64_t output, uint64_t input) {
     constexpr long instructions = 3;
 
-    configure_f32_tile(input, 0, output, elements, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
-    __tx_vec_v_fp32_sfu<0, 0, Operation>();
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
-template <long Operation>
-static inline void f32_scalar_sfu(uint64_t output, float input) {
+template <void (*Operation)()> static inline void f32_sfu(uint64_t output, uint64_t input, long elements) {
+    configure_f32_tile(elements);
+    issue_f32_sfu<Operation>(output, input);
+}
+
+template <void (*Operation)()> static inline void f32_scalar_sfu(uint64_t output, float input) {
     constexpr long instructions = 3;
 
     configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_g2v_broadcast32<0, 0>((long) f32_bits(input));
-    __tx_vec_v_fp32_sfu<0, 0, Operation>();
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
-static inline void f32_div(uint64_t output, uint64_t left, uint64_t right, long elements) {
+static inline void issue_f32_div(uint64_t output, uint64_t left, uint64_t right) {
     constexpr long instructions = 5;
 
-    configure_f32_tile(left, right, output, elements);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) left);
     __tx_vec_lsu_u2v<1, 1>((long) right);
@@ -343,10 +328,14 @@ static inline void f32_div(uint64_t output, uint64_t left, uint64_t right, long 
     dayan_wait_vec();
 }
 
-static inline void f32_sqrt(uint64_t output, uint64_t input, long elements) {
+static inline void f32_div(uint64_t output, uint64_t left, uint64_t right, long elements) {
+    configure_f32_tile(elements);
+    issue_f32_div(output, left, right);
+}
+
+static inline void issue_f32_sqrt(uint64_t output, uint64_t input) {
     constexpr long instructions = 4;
 
-    configure_f32_tile(input, 0, output, elements, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
     __tx_vec_v_fp32_sfu<0, 0, 4>();
@@ -356,43 +345,43 @@ static inline void f32_sqrt(uint64_t output, uint64_t input, long elements) {
     dayan_wait_vec();
 }
 
-template <long Operation>
-static inline void issue_f32_scalar_address(uint64_t output, uint64_t input, uint64_t scalar, long elements) {
+static inline void f32_sqrt(uint64_t output, uint64_t input, long elements) {
+    configure_f32_tile(elements);
+    issue_f32_sqrt(output, input);
+}
+
+template <void (*Operation)()>
+static inline void issue_f32_scalar_address(uint64_t output, uint64_t input, uint64_t scalar) {
     constexpr long instructions = 4;
 
-    configure_f32_tile(input, scalar, output, elements, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
     __tx_vec_lsu_u2v<1, 1>((long) scalar);
-    if constexpr (Operation == 0) {
-        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
-    } else if constexpr (Operation == 1) {
-        __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
-    } else {
-        static_assert(Operation == 2, "Unsupported scalar-address FP32 VEC operation");
-        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    }
+    Operation();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
 }
 
 static inline void f32_add_scalar_address(uint64_t output, uint64_t input, uint64_t scalar, long elements) {
-    issue_f32_scalar_address<0>(output, input, scalar, elements);
+    configure_f32_tile(elements, 0);
+    issue_f32_scalar_address<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(output, input, scalar);
 }
 
 static inline void f32_sub_scalar_address(uint64_t output, uint64_t input, uint64_t scalar, long elements) {
-    issue_f32_scalar_address<1>(output, input, scalar, elements);
+    configure_f32_tile(elements, 0);
+    issue_f32_scalar_address<__tx_vec_vv_fp32_sub<0, 0, 16, 0>>(output, input, scalar);
 }
 
 static inline void f32_mul_scalar_address(uint64_t output, uint64_t input, uint64_t scalar, long elements) {
-    issue_f32_scalar_address<2>(output, input, scalar, elements);
+    configure_f32_tile(elements, 0);
+    issue_f32_scalar_address<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(output, input, scalar);
 }
 
 static inline void f32_fill_bits(uint64_t output, uint32_t value_bits, long elements) {
     constexpr long instructions = 2;
 
-    configure_f32_tile(0, 0, output, elements, 0);
+    configure_f32_tile(elements);
     begin_vec_block(instructions);
     __tx_vec_lsu_g2v_broadcast32<0, 0>((long) value_bits);
     __tx_vec_lsu_v2u<0, 3>((long) output);
@@ -403,7 +392,7 @@ static inline void f32_fill_bits(uint64_t output, uint32_t value_bits, long elem
 static inline void f32_fill_address(uint64_t output, uint64_t scalar, long elements) {
     constexpr long instructions = 2;
 
-    configure_f32_tile(0, 0, output, elements, 0);
+    configure_f32_tile(elements);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v_broadcast32<0, 0>((long) scalar);
     __tx_vec_lsu_v2u<0, 3>((long) output);
@@ -427,10 +416,6 @@ static inline void f32_pad_tail_bits(uint64_t output, uint64_t mask_address, uin
 
     constexpr long instructions = 3;
     configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2s<0, 0>((long) mask_address);
     __tx_vec_lsu_g2v_broadcast32<0, 0>((long) value_bits);
@@ -450,10 +435,6 @@ static inline void f32_pad_tail_address(uint64_t output, uint64_t mask_address, 
 
     constexpr long instructions = 3;
     configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2s<0, 0>((long) mask_address);
     __tx_vec_lsu_u2v_broadcast32<0, 0>((long) scalar);
@@ -466,13 +447,9 @@ static inline void f32_int32_scalar(uint64_t output, uint32_t value) {
     constexpr long instructions = 3;
 
     configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_g2v_broadcast32<0, 0>((long) value);
-    vec_cvt_fp32_int32<0, 0, 0>();
+    __tx_vec_cvt_fp32_int32<0, 0, 0>();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     start_vec_block(instructions);
     dayan_wait_vec();
@@ -514,47 +491,42 @@ static inline void emit_f32_max_stages() {
     __tx_vec_vv_mux2<0, 0, 16, 0>();
 }
 
-template <bool Maximum>
+static inline void emit_f32_sum_combine() {
+    __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+}
+
+static inline void emit_f32_max_combine() {
+    __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+}
+
+template <void (*ReduceStages)(),
+          void (*Combine)(),
+          long ReduceInstructions,
+          long CombineInstructionsPerChunk,
+          long CombineInstructionOffset>
 static inline void f32_reduce(uint64_t output, uint64_t input, long elements) {
     const long chunks = f32_chunks(elements);
-    constexpr long reduce_instructions = Maximum ? 20 : 14;
 
     configure_vec_grid(chunks);
-    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
-    begin_vec_block(reduce_instructions);
+    begin_vec_block(ReduceInstructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
-    if constexpr (Maximum) {
-        emit_f32_max_stages();
-    } else {
-        emit_f32_sum_stages();
-    }
+    ReduceStages();
     __tx_vec_lsu_v2u<0, 3>((long) output);
-    start_vec_block(reduce_instructions);
+    start_vec_block(ReduceInstructions);
     dayan_wait_vec();
 
     if (chunks == 1) {
         return;
     }
 
-    const long combine_instructions = Maximum ? 3 * chunks - 1 : 2 * chunks;
+    const long combine_instructions = CombineInstructionsPerChunk * chunks + CombineInstructionOffset;
     configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(combine_instructions);
     __tx_vec_lsu_u2v_broadcast32<0, 0>((long) output);
     for (long chunk = 1; chunk < chunks; ++chunk) {
         __tx_vec_lsu_u2v_broadcast32<1, 1>((long) (output + (uint64_t) chunk * kVecBytes));
-        if constexpr (Maximum) {
-            __tx_vec_vv_fp32_cmp<0, 16, 0, 0b100>();
-            __tx_vec_vv_mux2<0, 0, 16, 0>();
-        } else {
-            __tx_vec_vv_fp32_add<0, 0, 16, 0>();
-        }
+        Combine();
     }
     __tx_vec_lsu_v2u<0, 0>((long) output);
     start_vec_block(combine_instructions);
@@ -562,18 +534,18 @@ static inline void f32_reduce(uint64_t output, uint64_t input, long elements) {
 }
 
 static inline void f32_reduce_sum(uint64_t output, uint64_t input, long elements) {
-    f32_reduce<false>(output, input, elements);
+    f32_reduce<emit_f32_sum_stages, emit_f32_sum_combine, 14, 2, 0>(output, input, elements);
 }
 
 static inline void f32_reduce_max(uint64_t output, uint64_t input, long elements) {
-    f32_reduce<true>(output, input, elements);
+    f32_reduce<emit_f32_max_stages, emit_f32_max_combine, 20, 3, -1>(output, input, elements);
 }
 
-static inline void configure_activation(const F32Tensor & input0,
-                                        const F32Tensor & input1,
-                                        const F32Tensor & output,
-                                        long              rows,
-                                        long              columns) {
+static inline void configure_activation(const F32Tensor &  input0,
+                                        const F32Tensor &  input1,
+                                        const F32Tensor &  output,
+                                        long               rows,
+                                        long               columns) {
     const long chunks = (columns + kVecLanes - 1) / kVecLanes;
 
     configure_vec_grid(chunks, rows);
@@ -584,10 +556,7 @@ static inline void configure_activation(const F32Tensor & input0,
 }
 
 template <long Group>
-static inline void copy_packed_lowp(const F32Tensor & scratch,
-                                    const LowpTensor & output,
-                                    long               rows,
-                                    long               chunks) {
+static inline void copy_packed_lowp(const F32Tensor & scratch, const LowpTensor & output, long rows, long chunks) {
     enum : long {
         kLowpBytes = kVecLanes * sizeof(uint16_t),
     };
@@ -623,8 +592,8 @@ static inline void copy_packed_lowp(const F32Tensor & scratch,
 }
 
 template <long MatDataType, long LsuGroup>
-static inline void convert_f32_to_lowp(const F32Tensor & input,
-                                       const F32Tensor & scratch,
+static inline void convert_f32_to_lowp(const F32Tensor &  input,
+                                       const F32Tensor &  scratch,
                                        const LowpTensor & output,
                                        long               rows,
                                        long               columns) {
@@ -641,10 +610,10 @@ static inline void convert_f32_to_lowp(const F32Tensor & input,
     begin_vec_block(kInstructions);
     __tx_vec_lsu_u2v<0, 0>(input.address);
     if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
-        vec_cvt_bf16_fp32<0, 0, 0>();
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
     } else {
         static_assert(MatDataType == BaseNPUInstBuilder::DT_FP16, "Unsupported low-precision VEC type");
-        vec_cvt_fp16_fp32<0, 0, 0>();
+        __tx_vec_cvt_fp16_fp32<0, 0, 0>();
     }
     __tx_vec_shuffle_compress<0, 0>(1);
     __tx_vec_lsu_v2u<0, 1>(scratch.address);
@@ -653,17 +622,14 @@ static inline void convert_f32_to_lowp(const F32Tensor & input,
     copy_packed_lowp<LsuGroup>(scratch, output, rows, chunks);
 }
 
-static inline void issue_sigmoid_mul(const F32Tensor &            gate,
-                                     const F32Tensor &            value,
-                                     const F32Tensor &            output,
-                                     const ActivationConstants & constants,
-                                     long                         rows,
-                                     long                         columns) {
+static inline void issue_sigmoid_mul_configured(const F32Tensor &           gate,
+                                                const F32Tensor &           value,
+                                                const F32Tensor &           output,
+                                                const ActivationConstants & constants) {
     enum : long {
         kInstructions = 10,
     };
 
-    configure_activation(gate, value, output, rows, columns);
     begin_vec_block(kInstructions);
     __tx_vec_lsu_u2v<0, 0>(gate.address);
     __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.neg_log2e);
@@ -678,25 +644,39 @@ static inline void issue_sigmoid_mul(const F32Tensor &            gate,
     start_vec_block(kInstructions);
 }
 
-static inline void issue_silu(const F32Tensor &            input,
-                              const F32Tensor &            output,
-                              const ActivationConstants & constants,
-                              long                         rows,
-                              long                         columns) {
-    issue_sigmoid_mul(input, input, output, constants, rows, columns);
+static inline void issue_sigmoid_mul(const F32Tensor &           gate,
+                                     const F32Tensor &           value,
+                                     const F32Tensor &           output,
+                                     const ActivationConstants & constants,
+                                     long                        rows,
+                                     long                        columns) {
+    configure_activation(gate, value, output, rows, columns);
+    issue_sigmoid_mul_configured(gate, value, output, constants);
 }
 
-static inline void issue_swiglu(const F32Tensor &            gate,
-                                const F32Tensor &            up,
-                                const F32Tensor &            output,
-                                const ActivationConstants & constants,
-                                long                         rows,
-                                long                         columns) {
+static inline void issue_silu_configured(const F32Tensor &           input,
+                                         const F32Tensor &           output,
+                                         const ActivationConstants & constants) {
+    issue_sigmoid_mul_configured(input, input, output, constants);
+}
+
+static inline void issue_silu(const F32Tensor &           input,
+                              const F32Tensor &           output,
+                              const ActivationConstants & constants,
+                              long                        rows,
+                              long                        columns) {
+    configure_activation(input, input, output, rows, columns);
+    issue_silu_configured(input, output, constants);
+}
+
+static inline void issue_swiglu_configured(const F32Tensor &           gate,
+                                           const F32Tensor &           up,
+                                           const F32Tensor &           output,
+                                           const ActivationConstants & constants) {
     enum : long {
         kInstructions = 12,
     };
 
-    configure_activation(gate, up, output, rows, columns);
     begin_vec_block(kInstructions);
     __tx_vec_lsu_u2v<0, 0>(gate.address);
     __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.neg_log2e);
@@ -713,17 +693,24 @@ static inline void issue_swiglu(const F32Tensor &            gate,
     start_vec_block(kInstructions);
 }
 
-static inline void issue_geglu(const F32Tensor &            gate,
-                               const F32Tensor &            up,
-                               const F32Tensor &            output,
-                               const ActivationConstants & constants,
-                               long                         rows,
-                               long                         columns) {
+static inline void issue_swiglu(const F32Tensor &           gate,
+                                const F32Tensor &           up,
+                                const F32Tensor &           output,
+                                const ActivationConstants & constants,
+                                long                        rows,
+                                long                        columns) {
+    configure_activation(gate, up, output, rows, columns);
+    issue_swiglu_configured(gate, up, output, constants);
+}
+
+static inline void issue_geglu_configured(const F32Tensor &           gate,
+                                          const F32Tensor &           up,
+                                          const F32Tensor &           output,
+                                          const ActivationConstants & constants) {
     enum : long {
         kInstructions = 30,
     };
 
-    configure_activation(gate, up, output, rows, columns);
     begin_vec_block(kInstructions);
     __tx_vec_lsu_u2v<0, 0>(gate.address);
     __tx_vec_lsu_u2v<1, 0>(gate.address);
@@ -756,6 +743,16 @@ static inline void issue_geglu(const F32Tensor &            gate,
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_lsu_v2u<0, 3>(output.address);
     start_vec_block(kInstructions);
+}
+
+static inline void issue_geglu(const F32Tensor &           gate,
+                               const F32Tensor &           up,
+                               const F32Tensor &           output,
+                               const ActivationConstants & constants,
+                               long                        rows,
+                               long                        columns) {
+    configure_activation(gate, up, output, rows, columns);
+    issue_geglu_configured(gate, up, output, constants);
 }
 
 }  // namespace ggml_dayan_vec_detail

@@ -8,6 +8,7 @@
 
 enum class ggml_backend_dayan_slot_kind {
     mul_mat,
+    mul_mat_silu,
     mul_mat_quantized,
     mul_mat_pair,
     mul_mat_swiglu,
@@ -90,6 +91,7 @@ struct ggml_backend_dayan_graph_plan {
 };
 
 bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op);
+bool ggml_backend_dayan_supports_mul_mat_silu(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_mul_mat_id(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op);
 bool ggml_backend_dayan_supports_glu(const ggml_tensor * op);

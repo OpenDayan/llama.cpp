@@ -2,7 +2,7 @@
 
 // Single-core FlashAttention for contiguous BF16 or FP16 Q/K/V tensors.
 //
-// A root KV producer feeds three fixed Q-slice child procs. The two matrix products use one
+// A root KV producer feeds three fixed Q-slice child Threads. The two matrix products use one
 // 16-bit type and accumulate to FP32:
 //   S  = Q_lowp * K_lowp^T
 //   PV = P_lowp * V_lowp
@@ -23,10 +23,11 @@ constexpr long kLsuVTranspose = 1;
 constexpr uint32_t kFlagCausal = 1u;
 constexpr long     kBr         = 64;
 constexpr long     kBc         = 64;
-constexpr long     kMaxHeadDim = 256;
-constexpr long     kVecLanes   = 64;
-constexpr long     kVecBytes   = kVecLanes * sizeof(float);
-constexpr long     kUramBytes  = 1024 * 1024;
+constexpr long     kMaxHeadDim   = 256;
+constexpr long     kVecLanes     = 64;
+constexpr long     kVecBytes     = kVecLanes * sizeof(float);
+constexpr long     kScalarStride = 32;
+constexpr long     kUramBytes    = 1024 * 1024;
 
 // Fixed-size buffers use the maximum supported head dimension.  Runtime strides inside Q/K,
 // Vt, PV, and O use the actual head dimension.
@@ -244,7 +245,7 @@ static inline void configure_vec_iterator(long dim0_stride,
     __tx_vec_tcsr_write<BASE + 6>(dim5_stride);
 }
 
-static inline void configure_vec_dims(long dim2, long dim3 = 1) {
+static inline void configure_vec_grid(long dim2, long dim3 = 1) {
     __tx_vec_tcsr_write<VEC_DIM0>(0);
     __tx_vec_tcsr_write<VEC_DIM1>(0);
     __tx_vec_tcsr_write<VEC_DIM2>(dim2 - 1);
@@ -292,12 +293,11 @@ constexpr long kFullSoftmaxVecInstructions   = 63;
 // Full 64-column tiles omit both lane-mask sequences, saving ten instructions on the common path.
 template <bool MASK_SCORES>
 static inline void issue_online_softmax_impl(long ctx_base, long rows, long threshold_row_stride) {
-    configure_vec_dims(rows);
+    configure_vec_grid(rows);
     configure_vec_iterator<VEC_V0_BASE>(0, 0, kVecBytes, 0);  // score/P row
     configure_vec_iterator<VEC_V1_BASE>(0, 0, 0, 0);          // shared constants
     if constexpr (MASK_SCORES) {
-        // broadcast32 expands one compact int32 threshold to all 64 lanes.  A KV tail reuses one
-        // scalar (stride 0); a causal diagonal tile advances by one int32 per row.
+        // A KV tail reuses one scalar. A causal diagonal tile uses one aligned scalar per row.
         configure_vec_iterator<VEC_V2_BASE>(0, 0, threshold_row_stride, 0);
     }
     configure_vec_iterator<VEC_V3_BASE>(0, 0, kVecBytes, 0);  // row state
@@ -396,7 +396,7 @@ constexpr long kUpdateOVecInstructions = 6;
 
 static inline void issue_update_o(long ctx_base, long rows, long head_dim) {
     const long chunks = head_dim / kVecLanes;
-    configure_vec_dims(rows, chunks);
+    configure_vec_grid(rows, chunks);
     configure_vec_iterator<VEC_V0_BASE>(0, 0, head_dim * sizeof(float), kVecBytes);
     configure_vec_iterator<VEC_V1_BASE>(0, 0, kVecBytes, 0);
     configure_vec_iterator<VEC_V2_BASE>(0, 0, 0, 0);
@@ -417,7 +417,7 @@ constexpr long kNormalizeOVecInstructions = 5;
 
 static inline void issue_normalize_o(long ctx_base, long rows, long head_dim) {
     const long chunks = head_dim / kVecLanes;
-    configure_vec_dims(rows, chunks);
+    configure_vec_grid(rows, chunks);
     configure_vec_iterator<VEC_V0_BASE>(0, 0, head_dim * sizeof(float), kVecBytes);
     configure_vec_iterator<VEC_V1_BASE>(0, 0, kVecBytes, 0);
     configure_vec_iterator<VEC_V2_BASE>(0, 0, 0, 0);
@@ -478,8 +478,7 @@ static inline bool prepare_softmax_mask(long   ctx_base,
         *threshold_row_stride = 0;
         return false;
     }
-    // A non-causal KV tail shares one scalar threshold across every row; only a causal diagonal
-    // tile needs a compact per-row table.
+    // A non-causal KV tail shares one scalar threshold across every row.
     if (all_rows_full) {
         threshold[0]          = static_cast<int32_t>(real_cols - 1);
         *threshold_row_stride = 0;
@@ -487,9 +486,9 @@ static inline bool prepare_softmax_mask(long   ctx_base,
     }
     for (long r = 0; r < rows; ++r) {
         const long last_valid = min_long(real_cols - 1, q_base + r - k_base);
-        threshold[r]          = static_cast<int32_t>(last_valid);
+        threshold[r * kScalarStride / sizeof(int32_t)] = static_cast<int32_t>(last_valid);
     }
-    *threshold_row_stride = sizeof(int32_t);
+    *threshold_row_stride = kScalarStride;
     return true;
 }
 
@@ -748,12 +747,10 @@ template <typename Format, long FIXED_SLICE>
 static void flash_attention_consumer(void * argument) {
     static_assert(FIXED_SLICE >= 0 && FIXED_SLICE < kConsumerCount, "FlashAttention consumer slice is out of range");
     static constexpr long kCtxBase     = context_base(FIXED_SLICE);
-    static constexpr long kLsuQGroup   = 2 + FIXED_SLICE * 2;
-    static constexpr long kLsuOutGroup = kLsuQGroup + 1;
-    static constexpr long kMatQKGroup  = FIXED_SLICE * 2;
-    static constexpr long kMatPVGroup  = FIXED_SLICE * 2 + 1;
-    static_assert(kLsuOutGroup < 8 && kMatPVGroup < 8,
-                  "FlashAttention unit group allocation exceeds the target TCSR file");
+    static constexpr long kLsuQGroup   = 0;
+    static constexpr long kLsuOutGroup = 1;
+    static constexpr long kMatQKGroup  = 0;
+    static constexpr long kMatPVGroup  = 1;
 
     FlashAttentionState * state = static_cast<FlashAttentionState *>(argument);
     uint64_t              generation_base = 0;
@@ -801,7 +798,8 @@ static void flash_attention_consumer(void * argument) {
                         &threshold_row_stride);
                     if (mask_scores) {
                         const size_t threshold_bytes = threshold_row_stride == 0 ? sizeof(int32_t) :
-                                                                               (size_t) rows * sizeof(int32_t);
+                                                                               (size_t) (rows - 1) * kScalarStride +
+                                                                                   sizeof(int32_t);
                         dayan_cache_flush(uram_ptr<int32_t>(kCtxBase + kCtxThreshold), threshold_bytes);
                     }
                     dayan_wait_mat();
@@ -834,31 +832,17 @@ static void flash_attention_consumer(void * argument) {
     }
 }
 
-template <typename Format>
-static int run_flash_attention_pipeline(FlashAttentionState * state) {
-    for (long index = 0; index < 2; ++index) {
-        const int status = dayan_resource_init(&state->buffers[index].resource);
-        if (status < 0) {
-            return status;
-        }
+static void flash_attention_producer(void * argument) {
+    FlashAttentionState * state = static_cast<FlashAttentionState *>(argument);
+
+    while (!state->start) {
+        dayan_yield();
+    }
+    if (state->abort) {
+        return;
     }
 
-    int status = dayan_create_proc("fa-consumer-0", flash_attention_consumer<Format, 0>, state);
-    if (status >= 0) {
-        status = dayan_create_proc("fa-consumer-1", flash_attention_consumer<Format, 1>, state);
-    }
-    if (status >= 0) {
-        status = dayan_create_proc("fa-consumer-2", flash_attention_consumer<Format, 2>, state);
-    }
-    if (status < 0) {
-        state->status = status;
-        state->abort  = 1;
-        state->start  = 1;
-        (void) dayan_join_all();
-        return status;
-    }
-
-    state->start = 1;
+    int      status     = 0;
     uint64_t generation = 0;
     const uint64_t work_items = static_cast<uint64_t>(state->batch) * state->q_heads;
     for (uint64_t work = state->task; work < work_items; work += state->tasks) {
@@ -871,13 +855,13 @@ static int run_flash_attention_pipeline(FlashAttentionState * state) {
                 status = dayan_resource_wait_free(&buffer->resource);
                 if (status < 0) {
                     remember_error(state, status);
-                    break;
+                    return;
                 }
                 status = dayan_resource_alloc(
                     &buffer->resource, 1, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)));
                 if (status < 0) {
                     remember_error(state, status);
-                    break;
+                    return;
                 }
 
                 buffer->generation = generation;
@@ -893,21 +877,49 @@ static int run_flash_attention_pipeline(FlashAttentionState * state) {
                 status = dayan_resource_produce(&buffer->resource);
                 if (status < 0) {
                     remember_error(state, status);
-                    break;
+                    return;
                 }
                 ++generation;
                 dayan_yield();
             }
-            if (status < 0) {
-                break;
-            }
         }
+    }
+}
+
+template <typename Format>
+static int run_flash_attention_pipeline(FlashAttentionState * state) {
+    for (long index = 0; index < 2; ++index) {
+        const int status = dayan_resource_init(&state->buffers[index].resource);
         if (status < 0) {
-            break;
+            return status;
         }
     }
 
-    status = dayan_join_all();
+    dayan_thread_resources_t resources;
+    dayan_thread_resources_init(&resources);
+    resources.lsu_tcsr_count = 2;
+    int status = dayan_create_thread("fa-producer", flash_attention_producer, state, &resources);
+    resources.mat_tcsr_count = 2;
+    resources.vec_tcsr_count = 1;
+    if (status >= 0) {
+        status = dayan_create_thread("fa-consumer-0", flash_attention_consumer<Format, 0>, state, &resources);
+    }
+    if (status >= 0) {
+        status = dayan_create_thread("fa-consumer-1", flash_attention_consumer<Format, 1>, state, &resources);
+    }
+    if (status >= 0) {
+        status = dayan_create_thread("fa-consumer-2", flash_attention_consumer<Format, 2>, state, &resources);
+    }
+    if (status < 0) {
+        state->status = status;
+        state->abort  = 1;
+        state->start  = 1;
+        (void) dayan_thread_join_all();
+        return status;
+    }
+
+    state->start = 1;
+    status = dayan_thread_join_all();
     if (status < 0 && state->status == 0) {
         state->status = status;
     }

@@ -10,7 +10,7 @@
 namespace ggml_dayan_matmul_detail {
 
 using ggml_dayan_vec_detail::begin_vec_block;
-using ggml_dayan_vec_detail::configure_vec_dims;
+using ggml_dayan_vec_detail::configure_vec_grid;
 using ggml_dayan_vec_detail::configure_vec_iterator;
 using ggml_dayan_vec_detail::start_vec_block;
 
@@ -23,8 +23,8 @@ static constexpr long kVecV3Base = ggml_dayan_vec_detail::kVecV3Base;
 struct Constants {
     enum : int {
         kLsuLocal            = 0,
-        kLsuShared           = 1,
-        kLsuOutput           = 3,
+        kLsuShared           = 0,
+        kLsuOutput           = 1,
         kTileM               = 128,
         kTileN               = 384,
         kTileK               = 256,
@@ -694,7 +694,7 @@ template <typename Format,
           bool           HasEpilogue,
           MatmulEpilogue Epilogue>
 static void consumer_1(void * argument) {
-    consume_slice<Format, ProducerLoadsA, 4, 1, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue>(
+    consume_slice<Format, ProducerLoadsA, 0, 1, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue>(
         (MatmulState *) argument);
 }
 
@@ -705,7 +705,7 @@ template <typename Format,
           bool           HasEpilogue,
           MatmulEpilogue Epilogue>
 static void consumer_2(void * argument) {
-    consume_slice<Format, ProducerLoadsA, 2, 2, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue>(
+    consume_slice<Format, ProducerLoadsA, 0, 2, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue>(
         (MatmulState *) argument);
 }
 #    endif
@@ -853,26 +853,33 @@ static int run_pipeline(const DayanMatmulConfig * config,
         state.shared[index].uram_offset = state.uram_offset + Layout::shared_base(index);
     }
 
-    int status = dayan_create_proc(
+    dayan_thread_resources_t resources;
+    dayan_thread_resources_init(&resources);
+    resources.lsu_tcsr_count = 2;
+    resources.mat_tcsr_count = 1;
+    resources.vec_tcsr_count = HasEpilogue ? 1 : 0;
+    int status = dayan_create_thread(
         "consumer-0", consumer_0<Format, ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue0>,
-        &state);
+        &state, &resources);
 #    if MATMUL_DAYAN_1C_SLICES == 3
     if (status >= 0) {
-        status = dayan_create_proc(
+        status = dayan_create_thread(
             "consumer-1",
-            consumer_1<Format, ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue1>, &state);
+            consumer_1<Format, ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue1>, &state,
+            &resources);
     }
     if (status >= 0) {
-        status = dayan_create_proc(
+        status = dayan_create_thread(
             "consumer-2",
-            consumer_2<Format, ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue2>, &state);
+            consumer_2<Format, ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue, Epilogue2>, &state,
+            &resources);
     }
 #    endif
     if (status < 0) {
         state.status = status;
         state.abort  = 1;
         state.start  = 1;
-        (void) dayan_join_all();
+        (void) dayan_thread_join_all();
         return status;
     }
 
@@ -884,7 +891,7 @@ static int run_pipeline(const DayanMatmulConfig * config,
         state.status = status;
     }
 
-    status = dayan_join_all();
+    status = dayan_thread_join_all();
     if (status < 0 && state.status == 0) {
         state.status = status;
     }
@@ -900,7 +907,10 @@ static inline int config_valid(const DayanMatmulConfig * config) {
         config->k > int_limit || (config->n % 16U) != 0 || config->a_stride < config->k * sizeof(uint16_t) ||
         config->bt_stride < config->k * sizeof(uint16_t) || config->output_stride < config->n * OutputElementBytes ||
         (config->output_stride & (output_alignment - 1U)) || config->a_stride > 0x7fffffffffffffffULL ||
-        config->bt_stride > 0x7fffffffffffffffULL || config->output_stride > 0x7fffffffffffffffULL) {
+        config->bt_stride > 0x7fffffffffffffffULL || config->output_stride > 0x7fffffffffffffffULL ||
+        config->batch_ne2 || config->batch_ne3 || config->weight_ne2 || config->weight_ne3 ||
+        config->a_batch_stride2 || config->a_batch_stride3 || config->bt_batch_stride2 ||
+        config->bt_batch_stride3 || config->output_batch_stride2 || config->output_batch_stride3) {
         return 0;
     }
     return AccumulatorCount == 1 || AccumulatorCount == 2;
@@ -922,6 +932,7 @@ template <bool HasEpilogue, typename Layout> static inline void initialize_const
         -2.8853900817779268f;
     *(volatile float *) (uintptr_t) (base + Constants::kConstantTwo * Constants::kConstantStride)  = 2.0f;
     *(volatile float *) (uintptr_t) (base + Constants::kConstantHalf * Constants::kConstantStride) = 0.5f;
+    dayan_cache_flush((const void *) (uintptr_t) base, Constants::kConstantCount * Constants::kConstantStride);
 }
 
 template <typename Format,
@@ -967,7 +978,7 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
     const uint64_t required_uram =
         (producer_loads_a ? AProducerLayout::total_bytes() : BProducerLayout::total_bytes()) + InputScratchBytes;
     if (!uram || dayan_uram_size() < required_uram) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 
     const uint64_t uram_address   = (uint64_t) (uintptr_t) uram;
@@ -987,7 +998,7 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
             config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context);
     }
     if (status < 0) {
-        dayan_proc_exit(status);
+        dayan_thread_exit(status);
     }
 
     const uint64_t pipeline_end = read_cycle();

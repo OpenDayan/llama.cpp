@@ -31,7 +31,7 @@ static inline bool moe_allocation_fits(uint64_t element_size, uint64_t ne0, uint
 static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
     const uint64_t scratch = (uint64_t) (uintptr_t) dayan_uram_base();
     if (scratch == 0 || dayan_uram_size() < sizeof(int32_t)) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
     return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
 }
@@ -149,6 +149,7 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     }
     elementwise_validate((uint64_t) config->width * config->experts_used * config->tokens, input, output);
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
 
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
@@ -168,7 +169,9 @@ static inline void run_add_id(const DayanAddIdConfig * config,
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             normalization_load(input_uram, input + row * config->width + offset, elements);
             normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements);
-            elementwise_add_tile(out_uram, input_uram, bias_uram, elements);
+            ggml_dayan_vec_detail::configure_vec_grid(ggml_dayan_vec_detail::f32_chunks(elements));
+            ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
+                out_uram, input_uram, bias_uram);
             normalization_store_f32(output + row * config->width + offset, out_uram, elements);
             dayan_wait_lsu();
         }
@@ -184,7 +187,7 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
     }
 
     if (dayan_uram_base() == nullptr || dayan_uram_size() < SortUramLayout::kTotal) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 
     const uint32_t task  = dayan_native_task_id();

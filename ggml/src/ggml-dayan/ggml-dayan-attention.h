@@ -256,9 +256,9 @@ template <typename Format> static inline void issue_attention_lowp_to_f32(uint64
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(input);
     if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
+        __tx_vec_cvt_fp32_bf16<0, 0, 0>();
     } else {
-        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
+        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
     }
     __tx_vec_lsu_v2u<0, 3>(input);
     start_vec_block(instructions);
@@ -351,7 +351,7 @@ static inline void issue_attention_factors(uint64_t output, uint32_t pair_base) 
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(attention_uram(kAttentionLane));
-    ggml_dayan_vec_detail::vec_cvt_fp32_int32<0, 0, 0>();
+    __tx_vec_cvt_fp32_int32<0, 0, 0>();
     __tx_vec_lsu_u2v_broadcast32<1, 1>(attention_uram(kAttentionConstants) +
                                         kAttentionPairBase * sizeof(uint32_t));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
@@ -401,7 +401,7 @@ static inline void issue_attention_position(uint64_t axes,
     } else {
         __tx_vec_lsu_u2v_broadcast32<0, 0>(positions);
     }
-    ggml_dayan_vec_detail::vec_cvt_fp32_int32<0, 0, 0>();
+    __tx_vec_cvt_fp32_int32<0, 0, 0>();
     __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
@@ -751,59 +751,78 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
     }
 }
 
-template <long Group>
-static inline void configure_gated_lsu(long block,
-                                       long dim0,
-                                       long dim1,
-                                       long input_block_stride,
-                                       long input_dim0_stride,
-                                       long input_dim1_stride,
-                                       long output_block_stride,
-                                       long output_dim0_stride,
-                                       long output_dim1_stride,
-                                       long transpose,
-                                       long read_size,
-                                       long write_size) {
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(block);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(dim0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(dim1);
+template <long Group, uint32_t ElementBytes = sizeof(uint16_t)>
+static inline void configure_gated_packed_load(uint32_t head_dim, uint32_t width, uint32_t output_row_stride) {
+    const uint32_t head_bytes = head_dim * ElementBytes;
+
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(head_bytes / 64U - 1U);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(input_block_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(input_dim0_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(input_dim1_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(output_block_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(output_dim0_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(output_dim1_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(transpose);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(block);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(read_size);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(64);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(2U * head_bytes);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(2U * width * ElementBytes);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(64);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(head_bytes);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(output_row_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(6);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(0);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_PADDINGVALUE>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(write_size);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESIZE>(0);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(64);
 }
 
-template <typename Format> static inline void issue_gated_lowp_to_f32(uint64_t input, long rows, long chunks) {
-    constexpr long instructions = 3;
-    constexpr long row_stride   = Constants::kTileK * sizeof(float);
+template <long Group>
+static inline void configure_gated_packed_load_dims(uint32_t heads, uint32_t rows) {
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(heads - 1U);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(rows - 1U);
+}
 
-    ggml_dayan_vec_detail::configure_vec_grid(chunks, rows);
-    configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, row_stride);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, row_stride);
+static inline void configure_gated_packed_to_f32(long input_row_stride, long output_row_stride) {
+    configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, input_row_stride);
+    configure_vec_iterator<kVecV3Base>(0, 0, 2 * Constants::kVecBytes, output_row_stride);
+}
+
+template <uint64_t LaneMask, long XorMask>
+static inline void gated_swap_vec_lane_bits() {
+    __tx_vec_lsu_g2s<0>((long) LaneMask);
+    __tx_vec_shuffle_xor<1, 0>(XorMask);
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+}
+
+template <void (*Convert)()>
+static inline void issue_gated_packed_to_f32(uint64_t output, uint64_t input, long rows, long columns) {
+    constexpr long instructions = 28;
+    const long     blocks       = (columns + 2 * Constants::kVecLanes - 1) / (2 * Constants::kVecLanes);
+
+    ggml_dayan_vec_detail::configure_vec_grid(blocks, rows);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(input);
-    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
-        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
-    } else {
-        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
-    }
-    __tx_vec_lsu_v2u<0, 3>(input);
+    gated_swap_vec_lane_bits<0x0000ffffffff0000ULL, 48>();
+    gated_swap_vec_lane_bits<0x00ffff0000ffff00ULL, 24>();
+    gated_swap_vec_lane_bits<0x0ff00ff00ff00ff0ULL, 12>();
+    gated_swap_vec_lane_bits<0x3c3c3c3c3c3c3c3cULL, 6>();
+    gated_swap_vec_lane_bits<0x6666666666666666ULL, 3>();
+    __tx_vec_shuffle_xor<1, 0>(1);
+    __tx_vec_lsu_g2s<0>((long) 0xaaaaaaaaaaaaaaaaULL);
+
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    __tx_vec_v_int32_srl<1, 0, 16>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    Convert();
+    __tx_vec_lsu_v2u<0, 3>(output);
+
+    __tx_vec_vv_mux2<0, 17, 3, 0>();
+    __tx_vec_v_int32_srl<1, 0, 16>();
+    __tx_vec_vv_mux2<0, 0, 16, 0>();
+    Convert();
+    __tx_vec_lsu_v2u<0, 3>(output + Constants::kVecBytes);
     start_vec_block(instructions);
 }
 
@@ -828,12 +847,13 @@ enum : uint64_t {
     kGatedInputScratchBytes = 2 * kGatedInputMatrixBytes + Constants::kConstantStride,
 };
 
-template <typename Format> static int load_gated_input(const MatmulInputArgs * args) {
+template <typename Format, void (*Convert)()> static int load_gated_input(const MatmulInputArgs * args) {
     const GatedInputContext *          context        = (const GatedInputContext *) args->context;
     const DayanGatedProjectionConfig * config         = context->config;
     const uint64_t                     attention_uram = args->scratch;
     const uint64_t                     gate_uram      = attention_uram + kGatedInputMatrixBytes;
     const uint64_t                     constants      = gate_uram + kGatedInputMatrixBytes;
+    const uint64_t                     packed_gate    = args->output;
     const uint32_t                     width          = config->heads * config->head_dim;
     const uint32_t                     heads          = args->cols / config->head_dim;
     const uint32_t                     first_head     = args->k_base / config->head_dim;
@@ -850,18 +870,14 @@ template <typename Format> static int load_gated_input(const MatmulInputArgs * a
     load_matrix<Constants::kLsuShared>((uint64_t) args->cols * sizeof(float), args->rows,
                                        Constants::kTileK * sizeof(float), Constants::kTileM, attention_uram,
                                        (uint64_t) (uintptr_t) (context->attention + attention_base));
-    configure_gated_lsu<Constants::kLsuShared>(
-        0, config->head_dim - 1, args->rows - 1, sizeof(uint16_t), sizeof(uint16_t), 2U * width * sizeof(uint16_t),
-        sizeof(float), sizeof(float), Constants::kTileK * sizeof(float), 6, sizeof(uint16_t) - 1, sizeof(float) - 1);
-    __tx_lsu_tcsr_write<Constants::kLsuShared * LSU_GROUPSZ + LSU_DIM2>(heads - 1);
-    __tx_lsu_tcsr_write<Constants::kLsuShared * LSU_GROUPSZ + LSU_INDIM2STRIDE>(2U * config->head_dim *
-                                                                                sizeof(uint16_t));
-    __tx_lsu_tcsr_write<Constants::kLsuShared * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(config->head_dim * sizeof(float));
-    __tx_lsu_dma_d2u<Constants::kLsuShared>(gate_uram, reinterpret_cast<uint64_t>(context->gate + gate_base));
+    configure_gated_packed_load<Constants::kLsuShared>(
+        config->head_dim, width, Constants::kTileK * sizeof(uint16_t));
+    configure_gated_packed_load_dims<Constants::kLsuShared>(heads, args->rows);
+    __tx_lsu_dma_d2u<Constants::kLsuShared>(packed_gate, reinterpret_cast<uint64_t>(context->gate + gate_base));
     dayan_wait_lsu();
 
-    const long chunks = args->cols / Constants::kVecLanes;
-    issue_gated_lowp_to_f32<Format>(gate_uram, args->rows, chunks);
+    configure_gated_packed_to_f32(Constants::kTileK * sizeof(uint16_t), Constants::kTileK * sizeof(float));
+    issue_gated_packed_to_f32<Convert>(gate_uram, packed_gate, args->rows, args->cols);
     dayan_wait_vec();
     ggml_dayan_vec_detail::issue_sigmoid_mul({ gate_uram, Constants::kTileK * (int) sizeof(float) },
                                              { attention_uram, Constants::kTileK * (int) sizeof(float) },
@@ -873,7 +889,7 @@ template <typename Format> static int load_gated_input(const MatmulInputArgs * a
     return 0;
 }
 
-template <typename Format>
+template <typename Format, void (*Convert)()>
 static inline void run_gated_output_projection(const DayanGatedProjectionConfig * config,
                                                const float *                      attention,
                                                const uint16_t *                   gate,
@@ -891,7 +907,7 @@ static inline void run_gated_output_projection(const DayanGatedProjectionConfig 
 
     const GatedInputContext input_context = { config, attention, gate };
     run_matmul_kernel<Format, 1, sizeof(float), false, epilogue_identity, epilogue_identity, epilogue_identity,
-                      epilogue_identity, epilogue_identity, epilogue_identity, load_gated_input<Format>,
+                      epilogue_identity, epilogue_identity, epilogue_identity, load_gated_input<Format, Convert>,
                       kGatedInputScratchBytes>(&config->matmul, (const uint16_t *) attention, weight, nullptr, output,
                                                perf, &input_context);
 }

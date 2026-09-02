@@ -4,7 +4,7 @@
 
 #if defined(ENABLE_PARAMS_CHECK)
 #    define DAYAN_PARAMS_IF(condition) if (condition)
-#    define DAYAN_PARAMS_ERROR() dayan_proc_exit(-22)
+#    define DAYAN_PARAMS_ERROR() dayan_thread_exit(-22)
 #else
 #    define DAYAN_PARAMS_IF(condition) if constexpr (false)
 #    define DAYAN_PARAMS_ERROR() __builtin_unreachable()

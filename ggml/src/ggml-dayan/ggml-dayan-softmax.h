@@ -40,7 +40,7 @@ static inline void softmax_slope(uint64_t output,
     ggml_dayan_vec_detail::f32_div(output, output, temporary, Constants::kVecLanes);
     ggml_dayan_vec_detail::f32_scalar_mul_bits(output, max_bias_bits, output, Constants::kVecLanes);
     ggml_dayan_vec_detail::f32_scalar_mul_bits(output, factor_bits, output, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_sfu<1>(output, output, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(output, output, Constants::kVecLanes);
 }
 
 static inline uint64_t softmax_mask_row(const DayanSoftmaxConfig * config,
@@ -96,6 +96,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     const uint64_t uram          = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t logits_uram   = uram + NormalizationLayout::kInput;
     const uint64_t sink_uram     = uram + NormalizationLayout::kAux;
@@ -160,7 +161,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
                                 mask_f32_uram);
             ggml_dayan_vec_detail::f32_sub_scalar_address(logits_uram, logits_uram, maximum, elements);
             ggml_dayan_vec_detail::f32_scalar_mul(logits_uram, 1.4426950408889634f, logits_uram, elements);
-            ggml_dayan_vec_detail::f32_sfu<1>(exp_uram, logits_uram, elements);
+            ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(exp_uram, logits_uram, elements);
             ggml_dayan_vec_detail::f32_reduce_sum(reduce, exp_uram, elements);
             ggml_dayan_vec_detail::f32_add(accumulator, accumulator, reduce, Constants::kVecLanes);
             normalization_store_f32(output + input_row * config->width + offset, exp_uram, elements);
@@ -169,11 +170,13 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
         if ((config->flags & kDayanSoftmaxHasSinks) != 0U) {
             ggml_dayan_vec_detail::f32_sub(sink_uram, sink_uram, maximum, Constants::kVecLanes);
             ggml_dayan_vec_detail::f32_scalar_mul(sink_uram, 1.4426950408889634f, sink_uram, Constants::kVecLanes);
-            ggml_dayan_vec_detail::f32_sfu<1>(sink_uram, sink_uram, Constants::kVecLanes);
+            ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 1>>(
+                sink_uram, sink_uram, Constants::kVecLanes);
             ggml_dayan_vec_detail::f32_add(accumulator, accumulator, sink_uram, Constants::kVecLanes);
         }
 
-        ggml_dayan_vec_detail::f32_sfu<5>(accumulator, accumulator, Constants::kVecLanes);
+        ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 5>>(
+            accumulator, accumulator, Constants::kVecLanes);
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             normalization_load(exp_uram, output + input_row * config->width + offset, elements);

@@ -23,7 +23,7 @@ static inline SSMConvUramLayout ssm_conv_uram_layout(uint32_t tokens, uint32_t k
     const uint64_t input_rows = (uint64_t) tokens + kernel_size - 1U;
 
     layout.constants = 0;
-    layout.weight    = align_up(layout.constants + Constants::kConstantStride, Constants::kUramAlignment);
+    layout.weight    = align_up(layout.constants + 2U * Constants::kConstantStride, Constants::kUramAlignment);
     layout.input     = align_up(layout.weight + (uint64_t) kernel_size * channels * sizeof(float),
                                 Constants::kUramAlignment);
     layout.output    = align_up(layout.input + input_rows * channels * sizeof(float), Constants::kUramAlignment);
@@ -84,7 +84,8 @@ static inline void configure_ssm_lsu(uint32_t dim0,
 }
 
 static inline void load_ssm_constants(uint64_t destination, const DayanSSMConvConfig * config) {
-    configure_ssm_lsu<0>(1, 1, 0, 0, 0, 0, 2U * sizeof(uint32_t), 2U * sizeof(uint32_t));
+    configure_ssm_lsu<0>(2, 1, sizeof(uint32_t), 0, Constants::kConstantStride, 0, sizeof(uint32_t),
+                         sizeof(uint32_t));
     __tx_lsu_dma_d2u<0>(destination, reinterpret_cast<uint64_t>(&config->neg_log2e_bits));
 }
 
@@ -155,7 +156,8 @@ static inline void issue_ssm_silu_f32(uint64_t input,
                                        uint32_t row_elements) {
     const long row_stride = (long) row_elements * sizeof(float);
     ggml_dayan_vec_detail::issue_silu({ input, row_stride }, { output, row_stride },
-                                      { constants, constants + sizeof(float), 0, 0, 0, 0, 0 }, rows, columns);
+                                      { constants, constants + Constants::kConstantStride, 0, 0, 0, 0, 0 }, rows,
+                                      columns);
 }
 
 static inline void store_ssm_output(float *  output,
@@ -196,7 +198,7 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
 
     void * uram = dayan_uram_base();
     if (uram == nullptr) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 
     const uint32_t task         = dayan_task_id(DAYAN_TASK_X);
@@ -208,7 +210,7 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
     const uint32_t max_channel_tile =
         ssm_conv_channel_tile(uram_size, token_tile, config->kernel_size, config->channels);
     if (max_channel_tile == 0) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
     const uint32_t balanced_channels = (config->channels + tasks - 1U) / tasks;
     const uint32_t channel_tile = min_int((int) max_channel_tile,

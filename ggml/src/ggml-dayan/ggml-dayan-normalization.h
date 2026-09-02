@@ -83,6 +83,23 @@ static inline void normalization_load(uint64_t uram, const float * dram, uint32_
     normalization_load_bits(uram, dram, elements, 0U);
 }
 
+using NormalizationLoad = void (*)(uint64_t, const void *, uint32_t);
+
+static inline void normalization_load_f32(uint64_t uram, const void * dram, uint32_t elements) {
+    normalization_load(uram, (const float *) dram, elements);
+}
+
+template <void (*Convert)()>
+static inline void normalization_load_lowp(uint64_t uram, const void * dram, uint32_t elements) {
+    const uint64_t staging = (uint64_t) (uintptr_t) dayan_uram_base() + NormalizationLayout::kLowp;
+    load_matrix<0>((uint64_t) elements * sizeof(uint16_t), 1,
+                   NormalizationLayout::kTileElements * sizeof(uint16_t), 1, staging,
+                   (uint64_t) (uintptr_t) dram);
+    dayan_wait_lsu();
+    ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(uram, staging, elements);
+    normalization_pad_tail_bits(uram, elements, 0U);
+}
+
 static inline void normalization_load_scalar_pad(uint64_t uram,
                                                  const float * dram,
                                                  uint32_t      elements,
@@ -115,36 +132,42 @@ static inline void normalization_quantize(uint64_t output, uint64_t input, uint6
         { output, (long) elements * (long) sizeof(uint16_t) }, 1, elements);
 }
 
+template <uint32_t InputType>
 static inline void normalization_validate(const DayanNormConfig * config) {
+    static_assert(InputType == kDayanDataTypeF32 || InputType == kDayanDataTypeBF16 ||
+                  InputType == kDayanDataTypeF16);
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
+
     if (config == nullptr || config->width == 0 || config->rows == 0 ||
         normalization_negative_bits(config->epsilon_bits) || config->input_ne[0] != config->width ||
-        config->input_nb[0] != sizeof(float) || config->input_ne[1] == 0 || config->input_ne[2] == 0 ||
-        config->input_ne[3] == 0 ||
+        config->input_type != InputType || config->input_nb[0] != input_bytes || config->input_ne[1] == 0 ||
+        config->input_ne[2] == 0 || config->input_ne[3] == 0 ||
         (uint64_t) config->input_ne[1] * config->input_ne[2] * config->input_ne[3] != config->rows) {
         DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 }
 
-static inline const float * normalization_input_row(const DayanNormConfig * config, const float * input, uint32_t row) {
+static inline const void * normalization_input_row(const DayanNormConfig * config, const void * input, uint32_t row) {
     uint32_t       index  = row;
     const uint32_t index1 = index % config->input_ne[1];
     index /= config->input_ne[1];
     const uint32_t index2 = index % config->input_ne[2];
     const uint32_t index3 = index / config->input_ne[2];
-    return (const float *) ((const char *) input + (uint64_t) index1 * config->input_nb[1] +
-                            (uint64_t) index2 * config->input_nb[2] + (uint64_t) index3 * config->input_nb[3]);
+    return (const char *) input + (uint64_t) index1 * config->input_nb[1] +
+           (uint64_t) index2 * config->input_nb[2] + (uint64_t) index3 * config->input_nb[3];
 }
 
-template <bool HasResidual>
+template <typename Format, void (*Convert)(), uint32_t InputType, NormalizationLoad Load, bool HasResidual>
 static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
-                                          const float *           left,
-                                          const float *           right,
-                                          float *                 residual,
+                                          const void *            left,
+                                          const void *            right,
+                                          void *                  residual,
                                           bool                    write_residual) {
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
     const uint64_t uram    = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input   = uram + NormalizationLayout::kInput;
     const uint64_t aux     = uram + NormalizationLayout::kAux;
@@ -158,15 +181,24 @@ static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
     for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
         const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
         if constexpr (HasResidual) {
-            normalization_load(input, left + offset, elements);
-            normalization_load(aux, right + offset, elements);
+            Load(input, (const char *) left + (uint64_t) offset * input_bytes, elements);
+            Load(aux, (const char *) right + (uint64_t) offset * input_bytes, elements);
             normalization_vec_add(input, aux, value, elements);
-            if (write_residual) {
-                normalization_store_f32(residual + offset, value, elements);
+            if constexpr (InputType != kDayanDataTypeF32) {
+                const uint64_t lowp = uram + NormalizationLayout::kLowp;
+                normalization_quantize<Format>(lowp, value, input, elements);
+                configure_normalization_lsu();
+                ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(value, lowp, elements);
+                if (write_residual) {
+                    normalization_store_lowp((uint16_t *) residual + offset, lowp, elements);
+                    dayan_wait_lsu();
+                }
+            } else if (write_residual) {
+                    normalization_store_f32((float *) residual + offset, value, elements);
                 dayan_wait_lsu();
             }
         } else {
-            normalization_load(value, left + offset, elements);
+            Load(value, (const char *) left + (uint64_t) offset * input_bytes, elements);
         }
 
         ggml_dayan_vec_detail::f32_mul(square, value, value, elements);
@@ -177,25 +209,27 @@ static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
     ggml_dayan_vec_detail::f32_int32_scalar(square, config->width);
     ggml_dayan_vec_detail::f32_div(inverse, inverse, square, Constants::kVecLanes);
     ggml_dayan_vec_detail::f32_scalar_add_bits(inverse, config->epsilon_bits, inverse, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_sfu<4>(inverse, inverse, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 4>>(
+        inverse, inverse, Constants::kVecLanes);
     return inverse;
 }
 
-template <typename Format, bool HasResidual, bool Quantize>
+template <typename Format, void (*Convert)(), uint32_t InputType, NormalizationLoad Load, bool HasResidual, bool Quantize>
 static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
-                               const float *                   left,
-                               const float *                   right,
+                               const void *                    left,
+                               const void *                    right,
                                const float *                   scale,
-                               float *                         residual,
+                               void *                          residual,
                                float *                         rms,
                                float *                         scaled,
                                uint16_t *                      lowp) {
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
     const bool write_residual = (config->flags & kDayanNormWriteResidual) != 0U;
     const bool write_rms      = (config->flags & kDayanNormWriteRms) != 0U;
     const bool write_scaled   = (config->flags & kDayanNormWriteScaled) != 0U;
 
     const DayanNormConfig * norm = &config->norm;
-    normalization_validate(norm);
+    normalization_validate<InputType>(norm);
     if (left == nullptr || scale == nullptr || (HasResidual && right == nullptr) ||
         (write_residual && residual == nullptr) || (write_rms && rms == nullptr) ||
         (write_scaled && scaled == nullptr) || (Quantize && lowp == nullptr)) {
@@ -203,13 +237,16 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     for (uint32_t row = dayan_native_task_id(); row < norm->rows; row += dayan_native_task_count()) {
         const uint64_t row_offset   = (uint64_t) row * norm->width;
-        const float *  left_row     = normalization_input_row(norm, left, row);
-        const float *  right_row    = HasResidual ? normalization_input_row(norm, right, row) : nullptr;
-        float * residual_row = HasResidual && write_residual ? residual + row_offset : nullptr;
-        const uint64_t inverse_uram =
-            normalization_inverse_rms<HasResidual>(norm, left_row, right_row, residual_row, write_residual);
+        const void *    left_row     = normalization_input_row(norm, left, row);
+        const void *    right_row    = HasResidual ? normalization_input_row(norm, right, row) : nullptr;
+        void * residual_row = HasResidual && write_residual ?
+                                  (char *) residual + row_offset * input_bytes :
+                                  nullptr;
+        const uint64_t inverse_uram = normalization_inverse_rms<Format, Convert, InputType, Load, HasResidual>(
+            norm, left_row, right_row, residual_row, write_residual);
         const uint64_t uram         = (uint64_t) (uintptr_t) dayan_uram_base();
         const uint64_t input        = uram + NormalizationLayout::kInput;
         const uint64_t value        = uram + NormalizationLayout::kValue;
@@ -221,14 +258,19 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
             const uint32_t elements = min_int((int) (norm->width - offset), (int) NormalizationLayout::kTileElements);
             if constexpr (HasResidual) {
                 if (write_residual) {
-                    normalization_load(value, residual_row + offset, elements);
+                    Load(value, (const char *) residual_row + (uint64_t) offset * input_bytes, elements);
                 } else {
-                    normalization_load(input, left_row + offset, elements);
-                    normalization_load(aux, right_row + offset, elements);
+                    Load(input, (const char *) left_row + (uint64_t) offset * input_bytes, elements);
+                    Load(aux, (const char *) right_row + (uint64_t) offset * input_bytes, elements);
                     normalization_vec_add(input, aux, value, elements);
+                    if constexpr (InputType != kDayanDataTypeF32) {
+                        normalization_quantize<Format>(lowp_uram, value, input, elements);
+                        configure_normalization_lsu();
+                        ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(value, lowp_uram, elements);
+                    }
                 }
             } else {
-                normalization_load(value, left_row + offset, elements);
+                Load(value, (const char *) left_row + (uint64_t) offset * input_bytes, elements);
             }
             normalization_load(aux, scale + offset, elements);
 
@@ -259,27 +301,46 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
     }
 }
 
-static inline void run_rms_norm(const DayanNormConfig * config, const float * input, float * output) {
-    normalization_validate(config);
+template <uint32_t InputType, NormalizationLoad Load>
+static inline void run_rms_norm_typed(const DayanNormConfig * config, const void * input, float * output) {
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
+    normalization_validate<InputType>(config);
     if (input == nullptr || output == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     for (uint32_t row = dayan_native_task_id(); row < config->rows; row += dayan_native_task_count()) {
         const uint64_t row_offset   = (uint64_t) row * config->width;
-        const float *  input_row    = normalization_input_row(config, input, row);
-        const uint64_t inverse_uram = normalization_inverse_rms<false>(config, input_row, nullptr, nullptr, false);
+        const void *    input_row    = normalization_input_row(config, input, row);
+        const uint64_t inverse_uram = normalization_inverse_rms<
+            Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, InputType, Load, false>(
+            config, input_row, nullptr, nullptr, false);
         const uint64_t uram         = (uint64_t) (uintptr_t) dayan_uram_base();
         const uint64_t value        = uram + NormalizationLayout::kValue;
         const uint64_t rms_uram     = uram + NormalizationLayout::kRms;
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
-            normalization_load(value, input_row + offset, elements);
+            Load(value, (const char *) input_row + (uint64_t) offset * input_bytes, elements);
             ggml_dayan_vec_detail::f32_mul_scalar_address(rms_uram, value, inverse_uram, elements);
             normalization_store_f32(output + row_offset + offset, rms_uram, elements);
             dayan_wait_lsu();
         }
+    }
+}
+
+static inline void run_rms_norm(const DayanNormConfig * config, const void * input, float * output) {
+    if (config->input_type == kDayanDataTypeF32) {
+        run_rms_norm_typed<kDayanDataTypeF32, normalization_load_f32>(config, input, output);
+    } else if (config->input_type == kDayanDataTypeBF16) {
+        run_rms_norm_typed<kDayanDataTypeBF16,
+                           normalization_load_lowp<__tx_vec_cvt_fp32_bf16<0, 0, 0>>>(config, input, output);
+    } else if (config->input_type == kDayanDataTypeF16) {
+        run_rms_norm_typed<kDayanDataTypeF16,
+                           normalization_load_lowp<__tx_vec_cvt_fp32_fp16<0, 0, 0>>>(config, input, output);
+    } else {
+        DAYAN_PARAMS_ERROR();
     }
 }
 
@@ -324,7 +385,8 @@ static inline void normalization_centered(const float * input,
 
     ggml_dayan_vec_detail::f32_div(inverse, inverse, width, Constants::kVecLanes);
     ggml_dayan_vec_detail::f32_scalar_add_bits(inverse, epsilon_bits, inverse, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_sfu<4>(inverse, inverse, Constants::kVecLanes);
+    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 4>>(
+        inverse, inverse, Constants::kVecLanes);
 
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
@@ -339,16 +401,18 @@ static inline void normalization_centered(const float * input,
 }
 
 static inline void run_norm(const DayanNormConfig * config, const float * input, float * output) {
-    normalization_validate(config);
+    normalization_validate<kDayanDataTypeF32>(config);
     if (input == nullptr || output == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     for (uint32_t row = dayan_native_task_id(); row < config->rows; row += dayan_native_task_count()) {
         const uint64_t offset = (uint64_t) row * config->width;
         normalization_centered(
-            normalization_input_row(config, input, row), output + offset, config->width, config->epsilon_bits);
+            (const float *) normalization_input_row(config, input, row), output + offset, config->width,
+            config->epsilon_bits);
     }
 }
 
@@ -361,10 +425,11 @@ static inline void run_group_norm(const DayanGroupNormConfig * config, const flo
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     const uint32_t channels_per_group = (config->channels + config->groups - 1U) / config->groups;
     const uint64_t channel_elements   = (uint64_t) config->width * config->height;
     const uint64_t work_items         = (uint64_t) config->batches * config->groups;
@@ -381,20 +446,23 @@ static inline void run_group_norm(const DayanGroupNormConfig * config, const flo
     }
 }
 
+template <typename Format, uint32_t InputType, NormalizationLoad Load>
 static inline void run_residual_add(const DayanElementwiseConfig * config,
-                                    const float *                  left,
-                                    const float *                  right,
-                                    float *                        output) {
+                                    const void *                   left,
+                                    const void *                   right,
+                                    void *                         output) {
     if (config == nullptr || config->elements == 0 || left == nullptr || right == nullptr || output == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
     if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_proc_exit(-12);
+        dayan_thread_exit(-12);
     }
 
     configure_normalization_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     const uint64_t uram  = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input = uram + NormalizationLayout::kInput;
     const uint64_t aux   = uram + NormalizationLayout::kAux;
@@ -405,19 +473,45 @@ static inline void run_residual_add(const DayanElementwiseConfig * config,
         const uint32_t elements  = remaining < NormalizationLayout::kTileElements ?
                                        (uint32_t) remaining :
                                        (uint32_t) NormalizationLayout::kTileElements;
-        normalization_load(input, left + offset, elements);
-        normalization_load(aux, right + offset, elements);
+        Load(input, (const char *) left + offset * input_bytes, elements);
+        Load(aux, (const char *) right + offset * input_bytes, elements);
         normalization_vec_add(input, aux, value, elements);
-        normalization_store_f32(output + offset, value, elements);
+        if constexpr (InputType == kDayanDataTypeF32) {
+            normalization_store_f32((float *) output + offset, value, elements);
+        } else {
+            const uint64_t lowp = uram + NormalizationLayout::kLowp;
+            normalization_quantize<Format>(lowp, value, input, elements);
+            configure_normalization_lsu();
+            normalization_store_lowp((uint16_t *) output + offset, lowp, elements);
+        }
         dayan_wait_lsu();
     }
 }
 
+template <typename Format, void (*Convert)(), uint32_t InputType, NormalizationLoad Load, bool HasResidual>
+static inline void run_rms_norm_pipeline_typed(const DayanNormPipelineConfig * config,
+                                               const void *                    left,
+                                               const void *                    right,
+                                               const float *                   scale,
+                                               void *                          residual,
+                                               float *                         rms,
+                                               float *                         scaled,
+                                               uint16_t *                      lowp) {
+    const bool write_lowp = (config->flags & kDayanNormWriteLowp) != 0U;
+    if (!write_lowp) {
+        run_rms_norm_scale<Format, Convert, InputType, Load, HasResidual, false>(
+            config, left, right, scale, residual, rms, scaled, lowp);
+    } else {
+        run_rms_norm_scale<Format, Convert, InputType, Load, HasResidual, true>(
+            config, left, right, scale, residual, rms, scaled, lowp);
+    }
+}
+
 static inline void run_rms_norm_pipeline(const DayanNormPipelineConfig * config,
-                                         const float *                   left,
-                                         const float *                   right,
+                                         const void *                    left,
+                                         const void *                    right,
                                          const float *                   scale,
-                                         float *                         residual,
+                                         void *                          residual,
                                          float *                         rms,
                                          float *                         scaled,
                                          uint16_t *                      lowp) {
@@ -431,24 +525,58 @@ static inline void run_rms_norm_pipeline(const DayanNormPipelineConfig * config,
 
     const bool has_residual = (config->flags & kDayanNormHasResidual) != 0U;
     const bool write_lowp   = (config->flags & kDayanNormWriteLowp) != 0U;
-    if (write_lowp && config->output_type != kDayanDataTypeBF16 && config->output_type != kDayanDataTypeF16) {
+    if ((write_lowp && config->output_type != kDayanDataTypeBF16 && config->output_type != kDayanDataTypeF16) ||
+        (has_residual && write_lowp && config->norm.input_type != kDayanDataTypeF32 &&
+         config->norm.input_type != config->output_type)) {
         DAYAN_PARAMS_ERROR();
     }
 
-    if (has_residual) {
-        if (!write_lowp) {
-            run_rms_norm_scale<Bf16Format, true, false>(config, left, right, scale, residual, rms, scaled, lowp);
-        } else if (config->output_type == kDayanDataTypeBF16) {
-            run_rms_norm_scale<Bf16Format, true, true>(config, left, right, scale, residual, rms, scaled, lowp);
+    if (config->norm.input_type == kDayanDataTypeF32) {
+        if (write_lowp && config->output_type == kDayanDataTypeF16) {
+            if (has_residual) {
+                run_rms_norm_pipeline_typed<
+                    Fp16Format, __tx_vec_cvt_fp32_fp16<0, 0, 0>, kDayanDataTypeF32, normalization_load_f32, true>(
+                    config, left, right, scale, residual, rms, scaled, lowp);
+            } else {
+                run_rms_norm_pipeline_typed<
+                    Fp16Format, __tx_vec_cvt_fp32_fp16<0, 0, 0>, kDayanDataTypeF32, normalization_load_f32, false>(
+                    config, left, right, scale, residual, rms, scaled, lowp);
+            }
+        } else if (has_residual) {
+            run_rms_norm_pipeline_typed<
+                Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, kDayanDataTypeF32, normalization_load_f32, true>(
+                config, left, right, scale, residual, rms, scaled, lowp);
         } else {
-            run_rms_norm_scale<Fp16Format, true, true>(config, left, right, scale, residual, rms, scaled, lowp);
+            run_rms_norm_pipeline_typed<
+                Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, kDayanDataTypeF32, normalization_load_f32, false>(
+                config, left, right, scale, residual, rms, scaled, lowp);
         }
-    } else if (!write_lowp) {
-        run_rms_norm_scale<Bf16Format, false, false>(config, left, right, scale, residual, rms, scaled, lowp);
-    } else if (config->output_type == kDayanDataTypeBF16) {
-        run_rms_norm_scale<Bf16Format, false, true>(config, left, right, scale, residual, rms, scaled, lowp);
+    } else if (config->norm.input_type == kDayanDataTypeBF16) {
+        if (has_residual) {
+            run_rms_norm_pipeline_typed<
+                Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, kDayanDataTypeBF16,
+                normalization_load_lowp<__tx_vec_cvt_fp32_bf16<0, 0, 0>>, true>(
+                config, left, right, scale, residual, rms, scaled, lowp);
+        } else {
+            run_rms_norm_pipeline_typed<
+                Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, kDayanDataTypeBF16,
+                normalization_load_lowp<__tx_vec_cvt_fp32_bf16<0, 0, 0>>, false>(
+                config, left, right, scale, residual, rms, scaled, lowp);
+        }
+    } else if (config->norm.input_type == kDayanDataTypeF16) {
+        if (has_residual) {
+            run_rms_norm_pipeline_typed<
+                Fp16Format, __tx_vec_cvt_fp32_fp16<0, 0, 0>, kDayanDataTypeF16,
+                normalization_load_lowp<__tx_vec_cvt_fp32_fp16<0, 0, 0>>, true>(
+                config, left, right, scale, residual, rms, scaled, lowp);
+        } else {
+            run_rms_norm_pipeline_typed<
+                Fp16Format, __tx_vec_cvt_fp32_fp16<0, 0, 0>, kDayanDataTypeF16,
+                normalization_load_lowp<__tx_vec_cvt_fp32_fp16<0, 0, 0>>, false>(
+                config, left, right, scale, residual, rms, scaled, lowp);
+        }
     } else {
-        run_rms_norm_scale<Fp16Format, false, true>(config, left, right, scale, residual, rms, scaled, lowp);
+        DAYAN_PARAMS_ERROR();
     }
 }
 

@@ -86,6 +86,8 @@ static const char * ggml_backend_dayan_slot_kind_name(ggml_backend_dayan_slot_ki
     switch (kind) {
         case ggml_backend_dayan_slot_kind::mul_mat:
             return "mul_mat";
+        case ggml_backend_dayan_slot_kind::mul_mat_silu:
+            return "mul_mat_silu";
         case ggml_backend_dayan_slot_kind::mul_mat_quantized:
             return "mul_mat_quantized";
         case ggml_backend_dayan_slot_kind::mul_mat_pair:
@@ -193,6 +195,9 @@ static const char * ggml_backend_dayan_slot_kind_name(ggml_backend_dayan_slot_ki
 static size_t ggml_backend_dayan_slot_outputs(const ggml_backend_dayan_graph_slot & slot,
                                               const ggml_tensor **                  outputs) {
     switch (slot.kind) {
+        case ggml_backend_dayan_slot_kind::mul_mat_silu:
+            outputs[0] = slot.nodes[1];
+            return 1;
         case ggml_backend_dayan_slot_kind::mul_mat_pair:
         case ggml_backend_dayan_slot_kind::mul_mat_id_pair:
             outputs[0] = slot.nodes[0];
@@ -384,6 +389,10 @@ struct ggml_backend_dayan_graph_buffers {
     std::vector<npu_buffer_t *> activations;
     std::unordered_map<ggml_backend_dayan_activation_key, npu_buffer_t *, ggml_backend_dayan_activation_key_hash>
         activation_by_tensor;
+    size_t   runtime_bf16_casts        = 0;
+    size_t   runtime_f16_casts         = 0;
+    uint64_t runtime_bf16_cast_elements = 0;
+    uint64_t runtime_f16_cast_elements  = 0;
 };
 
 static int ggml_backend_dayan_event_wait(npu_event_t * event) {
@@ -707,6 +716,13 @@ static int ggml_backend_dayan_prepare_activation(ggml_backend_dayan_context *   
 
     if (status == 0) {
         buffers->activation_by_tensor.emplace(key, device_buffer);
+        if (storage_type == GGML_TYPE_BF16) {
+            ++buffers->runtime_bf16_casts;
+            buffers->runtime_bf16_cast_elements += activation_count;
+        } else {
+            ++buffers->runtime_f16_casts;
+            buffers->runtime_f16_cast_elements += activation_count;
+        }
         *result = device_buffer;
     }
     return status;
@@ -766,39 +782,72 @@ static bool ggml_backend_dayan_matmul_workspace_size(size_t matrix_bytes,
     return true;
 }
 
-static int ggml_backend_dayan_mul_mat(ggml_backend_dayan_context * ctx,
-                                      ggml_tensor *                dst,
-                                      npu_buffer_t *               activation_buffer) {
-    const ggml_tensor * weight     = dst->src[0];
-    const ggml_tensor * activation = dst->src[1];
+static DayanMatmulConfig ggml_backend_dayan_matmul_config(const ggml_tensor * weight,
+                                                          const ggml_tensor * activation,
+                                                          const ggml_tensor * output) {
+    DayanMatmulConfig config = {};
+    config.m                 = activation->ne[1];
+    config.n                 = weight->ne[1];
+    config.k                 = weight->ne[0];
+    config.a_stride          = config.k * sizeof(uint16_t);
+    config.bt_stride         = weight->nb[1];
+    config.output_stride     = output->nb[1];
 
-    const uint64_t          m      = activation->ne[1];
-    const uint64_t          n      = weight->ne[1];
-    const uint64_t          k      = weight->ne[0];
-    const DayanMatmulConfig config = {
-        m, n, k, k * sizeof(uint16_t), weight->nb[1], dst->nb[1],
-    };
+    if (weight->ne[2] == 1 && weight->ne[3] == 1) {
+        config.m *= (uint64_t) activation->ne[2] * (uint64_t) activation->ne[3];
+        return config;
+    }
+
+    config.batch_ne2            = activation->ne[2];
+    config.batch_ne3            = activation->ne[3];
+    config.weight_ne2           = weight->ne[2];
+    config.weight_ne3           = weight->ne[3];
+    config.a_batch_stride2      = config.a_stride * (uint64_t) activation->ne[1];
+    config.a_batch_stride3      = config.a_batch_stride2 * config.batch_ne2;
+    config.bt_batch_stride2     = weight->nb[2];
+    config.bt_batch_stride3     = weight->nb[3];
+    config.output_batch_stride2 = output->nb[2];
+    config.output_batch_stride3 = output->nb[3];
+    return config;
+}
+
+static int ggml_backend_dayan_mul_mat(ggml_backend_dayan_context * ctx,
+                                      const ggml_tensor *          mul_mat,
+                                      ggml_tensor *                output,
+                                      npu_buffer_t *               activation_buffer,
+                                      bool                         silu) {
+    const ggml_tensor * weight     = mul_mat->src[0];
+    const ggml_tensor * activation = mul_mat->src[1];
+    const DayanMatmulConfig config = ggml_backend_dayan_matmul_config(weight, activation, output);
     ggml_backend_dayan_buffers buffers;
     int                        status =
         ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(DayanMatmulPerf), &buffers);
-    GGML_LOG_ERROR("DBG-mm: m=%llu n=%llu k=%llu prepare=%d actbuf=%d wbuf=%d dstbuf=%d perf=%d\n",
-        (unsigned long long) m, (unsigned long long) n, (unsigned long long) k, status,
-        activation_buffer ? 1 : 0, ggml_backend_dayan_tensor_buffer(weight) ? 1 : 0,
-        ggml_backend_dayan_tensor_buffer(dst) ? 1 : 0, buffers.perf ? 1 : 0);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        ggml_backend_dayan_init_matmul_launch_attrs(ctx, "ggml-mul-mat", &attrs);
-        status = weight->type == GGML_TYPE_BF16 ?
-                     matmul_bf16_4c(buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
-                                    ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs) :
-                     matmul_fp16_4c(buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
-                                    ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
-        GGML_LOG_ERROR("DBG-mm: matmul_4c status=%d\n", status);
+        ggml_backend_dayan_init_matmul_launch_attrs(ctx, silu ? "ggml-mm-silu" : "ggml-mul-mat", &attrs);
+        if (weight->type == GGML_TYPE_BF16) {
+            status = silu ?
+                         matmul_silu_bf16_4c(
+                             buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
+                             ggml_backend_dayan_tensor_buffer(output), buffers.perf, &attrs) :
+                         matmul_bf16_4c(
+                             buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
+                             ggml_backend_dayan_tensor_buffer(output), buffers.perf, &attrs);
+        } else {
+            status = silu ?
+                         matmul_silu_fp16_4c(
+                             buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
+                             ggml_backend_dayan_tensor_buffer(output), buffers.perf, &attrs) :
+                         matmul_fp16_4c(
+                             buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
+                             ggml_backend_dayan_tensor_buffer(output), buffers.perf, &attrs);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
 
     if (status < 0) {
-        GGML_LOG_ERROR("%s: Dayan matrix multiplication failed with status %d\n", __func__, status);
+        GGML_LOG_ERROR("%s: Dayan%s matrix multiplication failed with status %d\n", __func__,
+                       silu ? " SiLU" : "", status);
     }
     return status;
 }
@@ -1111,6 +1160,7 @@ static DayanNormConfig ggml_backend_dayan_norm_config(const ggml_tensor * rms) {
     DayanNormConfig     config = {};
     config.width               = (uint32_t) rms->ne[0];
     config.rows                = (uint32_t) ggml_nrows(rms);
+    GGML_ASSERT(ggml_backend_dayan_type_code(input->type, &config.input_type));
     for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
         config.input_ne[dimension] = (uint32_t) input->ne[dimension];
         config.input_nb[dimension] = input->nb[dimension];
@@ -1397,7 +1447,9 @@ static int ggml_backend_dayan_get_rows(ggml_backend_dayan_context * ctx, const g
     config.source_rows      = (uint64_t) ggml_nrows(source);
     config.destination_rows = (uint64_t) ggml_nrows(output);
     config.source_type      = source_type;
-    config.destination_type = kDayanDataTypeF32;
+    if (!ggml_backend_dayan_type_code(output->type, &config.destination_type)) {
+        return -1;
+    }
     config.index_type       = indices->type == GGML_TYPE_I32 ? kDayanDataTypeI32 : kDayanDataTypeI64;
     for (int dimension = 0; dimension < 3; ++dimension) {
         config.index_ne[dimension]       = (uint32_t) indices->ne[dimension];
@@ -1860,9 +1912,19 @@ static int ggml_backend_dayan_residual_add(ggml_backend_dayan_context *         
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(
             ctx, "residual-add", ggml_backend_dayan_native_tiles(config.elements), &attrs);
-        status = residual_add_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(add->src[0]),
-                                     ggml_backend_dayan_tensor_buffer(add->src[1]),
-                                     ggml_backend_dayan_tensor_buffer(add), &attrs);
+        if (add->type == GGML_TYPE_F32) {
+            status = residual_add_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(add->src[0]),
+                                         ggml_backend_dayan_tensor_buffer(add->src[1]),
+                                         ggml_backend_dayan_tensor_buffer(add), &attrs);
+        } else if (add->type == GGML_TYPE_BF16) {
+            status = residual_add_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(add->src[0]),
+                                          ggml_backend_dayan_tensor_buffer(add->src[1]),
+                                          ggml_backend_dayan_tensor_buffer(add), &attrs);
+        } else {
+            status = residual_add_fp16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(add->src[0]),
+                                          ggml_backend_dayan_tensor_buffer(add->src[1]),
+                                          ggml_backend_dayan_tensor_buffer(add), &attrs);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     if (status < 0) {
@@ -2028,14 +2090,14 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(
-            ctx, q->type == GGML_TYPE_BF16 ? "ggml-fattn-bf16" : "ggml-fattn-fp16",
+            ctx, q->type == GGML_TYPE_BF16 ? "renew-attn-bf16" : "renew-attn-fp16",
             (uint64_t) config.batch * config.q_heads, &attrs);
         if (q->type == GGML_TYPE_BF16) {
-            status = flash_attention_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
+            status = renew_attention_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
                                              ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
                                              ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
         } else if (q->type == GGML_TYPE_F16) {
-            status = flash_attention_fp16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
+            status = renew_attention_fp16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
                                              ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
                                              ggml_backend_dayan_tensor_buffer(dst), buffers.perf, &attrs);
         } else {
@@ -2100,7 +2162,6 @@ static int ggml_backend_dayan_gated_delta_net(ggml_backend_dayan_context * ctx, 
 }
 
 static int ggml_backend_dayan_gated_output_projection(ggml_backend_dayan_context *          ctx,
-                                                      ggml_backend_dayan_graph_buffers *    graph_buffers,
                                                       const ggml_backend_dayan_graph_slot & slot) {
     const ggml_tensor * sigmoid    = slot.nodes[0];
     const ggml_tensor * gated      = slot.nodes[1];
@@ -2120,9 +2181,9 @@ static int ggml_backend_dayan_gated_output_projection(ggml_backend_dayan_context
         (uint32_t) heads,
         (uint32_t) head_dim,
     };
-    npu_buffer_t *             qg_lowp = nullptr;
+    npu_buffer_t *             qg_buffer = ggml_backend_dayan_tensor_buffer(qg);
     ggml_backend_dayan_buffers buffers;
-    int status = ggml_backend_dayan_prepare_activation(ctx, graph_buffers, qg, weight->type, &qg_lowp);
+    int status = qg_buffer != nullptr && (qg->type == GGML_TYPE_F32 || qg->type == weight->type) ? 0 : -1;
     size_t perf_size = 0;
     if (status == 0) {
         status = ggml_backend_dayan_matmul_workspace_size(
@@ -2133,13 +2194,27 @@ static int ggml_backend_dayan_gated_output_projection(ggml_backend_dayan_context
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_matmul_launch_attrs(ctx, "gate-out", &attrs);
-        status = weight->type == GGML_TYPE_BF16 ?
-                     project_gated_output_bf16_4c(buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_lowp,
-                                                  ggml_backend_dayan_tensor_buffer(weight),
-                                                  ggml_backend_dayan_tensor_buffer(projection), buffers.perf, &attrs) :
-                     project_gated_output_fp16_4c(buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_lowp,
-                                                  ggml_backend_dayan_tensor_buffer(weight),
-                                                  ggml_backend_dayan_tensor_buffer(projection), buffers.perf, &attrs);
+        if (qg->type == GGML_TYPE_F32) {
+            status = weight->type == GGML_TYPE_BF16 ?
+                         project_gated_output_f32_gate_bf16_4c(
+                             buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_buffer,
+                             ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(projection),
+                             buffers.perf, &attrs) :
+                         project_gated_output_f32_gate_fp16_4c(
+                             buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_buffer,
+                             ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(projection),
+                             buffers.perf, &attrs);
+        } else {
+            status = weight->type == GGML_TYPE_BF16 ?
+                         project_gated_output_bf16_4c(
+                             buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_buffer,
+                             ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(projection),
+                             buffers.perf, &attrs) :
+                         project_gated_output_fp16_4c(
+                             buffers.config, ggml_backend_dayan_tensor_buffer(attention), qg_buffer,
+                             ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(projection),
+                             buffers.perf, &attrs);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     if (status < 0) {
@@ -2457,7 +2532,19 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
                     status = ggml_backend_dayan_prepare_activation(ctx, &graph_buffers, slot.nodes[0]->src[1],
                                                                    slot.nodes[0]->src[0]->type, &activation_buffer);
                     if (status == 0) {
-                        status = ggml_backend_dayan_mul_mat(ctx, slot.nodes[0], activation_buffer);
+                        status = ggml_backend_dayan_mul_mat(
+                            ctx, slot.nodes[0], slot.nodes[0], activation_buffer, false);
+                    }
+                }
+                break;
+            case ggml_backend_dayan_slot_kind::mul_mat_silu:
+                {
+                    npu_buffer_t * activation_buffer = nullptr;
+                    status = ggml_backend_dayan_prepare_activation(ctx, &graph_buffers, slot.nodes[0]->src[1],
+                                                                   slot.nodes[0]->src[0]->type, &activation_buffer);
+                    if (status == 0) {
+                        status = ggml_backend_dayan_mul_mat(
+                            ctx, slot.nodes[0], slot.nodes[1], activation_buffer, true);
                     }
                 }
                 break;
@@ -2609,7 +2696,7 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
                 status = ggml_backend_dayan_gated_delta_net(ctx, slot.nodes[0]);
                 break;
             case ggml_backend_dayan_slot_kind::gated_output_projection:
-                status = ggml_backend_dayan_gated_output_projection(ctx, &graph_buffers, slot);
+                status = ggml_backend_dayan_gated_output_projection(ctx, slot);
                 break;
             case ggml_backend_dayan_slot_kind::ssm_conv:
             case ggml_backend_dayan_slot_kind::ssm_conv_silu:
@@ -2633,14 +2720,77 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
     }
 
     if (!plan.slots.empty()) {
+        size_t   memory_bf16_widen_slots    = 0;
+        size_t   memory_f16_widen_slots     = 0;
+        size_t   local_bf16_widen_slots     = 0;
+        size_t   local_f16_widen_slots      = 0;
+        uint64_t memory_bf16_widen_elements = 0;
+        uint64_t memory_f16_widen_elements  = 0;
+        uint64_t local_bf16_widen_elements  = 0;
+        uint64_t local_f16_widen_elements   = 0;
+        for (const ggml_backend_dayan_graph_slot & slot : plan.slots) {
+            enum ggml_type source_type = GGML_TYPE_COUNT;
+            uint64_t       elements    = 0;
+            bool           local       = false;
+            if ((slot.kind == ggml_backend_dayan_slot_kind::get_rows ||
+                 slot.kind == ggml_backend_dayan_slot_kind::copy) &&
+                slot.nodes[0] != nullptr && slot.nodes[0]->src[0] != nullptr &&
+                slot.nodes[0]->type == GGML_TYPE_F32) {
+                source_type = slot.nodes[0]->src[0]->type;
+                elements    = ggml_nelements(slot.nodes[0]);
+            } else if (slot.kind == ggml_backend_dayan_slot_kind::softmax &&
+                       slot.nodes[0] != nullptr && slot.nodes[0]->src[1] != nullptr) {
+                source_type = slot.nodes[0]->src[1]->type;
+                elements    = ggml_nelements(slot.nodes[0]);
+                local       = true;
+            } else if (slot.kind == ggml_backend_dayan_slot_kind::gated_output_projection &&
+                       slot.nodes[0] != nullptr && slot.nodes[3] != nullptr) {
+                source_type = slot.nodes[3]->type;
+                elements    = ggml_nelements(slot.nodes[0]);
+                local       = true;
+            } else if (slot.kind == ggml_backend_dayan_slot_kind::norm_pipeline && slot.nodes[1] != nullptr &&
+                       slot.nodes[1]->src[0] != nullptr) {
+                source_type = slot.nodes[1]->src[0]->type;
+                elements    = ggml_nelements(slot.nodes[1]);
+                local       = true;
+            } else if (slot.kind == ggml_backend_dayan_slot_kind::rms_norm && slot.nodes[0] != nullptr &&
+                       slot.nodes[0]->src[0] != nullptr) {
+                source_type = slot.nodes[0]->src[0]->type;
+                elements    = ggml_nelements(slot.nodes[0]);
+                local       = true;
+            }
+            if (source_type == GGML_TYPE_BF16) {
+                if (local) {
+                    ++local_bf16_widen_slots;
+                    local_bf16_widen_elements += elements;
+                } else {
+                    ++memory_bf16_widen_slots;
+                    memory_bf16_widen_elements += elements;
+                }
+            } else if (source_type == GGML_TYPE_F16) {
+                if (local) {
+                    ++local_f16_widen_slots;
+                    local_f16_widen_elements += elements;
+                } else {
+                    ++memory_f16_widen_slots;
+                    memory_f16_widen_elements += elements;
+                }
+            }
+        }
         GGML_LOG_DEBUG(
             "%s: lowered %d nodes to %zu slots, paired=%zu, fused=%zu, residual=%zu, rms=%zu, "
             "attention=%zu, delta=%zu, gated=%zu, conv=%zu, moe=%zu, moe-fused=%zu, routing=%zu, activations=%zu, "
-            "compile=%.3f ms\n",
+            "memory-widen=bf16:%zu/%" PRIu64 ",f16:%zu/%" PRIu64 ", "
+            "local-widen=bf16:%zu/%" PRIu64 ",f16:%zu/%" PRIu64 ", "
+            "runtime-cast=bf16:%zu/%" PRIu64 ",f16:%zu/%" PRIu64 ", compile=%.3f ms\n",
             __func__, cgraph->n_nodes, plan.slots.size(), plan.paired_mul_mat_slots, plan.fused_mul_mat_slots,
             plan.residual_add_slots, plan.rms_norm_slots, plan.flash_attention_slots, plan.gated_delta_net_slots,
             plan.gated_output_slots, plan.ssm_conv_slots, plan.moe_slots, plan.fused_moe_slots, plan.routing_slots,
-            graph_buffers.activation_by_tensor.size(), compile_ms);
+            graph_buffers.activation_by_tensor.size(), memory_bf16_widen_slots, memory_bf16_widen_elements,
+            memory_f16_widen_slots, memory_f16_widen_elements, local_bf16_widen_slots, local_bf16_widen_elements,
+            local_f16_widen_slots, local_f16_widen_elements, graph_buffers.runtime_bf16_casts,
+            graph_buffers.runtime_bf16_cast_elements, graph_buffers.runtime_f16_casts,
+            graph_buffers.runtime_f16_cast_elements, compile_ms);
     }
     return GGML_STATUS_SUCCESS;
 }

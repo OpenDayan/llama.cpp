@@ -24,8 +24,8 @@ struct Matmul4cShape {
 struct Constants {
     enum : int {
         kDramLoad = 0,
-        kRemoteCopy = 1,
-        kCStore = 3,
+        kRemoteCopy = 0,
+        kCStore = 0,
         kTileM = Matmul4cShape::kTileM,
         kTileN = Matmul4cShape::kTileN,
         kTileK = Matmul4cShape::kTileK,
@@ -52,6 +52,8 @@ static_assert(Constants::kClusterRows == Constants::kClusterColumns,
 static_assert((Constants::kUramWindowStride &
                (Constants::kUramWindowStride - 1)) == 0,
               "URAM window stride must be a power of two");
+
+static constexpr uint64_t kMatBatchSwizzle = MAT_BATCH_SWIZZLE(5, 3, 5);
 
 static inline int min_int(int left, int right)
 {
@@ -151,6 +153,16 @@ static_assert(AProducerLayout::total_bytes() <= Matmul4cShape::kUramBytes,
               "A-producer matmul URAM layout is too large");
 static_assert(BProducerLayout::total_bytes() <= Matmul4cShape::kUramBytes,
               "B-producer matmul URAM layout is too large");
+static_assert(AProducerLayout::total_bytes() +
+                  ggml_dayan_matmul_detail::Constants::kConstantCount *
+                      ggml_dayan_matmul_detail::Constants::kConstantStride <=
+              Matmul4cShape::kUramBytes,
+              "A-producer SiLU constants do not fit in URAM");
+static_assert(BProducerLayout::total_bytes() +
+                  ggml_dayan_matmul_detail::Constants::kConstantCount *
+                      ggml_dayan_matmul_detail::Constants::kConstantStride <=
+              Matmul4cShape::kUramBytes,
+              "B-producer SiLU constants do not fit in URAM");
 
 struct alignas(Constants::kCoherentCacheLine) SharedBuffer {
     dayan_shared_resource_t resource;
@@ -172,33 +184,28 @@ struct ClusterShared {
 static_assert(sizeof(ClusterShared) <= Matmul4cShape::kAtomicBytes,
               "cluster matmul shared state exceeds its atomic-cache request");
 
-static inline ClusterShared &cluster_shared()
-{
+static inline ClusterShared & cluster_shared() {
     return *static_cast<ClusterShared *>(shared);
 }
 
-template <bool ProducerLoadsA>
-static inline SharedBuffer *shared_a(uint32_t row_lane, int index)
-{
-    return ProducerLoadsA ? &cluster_shared().buffered[row_lane][index]
-                          : &cluster_shared().sliced[row_lane][index];
+template <bool ProducerLoadsA> static inline SharedBuffer * shared_a(uint32_t row_lane, int index) {
+    return ProducerLoadsA ? &cluster_shared().buffered[row_lane][index] : &cluster_shared().sliced[row_lane][index];
 }
 
-template <bool ProducerLoadsA>
-static inline SharedBuffer *shared_b(uint32_t column_lane, int index)
-{
-    return ProducerLoadsA ? &cluster_shared().sliced[column_lane][index]
-                          : &cluster_shared().buffered[column_lane][index];
+template <bool ProducerLoadsA> static inline SharedBuffer * shared_b(uint32_t column_lane, int index) {
+    return ProducerLoadsA ? &cluster_shared().sliced[column_lane][index] :
+                            &cluster_shared().buffered[column_lane][index];
 }
 
 struct LocalBuffer {
     dayan_resource_t resource;
-    uint64_t uram;
+    uint64_t         uram;
 };
 
-struct TileConfig {
+struct MatConfig {
     int rows;
     int columns;
+    int k;
 };
 
 struct LsuConfig {
@@ -223,13 +230,13 @@ struct MatmulState {
     uint64_t bt_stride;
     uint64_t c_stride;
     uint64_t uram_base;
+    uint64_t physical_uram;
+    uint64_t constants;
     LocalBuffer a[Constants::kSlices];
     LocalBuffer b[Constants::kSlices];
-    dayan_resource_t load_issued[2];
     dayan_resource_t mat_turn[2];
     dayan_resource_t c[Constants::kSlices];
     uint64_t generation_count;
-    TileConfig mat_config[Constants::kSlices];
     LsuConfig store_config;
 };
 
@@ -370,7 +377,7 @@ static inline void decode_generation(const MatmulState *state,
 static inline void require_status(int status)
 {
     if (status < 0)
-        dayan_proc_exit(status);
+        dayan_thread_exit(status);
 }
 
 template <bool ProducerLoadsA>
@@ -391,7 +398,7 @@ static inline LsuConfig configure_loader(const MatmulState *state,
     long checksum = 0;
     constexpr int row_bytes =
         Constants::kTileK * (int)sizeof(uint16_t);
-    constexpr uint64_t swizzle = MAT_BATCH_SWIZZLE(5, 3, 5);
+    constexpr uint64_t swizzle = kMatBatchSwizzle;
     const int rows = loads_a ?
         (ProducerLoadsA ? Constants::kTileM : Layout::slice_size(0)) :
         (ProducerLoadsA ? Layout::slice_size(0) : Constants::kTileN);
@@ -441,7 +448,6 @@ static inline void issue_dram_load(LocalBuffer *local,
                                    uint32_t local_consumers,
                                    bool remote_active, uint64_t dram,
                                    uint64_t major_bytes,
-                                   dayan_resource_t *load_issued,
                                    int *configured_dim0)
 {
     if (local_consumers)
@@ -450,7 +456,6 @@ static inline void issue_dram_load(LocalBuffer *local,
         begin_resource(&remote->resource, 1U);
 
     uint64_t uram = local->uram;
-    bool first_command = true;
 
     while (major_bytes) {
         uint64_t handled_bytes = major_bytes & ~0x3fULL;
@@ -472,9 +477,6 @@ static inline void issue_dram_load(LocalBuffer *local,
             LoadGroup * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(
                 request_size - 1U);
         __tx_lsu_dma_d2u<LoadGroup>((long)uram, (long)dram);
-        if (first_command && load_issued)
-            require_status(dayan_resource_produce(load_issued));
-        first_command = false;
         uram += handled_bytes;
         dram += handled_bytes;
         major_bytes -= handled_bytes;
@@ -511,13 +513,8 @@ static void dram_load_a(MatmulState *state, uint64_t generation,
 {
     using Layout = UramLayout<ProducerLoadsA>;
 
-    const bool signal_copy =
-        generation_has_local_work<ProducerLoadsA>(state, tile_m, tile_n);
     const int real_k = k_for_tile(state, tile_k);
-    bool issued = false;
 
-    if (signal_copy)
-        begin_resource(&state->load_issued[generation & 1U], 1U);
     if (ProducerLoadsA) {
         const int real_rows = rows_for_tile(
             state, tile_m, state->row_lane);
@@ -547,7 +544,6 @@ static void dram_load_a(MatmulState *state, uint64_t generation,
         issue_dram_load<LoadGroup>(
             local, shared_buffer, (uint32_t)local_users, peer_users > 0,
             a_dram, (uint64_t)real_k * sizeof(uint16_t),
-            signal_copy ? &state->load_issued[generation & 1U] : nullptr,
             &configured->dim0);
         return;
     }
@@ -577,16 +573,11 @@ static void dram_load_a(MatmulState *state, uint64_t generation,
         const uint64_t a_dram =
             state->a_base + global_row * state->a_stride +
             (uint64_t)tile_k * Constants::kTileK * sizeof(uint16_t);
-        dayan_resource_t *load_issued =
-            !issued && signal_copy ?
-                &state->load_issued[generation & 1U] : nullptr;
 
         issue_dram_load<LoadGroup>(
             local, shared_buffer, local_active ? 1U : 0U, peer_active,
-            a_dram, (uint64_t)real_k * sizeof(uint16_t), load_issued,
+            a_dram, (uint64_t)real_k * sizeof(uint16_t),
             &configured->dim0);
-        if (load_issued)
-            issued = true;
     }
 }
 
@@ -597,13 +588,8 @@ static void dram_load_b(MatmulState *state, uint64_t generation,
 {
     using Layout = UramLayout<ProducerLoadsA>;
 
-    const bool signal_copy =
-        generation_has_local_work<ProducerLoadsA>(state, tile_m, tile_n);
     const int real_k = k_for_tile(state, tile_k);
-    bool issued = false;
 
-    if (signal_copy)
-        begin_resource(&state->load_issued[generation & 1U], 1U);
     if (ProducerLoadsA) {
         const int local_rows = rows_for_tile(
             state, tile_m, state->row_lane);
@@ -630,17 +616,12 @@ static void dram_load_b(MatmulState *state, uint64_t generation,
             const uint64_t bt_dram =
                 state->bt_base + global_column * state->bt_stride +
                 (uint64_t)tile_k * Constants::kTileK * sizeof(uint16_t);
-            dayan_resource_t *load_issued =
-                !issued && signal_copy ?
-                    &state->load_issued[generation & 1U] : nullptr;
 
             issue_dram_load<LoadGroup>(
                 local, shared_buffer, local_active ? 1U : 0U,
                 peer_active, bt_dram,
-                (uint64_t)real_k * sizeof(uint16_t), load_issued,
+                (uint64_t)real_k * sizeof(uint16_t),
                 &configured->dim0);
-            if (load_issued)
-                issued = true;
         }
         return;
     }
@@ -672,7 +653,6 @@ static void dram_load_b(MatmulState *state, uint64_t generation,
     issue_dram_load<LoadGroup>(
         local, shared_buffer, (uint32_t)local_users, peer_users > 0,
         bt_dram, (uint64_t)real_k * sizeof(uint16_t),
-        signal_copy ? &state->load_issued[generation & 1U] : nullptr,
         &configured->dim0);
 }
 
@@ -828,11 +808,6 @@ static void remote_copy(void *argument)
         if (!generation_has_local_work<ProducerLoadsA>(
                 state, tile_m, tile_n))
             continue;
-        dayan_resource_t *load_issued =
-            &state->load_issued[generation & 1U];
-
-        require_status(dayan_resource_wait_ready(load_issued));
-        require_status(dayan_resource_consume(load_issued));
         if (copies_a) {
             copy_a<ProducerLoadsA, Constants::kRemoteCopy>(
                 state, generation, tile_m, tile_n, &configured.dim1);
@@ -843,14 +818,14 @@ static void remote_copy(void *argument)
     }
 }
 
-template <typename Format, bool ProducerLoadsA, long GroupBase, int Slice>
-static inline void configure_mat_group()
+template <typename Format, bool ProducerLoadsA, uint64_t OutputSwizzle, long GroupBase>
+static inline MatConfig configure_mat_group()
 {
     using Layout = UramLayout<ProducerLoadsA>;
 
-    constexpr int rows = Layout::max_rows(Slice);
-    constexpr int columns = Layout::max_cols(Slice);
-    constexpr uint64_t swizzle = MAT_BATCH_SWIZZLE(5, 3, 5);
+    constexpr int rows = Layout::max_rows(0);
+    constexpr int columns = Layout::max_cols(0);
+    constexpr uint64_t swizzle = kMatBatchSwizzle;
 
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_M>(rows - 1);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_N>(columns - 1);
@@ -867,30 +842,14 @@ static inline void configure_mat_group()
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_BSWIZZLEMBS>(
         swizzle);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_CSWIZZLEMBS>(
-        swizzle);
+        OutputSwizzle);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_PERSISTENTMODE>(0);
     __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_DATATYPE>(
         Format::kMatDataType);
-}
-
-template <bool ProducerLoadsA, long StoreGroup>
-static inline LsuConfig configure_c_store(const MatmulState *state)
-{
-    using Layout = UramLayout<ProducerLoadsA>;
-
-    constexpr int rows = Layout::max_rows(0);
-    constexpr int columns = Layout::max_cols(0);
-    long checksum = 0;
-    constexpr uint64_t swizzle = MAT_BATCH_SWIZZLE(5, 3, 5);
-
-    set_lsu_matrix<StoreGroup>(
-        checksum, rows, columns * (int)sizeof(float),
-        columns * (int)sizeof(float), (long)state->c_stride);
-    __tx_lsu_tcsr_write<
-        StoreGroup * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(swizzle);
     return {
-        columns * (int)sizeof(float) / 64 - 1,
-        rows - 1,
+        rows,
+        columns,
+        Constants::kTileK,
     };
 }
 
@@ -904,7 +863,7 @@ static inline void pass_mat_turn(MatmulState *state, uint32_t worker)
 
 template <typename Format, bool ProducerLoadsA, long GroupBase, int Slice>
 static void execute_mat_job(MatmulState *state, const MatJob &job,
-                            uint32_t worker)
+                            uint32_t worker, MatConfig *configured)
 {
     using Layout = UramLayout<ProducerLoadsA>;
 
@@ -919,20 +878,22 @@ static void execute_mat_job(MatmulState *state, const MatJob &job,
     LocalBuffer *a = &state->a[a_buffer_index];
     LocalBuffer *b = &state->b[b_buffer_index];
     const uint64_t c_uram = state->uram_base + Layout::c_base(Slice);
-    TileConfig *config = &state->mat_config[Slice];
 
-    if (real_rows != config->rows) {
+    if (real_rows != configured->rows) {
         __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_M>(
             real_rows - 1);
-        config->rows = real_rows;
+        configured->rows = real_rows;
     }
-    if (real_columns != config->columns) {
+    if (real_columns != configured->columns) {
         __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_N>(
             real_columns - 1);
-        config->columns = real_columns;
+        configured->columns = real_columns;
     }
-    __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_K>(
-        k_for_tile(state, job.tile_k) - 1);
+    const int real_k = k_for_tile(state, job.tile_k);
+    if (real_k != configured->k) {
+        __tx_mat_tcsr_write<GroupBase * MAT_GROUPSZ + MAT_K>(real_k - 1);
+        configured->k = real_k;
+    }
     if (job.tile_k == 0)
         __tx_mat_mm<GroupBase>((long)c_uram, (long)a->uram,
                                (long)b->uram);
@@ -954,7 +915,7 @@ static void execute_mat_job(MatmulState *state, const MatJob &job,
     require_status(dayan_resource_consume(&b->resource));
 }
 
-template <typename Format, bool ProducerLoadsA>
+template <typename Format, bool ProducerLoadsA, uint64_t OutputSwizzle>
 static void mat_worker(void *argument)
 {
     MatWorkerArgs *args = (MatWorkerArgs *)argument;
@@ -962,6 +923,8 @@ static void mat_worker(void *argument)
     const uint32_t worker = args->worker;
     const uint64_t job_count =
         state->generation_count * Constants::kSlices;
+    MatConfig configured =
+        configure_mat_group<Format, ProducerLoadsA, OutputSwizzle, 0>();
 
     for (uint64_t sequence = worker; sequence < job_count;
          sequence += 2U) {
@@ -1002,22 +965,22 @@ static void mat_worker(void *argument)
             switch (job.slice) {
             case 0:
                 execute_mat_job<Format, ProducerLoadsA, 0, 0>(
-                    state, job, worker);
+                    state, job, worker, &configured);
                 break;
             case 1:
-                execute_mat_job<Format, ProducerLoadsA, 4, 1>(
-                    state, job, worker);
+                execute_mat_job<Format, ProducerLoadsA, 0, 1>(
+                    state, job, worker, &configured);
                 break;
             case 2:
-                execute_mat_job<Format, ProducerLoadsA, 2, 2>(
-                    state, job, worker);
+                execute_mat_job<Format, ProducerLoadsA, 0, 2>(
+                    state, job, worker, &configured);
                 break;
             case 3:
-                execute_mat_job<Format, ProducerLoadsA, 1, 3>(
-                    state, job, worker);
+                execute_mat_job<Format, ProducerLoadsA, 0, 3>(
+                    state, job, worker, &configured);
                 break;
             default:
-                dayan_proc_exit(-22);
+                dayan_thread_exit(-22);
             }
         } else {
             pass_mat_turn(state, worker);
@@ -1025,80 +988,122 @@ static void mat_worker(void *argument)
     }
 }
 
-template <bool ProducerLoadsA>
-static void issue_c_store(MatmulState *state, int tile_m, int tile_n,
-                          int slice)
-{
+template <bool ProducerLoadsA, bool Silu>
+static void issue_c_store(MatmulState * state, int tile_m, int tile_n, int slice) {
     using Layout = UramLayout<ProducerLoadsA>;
 
-    const int real_rows = rows_for_slice<ProducerLoadsA>(
-        state, tile_m, state->row_lane, slice);
-    const int real_columns = cols_for_slice<ProducerLoadsA>(
-        state, tile_n, state->column_lane, slice);
+    const int real_rows    = rows_for_slice<ProducerLoadsA>(state, tile_m, state->row_lane, slice);
+    const int real_columns = cols_for_slice<ProducerLoadsA>(state, tile_n, state->column_lane, slice);
     require_status(dayan_resource_wait_ready(&state->c[slice]));
-    configure_lsu_tcsr<Constants::kCStore * LSU_GROUPSZ + LSU_DIM1>(
-        real_rows - 1, &state->store_config.dim1);
+    configure_lsu_tcsr<Constants::kCStore * LSU_GROUPSZ + LSU_DIM1>(real_rows - 1, &state->store_config.dim1);
     configure_lsu_tcsr<Constants::kCStore * LSU_GROUPSZ + LSU_DIM0>(
-        (int)((uint64_t)real_columns * sizeof(float) / 64U - 1U),
-        &state->store_config.dim0);
-    const uint64_t global_row =
-        (uint64_t)row_partition_begin(state, state->row_lane) +
-        (uint64_t)tile_m * Constants::kTileM +
-        (ProducerLoadsA ? 0U : (uint64_t)Layout::slice_offset(slice));
+        (int) ((uint64_t) real_columns * sizeof(float) / 64U - 1U), &state->store_config.dim0);
+    const uint64_t global_row = (uint64_t) row_partition_begin(state, state->row_lane) +
+                                (uint64_t) tile_m * Constants::kTileM +
+                                (ProducerLoadsA ? 0U : (uint64_t) Layout::slice_offset(slice));
     const uint64_t global_column =
-        (uint64_t)(tile_n * Constants::kClusterColumns +
-                   (int)state->column_lane) * Constants::kTileN +
-        (ProducerLoadsA ? (uint64_t)Layout::slice_offset(slice) : 0U);
+        (uint64_t) (tile_n * Constants::kClusterColumns + (int) state->column_lane) * Constants::kTileN +
+        (ProducerLoadsA ? (uint64_t) Layout::slice_offset(slice) : 0U);
     const uint64_t c_uram = state->uram_base + Layout::c_base(slice);
-    const uint64_t c_dram =
-        state->c_base + global_row * state->c_stride +
-        global_column * sizeof(float);
+    const uint64_t c_dram = state->c_base + global_row * state->c_stride + global_column * sizeof(float);
 
-    __tx_lsu_dma_u2d<Constants::kCStore>((long)c_dram, (long)c_uram);
+    if constexpr (Silu) {
+        const uint64_t constant_stride = ggml_dayan_matmul_detail::Constants::kConstantStride;
+        const ggml_dayan_vec_detail::ActivationConstants constants = {
+            state->constants + ggml_dayan_matmul_detail::Constants::kConstantNegLog2E * constant_stride,
+            state->constants + ggml_dayan_matmul_detail::Constants::kConstantOne * constant_stride,
+            0U,
+            0U,
+            0U,
+            0U,
+            0U,
+        };
+        const ggml_dayan_vec_detail::F32Tensor tile = {
+            state->physical_uram + Layout::c_base(slice),
+            (long) Layout::max_cols(slice) * (long) sizeof(float),
+        };
+        ggml_dayan_vec_detail::issue_silu_configured(tile, tile, constants);
+        dayan_wait_vec();
+    }
+
+    __tx_lsu_dma_u2d<Constants::kCStore>((long) c_dram, (long) c_uram);
 }
 
-static inline void complete_c_store_batch(MatmulState *state,
-                                          uint32_t active_mask)
-{
+static inline void complete_c_store_batch(MatmulState * state, uint32_t active_mask) {
     dayan_wait_lsu();
     for (int slice = 0; slice < Constants::kSlices; ++slice) {
-        if (active_mask & (1U << slice))
+        if (active_mask & (1U << slice)) {
             require_status(dayan_resource_consume(&state->c[slice]));
+        }
     }
 }
 
-template <bool ProducerLoadsA>
-static void c_store_worker(void *argument)
-{
-    MatmulState *state = (MatmulState *)argument;
-    const uint64_t output_count =
-        (uint64_t)state->count_m * (uint64_t)state->count_n;
+template <bool ProducerLoadsA, bool Silu, uint64_t OutputSwizzle> static void c_store_worker(void * argument) {
+    using Layout = UramLayout<ProducerLoadsA>;
+
+    MatmulState *      state    = (MatmulState *) argument;
+    constexpr int      rows     = Layout::max_rows(0);
+    constexpr int      columns  = Layout::max_cols(0);
+    long               checksum = 0;
+
+    set_lsu_matrix<Constants::kCStore>(checksum, rows, columns * (int) sizeof(float), columns * (int) sizeof(float),
+                                       (long) state->c_stride);
+    __tx_lsu_tcsr_write<Constants::kCStore * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(OutputSwizzle);
+    state->store_config = {
+        columns * (int) sizeof(float) / 64 - 1,
+        rows - 1,
+    };
+    if constexpr (Silu) {
+        const ggml_dayan_vec_detail::F32Tensor tile = {
+            state->physical_uram + Layout::c_base(0),
+            (long) columns * (long) sizeof(float),
+        };
+        ggml_dayan_vec_detail::configure_activation(tile, tile, tile, rows, columns);
+    }
+    const uint64_t output_count = (uint64_t) state->count_m * (uint64_t) state->count_n;
 
     for (uint64_t output = 0; output < output_count; ++output) {
-        const int tile_m = (int)(output / (uint64_t)state->count_n);
-        const int tile_n = (int)(output % (uint64_t)state->count_n);
-        uint32_t active_mask = 0;
-        int issued = 0;
+        const int tile_m      = (int) (output / (uint64_t) state->count_n);
+        const int tile_n      = (int) (output % (uint64_t) state->count_n);
+        uint32_t  active_mask = 0;
+        int       issued      = 0;
 
         for (int slice = 0; slice < Constants::kSlices; ++slice) {
-            const int rows = rows_for_slice<ProducerLoadsA>(
-                state, tile_m, state->row_lane, slice);
-            const int columns = cols_for_slice<ProducerLoadsA>(
-                state, tile_n, state->column_lane, slice);
+            const int rows    = rows_for_slice<ProducerLoadsA>(state, tile_m, state->row_lane, slice);
+            const int columns = cols_for_slice<ProducerLoadsA>(state, tile_n, state->column_lane, slice);
 
-            if (!rows || !columns)
+            if (!rows || !columns) {
                 continue;
+            }
             active_mask |= 1U << slice;
-            issue_c_store<ProducerLoadsA>(state, tile_m, tile_n, slice);
+            issue_c_store<ProducerLoadsA, Silu>(state, tile_m, tile_n, slice);
             if (++issued == 2) {
                 complete_c_store_batch(state, active_mask);
                 active_mask = 0;
-                issued = 0;
+                issued      = 0;
             }
         }
-        if (active_mask)
+        if (active_mask) {
             complete_c_store_batch(state, active_mask);
+        }
     }
+}
+
+static inline bool batch_stride_valid(uint64_t rows,
+                                      uint64_t row_stride,
+                                      uint64_t batch_ne2,
+                                      uint64_t batch_ne3,
+                                      uint64_t batch_stride2,
+                                      uint64_t batch_stride3) {
+    if (rows > UINT64_MAX / row_stride)
+        return false;
+    const uint64_t matrix_bytes = rows * row_stride;
+    if (batch_stride2 < matrix_bytes ||
+        batch_ne2 > UINT64_MAX / batch_stride2 ||
+        batch_stride3 < batch_ne2 * batch_stride2 ||
+        batch_ne3 > UINT64_MAX / batch_stride3)
+        return false;
+    return true;
 }
 
 static inline int config_valid(const DayanMatmulConfig *config)
@@ -1115,6 +1120,37 @@ static inline int config_valid(const DayanMatmulConfig *config)
         config->a_stride > 0x7fffffffffffffffULL ||
         config->bt_stride > 0x7fffffffffffffffULL ||
         config->output_stride > 0x7fffffffffffffffULL)
+        return 0;
+
+    const uint64_t batch_fields =
+        config->batch_ne2 | config->batch_ne3 |
+        config->weight_ne2 | config->weight_ne3 |
+        config->a_batch_stride2 | config->a_batch_stride3 |
+        config->bt_batch_stride2 | config->bt_batch_stride3 |
+        config->output_batch_stride2 | config->output_batch_stride3;
+    if (batch_fields == 0U)
+        return 1;
+    if (!config->batch_ne2 || !config->batch_ne3 ||
+        !config->weight_ne2 || !config->weight_ne3 ||
+        !config->a_batch_stride2 || !config->a_batch_stride3 ||
+        !config->bt_batch_stride2 || !config->bt_batch_stride3 ||
+        !config->output_batch_stride2 ||
+        !config->output_batch_stride3 ||
+        config->batch_ne2 % config->weight_ne2 != 0U ||
+        config->batch_ne3 % config->weight_ne3 != 0U ||
+        config->batch_ne2 > int_limit / config->batch_ne3 ||
+        !batch_stride_valid(config->m, config->a_stride,
+                            config->batch_ne2, config->batch_ne3,
+                            config->a_batch_stride2,
+                            config->a_batch_stride3) ||
+        !batch_stride_valid(config->n, config->bt_stride,
+                            config->weight_ne2, config->weight_ne3,
+                            config->bt_batch_stride2,
+                            config->bt_batch_stride3) ||
+        !batch_stride_valid(config->m, config->output_stride,
+                            config->batch_ne2, config->batch_ne3,
+                            config->output_batch_stride2,
+                            config->output_batch_stride3))
         return 0;
     return 1;
 }
@@ -1154,7 +1190,7 @@ static int initialize_cluster_shared(ClusterShared &cluster, uint32_t lane,
     return cluster.init_status;
 }
 
-template <typename Format, bool ProducerLoadsA>
+template <typename Format, bool ProducerLoadsA, bool Silu, uint64_t OutputSwizzle>
 static int run_pipeline(const DayanMatmulConfig *config,
                         const uint16_t *a, const uint16_t *bt, float *c,
                         uint32_t lane, uint64_t physical_uram)
@@ -1180,22 +1216,29 @@ static int run_pipeline(const DayanMatmulConfig *config,
                     Constants::kTileK;
     state.lane = lane;
     state.row_lane = lane >> 1;
-    state.column_lane = lane & 1U;
-    state.a_base = (uint64_t)(uintptr_t)a;
-    state.bt_base = (uint64_t)(uintptr_t)bt;
-    state.c_base = (uint64_t)(uintptr_t)c;
-    state.a_stride = config->a_stride;
-    state.bt_stride = config->bt_stride;
-    state.c_stride = config->output_stride;
-    state.uram_base = physical_uram &
-                      (Constants::kUramWindowStride - 1U);
+    state.column_lane   = lane & 1U;
+    state.a_base        = (uint64_t) (uintptr_t) a;
+    state.bt_base       = (uint64_t) (uintptr_t) bt;
+    state.c_base        = (uint64_t) (uintptr_t) c;
+    state.a_stride      = config->a_stride;
+    state.bt_stride     = config->bt_stride;
+    state.c_stride      = config->output_stride;
+    state.uram_base     = physical_uram & (Constants::kUramWindowStride - 1U);
+    state.physical_uram = physical_uram;
+    state.constants     = physical_uram + Layout::total_bytes();
+    if constexpr (Silu) {
+        const uint64_t stride = ggml_dayan_matmul_detail::Constants::kConstantStride;
+        *(volatile float *) (uintptr_t) (state.constants + ggml_dayan_matmul_detail::Constants::kConstantNegLog2E *
+                                                               stride) = -1.4426950408889634f;
+        *(volatile float *) (uintptr_t) (state.constants + ggml_dayan_matmul_detail::Constants::kConstantOne * stride) =
+            1.0f;
+        dayan_cache_flush((const void *) (uintptr_t) state.constants, 2U * stride);
+    }
     state.generation_count =
         (uint64_t)state.count_m * (uint64_t)state.count_n *
         (uint64_t)state.count_k;
 
     for (int slice = 0; slice < Constants::kSlices; ++slice) {
-        state.mat_config[slice].rows = Layout::max_rows(slice);
-        state.mat_config[slice].columns = Layout::max_cols(slice);
         status = dayan_resource_init(&state.c[slice]);
         if (status < 0)
             return status;
@@ -1213,9 +1256,6 @@ static int run_pipeline(const DayanMatmulConfig *config,
         state.b[index].uram = state.uram_base + Layout::b_base(index);
     }
     for (int index = 0; index < 2; ++index) {
-        status = dayan_resource_init(&state.load_issued[index]);
-        if (status < 0)
-            return status;
         status = dayan_resource_init(&state.mat_turn[index]);
         if (status < 0)
             return status;
@@ -1224,41 +1264,45 @@ static int run_pipeline(const DayanMatmulConfig *config,
     if (status < 0)
         return status;
 
-    configure_mat_group<Format, ProducerLoadsA, 0, 0>();
-    configure_mat_group<Format, ProducerLoadsA, 4, 1>();
-    configure_mat_group<Format, ProducerLoadsA, 2, 2>();
-    configure_mat_group<Format, ProducerLoadsA, 1, 3>();
-    state.store_config =
-        configure_c_store<ProducerLoadsA, Constants::kCStore>(&state);
     MatWorkerArgs mat_args[2] = {
         {&state, 0U},
         {&state, 1U},
     };
-    status = dayan_create_proc("dram-load", dram_loader<ProducerLoadsA>,
-                               &state);
+    dayan_thread_resources_t resources;
+    dayan_thread_resources_init(&resources);
+    resources.lsu_tcsr_count = 1;
+    status = dayan_create_thread("dram-load", dram_loader<ProducerLoadsA>,
+                                 &state, &resources);
     if (status >= 0)
-        status = dayan_create_proc("remote-copy",
-                                   remote_copy<ProducerLoadsA>, &state);
+        status = dayan_create_thread("remote-copy",
+                                     remote_copy<ProducerLoadsA>, &state,
+                                     &resources);
+    resources.lsu_tcsr_count = 0;
+    resources.mat_tcsr_count = 1;
     if (status >= 0)
-        status = dayan_create_proc("mat-0", mat_worker<Format, ProducerLoadsA>,
-                                   &mat_args[0]);
+        status = dayan_create_thread("mat-0", mat_worker<Format, ProducerLoadsA, OutputSwizzle>,
+                                     &mat_args[0], &resources);
     if (status >= 0)
-        status = dayan_create_proc("mat-1", mat_worker<Format, ProducerLoadsA>,
-                                   &mat_args[1]);
+        status = dayan_create_thread("mat-1", mat_worker<Format, ProducerLoadsA, OutputSwizzle>,
+                                     &mat_args[1], &resources);
+    resources.mat_tcsr_count = 0;
+    resources.lsu_tcsr_count = 1;
+    resources.vec_tcsr_count = (uint32_t) Silu;
     if (status >= 0)
-        status = dayan_create_proc("c-store",
-                                   c_store_worker<ProducerLoadsA>, &state);
+        status = dayan_create_thread("c-store",
+                                     c_store_worker<ProducerLoadsA, Silu, OutputSwizzle>, &state,
+                                     &resources);
     if (status < 0)
         return status;
 
-    status = dayan_join_all();
+    status = dayan_thread_join_all();
     if (status < 0)
         return status;
     return dayan_cluster_barrier(Constants::kClusterCores,
                                  &cluster_shared().barrier);
 }
 
-template <typename Format>
+template <typename Format, bool Silu, uint64_t OutputSwizzle>
 static int run_matmul_pipeline_4c(const DayanMatmulConfig *config,
                                   const uint16_t *a, const uint16_t *bt,
                                   float *c)
@@ -1282,10 +1326,40 @@ static int run_matmul_pipeline_4c(const DayanMatmulConfig *config,
     if (!shared)
         return -108;
 
-    void *uram = dayan_uram_base();
-    const bool producer_loads_a = config->m < config->n;
-    const uint64_t required_uram = producer_loads_a ?
+    const bool batched = config->batch_ne2 != 0U;
+    const uint64_t batch_ne2 = batched ? config->batch_ne2 : 1U;
+    const uint64_t batch_ne3 = batched ? config->batch_ne3 : 1U;
+    const uint64_t weight_ne2 = batched ? config->weight_ne2 : 1U;
+    const uint64_t weight_ne3 = batched ? config->weight_ne3 : 1U;
+    const uint64_t ratio2 = batch_ne2 / weight_ne2;
+    const uint64_t ratio3 = batch_ne3 / weight_ne3;
+    const bool packed_dim2 = batched &&
+        config->a_batch_stride2 == config->m * config->a_stride &&
+        config->output_batch_stride2 == config->m * config->output_stride;
+    const bool packed_dim3 = packed_dim2 && weight_ne2 == 1U &&
+        config->a_batch_stride3 == batch_ne2 * config->a_batch_stride2 &&
+        config->output_batch_stride3 == batch_ne2 * config->output_batch_stride2;
+    uint64_t group_ne2 = packed_dim2 ? ratio2 : 1U;
+    uint64_t group_ne3 = packed_dim3 ? ratio3 : 1U;
+    const uint64_t int_limit = 0x7ffff000ULL;
+    if (config->m > int_limit / group_ne2) {
+        group_ne2 = 1U;
+        group_ne3 = 1U;
+    }
+    if (config->m * group_ne2 > int_limit / group_ne3)
+        group_ne3 = 1U;
+
+    DayanMatmulConfig matrix = *config;
+    matrix.m *= group_ne2 * group_ne3;
+    const bool producer_loads_a = matrix.m < matrix.n;
+    uint64_t required_uram = producer_loads_a ?
         AProducerLayout::total_bytes() : BProducerLayout::total_bytes();
+    if constexpr (Silu) {
+        required_uram +=
+            ggml_dayan_matmul_detail::Constants::kConstantCount *
+            ggml_dayan_matmul_detail::Constants::kConstantStride;
+    }
+    void *uram = dayan_uram_base();
     if (!uram || dayan_uram_size() < required_uram)
         return -120;
 
@@ -1297,9 +1371,34 @@ static int run_matmul_pipeline_4c(const DayanMatmulConfig *config,
             Constants::kUramWindowStride - required_uram)
         return -109;
 
-    return producer_loads_a ?
-        run_pipeline<Format, true>(config, a, bt, c, lane, physical_uram) :
-        run_pipeline<Format, false>(config, a, bt, c, lane, physical_uram);
+    for (uint64_t i3 = 0; i3 < batch_ne3; i3 += group_ne3) {
+        for (uint64_t i2 = 0; i2 < batch_ne2; i2 += group_ne2) {
+            const uint64_t a_offset = batched ?
+                i3 * config->a_batch_stride3 +
+                    i2 * config->a_batch_stride2 : 0U;
+            const uint64_t bt_offset = batched ?
+                (i3 / ratio3) * config->bt_batch_stride3 +
+                    (i2 / ratio2) * config->bt_batch_stride2 : 0U;
+            const uint64_t c_offset = batched ?
+                i3 * config->output_batch_stride3 +
+                    i2 * config->output_batch_stride2 : 0U;
+            const uint16_t *batch_a =
+                (const uint16_t *)((const char *)a + a_offset);
+            const uint16_t *batch_bt =
+                (const uint16_t *)((const char *)bt + bt_offset);
+            float *batch_c = (float *)((char *)c + c_offset);
+            const int status = producer_loads_a ?
+                run_pipeline<Format, true, Silu, OutputSwizzle>(
+                    &matrix, batch_a, batch_bt, batch_c, lane,
+                    physical_uram) :
+                run_pipeline<Format, false, Silu, OutputSwizzle>(
+                    &matrix, batch_a, batch_bt, batch_c, lane,
+                    physical_uram);
+            if (status < 0)
+                return status;
+        }
+    }
+    return 0;
 }
 
 static inline int finish_epilogue_4c()
@@ -1445,7 +1544,20 @@ static int run_matmul_4c(const DayanMatmulConfig *config,
     if (!perf)
         return -22;
     const uint64_t kernel_begin = ggml_dayan_matmul_detail::read_cycle();
-    const int status = run_matmul_pipeline_4c<Format>(config, a, bt, c);
+    const int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(config, a, bt, c);
+    return status < 0 ? status : write_perf_4c(config, perf, kernel_begin);
+}
+
+template <typename Format>
+static int run_matmul_silu_4c(const DayanMatmulConfig *config,
+                              const uint16_t *a, const uint16_t *bt,
+                              float *c, DayanMatmulPerf *perf)
+{
+    if (!perf)
+        return -22;
+    const uint64_t kernel_begin = ggml_dayan_matmul_detail::read_cycle();
+    const int status =
+        run_matmul_pipeline_4c<Format, true, 0U>(config, a, bt, c);
     return status < 0 ? status : write_perf_4c(config, perf, kernel_begin);
 }
 
@@ -1709,7 +1821,7 @@ static int run_matmul_quantized_4c(const DayanMatmulConfig *config,
     DayanMatmulConfig f32 = *config;
     f32.output_stride = config->n * sizeof(float);
     float *workspace = workspace_4c(perf);
-    int status = run_matmul_pipeline_4c<Format>(&f32, a, bt, workspace);
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(&f32, a, bt, workspace);
     if (status == 0)
         status = quantize_matrix_4c<Format>(config, workspace, output);
     return status < 0 ? status : write_perf_4c(config, perf, kernel_begin);
@@ -1728,9 +1840,9 @@ static int run_matmul_glu_4c(const DayanMatmulConfig *config,
     f32.output_stride = config->n * sizeof(float);
     float *gate = workspace_4c(perf);
     float *up = gate + config->m * config->n;
-    int status = run_matmul_pipeline_4c<Format>(&f32, a, gate_bt, gate);
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(&f32, a, gate_bt, gate);
     if (status == 0)
-        status = run_matmul_pipeline_4c<Format>(&f32, a, up_bt, up);
+        status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(&f32, a, up_bt, up);
     if (status == 0)
         status = glu_matrix_4c<Format, GeGLU>(config, gate, up, output);
     return status < 0 ? status : write_perf_4c(config, perf, kernel_begin);
@@ -1746,10 +1858,10 @@ static int run_matmul_pair_4c(const DayanMatmulPairConfig *config,
         config->first.k != config->second.k)
         return -22;
     const uint64_t kernel_begin = ggml_dayan_matmul_detail::read_cycle();
-    int status = run_matmul_pipeline_4c<Format>(
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
         &config->first, a, first_bt, first);
     if (status == 0)
-        status = run_matmul_pipeline_4c<Format>(
+        status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
             &config->second, a, second_bt, second);
     return status < 0 ? status :
         write_perf_4c(&config->second, perf, kernel_begin);
@@ -1779,7 +1891,7 @@ static int run_mul_mat_id_4c(const DayanMulMatIdConfig *config,
                 config, ids, (uint64_t)token * config->experts_used + used,
                 &expert);
             if (status == 0) {
-                status = run_matmul_pipeline_4c<Format>(
+                status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
                     &matmul,
                     activation + moe_activation_offset_4c(config, token, used),
                     weight + (uint64_t)expert * weight_elements,
@@ -1830,14 +1942,14 @@ static int run_mul_mat_id_pair_4c(const DayanMulMatIdPairConfig *config,
             const uint16_t *input = activation + moe_activation_offset_4c(
                 &config->first, token, used);
             if (status == 0) {
-                status = run_matmul_pipeline_4c<Format>(
+                status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
                     &first_matmul, input,
                     first_weight + (uint64_t)expert * first_weight_elements,
                     first_output + moe_output_offset_4c(
                         &config->first, token, used));
             }
             if (status == 0) {
-                status = run_matmul_pipeline_4c<Format>(
+                status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
                     &second_matmul, input,
                     second_weight + (uint64_t)expert * second_weight_elements,
                     second_output + moe_output_offset_4c(
@@ -1883,10 +1995,10 @@ static int run_mul_mat_id_glu_4c(const DayanMulMatIdConfig *config,
             const uint64_t weight_offset =
                 (uint64_t)expert * weight_elements;
             if (status == 0)
-                status = run_matmul_pipeline_4c<Format>(
+                status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
                     &matmul, input, gate_weight + weight_offset, gate);
             if (status == 0)
-                status = run_matmul_pipeline_4c<Format>(
+                status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
                     &matmul, input, up_weight + weight_offset, up);
             if (status == 0)
                 status = glu_matrix_4c<Format, GeGLU>(
@@ -1946,7 +2058,7 @@ static int run_attention_projection_4c(
     DayanMatmulConfig f32 = config->matmul;
     f32.output_stride = config->matmul.n * sizeof(float);
     float *workspace = workspace_4c(perf);
-    int status = run_matmul_pipeline_4c<Format>(
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
         &f32, activation, weight, workspace);
     if (status == 0)
         status = quantize_matrix_4c<Format>(
@@ -1974,7 +2086,7 @@ static int run_value_projection_4c(
     DayanMatmulConfig f32 = config->matmul;
     f32.output_stride = config->matmul.n * sizeof(float);
     float *workspace = workspace_4c(perf);
-    int status = run_matmul_pipeline_4c<Format>(
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
         &f32, activation, weight, workspace);
     if (status == 0)
         status = quantize_matrix_4c<Format>(
@@ -2019,7 +2131,7 @@ static int run_k_cache_projection_4c(
     DayanMatmulConfig f32 = projection->matmul;
     f32.output_stride = projection->matmul.n * sizeof(float);
     float *workspace = workspace_4c(perf);
-    int status = run_matmul_pipeline_4c<Format>(
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
         &f32, activation, weight, workspace);
     if (status == 0)
         status = quantize_matrix_4c<Format>(
@@ -2083,7 +2195,7 @@ static int run_v_cache_projection_4c(
     DayanMatmulConfig f32 = projection->matmul;
     f32.output_stride = projection->matmul.n * sizeof(float);
     float *workspace = workspace_4c(perf);
-    int status = run_matmul_pipeline_4c<Format>(
+    int status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
         &f32, activation, weight, workspace);
     if (status == 0)
         status = quantize_matrix_4c<Format>(
@@ -2120,39 +2232,74 @@ static int run_v_cache_projection_4c(
         write_perf_4c(&projection->matmul, perf, kernel_begin);
 }
 
-template <typename Format>
-static inline void issue_gated_lowp_to_f32_4c(uint64_t input, int rows,
-                                               int columns)
+static inline void configure_gated_lowp_load_4c(
+    const DayanGatedProjectionConfig *config)
 {
-    constexpr long instructions = 3;
-    const long row_stride = PostprocessLayout::kColumns * sizeof(float);
-
-    ggml_dayan_vec_detail::configure_vec_grid(
-        columns / ggml_dayan_matmul_detail::Constants::kVecLanes, rows);
-    ggml_dayan_matmul_detail::configure_vec_iterator<
-        ggml_dayan_matmul_detail::kVecV0Base>(
-        0, 0, ggml_dayan_matmul_detail::Constants::kVecBytes, row_stride);
-    ggml_dayan_matmul_detail::configure_vec_iterator<
-        ggml_dayan_matmul_detail::kVecV1Base>(0, 0, 0, 0);
-    ggml_dayan_matmul_detail::configure_vec_iterator<
-        ggml_dayan_matmul_detail::kVecV2Base>(0, 0, 0, 0);
-    ggml_dayan_matmul_detail::configure_vec_iterator<
-        ggml_dayan_matmul_detail::kVecV3Base>(
-        0, 0, ggml_dayan_matmul_detail::Constants::kVecBytes, row_stride);
-    ggml_dayan_matmul_detail::begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(input);
-    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16)
-        ggml_dayan_vec_detail::vec_cvt_fp32_bf16<0, 0, 0>();
-    else
-        ggml_dayan_vec_detail::vec_cvt_fp32_fp16<0, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(input);
-    ggml_dayan_matmul_detail::start_vec_block(instructions);
+    const uint32_t width = config->heads * config->head_dim;
+    ggml_dayan_matmul_detail::configure_gated_packed_load<1, sizeof(uint16_t)>(
+        config->head_dim, width,
+        PostprocessLayout::kColumns * sizeof(uint16_t));
+    ggml_dayan_matmul_detail::configure_gated_packed_to_f32(
+        PostprocessLayout::kColumns * sizeof(uint16_t),
+        PostprocessLayout::kColumns * sizeof(float));
 }
 
-template <typename Format>
+static inline void configure_gated_f32_load_4c(
+    const DayanGatedProjectionConfig *config)
+{
+    const uint32_t width = config->heads * config->head_dim;
+    ggml_dayan_matmul_detail::configure_gated_packed_load<1, sizeof(float)>(
+        config->head_dim, width,
+        PostprocessLayout::kColumns * sizeof(float));
+}
+
+template <void (*Convert)()>
+static inline void load_gated_lowp_tile_4c(
+    const DayanGatedProjectionConfig *config, const void *gate,
+    uint32_t row_base, uint32_t head_base, uint32_t heads, int rows,
+    int columns)
+{
+    const uint32_t width = config->heads * config->head_dim;
+    ggml_dayan_matmul_detail::configure_gated_packed_load_dims<1>(heads, rows);
+    __tx_lsu_dma_d2u<1>(
+        postprocess_uram(PostprocessLayout::kOutput),
+        reinterpret_cast<uint64_t>(
+            static_cast<const uint16_t *>(gate) +
+            (uint64_t)row_base * 2U * width +
+            (uint64_t)head_base * 2U * config->head_dim +
+            config->head_dim));
+    dayan_wait_lsu();
+    ggml_dayan_matmul_detail::issue_gated_packed_to_f32<Convert>(
+        postprocess_uram(PostprocessLayout::kInput1),
+        postprocess_uram(PostprocessLayout::kOutput), rows, columns);
+    dayan_wait_vec();
+}
+
+static inline void load_gated_f32_tile_4c(
+    const DayanGatedProjectionConfig *config, const void *gate,
+    uint32_t row_base, uint32_t head_base, uint32_t heads, int rows,
+    int columns)
+{
+    (void) columns;
+    const uint32_t width = config->heads * config->head_dim;
+    ggml_dayan_matmul_detail::configure_gated_packed_load_dims<1>(heads, rows);
+    __tx_lsu_dma_d2u<1>(
+        postprocess_uram(PostprocessLayout::kInput1),
+        reinterpret_cast<uint64_t>(
+            static_cast<const float *>(gate) +
+            (uint64_t)row_base * 2U * width +
+            (uint64_t)head_base * 2U * config->head_dim +
+            config->head_dim));
+    dayan_wait_lsu();
+}
+
+template <typename Format,
+          void (*ConfigureGate)(const DayanGatedProjectionConfig *),
+          void (*LoadGate)(const DayanGatedProjectionConfig *, const void *,
+                           uint32_t, uint32_t, uint32_t, int, int)>
 static int gate_attention_input_4c(
     const DayanGatedProjectionConfig *config, const float *attention,
-    const uint16_t *gate, uint16_t *output)
+    const void *gate, uint16_t *output)
 {
     using namespace ggml_dayan_matmul_detail;
 
@@ -2170,6 +2317,7 @@ static int gate_attention_input_4c(
     initialize_postprocess_constants();
     configure_postprocess_load(0, (uint64_t)width * sizeof(float));
     configure_postprocess_store((uint64_t)width * sizeof(uint16_t));
+    ConfigureGate(config);
     for (uint64_t tile = lane; tile < tile_count;
          tile += Constants::kClusterCores) {
         const uint32_t row_tile = (uint32_t)(tile / head_tiles);
@@ -2188,26 +2336,7 @@ static int gate_attention_input_4c(
             attention + (uint64_t)row_base * width +
                 (uint64_t)head_base * config->head_dim,
             rows, columns);
-        configure_gated_lsu<1>(
-            0, config->head_dim - 1U, rows - 1U, sizeof(uint16_t),
-            sizeof(uint16_t), 2U * width * sizeof(uint16_t), sizeof(float),
-            sizeof(float), PostprocessLayout::kColumns * sizeof(float), 6,
-            sizeof(uint16_t) - 1U, sizeof(float) - 1U);
-        __tx_lsu_tcsr_write<1 * LSU_GROUPSZ + LSU_DIM2>(heads - 1U);
-        __tx_lsu_tcsr_write<1 * LSU_GROUPSZ + LSU_INDIM2STRIDE>(
-            2U * config->head_dim * sizeof(uint16_t));
-        __tx_lsu_tcsr_write<1 * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(
-            config->head_dim * sizeof(float));
-        __tx_lsu_dma_d2u<1>(
-            postprocess_uram(PostprocessLayout::kInput1),
-            reinterpret_cast<uint64_t>(
-                gate + (uint64_t)row_base * 2U * width +
-                (uint64_t)head_base * 2U * config->head_dim +
-                config->head_dim));
-        dayan_wait_lsu();
-        issue_gated_lowp_to_f32_4c<Format>(
-            postprocess_uram(PostprocessLayout::kInput1), rows, columns);
-        dayan_wait_vec();
+        LoadGate(config, gate, row_base, head_base, heads, rows, columns);
         ggml_dayan_vec_detail::issue_sigmoid_mul(
             {postprocess_uram(PostprocessLayout::kInput1),
              (long)PostprocessLayout::kColumns * (long)sizeof(float)},
@@ -2234,10 +2363,13 @@ static int gate_attention_input_4c(
     return finish_epilogue_4c();
 }
 
-template <typename Format>
-static int run_gated_output_projection_4c(
+template <typename Format,
+          void (*ConfigureGate)(const DayanGatedProjectionConfig *),
+          void (*LoadGate)(const DayanGatedProjectionConfig *, const void *,
+                           uint32_t, uint32_t, uint32_t, int, int)>
+static int run_gated_output_projection_impl_4c(
     const DayanGatedProjectionConfig *config, const float *attention,
-    const uint16_t *gate, const uint16_t *weight, float *output,
+    const void *gate, const uint16_t *weight, float *output,
     DayanMatmulPerf *perf)
 {
     const uint64_t width = config ?
@@ -2253,13 +2385,36 @@ static int run_gated_output_projection_4c(
 
     const uint64_t kernel_begin = ggml_dayan_matmul_detail::read_cycle();
     uint16_t *gated = reinterpret_cast<uint16_t *>(workspace_4c(perf));
-    int status = gate_attention_input_4c<Format>(
+    int status = gate_attention_input_4c<Format, ConfigureGate, LoadGate>(
         config, attention, gate, gated);
     if (status == 0)
-        status = run_matmul_pipeline_4c<Format>(
+        status = run_matmul_pipeline_4c<Format, false, kMatBatchSwizzle>(
             &config->matmul, gated, weight, output);
     return status < 0 ? status :
         write_perf_4c(&config->matmul, perf, kernel_begin);
+}
+
+template <typename Format, void (*Convert)()>
+static int run_gated_output_projection_4c(
+    const DayanGatedProjectionConfig *config, const float *attention,
+    const uint16_t *gate, const uint16_t *weight, float *output,
+    DayanMatmulPerf *perf)
+{
+    return run_gated_output_projection_impl_4c<
+        Format, configure_gated_lowp_load_4c,
+        load_gated_lowp_tile_4c<Convert>>(
+            config, attention, gate, weight, output, perf);
+}
+
+template <typename Format>
+static int run_gated_output_projection_f32_gate_4c(
+    const DayanGatedProjectionConfig *config, const float *attention,
+    const float *gate, const uint16_t *weight, float *output,
+    DayanMatmulPerf *perf)
+{
+    return run_gated_output_projection_impl_4c<
+        Format, configure_gated_f32_load_4c, load_gated_f32_tile_4c>(
+            config, attention, gate, weight, output, perf);
 }
 
 }  // namespace ggml_dayan_matmul_4c_detail
