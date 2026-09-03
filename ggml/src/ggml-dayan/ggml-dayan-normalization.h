@@ -96,6 +96,7 @@ static inline void normalization_load_lowp(uint64_t uram, const void * dram, uin
                    NormalizationLayout::kTileElements * sizeof(uint16_t), 1, staging,
                    (uint64_t) (uintptr_t) dram);
     dayan_wait_lsu();
+    ggml_dayan_vec_detail::configure_f32_iterators();
     ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(uram, staging, elements);
     normalization_pad_tail_bits(uram, elements, 0U);
 }
@@ -121,7 +122,17 @@ static inline void normalization_store_lowp(uint16_t * dram, uint64_t uram, uint
 }
 
 static inline void normalization_vec_add(uint64_t left, uint64_t right, uint64_t output, uint32_t elements) {
-    ggml_dayan_vec_detail::f32_add(output, left, right, elements);
+    constexpr long instructions = 4;
+
+    ggml_dayan_vec_detail::configure_f32_iterators();
+    ggml_dayan_vec_detail::configure_f32_tile(elements);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>((long) left);
+    __tx_vec_lsu_u2v<1, 1>((long) right);
+    __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>((long) output);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
 }
 
 template <typename Format>
@@ -161,6 +172,190 @@ static inline const void * normalization_input_row(const DayanNormConfig * confi
            (uint64_t) index2 * config->input_nb[2] + (uint64_t) index3 * config->input_nb[3];
 }
 
+static inline void normalization_sum_accumulate(uint64_t accumulator,
+                                                uint64_t input,
+                                                uint32_t elements,
+                                                bool initialize) {
+    const long chunks       = ggml_dayan_vec_detail::f32_chunks(elements);
+    const long instructions = 2 + 14 * chunks;
+
+    ggml_dayan_vec_detail::configure_vec_grid(1);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    if (initialize) {
+        __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+    } else {
+        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+    }
+    for (long chunk = 0; chunk < chunks; ++chunk) {
+        __tx_vec_lsu_u2v<0, 0>((long) (input + (uint64_t) chunk * Constants::kVecBytes));
+        ggml_dayan_vec_detail::emit_f32_sum_stages();
+        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
+    }
+    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_square_sum_accumulate(uint64_t accumulator,
+                                                       uint64_t input,
+                                                       uint32_t elements,
+                                                       bool initialize) {
+    const long chunks       = ggml_dayan_vec_detail::f32_chunks(elements);
+    const long instructions = 2 + 15 * chunks;
+
+    ggml_dayan_vec_detail::configure_vec_grid(1);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    if (initialize) {
+        __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+    } else {
+        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+    }
+    for (long chunk = 0; chunk < chunks; ++chunk) {
+        __tx_vec_lsu_u2v<0, 0>((long) (input + (uint64_t) chunk * Constants::kVecBytes));
+        __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
+        ggml_dayan_vec_detail::emit_f32_sum_stages();
+        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
+    }
+    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_centered_square_sum_accumulate(uint64_t accumulator,
+                                                                 uint64_t input,
+                                                                 uint64_t mean,
+                                                                 uint32_t elements,
+                                                                 bool initialize) {
+    const long chunks       = ggml_dayan_vec_detail::f32_chunks(elements);
+    const long instructions = 2 + 17 * chunks;
+
+    ggml_dayan_vec_detail::configure_vec_grid(1);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    if (initialize) {
+        __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+    } else {
+        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+    }
+    for (long chunk = 0; chunk < chunks; ++chunk) {
+        __tx_vec_lsu_u2v<0, 0>((long) (input + (uint64_t) chunk * Constants::kVecBytes));
+        __tx_vec_lsu_u2v_broadcast32<0, 0>((long) mean);
+        __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
+        __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
+        ggml_dayan_vec_detail::emit_f32_sum_stages();
+        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
+    }
+    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_mean(uint64_t output, uint64_t sum, uint32_t width) {
+    constexpr long instructions = 6;
+
+    ggml_dayan_vec_detail::configure_vec_grid(1);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_u2v_broadcast32<0, 0>((long) sum);
+    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) width);
+    __tx_vec_cvt_fp32_int32<1, 16, 0>();
+    __tx_vec_v_fp32_sfu<1, 16, 5>();
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>((long) output);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_inverse_rms_finalize(uint64_t inverse, uint32_t width, uint32_t epsilon_bits) {
+    constexpr long instructions = 9;
+
+    ggml_dayan_vec_detail::configure_vec_grid(1);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_u2v_broadcast32<0, 0>((long) inverse);
+    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) width);
+    __tx_vec_cvt_fp32_int32<1, 16, 0>();
+    __tx_vec_v_fp32_sfu<1, 16, 5>();
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) epsilon_bits);
+    __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 4>();
+    __tx_vec_lsu_v2u<0, 3>((long) inverse);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_apply_rms(uint64_t output, uint64_t input, uint64_t inverse, uint32_t elements) {
+    constexpr long instructions = 4;
+
+    ggml_dayan_vec_detail::configure_f32_iterators();
+    ggml_dayan_vec_detail::configure_f32_tile(elements, 0);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>((long) input);
+    __tx_vec_lsu_u2v_broadcast32<1, 1>((long) inverse);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>((long) output);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_apply_rms_scale(uint64_t rms,
+                                                 uint64_t scaled,
+                                                 uint64_t input,
+                                                 uint64_t inverse,
+                                                 uint64_t scale,
+                                                 uint32_t elements,
+                                                 bool write_rms) {
+    const long instructions = write_rms ? 8 : 6;
+
+    ggml_dayan_vec_detail::configure_f32_iterators();
+    ggml_dayan_vec_detail::configure_f32_tile(elements);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>((long) input);
+    __tx_vec_lsu_u2v_broadcast32<1, 2>((long) inverse);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    if (write_rms) {
+        __tx_vec_shuffle_xor<1, 0>(0);
+    }
+    __tx_vec_lsu_u2v<1, 1>((long) scale);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>((long) scaled);
+    if (write_rms) {
+        __tx_vec_lsu_v2u<17, 3>((long) rms);
+    }
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
+static inline void normalization_center_scale(uint64_t output,
+                                              uint64_t input,
+                                              uint64_t mean,
+                                              uint64_t inverse,
+                                              uint32_t elements) {
+    constexpr long instructions = 6;
+
+    ggml_dayan_vec_detail::configure_f32_iterators();
+    ggml_dayan_vec_detail::configure_f32_tile(elements, 0);
+    ggml_dayan_vec_detail::begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>((long) input);
+    __tx_vec_lsu_u2v_broadcast32<1, 1>((long) mean);
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
+    __tx_vec_lsu_u2v_broadcast32<1, 1>((long) inverse);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    __tx_vec_lsu_v2u<0, 3>((long) output);
+    ggml_dayan_vec_detail::start_vec_block(instructions);
+    dayan_wait_vec();
+}
+
 template <typename Format, void (*Convert)(), uint32_t InputType, NormalizationLoad Load, bool HasResidual>
 static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
                                           const void *            left,
@@ -172,11 +367,7 @@ static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
     const uint64_t input   = uram + NormalizationLayout::kInput;
     const uint64_t aux     = uram + NormalizationLayout::kAux;
     const uint64_t value   = uram + NormalizationLayout::kValue;
-    const uint64_t square  = uram + NormalizationLayout::kSquare;
     const uint64_t inverse = uram + NormalizationLayout::kVectorScalar;
-    const uint64_t reduce  = uram + NormalizationLayout::kVecReduce;
-
-    ggml_dayan_vec_detail::f32_fill_bits(inverse, 0U, Constants::kVecLanes);
 
     for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
         const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
@@ -201,16 +392,10 @@ static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
             Load(value, (const char *) left + (uint64_t) offset * input_bytes, elements);
         }
 
-        ggml_dayan_vec_detail::f32_mul(square, value, value, elements);
-        ggml_dayan_vec_detail::f32_reduce_sum(reduce, square, elements);
-        ggml_dayan_vec_detail::f32_add(inverse, inverse, reduce, Constants::kVecLanes);
+        normalization_square_sum_accumulate(inverse, value, elements, offset == 0);
     }
 
-    ggml_dayan_vec_detail::f32_int32_scalar(square, config->width);
-    ggml_dayan_vec_detail::f32_div(inverse, inverse, square, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_scalar_add_bits(inverse, config->epsilon_bits, inverse, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 4>>(
-        inverse, inverse, Constants::kVecLanes);
+    normalization_inverse_rms_finalize(inverse, config->width, config->epsilon_bits);
     return inverse;
 }
 
@@ -274,8 +459,8 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
             }
             normalization_load(aux, scale + offset, elements);
 
-            ggml_dayan_vec_detail::f32_mul_scalar_address(rms_uram, value, inverse_uram, elements);
-            ggml_dayan_vec_detail::f32_mul(scaled_uram, rms_uram, aux, elements);
+            normalization_apply_rms_scale(
+                rms_uram, scaled_uram, value, inverse_uram, aux, elements, write_rms);
             if constexpr (Quantize) {
                 normalization_quantize<Format>(lowp_uram, scaled_uram, input, elements);
                 configure_normalization_lsu();
@@ -323,7 +508,7 @@ static inline void run_rms_norm_typed(const DayanNormConfig * config, const void
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             Load(value, (const char *) input_row + (uint64_t) offset * input_bytes, elements);
-            ggml_dayan_vec_detail::f32_mul_scalar_address(rms_uram, value, inverse_uram, elements);
+            normalization_apply_rms(rms_uram, value, inverse_uram, elements);
             normalization_store_f32(output + row_offset + offset, rms_uram, elements);
             dayan_wait_lsu();
         }
@@ -350,51 +535,35 @@ static inline void normalization_centered(const float * input,
                                           uint32_t      epsilon_bits) {
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
-    const uint64_t width      = uram + NormalizationLayout::kAux;
-    const uint64_t centered   = uram + NormalizationLayout::kValue;
-    const uint64_t square     = uram + NormalizationLayout::kSquare;
     const uint64_t mean       = uram + NormalizationLayout::kRms;
     const uint64_t scaled     = uram + NormalizationLayout::kScaled;
     const uint64_t inverse    = uram + NormalizationLayout::kVectorScalar;
-    const uint64_t reduce     = uram + NormalizationLayout::kVecReduce;
-
-    ggml_dayan_vec_detail::f32_fill_bits(inverse, 0U, Constants::kVecLanes);
 
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
             (uint32_t) (elements - offset < NormalizationLayout::kTileElements ? elements - offset :
                                                                                  NormalizationLayout::kTileElements);
         normalization_load(input_uram, input + offset, count);
-        ggml_dayan_vec_detail::f32_reduce_sum(reduce, input_uram, count);
-        ggml_dayan_vec_detail::f32_add(inverse, inverse, reduce, Constants::kVecLanes);
+        normalization_sum_accumulate(inverse, input_uram, count, offset == 0);
     }
 
-    ggml_dayan_vec_detail::f32_int32_scalar(width, (uint32_t) elements);
-    ggml_dayan_vec_detail::f32_div(mean, inverse, width, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_fill_bits(inverse, 0U, Constants::kVecLanes);
+    normalization_mean(mean, inverse, (uint32_t) elements);
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
             (uint32_t) (elements - offset < NormalizationLayout::kTileElements ? elements - offset :
                                                                                  NormalizationLayout::kTileElements);
         normalization_load_scalar_pad(input_uram, input + offset, count, mean);
-        ggml_dayan_vec_detail::f32_sub_scalar_address(centered, input_uram, mean, count);
-        ggml_dayan_vec_detail::f32_mul(square, centered, centered, count);
-        ggml_dayan_vec_detail::f32_reduce_sum(reduce, square, count);
-        ggml_dayan_vec_detail::f32_add(inverse, inverse, reduce, Constants::kVecLanes);
+        normalization_centered_square_sum_accumulate(inverse, input_uram, mean, count, offset == 0);
     }
 
-    ggml_dayan_vec_detail::f32_div(inverse, inverse, width, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_scalar_add_bits(inverse, epsilon_bits, inverse, Constants::kVecLanes);
-    ggml_dayan_vec_detail::f32_sfu<__tx_vec_v_fp32_sfu<0, 0, 4>>(
-        inverse, inverse, Constants::kVecLanes);
+    normalization_inverse_rms_finalize(inverse, (uint32_t) elements, epsilon_bits);
 
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
             (uint32_t) (elements - offset < NormalizationLayout::kTileElements ? elements - offset :
                                                                                  NormalizationLayout::kTileElements);
         normalization_load(input_uram, input + offset, count);
-        ggml_dayan_vec_detail::f32_sub_scalar_address(centered, input_uram, mean, count);
-        ggml_dayan_vec_detail::f32_mul_scalar_address(scaled, centered, inverse, count);
+        normalization_center_scale(scaled, input_uram, mean, inverse, count);
         normalization_store_f32(output + offset, scaled, count);
         dayan_wait_lsu();
     }

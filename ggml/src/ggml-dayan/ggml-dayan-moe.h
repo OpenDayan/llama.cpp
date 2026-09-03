@@ -141,7 +141,7 @@ static inline void run_add_id(const DayanAddIdConfig * config,
                               float *                  output) {
     if (config == nullptr || input == nullptr || bias == nullptr || ids == nullptr || output == nullptr ||
         config->width == 0 || config->experts == 0 || config->experts > INT32_MAX || config->experts_used == 0 ||
-        config->tokens == 0 ||
+        config->tokens == 0 || config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
         !moe_allocation_fits(sizeof(float), config->width, config->experts_used, config->tokens) ||
         !moe_allocation_fits(sizeof(float), config->width, config->experts, 1) ||
         !moe_allocation_fits(sizeof(int32_t), config->experts_used, config->tokens, 1)) {
@@ -161,7 +161,9 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     for (uint64_t row = task; row < rows; row += tasks) {
         const uint32_t used   = (uint32_t) (row % config->experts_used);
         const uint32_t token  = (uint32_t) (row / config->experts_used);
-        const int32_t  expert = moe_read_expert(ids, (uint64_t) token * config->experts_used + used);
+        const int32_t * token_ids =
+            (const int32_t *) ((const char *) ids + (uint64_t) token * config->ids_row_stride);
+        const int32_t expert = moe_read_expert(token_ids, used);
         if (expert < 0 || expert >= (int32_t) config->experts) {
             DAYAN_PARAMS_ERROR();
         }
@@ -170,8 +172,14 @@ static inline void run_add_id(const DayanAddIdConfig * config,
             normalization_load(input_uram, input + row * config->width + offset, elements);
             normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements);
             ggml_dayan_vec_detail::configure_vec_grid(ggml_dayan_vec_detail::f32_chunks(elements));
-            ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
-                out_uram, input_uram, bias_uram);
+            constexpr long instructions = 4;
+            ggml_dayan_vec_detail::begin_vec_block(instructions);
+            __tx_vec_lsu_u2v<0, 0>((long) input_uram);
+            __tx_vec_lsu_u2v<1, 1>((long) bias_uram);
+            __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+            __tx_vec_lsu_v2u<0, 3>((long) out_uram);
+            ggml_dayan_vec_detail::start_vec_block(instructions);
+            dayan_wait_vec();
             normalization_store_f32(output + row * config->width + offset, out_uram, elements);
             dayan_wait_lsu();
         }

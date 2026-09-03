@@ -522,6 +522,7 @@ template <void (*Convert)()>
 static inline void memory_load_configured_lowp_to_f32(uint64_t output, const void * input, uint32_t elements) {
     const uint64_t staging = memory_lowp_staging();
     memory_load_bytes(staging, input, (uint64_t) elements * sizeof(uint16_t));
+    ggml_dayan_vec_detail::configure_f32_iterators();
     ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(output, staging, elements);
 }
 

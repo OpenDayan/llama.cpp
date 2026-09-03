@@ -1131,8 +1131,7 @@ __kernel__ void elementwise_add_f32_1c(const DayanElementwiseConfig * config,
                                        float *                        output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
-    run_binary_f32<ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_add<0, 0, 16, 0>>>(
-        config, left, right, output);
+    run_binary_f32<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(config, left, right, output);
 }
 
 __kernel__ void elementwise_mul_f32_1c(const DayanElementwiseConfig * config,
@@ -1141,8 +1140,7 @@ __kernel__ void elementwise_mul_f32_1c(const DayanElementwiseConfig * config,
                                        float *                        output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
-    run_binary_f32<ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>>(
-        config, left, right, output);
+    run_binary_f32<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(config, left, right, output);
 }
 
 __kernel__ void elementwise_sub_f32_1c(const DayanElementwiseConfig * config,
@@ -1151,8 +1149,7 @@ __kernel__ void elementwise_sub_f32_1c(const DayanElementwiseConfig * config,
                                        float *                        output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
-    run_binary_f32<ggml_dayan_vec_detail::issue_f32_binary<__tx_vec_vv_fp32_sub<0, 0, 16, 0>>>(
-        config, left, right, output);
+    run_binary_f32<__tx_vec_vv_fp32_sub<0, 0, 16, 0>>(config, left, right, output);
 }
 
 __kernel__ void elementwise_div_f32_1c(const DayanElementwiseConfig * config,
@@ -1161,7 +1158,7 @@ __kernel__ void elementwise_div_f32_1c(const DayanElementwiseConfig * config,
                                        float *                        output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
-    run_binary_f32<ggml_dayan_vec_detail::issue_f32_div>(config, left, right, output);
+    run_div_f32(config, left, right, output);
 }
 
 __kernel__ void scale_f32_1c(const DayanScaleConfig * config, const float * input, float * output) {

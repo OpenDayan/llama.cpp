@@ -1591,6 +1591,7 @@ static int ggml_backend_dayan_add_id(ggml_backend_dayan_context * ctx, const ggm
         (uint32_t) bias->ne[1],
         (uint32_t) output->ne[1],
         (uint32_t) output->ne[2],
+        output->src[2]->nb[1],
     };
     ggml_backend_dayan_buffers buffers;
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);

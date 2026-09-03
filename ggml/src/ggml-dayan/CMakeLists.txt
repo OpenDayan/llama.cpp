@@ -51,6 +51,9 @@ set(DAYAN_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/ggml-dayan-kernels.o")
 
 add_custom_command(
     OUTPUT "${DAYAN_KERNEL_OBJECT}"
+    COMMAND "${CMAKE_COMMAND}"
+        "-DDAYAN_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/check-vec-fusion.cmake"
     COMMAND "${DAYAN_DYCC}"
         -O2 -Wall -Wextra -Werror -Wno-error=format -Wno-error=unused-parameter -Wno-error=unused-variable
         "-I${CMAKE_CURRENT_SOURCE_DIR}"
@@ -80,6 +83,7 @@ add_custom_command(
         device_include/cstdint
         device_include/cstdio
         device_include/type_traits
+        check-vec-fusion.cmake
         "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_attrs.h"
         "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_intrinsics.h"
         "${DAYAN_DEVICE_INCLUDE_DIR}/dayan_list.h"

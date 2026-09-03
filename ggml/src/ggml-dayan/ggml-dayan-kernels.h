@@ -275,6 +275,7 @@ struct DayanAddIdConfig {
     uint32_t experts;
     uint32_t experts_used;
     uint32_t tokens;
+    uint64_t ids_row_stride;
 };
 
 struct DayanSortConfig {
