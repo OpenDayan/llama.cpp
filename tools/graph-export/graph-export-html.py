@@ -350,6 +350,7 @@ function slotLabel(node, showMembers) {
   lines.push('host: ' + implementation.executor);
   lines.push('kernel: ' + implementation.kernel);
   lines.push('launch: ' + implementation.launch_name);
+  if (node.sort_k) lines.push('selected indices per row: ' + node.sort_k);
   lines.push('mode: ' + implementation.task_mode + ' x' + implementation.task_dim_x);
   lines.push('I/O: ' + node.inputs.length + ' inputs / ' + node.outputs.length + ' outputs');
   if (showMembers) {

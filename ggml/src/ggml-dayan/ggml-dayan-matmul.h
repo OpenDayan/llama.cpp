@@ -165,6 +165,7 @@ struct SharedBuffer {
     dayan_resource_t  resource;
     volatile uint64_t generation;
     uint64_t          uram_offset;
+    uint32_t          initial_phase;
 };
 
 struct MatmulState {
@@ -382,13 +383,9 @@ static inline void store_matrix(uint64_t major_left,
 static inline int wait_for_generation(SharedBuffer * buffer, uint64_t expected_generation) {
     for (;;) {
         if (buffer->generation == expected_generation) {
-            return dayan_resource_wait_ready(&buffer->resource);
+            return dayan_resource_wait_ready(buffer->resource, buffer->initial_phase ^ ((expected_generation / 2U) & 1U));
         }
 
-        const int status = dayan_resource_wait_free(&buffer->resource);
-        if (status < 0) {
-            return status;
-        }
         dayan_yield();
     }
 }
@@ -629,7 +626,7 @@ static void consume_slice(MatmulState * state) {
                     }
                     dayan_wait_mat();
 
-                    status = dayan_resource_consume(&shared->resource);
+                    status = dayan_resource_consume_mat(DAYAN_RESOURCE_MASK(shared->resource));
                     if (status < 0) {
                         remember_error(state, status);
                         return;
@@ -673,6 +670,7 @@ static void consume_slice(MatmulState * state) {
         }
     }
     dayan_wait_lsu();
+    dayan_wait_mat();
 }
 
 template <typename Format,
@@ -751,16 +749,12 @@ static int produce_shared(MatmulState * state) {
                         (uint64_t) tile_k * Constants::kTileK * sizeof(uint16_t) +
                         (ProducerLoadsA ? (uint64_t) tile_m * Constants::kTileM * state->a_stride :
                                           (uint64_t) tile_n * Constants::kTileN * state->bt_stride);
-                    int status = dayan_resource_wait_free(&shared->resource);
+                    int status = dayan_resource_wait_free(shared->resource);
 
                     if (status < 0) {
                         return remember_error(state, status);
                     }
                     const int users = ProducerLoadsA ? active * AccumulatorCount : active;
-                    status          = dayan_resource_alloc(&shared->resource, 1, (uint32_t) users);
-                    if (status < 0) {
-                        return remember_error(state, status);
-                    }
 
                     shared->generation = generation;
                     if constexpr (ProducerLoadsA && InputLoader != nullptr) {
@@ -784,10 +778,9 @@ static int produce_shared(MatmulState * state) {
                             Constants::kTileK * sizeof(uint16_t),
                             ProducerLoadsA ? Constants::kTileM : Constants::kTileN,
                             state->uram_address + (shared->uram_offset - state->uram_offset), shared_dram);
-                        dayan_wait_lsu();
                     }
 
-                    status = dayan_resource_produce(&shared->resource);
+                    status = dayan_resource_produce_lsu(shared->resource, (uint32_t) users, 0);
                     if (status < 0) {
                         return remember_error(state, status);
                     }
@@ -796,6 +789,7 @@ static int produce_shared(MatmulState * state) {
             }
         }
     }
+    dayan_wait_lsu();
     return 0;
 }
 
@@ -817,7 +811,8 @@ static int run_pipeline(const DayanMatmulConfig * config,
                         uint64_t                  uram_address,
                         uint64_t                  uram_offset,
                         uint64_t *                pipeline_begin,
-                        const void *              input_context) {
+                        const void *              input_context,
+                        uint64_t &                resource_phases) {
     using Layout = UramLayout<ProducerLoadsA, AccumulatorCount, OutputElementBytes, HasEpilogue>;
 
     MatmulState state;
@@ -844,17 +839,15 @@ static int run_pipeline(const DayanMatmulConfig * config,
     state.abort         = 0;
 
     for (int index = 0; index < 2; ++index) {
-        int status = dayan_resource_init(&state.shared[index].resource);
-
-        if (status < 0) {
-            return status;
-        }
+        state.shared[index].resource = DAYAN_LOCAL_RESOURCE(index);
+        state.shared[index].initial_phase = (resource_phases >> index) & 1U;
         state.shared[index].generation  = ~0ULL;
         state.shared[index].uram_offset = state.uram_offset + Layout::shared_base(index);
     }
 
     dayan_thread_resources_t resources;
     dayan_thread_resources_init(&resources);
+    resources.local_resource_count = 2;
     resources.lsu_tcsr_count = 2;
     resources.mat_tcsr_count = 1;
     resources.vec_tcsr_count = HasEpilogue ? 1 : 0;
@@ -895,18 +888,20 @@ static int run_pipeline(const DayanMatmulConfig * config,
     if (status < 0 && state.status == 0) {
         state.status = status;
     }
+    const uint64_t generations = (uint64_t) state.count_m * state.count_n * state.count_k * (ProducerLoadsA ? 1 : AccumulatorCount);
+    resource_phases ^= ((generations + 1U) / 2U) & 1U;
+    resource_phases ^= ((generations / 2U) & 1U) << 1U;
     return state.status;
 }
 
 template <int AccumulatorCount, int OutputElementBytes>
 static inline int config_valid(const DayanMatmulConfig * config) {
     const uint64_t int_limit        = 0x7ffff000ULL;
-    const uint64_t output_alignment = OutputElementBytes == 4 ? 64U : 32U;
 
     if (!config || !config->m || !config->n || !config->k || config->m > int_limit || config->n > int_limit ||
-        config->k > int_limit || (config->n % 16U) != 0 || config->a_stride < config->k * sizeof(uint16_t) ||
+        config->k > int_limit || config->a_stride < config->k * sizeof(uint16_t) ||
         config->bt_stride < config->k * sizeof(uint16_t) || config->output_stride < config->n * OutputElementBytes ||
-        (config->output_stride & (output_alignment - 1U)) || config->a_stride > 0x7fffffffffffffffULL ||
+        (config->output_stride % OutputElementBytes) || config->a_stride > 0x7fffffffffffffffULL ||
         config->bt_stride > 0x7fffffffffffffffULL || config->output_stride > 0x7fffffffffffffffULL ||
         config->batch_ne2 || config->batch_ne3 || config->weight_ne2 || config->weight_ne3 ||
         config->a_batch_stride2 || config->a_batch_stride3 || config->bt_batch_stride2 ||
@@ -932,7 +927,6 @@ template <bool HasEpilogue, typename Layout> static inline void initialize_const
         -2.8853900817779268f;
     *(volatile float *) (uintptr_t) (base + Constants::kConstantTwo * Constants::kConstantStride)  = 2.0f;
     *(volatile float *) (uintptr_t) (base + Constants::kConstantHalf * Constants::kConstantStride) = 0.5f;
-    dayan_cache_flush((const void *) (uintptr_t) base, Constants::kConstantCount * Constants::kConstantStride);
 }
 
 template <typename Format,
@@ -953,7 +947,8 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
                               const uint16_t *          bt1,
                               void *                    output,
                               DayanMatmulPerf *         perf,
-                              const void *              input_context = nullptr) {
+                              const void *              input_context = nullptr,
+                              uint64_t *                resource_phases = nullptr) {
     using AProducerLayout = UramLayout<true, AccumulatorCount, OutputElementBytes, HasEpilogue>;
     using BProducerLayout = UramLayout<false, AccumulatorCount, OutputElementBytes, HasEpilogue>;
 
@@ -985,17 +980,19 @@ static void run_matmul_kernel(const DayanMatmulConfig * config,
     const uint64_t uram_offset    = uram_address & (Constants::kUramWindowStride - 1U);
     uint64_t       pipeline_begin = 0;
     int            status;
+    uint64_t       initial_phases = 0;
+    uint64_t &     phases = resource_phases == nullptr ? initial_phases : *resource_phases;
 
     if (producer_loads_a) {
         initialize_constants<HasEpilogue, AProducerLayout>(uram_address);
         status = run_pipeline<Format, true, AccumulatorCount, OutputElementBytes, HasEpilogue, AProducerEpilogue0,
                               AProducerEpilogue1, AProducerEpilogue2, InputLoader, InputScratchBytes>(
-            config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context);
+            config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context, phases);
     } else {
         initialize_constants<HasEpilogue, BProducerLayout>(uram_address);
         status = run_pipeline<Format, false, AccumulatorCount, OutputElementBytes, HasEpilogue, BProducerEpilogue0,
                               BProducerEpilogue1, BProducerEpilogue2, InputLoader, InputScratchBytes>(
-            config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context);
+            config, a, bt0, bt1, output, uram_address, uram_offset, &pipeline_begin, input_context, phases);
     }
     if (status < 0) {
         dayan_thread_exit(status);

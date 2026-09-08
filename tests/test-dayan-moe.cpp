@@ -21,6 +21,8 @@ struct moe_graph {
     ggml_cgraph *    graph         = nullptr;
     ggml_tensor *    input         = nullptr;
     ggml_tensor *    router_weight = nullptr;
+    ggml_tensor *    router_scale  = nullptr;
+    ggml_tensor *    residual      = nullptr;
     ggml_tensor *    gate_weight   = nullptr;
     ggml_tensor *    up_weight     = nullptr;
     ggml_tensor *    down_weight   = nullptr;
@@ -60,7 +62,7 @@ static ggml_tensor * new_input(ggml_context *  ctx,
     return tensor;
 }
 
-static moe_graph build_graph() {
+static moe_graph build_graph(bool full_sort) {
     ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * kGraphSize + ggml_graph_overhead_custom(kGraphSize, false),
         /* .mem_buffer = */ nullptr,
@@ -79,12 +81,15 @@ static moe_graph build_graph() {
     const int64_t bias_shape[]   = { kEmbedding, kExperts };
     result.input                 = new_input(result.ctx.get(), GGML_TYPE_F32, 2, input_shape, "input");
     result.router_weight         = new_input(result.ctx.get(), GGML_TYPE_BF16, 2, router_shape, "router_weight");
+    result.router_scale          = new_input(result.ctx.get(), GGML_TYPE_F32, 1, input_shape, "router_scale");
     result.gate_weight           = new_input(result.ctx.get(), GGML_TYPE_BF16, 3, up_shape, "gate_weight");
     result.up_weight             = new_input(result.ctx.get(), GGML_TYPE_BF16, 3, up_shape, "up_weight");
     result.down_weight           = new_input(result.ctx.get(), GGML_TYPE_BF16, 3, down_shape, "down_weight");
     result.down_bias             = new_input(result.ctx.get(), GGML_TYPE_F32, 2, bias_shape, "down_bias");
 
-    ggml_tensor * logits = ggml_mul_mat(result.ctx.get(), result.router_weight, result.input);
+    result.residual = ggml_add(result.ctx.get(), result.input, result.input);
+    ggml_tensor * norm = ggml_mul(result.ctx.get(), ggml_rms_norm(result.ctx.get(), result.residual, 1.0e-6f), result.router_scale);
+    ggml_tensor * logits = ggml_mul_mat(result.ctx.get(), result.router_weight, norm);
     ggml_tensor * probs  = ggml_soft_max(result.ctx.get(), logits);
     result.argsort       = ggml_argsort(result.ctx.get(), probs, GGML_SORT_ORDER_DESC);
     result.selected = ggml_view_2d(result.ctx.get(), result.argsort, kExpertsUsed, kTokens, result.argsort->nb[1], 0);
@@ -108,6 +113,9 @@ static moe_graph build_graph() {
     }
 
     ggml_set_name(result.argsort, "argsort");
+    if (full_sort) {
+        ggml_set_output(result.argsort);
+    }
     ggml_set_name(result.top_k, "top_k");
     ggml_set_name(result.gate, "gate");
     ggml_set_name(result.up, "up");
@@ -155,6 +163,7 @@ static bool initialize_graph(const moe_graph & graph) {
     const std::vector<ggml_bf16_t> gate   = make_expert_weight(kEmbedding, kHidden, 1);
     const std::vector<ggml_bf16_t> up     = make_expert_weight(kEmbedding, kHidden, 5);
     const std::vector<ggml_bf16_t> down   = make_expert_weight(kHidden, kEmbedding, 9);
+    const std::vector<float>       scale((size_t) kEmbedding, 0.125f);
     std::vector<float>             bias((size_t) kEmbedding * kExperts);
     for (int64_t expert = 0; expert < kExperts; ++expert) {
         for (int64_t element = 0; element < kEmbedding; ++element) {
@@ -164,6 +173,7 @@ static bool initialize_graph(const moe_graph & graph) {
 
     ggml_backend_tensor_set(graph.input, input.data(), 0, ggml_nbytes(graph.input));
     ggml_backend_tensor_set(graph.router_weight, router.data(), 0, ggml_nbytes(graph.router_weight));
+    ggml_backend_tensor_set(graph.router_scale, scale.data(), 0, ggml_nbytes(graph.router_scale));
     ggml_backend_tensor_set(graph.gate_weight, gate.data(), 0, ggml_nbytes(graph.gate_weight));
     ggml_backend_tensor_set(graph.up_weight, up.data(), 0, ggml_nbytes(graph.up_weight));
     ggml_backend_tensor_set(graph.down_weight, down.data(), 0, ggml_nbytes(graph.down_weight));
@@ -181,7 +191,7 @@ static float compare_f32(const ggml_tensor * expected, const ggml_tensor * actua
     for (size_t i = 0; i < reference.size(); ++i) {
         const float error = std::abs(reference[i] - observed[i]);
         max_abs           = std::max(max_abs, error);
-        *close            = *close && error <= 0.05f + 0.08f * std::abs(reference[i]);
+        *close            = *close && error <= 1.0e-5f + 1.0e-4f * std::abs(reference[i]);
     }
     return max_abs;
 }
@@ -198,7 +208,7 @@ static float compare_bf16(const ggml_tensor * expected, const ggml_tensor * actu
         const float actual_value   = ggml_bf16_to_fp32(observed[i]);
         const float error          = std::abs(expected_value - actual_value);
         max_abs                    = std::max(max_abs, error);
-        *close                     = *close && error <= 0.02f + 0.08f * std::abs(expected_value);
+        *close                     = *close && error <= 1.0e-5f + 1.0e-4f * std::abs(expected_value);
     }
     return max_abs;
 }
@@ -211,24 +221,20 @@ static bool compare_i32(const ggml_tensor * expected, const ggml_tensor * actual
     return reference == observed;
 }
 
-int main() {
-    ggml_backend_load_all();
-
-    ggml_backend_ptr dayan(ggml_backend_init_by_name("DAYAN", nullptr));
-    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
-    if (!dayan || !cpu) {
-        return fail("cannot initialize backends");
-    }
-
-    moe_graph reference = build_graph();
-    moe_graph actual    = build_graph();
-    if (!reference.ctx || !actual.ctx || !rewrite_graph(dayan.get(), reference.ctx.get(), reference.graph) ||
-        !rewrite_graph(dayan.get(), actual.ctx.get(), actual.graph)) {
+static int run_case(ggml_backend_t dayan, ggml_backend_t cpu, bool full_sort) {
+    moe_graph reference = build_graph(full_sort);
+    moe_graph actual    = build_graph(full_sort);
+    if (!reference.ctx || !actual.ctx || !rewrite_graph(dayan, reference.ctx.get(), reference.graph) ||
+        !rewrite_graph(dayan, actual.ctx.get(), actual.graph)) {
         return fail("cannot build or rewrite graphs");
     }
 
     reference.fused_lowp = reference.down->src[1];
     actual.fused_lowp    = actual.down->src[1];
+    if (actual.residual->type != GGML_TYPE_F32 || actual.residual->src[0] != actual.input ||
+        actual.residual->src[1] != actual.input) {
+        return fail("graph rewrite reduced MoE residual precision");
+    }
     if (actual.gate->src[1] == actual.input || actual.gate->src[1] != actual.up->src[1] ||
         actual.gate->src[1]->op != GGML_OP_CPY || actual.gate->src[1]->type != GGML_TYPE_BF16 ||
         actual.fused_lowp == actual.fused || actual.fused_lowp->op != GGML_OP_CPY ||
@@ -236,31 +242,55 @@ int main() {
         return fail("graph rewrite did not create the expected MoE activation casts");
     }
 
-    ggml_backend_buffer_ptr reference_buffer(ggml_backend_alloc_ctx_tensors(reference.ctx.get(), cpu.get()));
-    ggml_backend_buffer_ptr actual_buffer(ggml_backend_alloc_ctx_tensors(actual.ctx.get(), dayan.get()));
+    ggml_backend_buffer_ptr reference_buffer(ggml_backend_alloc_ctx_tensors(reference.ctx.get(), cpu));
+    ggml_backend_buffer_ptr actual_buffer(ggml_backend_alloc_ctx_tensors(actual.ctx.get(), dayan));
     if (!reference_buffer || !actual_buffer || !initialize_graph(reference) || !initialize_graph(actual)) {
         return fail("cannot allocate or initialize tensors");
     }
-    if (ggml_backend_graph_compute(cpu.get(), reference.graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(cpu, reference.graph) != GGML_STATUS_SUCCESS) {
         return fail("CPU reference graph failed");
     }
-    if (ggml_backend_graph_compute(dayan.get(), actual.graph) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(dayan, actual.graph) != GGML_STATUS_SUCCESS) {
         return fail("Dayan MoE graph failed");
     }
 
-    bool        close = compare_i32(reference.argsort, actual.argsort) && compare_i32(reference.top_k, actual.top_k);
+    bool close = compare_i32(reference.top_k, actual.top_k);
+    if (full_sort) {
+        close = compare_i32(reference.argsort, actual.argsort) && close;
+    } else {
+        for (int64_t token = 0; token < kTokens; ++token) {
+            int32_t expected[kExpertsUsed];
+            int32_t observed[kExpertsUsed];
+            ggml_backend_tensor_get(reference.selected, expected, token * reference.selected->nb[1], sizeof(expected));
+            ggml_backend_tensor_get(actual.selected, observed, token * actual.selected->nb[1], sizeof(observed));
+            close = std::equal(expected, expected + kExpertsUsed, observed) && close;
+        }
+    }
     const float fused_max_abs  = compare_bf16(reference.fused_lowp, actual.fused_lowp, &close);
     const float down_max_abs   = compare_f32(reference.biased, actual.biased, &close);
     const float output_max_abs = compare_f32(reference.output, actual.output, &close);
     std::printf(
-        "experts=%lld used=%lld tokens=%lld embd=%lld hidden=%lld fused_max_abs=%g down_max_abs=%g "
+        "full_sort=%d experts=%lld used=%lld tokens=%lld embd=%lld hidden=%lld fused_max_abs=%g down_max_abs=%g "
         "output_max_abs=%g\n",
-        (long long) kExperts, (long long) kExpertsUsed, (long long) kTokens, (long long) kEmbedding,
+        full_sort, (long long) kExperts, (long long) kExpertsUsed, (long long) kTokens, (long long) kEmbedding,
         (long long) kHidden, fused_max_abs, down_max_abs, output_max_abs);
     if (!close) {
         return fail("numerical comparison failed");
     }
 
+    return 0;
+}
+
+int main() {
+    ggml_backend_load_all();
+    ggml_backend_ptr dayan(ggml_backend_init_by_name("DAYAN", nullptr));
+    ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    if (!dayan || !cpu) {
+        return fail("cannot initialize backends");
+    }
+    if (run_case(dayan.get(), cpu.get(), true) || run_case(dayan.get(), cpu.get(), false)) {
+        return 1;
+    }
     std::puts("test-dayan-moe: PASS");
     return 0;
 }

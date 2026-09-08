@@ -86,6 +86,7 @@ __kernel__ void matmul_bf16_4c(const DayanMatmulConfig * config,
                                float *                   output,
                                DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, a, bt, output, perf);
     if (status < 0) {
@@ -99,6 +100,7 @@ __kernel__ void matmul_fp16_4c(const DayanMatmulConfig * config,
                                float *                   output,
                                DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, a, bt, output, perf);
     if (status < 0) {
@@ -112,6 +114,7 @@ __kernel__ void matmul_silu_bf16_4c(const DayanMatmulConfig * config,
                                     float *                   output,
                                     DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_silu_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, a, bt, output, perf);
     if (status < 0) {
@@ -125,6 +128,7 @@ __kernel__ void matmul_silu_fp16_4c(const DayanMatmulConfig * config,
                                     float *                   output,
                                     DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_silu_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, a, bt, output, perf);
     if (status < 0) {
@@ -140,6 +144,7 @@ __kernel__ void matmul_pair_bf16_4c(const DayanMatmulPairConfig * config,
                                     float *                       second,
                                     DayanMatmulPerf *             perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, a, first_bt, second_bt, first, second, perf);
     if (status < 0) {
@@ -155,6 +160,7 @@ __kernel__ void matmul_pair_fp16_4c(const DayanMatmulPairConfig * config,
                                     float *                       second,
                                     DayanMatmulPerf *             perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, a, first_bt, second_bt, first, second, perf);
     if (status < 0) {
@@ -194,6 +200,7 @@ __kernel__ void matmul_quantized_bf16_4c(const DayanMatmulConfig * config,
                                          uint16_t *                output,
                                          DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, a, bt, output, perf);
     if (status < 0) {
@@ -207,6 +214,7 @@ __kernel__ void matmul_quantized_fp16_4c(const DayanMatmulConfig * config,
                                          uint16_t *                output,
                                          DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, a, bt, output, perf);
     if (status < 0) {
@@ -277,6 +285,7 @@ __kernel__ void matmul_swiglu_bf16_4c(const DayanMatmulConfig * config,
                                       uint16_t *                output,
                                       DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, false>(
         config, a, gate_bt, up_bt, output, perf);
     if (status < 0) {
@@ -291,6 +300,7 @@ __kernel__ void matmul_swiglu_fp16_4c(const DayanMatmulConfig * config,
                                       uint16_t *                output,
                                       DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Fp16Format, false>(
         config, a, gate_bt, up_bt, output, perf);
     if (status < 0) {
@@ -305,6 +315,7 @@ __kernel__ void matmul_geglu_bf16_4c(const DayanMatmulConfig * config,
                                      uint16_t *                output,
                                      DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, true>(
         config, a, gate_bt, up_bt, output, perf);
     if (status < 0) {
@@ -319,6 +330,7 @@ __kernel__ void matmul_geglu_fp16_4c(const DayanMatmulConfig * config,
                                      uint16_t *                output,
                                      DayanMatmulPerf *         perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Fp16Format, true>(
         config, a, gate_bt, up_bt, output, perf);
     if (status < 0) {
@@ -355,6 +367,7 @@ __kernel__ void mul_mat_id_bf16_4c(const DayanMulMatIdConfig * config,
                                    float *                     output,
                                    DayanMatmulPerf *           perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, activation, weight, ids, output, perf);
     if (status < 0) {
@@ -369,6 +382,7 @@ __kernel__ void mul_mat_id_fp16_4c(const DayanMulMatIdConfig * config,
                                    float *                     output,
                                    DayanMatmulPerf *           perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, activation, weight, ids, output, perf);
     if (status < 0) {
@@ -385,6 +399,7 @@ __kernel__ void mul_mat_id_pair_bf16_4c(const DayanMulMatIdPairConfig * config,
                                         float *                         second_output,
                                         DayanMatmulPerf *               perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, activation, first_weight, second_weight, ids, first_output, second_output, perf);
     if (status < 0) {
@@ -401,6 +416,7 @@ __kernel__ void mul_mat_id_pair_fp16_4c(const DayanMulMatIdPairConfig * config,
                                         float *                         second_output,
                                         DayanMatmulPerf *               perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_pair_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, activation, first_weight, second_weight, ids, first_output, second_output, perf);
     if (status < 0) {
@@ -472,6 +488,7 @@ __kernel__ void mul_mat_id_swiglu_bf16_4c(const DayanMulMatIdConfig * config,
                                           uint16_t *                  output,
                                           DayanMatmulPerf *           perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
         ggml_dayan_matmul_detail::Bf16Format, false>(
         config, activation, gate_weight, up_weight, ids, output, perf);
@@ -488,6 +505,7 @@ __kernel__ void mul_mat_id_swiglu_fp16_4c(const DayanMulMatIdConfig * config,
                                           uint16_t *                  output,
                                           DayanMatmulPerf *           perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
         ggml_dayan_matmul_detail::Fp16Format, false>(
         config, activation, gate_weight, up_weight, ids, output, perf);
@@ -504,6 +522,7 @@ __kernel__ void mul_mat_id_geglu_bf16_4c(const DayanMulMatIdConfig * config,
                                          uint16_t *                  output,
                                          DayanMatmulPerf *           perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
         ggml_dayan_matmul_detail::Bf16Format, true>(
         config, activation, gate_weight, up_weight, ids, output, perf);
@@ -520,6 +539,7 @@ __kernel__ void mul_mat_id_geglu_fp16_4c(const DayanMulMatIdConfig * config,
                                          uint16_t *                  output,
                                          DayanMatmulPerf *           perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_mul_mat_id_glu_4c<
         ggml_dayan_matmul_detail::Fp16Format, true>(
         config, activation, gate_weight, up_weight, ids, output, perf);
@@ -755,6 +775,7 @@ __kernel__ void project_qg_bf16_4c(const DayanAttentionProjectionConfig * config
                                    uint16_t *                             q_output,
                                    DayanMatmulPerf *                      perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
         ggml_dayan_matmul_detail::Bf16Format, true>(
         config, activation, weight, norm, positions, qg_output, q_output, perf);
@@ -772,6 +793,7 @@ __kernel__ void project_qg_fp16_4c(const DayanAttentionProjectionConfig * config
                                    uint16_t *                             q_output,
                                    DayanMatmulPerf *                      perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
         ggml_dayan_matmul_detail::Fp16Format, true>(
         config, activation, weight, norm, positions, qg_output, q_output, perf);
@@ -817,6 +839,7 @@ __kernel__ void project_k_bf16_4c(const DayanAttentionProjectionConfig * config,
                                   uint16_t *                             k_output,
                                   DayanMatmulPerf *                      perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
         ggml_dayan_matmul_detail::Bf16Format, false>(
         config, activation, weight, norm, positions, raw_output, k_output, perf);
@@ -834,6 +857,7 @@ __kernel__ void project_k_fp16_4c(const DayanAttentionProjectionConfig * config,
                                   uint16_t *                             k_output,
                                   DayanMatmulPerf *                      perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_attention_projection_4c<
         ggml_dayan_matmul_detail::Fp16Format, false>(
         config, activation, weight, norm, positions, raw_output, k_output, perf);
@@ -871,6 +895,7 @@ __kernel__ void project_v_bf16_4c(const DayanAttentionProjectionConfig * config,
                                   uint16_t *                             v_output,
                                   DayanMatmulPerf *                      perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_value_projection_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, activation, weight, raw_output, v_output, perf);
     if (status < 0) {
@@ -885,6 +910,7 @@ __kernel__ void project_v_fp16_4c(const DayanAttentionProjectionConfig * config,
                                   uint16_t *                             v_output,
                                   DayanMatmulPerf *                      perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_value_projection_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, activation, weight, raw_output, v_output, perf);
     if (status < 0) {
@@ -927,6 +953,7 @@ __kernel__ void project_k_cache_bf16_4c(const DayanKVProjectionConfig * config,
                                         uint16_t *                      cache,
                                         DayanMatmulPerf *               perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_k_cache_projection_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, activation, weight, norm, positions_indices, workspace, cache, perf);
     if (status < 0) {
@@ -943,6 +970,7 @@ __kernel__ void project_k_cache_fp16_4c(const DayanKVProjectionConfig * config,
                                         uint16_t *                      cache,
                                         DayanMatmulPerf *               perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_k_cache_projection_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, activation, weight, norm, positions_indices, workspace, cache, perf);
     if (status < 0) {
@@ -982,6 +1010,7 @@ __kernel__ void project_v_cache_bf16_4c(const DayanKVProjectionConfig * config,
                                         uint16_t *                      cache,
                                         DayanMatmulPerf *               perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_v_cache_projection_4c<ggml_dayan_matmul_detail::Bf16Format>(
         config, activation, weight, indices, workspace, cache, perf);
     if (status < 0) {
@@ -997,6 +1026,7 @@ __kernel__ void project_v_cache_fp16_4c(const DayanKVProjectionConfig * config,
                                         uint16_t *                      cache,
                                         DayanMatmulPerf *               perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_v_cache_projection_4c<ggml_dayan_matmul_detail::Fp16Format>(
         config, activation, weight, indices, workspace, cache, perf);
     if (status < 0) {
@@ -1035,6 +1065,7 @@ __kernel__ void project_gated_output_bf16_4c(const DayanGatedProjectionConfig * 
                                              float *                            output,
                                              DayanMatmulPerf *                  perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_gated_output_projection_4c<
         ggml_dayan_matmul_detail::Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>>(
         config, attention, gate, weight, output, perf);
@@ -1050,6 +1081,7 @@ __kernel__ void project_gated_output_fp16_4c(const DayanGatedProjectionConfig * 
                                              float *                            output,
                                              DayanMatmulPerf *                  perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_gated_output_projection_4c<
         ggml_dayan_matmul_detail::Fp16Format, __tx_vec_cvt_fp32_fp16<0, 0, 0>>(
         config, attention, gate, weight, output, perf);
@@ -1065,6 +1097,7 @@ __kernel__ void project_gated_output_f32_gate_bf16_4c(const DayanGatedProjection
                                                       float *                            output,
                                                       DayanMatmulPerf *                  perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_gated_output_projection_f32_gate_4c<
         ggml_dayan_matmul_detail::Bf16Format>(config, attention, gate, weight, output, perf);
     if (status < 0) {
@@ -1079,6 +1112,7 @@ __kernel__ void project_gated_output_f32_gate_fp16_4c(const DayanGatedProjection
                                                       float *                            output,
                                                       DayanMatmulPerf *                  perf) {
     dayan_acquire_config(config);
+    ggml_dayan_matmul_4c_detail::initialize_resources();
     const int status = ggml_dayan_matmul_4c_detail::run_gated_output_projection_f32_gate_4c<
         ggml_dayan_matmul_detail::Fp16Format>(config, attention, gate, weight, output, perf);
     if (status < 0) {
@@ -1444,13 +1478,13 @@ __kernel__ void rms_norm_pipeline_1c(const DayanNormPipelineConfig * config,
 #define DAYAN_DESC_URAM_BYTES(bytes)                                                                                \
     (((bytes) + DAYAN_URAM_ALLOCATION_GRANULE - 1U) & ~(DAYAN_URAM_ALLOCATION_GRANULE - 1U))
 #define DAYAN_MATMUL_1C_DESC(kernel)                                                                                 \
-    DAYAN_KERNEL_LOCKED_TASK_DESC(kernel, MATMUL_DAYAN_1C_SLICES, 0,                                                \
+    DAYAN_KERNEL_RESOURCE_DESC_EX(kernel, 1U, MATMUL_DAYAN_1C_SLICES, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0,         \
                                   DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),                                \
                                   2 * MATMUL_DAYAN_1C_SLICES + 2, MATMUL_DAYAN_1C_SLICES,                          \
-                                  MATMUL_DAYAN_1C_SLICES + 1, 0)
+                                  MATMUL_DAYAN_1C_SLICES + 1, 0, 2, 0)
 #define DAYAN_MATMUL_4C_DESC(kernel)                                                                                 \
-    DAYAN_KERNEL_DESC(kernel, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,                                \
-                      DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 4, 2, 1, 0)
+    DAYAN_KERNEL_NAMED_RESOURCE_DESC(kernel, MATMUL_DAYAN_4C_WORKERS, MATMUL_DAYAN_4C_ATOMIC_BYTES,                 \
+                      DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 4, 1, 1, 0, 12, 12)
 
 DAYAN_MATMUL_1C_DESC(matmul_bf16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_fp16_1c);
@@ -1486,14 +1520,14 @@ DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_fp16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_fp16_4c);
-DAYAN_KERNEL_LOCKED_TASK_DESC(flash_attention_bf16_1c, 4, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 3, 0);
-DAYAN_KERNEL_LOCKED_TASK_DESC(flash_attention_fp16_1c, 4, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 3, 0);
-DAYAN_KERNEL_LOCKED_TASK_DESC(renew_attention_bf16_1c, 4, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 4, 0);
-DAYAN_KERNEL_LOCKED_TASK_DESC(renew_attention_fp16_1c, 4, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 4, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
+                              8, 6, 3, 0, 2, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
+                              8, 6, 3, 0, 2, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(renew_attention_bf16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
+                              8, 6, 4, 0, 2, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(renew_attention_fp16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
+                              8, 6, 4, 0, 2, 0);
 DAYAN_KERNEL_LOCKED_TASK_DESC(gated_delta_net_f32_1c, 0, 0,
                               DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 0, 1, 0);
 DAYAN_MATMUL_1C_DESC(project_qg_bf16_1c);
@@ -1578,8 +1612,8 @@ DAYAN_NATIVE_KERNEL_DESC(rms_norm_pipeline_1c);
 
 #undef DAYAN_NATIVE_KERNEL_DESC
 
-DAYAN_KERNEL_LOCKED_TASK_DESC(argsort_f32_1c, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 1, 0);
-DAYAN_KERNEL_LOCKED_TASK_DESC(top_k_f32_1c, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 0, 0);
+DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 0, 0);
 
 #undef DAYAN_MATMUL_4C_DESC
 #undef DAYAN_MATMUL_1C_DESC

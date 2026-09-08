@@ -56,7 +56,7 @@ bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op) {
         weight->ne[0] != activation->ne[0] || op->ne[0] != weight->ne[1] || op->ne[1] != activation->ne[1] ||
         op->ne[2] != activation->ne[2] || op->ne[3] != activation->ne[3] || weight->ne[0] <= 0 ||
         weight->ne[0] > dimension_limit || weight->ne[1] <= 0 || weight->ne[1] > dimension_limit ||
-        activation->ne[1] <= 0 || activation->ne[1] > dimension_limit || weight->ne[1] % 16 != 0 ||
+        activation->ne[1] <= 0 || activation->ne[1] > dimension_limit ||
         weight->ne[2] <= 0 || weight->ne[3] <= 0 || activation->ne[2] <= 0 || activation->ne[3] <= 0 ||
         activation->ne[2] % weight->ne[2] != 0 || activation->ne[3] % weight->ne[3] != 0 ||
         !ggml_is_contiguous(weight) || !ggml_is_contiguous(activation) || !ggml_is_contiguous(op) ||
@@ -102,6 +102,7 @@ bool ggml_backend_dayan_supports_mul_mat_id(const ggml_tensor * op) {
         ids->ne[3] != 1 || op->ne[3] != 1 || weight->ne[0] != activation->ne[0] || ids->ne[1] != activation->ne[2] ||
         activation->ne[1] <= 0 || ids->ne[0] % activation->ne[1] != 0 || op->ne[0] != weight->ne[1] ||
         op->ne[1] != ids->ne[0] || op->ne[2] != ids->ne[1] || ids->nb[0] != sizeof(int32_t) ||
+        ids->nb[1] < (uint64_t) ids->ne[0] * sizeof(int32_t) ||
         !ggml_is_contiguous(weight) || !ggml_is_contiguous(activation) || !ggml_is_contiguous(op)) {
         return false;
     }
@@ -231,7 +232,7 @@ bool ggml_backend_dayan_supports_residual_add(const ggml_tensor * op) {
 static bool ggml_backend_dayan_supports_elementwise_binary(const ggml_tensor * op, enum ggml_op kind) {
     if (op == nullptr || op->op != kind || op->src[0] == nullptr || op->src[1] == nullptr ||
         op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 || op->src[1]->type != GGML_TYPE_F32 ||
-        !ggml_are_same_shape(op, op->src[0]) || !ggml_can_repeat(op->src[1], op->src[0])) {
+        !ggml_are_same_shape(op, op->src[0]) || !ggml_can_repeat(op->src[1], op->src[0]) || !ggml_is_contiguous(op)) {
         return false;
     }
 
@@ -350,7 +351,7 @@ bool ggml_backend_dayan_supports_get_rows(const ggml_tensor * op) {
         (op->type != GGML_TYPE_F32 && op->type != op->src[0]->type) ||
         (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64) || op->ne[0] != op->src[0]->ne[0] ||
         op->ne[1] != op->src[1]->ne[0] || op->ne[2] != op->src[1]->ne[1] || op->ne[3] != op->src[1]->ne[2] ||
-        !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) || !ggml_is_contiguous(op)) {
+        !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) {
         return false;
     }
 
@@ -485,7 +486,7 @@ bool ggml_backend_dayan_supports_clamp(const ggml_tensor * op) {
 
     float parameters[2];
     std::memcpy(parameters, op->op_params, sizeof(parameters));
-    return std::isfinite(parameters[0]) && std::isfinite(parameters[1]) && parameters[0] <= parameters[1];
+    return parameters[0] <= parameters[1];
 }
 
 bool ggml_backend_dayan_supports_softmax(const ggml_tensor * op) {
@@ -1333,8 +1334,10 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     size_t                                                           gated_f32 = 0;
     size_t                                                           embedding_lowp = 0;
     size_t                                                           residual_lowp = 0;
+    bool                                                             has_moe = false;
 
     for (ggml_tensor * node : nodes) {
+        has_moe = has_moe || node->op == GGML_OP_MUL_MAT_ID;
         for (int source = 0; source < GGML_MAX_SRC; ++source) {
             if (node->src[source] != nullptr) {
                 uses[node->src[source]].push_back({ node, source });
@@ -1343,15 +1346,16 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     }
 
     ggml_backend_dayan_residual_type_map residual_types;
+    // Keep MoE residuals in F32 to avoid changing close router scores.
     for (ggml_tensor * node : nodes) {
         enum ggml_type type;
-        if (ggml_backend_dayan_supports_residual_add(node) &&
+        if (!has_moe && ggml_backend_dayan_supports_residual_add(node) &&
             ggml_backend_dayan_activation_storage_type(node, uses, &type) &&
             ggml_backend_dayan_layout_can_change_type(node, type)) {
             residual_types.emplace(node, type);
         }
     }
-    for (bool changed = true; changed;) {
+    for (bool changed = !has_moe; changed;) {
         changed = false;
         for (ggml_tensor * node : nodes) {
             if (!ggml_backend_dayan_supports_residual_add(node) || residual_types.count(node) != 0) {
@@ -1817,6 +1821,30 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
                                                             ggml_backend_dayan_slot_kind::top_k;
             slot.nodes[0]   = node;
             slot.node_count = 1;
+            slot.sort_k     = (uint32_t) node->ne[0];
+            if (node->op == GGML_OP_ARGSORT && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                uint32_t prefix = 0;
+                for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+                    const ggml_tensor * user = cgraph->nodes[j];
+                    for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                        if (user->src[source] != node) {
+                            continue;
+                        }
+                        if (user->op != GGML_OP_VIEW || source != 0 || user->view_offs != 0 ||
+                            user->nb[0] != node->nb[0] || user->nb[1] != node->nb[1] ||
+                            user->nb[2] != node->nb[2] || user->nb[3] != node->nb[3] ||
+                            user->ne[1] != node->ne[1] || user->ne[2] != node->ne[2] ||
+                            user->ne[3] != node->ne[3]) {
+                            prefix = (uint32_t) node->ne[0];
+                        } else {
+                            prefix = std::max(prefix, (uint32_t) user->ne[0]);
+                        }
+                    }
+                }
+                if (prefix > 0) {
+                    slot.sort_k = prefix;
+                }
+            }
             plan->slots.push_back(slot);
             ++plan->routing_slots;
             ++i;

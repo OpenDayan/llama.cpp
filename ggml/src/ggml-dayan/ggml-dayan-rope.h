@@ -213,6 +213,7 @@ static inline void emit_rope_common(uint64_t axes,
     __tx_vec_lsu_u2v<1, 1>(factors);
     __tx_vec_v_fp32_sfu<1, 16, 5>();
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    emit_rope_reduce_angle();
     __tx_vec_v_fp32_sfu<0, 0, 2>();
     __tx_vec_lsu_g2v_broadcast32<1, 1>(mscale_bits);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
@@ -227,7 +228,7 @@ static inline void issue_rope_split(uint64_t values,
                                     uint64_t multiplier,
                                     uint64_t factors,
                                     uint32_t mscale_bits) {
-    constexpr long instructions = 38;
+    constexpr long instructions = 38 + kRopeReduceInstructions;
     begin_vec_block(instructions);
     emit_rope_common(axes, positions, multiplier, factors, mscale_bits);
     __tx_vec_lsu_u2v<0, 0>(values);
@@ -250,7 +251,7 @@ static inline void issue_rope_interleaved(uint64_t values,
                                           uint64_t multiplier,
                                           uint64_t factors,
                                           uint32_t mscale_bits) {
-    constexpr long instructions = 39;
+    constexpr long instructions = 39 + kRopeReduceInstructions;
     begin_vec_block(instructions);
     emit_rope_common(axes, positions, multiplier, factors, mscale_bits);
     __tx_vec_shuffle_compress<0, 0>(32);
@@ -323,11 +324,9 @@ static inline void run_rope_f32(const DayanRopeConfig * config,
             const uint64_t position_address = reinterpret_cast<uint64_t>(position_source);
             __tx_lsu_dma_d2u<0>(position_scratch, position_address & ~63ULL);
             dayan_wait_lsu();
-            dayan_cache_invalidate(reinterpret_cast<void *>(position_scratch), 64);
             *reinterpret_cast<int32_t *>(position_in + (uint64_t) axis * RopeUramLayout::kScalarStride) =
                 *reinterpret_cast<const int32_t *>(position_scratch + (position_address & 63U));
         }
-        dayan_cache_flush(reinterpret_cast<void *>(position_in), position_axes * RopeUramLayout::kScalarStride);
 
         const uint32_t pairs_per_tile = config->mode == 0U ? Constants::kVecLanes / 2U : Constants::kVecLanes;
         for (uint32_t pair_base = 0; pair_base < half; pair_base += pairs_per_tile) {

@@ -270,6 +270,8 @@ static inline void begin_vec_block(long instructions) {
 }
 
 static inline void start_vec_block(long instructions) {
+    // Keep CPU URAM stores before VEC submission.
+    __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<VEC_CONTROL>(vec_control(instructions));
 }
 
@@ -445,10 +447,6 @@ static inline void initialize_constants(float scale_log2e) {
         floor_vec[i] = finite_floor;
         zero_vec[i]  = 0.0f;
     }
-    dayan_cache_flush(lane, kVecBytes);
-    dayan_cache_flush(scale_vec, kVecBytes);
-    dayan_cache_flush(floor_vec, kVecBytes);
-    dayan_cache_flush(zero_vec, kVecBytes);
 }
 
 // Initialize only the online-softmax state: m=-FLT_MAX, l=0, and O=0.  Q is loaded directly, while
@@ -728,13 +726,9 @@ static inline int remember_error(FlashAttentionState * state, int status) {
 static inline int wait_for_generation(FlashAttentionBuffer * buffer, uint64_t expected_generation) {
     for (;;) {
         if (buffer->generation == expected_generation) {
-            return dayan_resource_wait_ready(&buffer->resource);
+            return dayan_resource_wait_ready(buffer->resource, (expected_generation / 2U) & 1U);
         }
 
-        const int status = dayan_resource_wait_free(&buffer->resource);
-        if (status < 0) {
-            return status;
-        }
         dayan_yield();
     }
 }
@@ -796,12 +790,6 @@ static void flash_attention_consumer(void * argument) {
                     const bool mask_scores = prepare_softmax_mask(
                         kCtxBase, rows, cols, q_row + state->causal_offset, k_row, state->causal,
                         &threshold_row_stride);
-                    if (mask_scores) {
-                        const size_t threshold_bytes = threshold_row_stride == 0 ? sizeof(int32_t) :
-                                                                               (size_t) (rows - 1) * kScalarStride +
-                                                                                   sizeof(int32_t);
-                        dayan_cache_flush(uram_ptr<int32_t>(kCtxBase + kCtxThreshold), threshold_bytes);
-                    }
                     dayan_wait_mat();
 
                     issue_online_softmax(kCtxBase, rows, threshold_row_stride, mask_scores);
@@ -810,7 +798,7 @@ static void flash_attention_consumer(void * argument) {
                     issue_pv<Format, kMatPVGroup>(kCtxBase, rows, state->head_dim, buffer->k_offset + kKvVtOffset);
                     dayan_wait_mat();
 
-                    status = dayan_resource_consume(&buffer->resource);
+                    status = dayan_resource_consume_mat(DAYAN_RESOURCE_MASK(buffer->resource));
                     if (status < 0) {
                         remember_error(state, status);
                         return;
@@ -830,6 +818,7 @@ static void flash_attention_consumer(void * argument) {
             generation_base += static_cast<uint64_t>(producer_keys);
         }
     }
+    dayan_wait_mat();
 }
 
 static void flash_attention_producer(void * argument) {
@@ -852,18 +841,11 @@ static void flash_attention_producer(void * argument) {
             const long producer_keys = state->producer_key_tile_count(q_group);
             for (long ki = 0; ki < producer_keys; ++ki) {
                 FlashAttentionBuffer * buffer = &state->buffers[generation & 1U];
-                status = dayan_resource_wait_free(&buffer->resource);
+                status = dayan_resource_wait_free(buffer->resource);
                 if (status < 0) {
                     remember_error(state, status);
                     return;
                 }
-                status = dayan_resource_alloc(
-                    &buffer->resource, 1, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)));
-                if (status < 0) {
-                    remember_error(state, status);
-                    return;
-                }
-
                 buffer->generation = generation;
                 const long k_row = ki * kBc;
                 const long cols  = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
@@ -872,9 +854,7 @@ static void flash_attention_producer(void * argument) {
                 __tx_lsu_dma_d2u<kLsuK>(uram_addr(buffer->k_offset), state->k_row_address(b, qh, k_row));
                 load_v_transposed(state->v_row_address(b, qh, k_row), buffer->k_offset + kKvVtOffset, cols,
                                   state->head_dim, state->v_row_stride);
-                dayan_wait_lsu();
-
-                status = dayan_resource_produce(&buffer->resource);
+                status = dayan_resource_produce_lsu(buffer->resource, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)), 0);
                 if (status < 0) {
                     remember_error(state, status);
                     return;
@@ -884,19 +864,18 @@ static void flash_attention_producer(void * argument) {
             }
         }
     }
+    dayan_wait_lsu();
 }
 
 template <typename Format>
 static int run_flash_attention_pipeline(FlashAttentionState * state) {
     for (long index = 0; index < 2; ++index) {
-        const int status = dayan_resource_init(&state->buffers[index].resource);
-        if (status < 0) {
-            return status;
-        }
+        state->buffers[index].resource = DAYAN_LOCAL_RESOURCE(index);
     }
 
     dayan_thread_resources_t resources;
     dayan_thread_resources_init(&resources);
+    resources.local_resource_count = 2;
     resources.lsu_tcsr_count = 2;
     int status = dayan_create_thread("fa-producer", flash_attention_producer, state, &resources);
     resources.mat_tcsr_count = 2;

@@ -25,15 +25,7 @@ struct NormalizationLayout {
 };
 
 static_assert(NormalizationLayout::kTotalBytes <= DAYAN_NATIVE_TASK_URAM_BYTES, "Native Task URAM layout is too large");
-static_assert((NormalizationLayout::kScalar & 63U) == 0U, "Normalization scalar storage must be cache-line aligned");
-
-static inline void normalization_scalar_acquire(const void * scalar) {
-    dayan_cache_invalidate(scalar, 64);
-}
-
-static inline void normalization_scalar_release(const void * scalar) {
-    dayan_cache_flush(scalar, 64);
-}
+static_assert((NormalizationLayout::kScalar & 63U) == 0U, "Normalization scalar storage must be 64-byte aligned");
 
 static inline uint32_t dayan_native_task_id() {
     const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);

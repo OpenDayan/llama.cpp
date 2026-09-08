@@ -82,6 +82,8 @@ static inline void begin_vec_block(long instructions) {
 }
 
 static inline void start_vec_block(long instructions) {
+    // Keep CPU URAM stores before VEC submission.
+    __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<kVecSync>(0);
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
@@ -164,7 +166,6 @@ static inline void f32_pad_tail_bits(uint64_t output, uint64_t mask_address, uin
     }
 
     *reinterpret_cast<volatile uint64_t *>(mask_address) = mask;
-    dayan_cache_flush(reinterpret_cast<const void *>(mask_address), sizeof(mask));
 
     constexpr long instructions = 3;
     configure_vec_grid(1);
@@ -183,7 +184,6 @@ static inline void f32_pad_tail_address(uint64_t output, uint64_t mask_address, 
     }
 
     *reinterpret_cast<volatile uint64_t *>(mask_address) = mask;
-    dayan_cache_flush(reinterpret_cast<const void *>(mask_address), sizeof(mask));
 
     constexpr long instructions = 3;
     configure_vec_grid(1);

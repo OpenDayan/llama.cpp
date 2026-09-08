@@ -188,6 +188,9 @@ static json make_signature(const ggml_backend_dayan_slot_trace_event * event) {
     if (event->output_mask != 0U) {
         signature["output_mask"] = event->output_mask;
     }
+    if (event->version >= 4 && event->sort_k != 0 && event->sort_k < event->nodes[0]->ne[0]) {
+        signature["sort_k"] = event->sort_k;
+    }
     signature["nodes"]      = json::array();
     for (size_t i = 0; i < GGML_DAYAN_SLOT_TRACE_MAX_NODES; ++i) {
         const ggml_tensor * node = event->nodes[i];
@@ -255,7 +258,7 @@ class trace_collector {
 
   private:
     void record(const ggml_backend_dayan_slot_trace_event * event) {
-        if (event->version != 3) {
+        if (event->version != 3 && event->version != 4) {
             throw std::runtime_error("unsupported Dayan slot trace event version");
         }
 
@@ -272,9 +275,17 @@ class trace_collector {
                 if (output == nullptr || output->buffer == nullptr) {
                     throw std::runtime_error("fused slot output has no backend buffer");
                 }
-                const size_t size = ggml_nbytes(output);
+                const bool partial_sort = event->version >= 4 && event->sort_k != 0 && event->sort_k < output->ne[0];
+                const size_t row_bytes = partial_sort ? event->sort_k * sizeof(int32_t) : 0;
+                const size_t size = partial_sort ? row_bytes * ggml_nrows(output) : ggml_nbytes(output);
                 scratch_.resize(size);
-                ggml_backend_tensor_get(output, scratch_.data(), 0, size);
+                if (partial_sort) {
+                    for (int64_t row = 0; row < ggml_nrows(output); ++row) {
+                        ggml_backend_tensor_get(output, scratch_.data() + row * row_bytes, row * output->nb[1], row_bytes);
+                    }
+                } else {
+                    ggml_backend_tensor_get(output, scratch_.data(), 0, size);
+                }
                 sample.outputs.push_back({ size, hash_bytes(scratch_.data(), size) });
             }
         }

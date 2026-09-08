@@ -163,7 +163,7 @@ static int run_case(ggml_backend_t dayan,
                     const float actual    = result[result_index];
                     const float abs_error = std::abs(actual - expected);
                     const float rel_error = abs_error / std::max(std::abs(expected), 1.0e-6f);
-                    const float tolerance = silu ? 0.02f + 0.08f * std::abs(expected) : 1.0e-5f;
+                    const float tolerance = silu ? 1.0e-5f + 1.0e-4f * std::abs(expected) : 1.0e-5f;
                     close                 = close && std::isfinite(actual) && abs_error <= tolerance;
                     max_rel               = std::max(max_rel, rel_error);
                     if (abs_error > max_abs) {
@@ -218,7 +218,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (argc == 1 &&
-        (run_case(dayan.get(), GGML_TYPE_BF16, 2, 64, 64, 1, 1, 2, 2, false) != 0 ||
+        (run_case(dayan.get(), GGML_TYPE_BF16, 1, 1, 2048, 1, 1, 1, 1, false) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_BF16, 8, 1, 2048, 1, 1, 1, 1, false) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_F16, 2, 97, 300, 1, 1, 1, 1, true) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_BF16, 2, 64, 64, 1, 1, 2, 2, false) != 0 ||
          run_case(dayan.get(), GGML_TYPE_BF16, 2, 64, 64, 2, 1, 4, 2, false) != 0 ||
          run_case(dayan.get(), GGML_TYPE_BF16, 2, 64, 64, 1, 2, 4, 4, false) != 0 ||
          run_case(dayan.get(), GGML_TYPE_BF16, 2, 384, 300, 1, 1, 1, 1, false) != 0 ||

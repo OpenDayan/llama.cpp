@@ -495,7 +495,6 @@ static inline uint64_t memory_read_index(const void * indices, uint32_t index, u
     configure_memory_lsu<1>(1, 0, 0, bytes, bytes);
     __tx_lsu_dma_d2u<1>((long) scratch, (long) ((const char *) indices + (uint64_t) index * bytes));
     dayan_wait_lsu();
-    normalization_scalar_acquire((void *) (uintptr_t) scratch);
     if (type == kDayanDataTypeI32) {
         const int32_t value = *(const int32_t *) (uintptr_t) scratch;
         if (value < 0) {
@@ -640,7 +639,9 @@ static inline void run_get_rows(const DayanRowsConfig * config,
             uint32_t       linear   = row / config->index_ne[0];
             const uint32_t index1   = linear % config->index_ne[1];
             const uint32_t index2   = linear / config->index_ne[1];
-            const uint64_t selected = memory_read_index(indices, row, config->index_type, index_uram);
+            const char * index = (const char *) indices + (row % config->index_ne[0]) * config->index_nb[0] +
+                                 index1 * config->index_nb[1] + index2 * config->index_nb[2];
+            const uint64_t selected = memory_read_index(index, 0, config->index_type, index_uram);
             const uint64_t source_index =
                 selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
             if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
@@ -675,7 +676,9 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         uint32_t       linear   = row / config->index_ne[0];
         const uint32_t index1   = linear % config->index_ne[1];
         const uint32_t index2   = linear / config->index_ne[1];
-        const uint64_t selected = memory_read_index(indices, row, config->index_type, index_uram);
+        const char * index = (const char *) indices + (row % config->index_ne[0]) * config->index_nb[0] +
+                             index1 * config->index_nb[1] + index2 * config->index_nb[2];
+        const uint64_t selected = memory_read_index(index, 0, config->index_type, index_uram);
         const uint64_t source_index =
             selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
         if (selected >= config->source_ne[0] || source_index >= config->source_rows) {

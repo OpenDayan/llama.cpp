@@ -133,7 +133,7 @@ static void physical_plan_callback(const ggml_backend_dayan_graph_plan_slot * sl
     if (!context->error.empty()) {
         return;
     }
-    if (slot->version != 1) {
+    if (slot->version != 1 && slot->version != 2) {
         context->error = "unsupported DAYAN physical graph plan version";
         return;
     }
@@ -212,6 +212,9 @@ static void physical_plan_callback(const ggml_backend_dayan_graph_plan_slot * sl
              { "task_dim_x",  slot->task_dim_x  },
          } },
     });
+    if (slot->version >= 2 && slot->sort_k != 0) {
+        context->slots.back()["sort_k"] = slot->sort_k;
+    }
 }
 
 static json export_physical_plan(ggml_backend_dayan_get_graph_plan_t                  get_plan,

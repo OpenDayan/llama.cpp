@@ -260,9 +260,10 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     for (float & value : k_norm) {
         value = 1.0f + norm_dist(generator);
     }
+    constexpr int32_t test_positions[tokens] = { 0, 359, -359 };
     for (uint32_t axis = 0; axis < 4; ++axis) {
         for (uint32_t token = 0; token < tokens; ++token) {
-            positions[token + axis * tokens] = (int32_t) (token + axis);
+            positions[token + axis * tokens] = test_positions[token] + (int32_t) axis;
         }
     }
 

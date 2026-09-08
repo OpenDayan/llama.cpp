@@ -155,7 +155,7 @@ static int run_case(ggml_backend_t dayan,
     for (size_t index = 0; index < expected.size(); ++index) {
         const float abs_error = std::abs(observed[index] - expected[index]);
         const float rel_error = abs_error / std::max(std::abs(expected[index]), 1.0e-6f);
-        close                 = close && abs_error <= 0.004f + 0.04f * std::abs(expected[index]);
+        close                 = close && abs_error <= 1.0e-6f + 1.0e-4f * std::abs(expected[index]);
         if (abs_error > max_abs) {
             max_abs       = abs_error;
             max_abs_index = index;

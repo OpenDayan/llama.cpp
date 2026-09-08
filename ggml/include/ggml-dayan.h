@@ -27,6 +27,7 @@ struct ggml_backend_dayan_slot_trace_event {
     int32_t                    status;
     int64_t                    elapsed_us;
     uint32_t                   output_mask;
+    uint32_t                   sort_k;
 };
 
 typedef void (*ggml_backend_dayan_slot_trace_callback)(const struct ggml_backend_dayan_slot_trace_event * event,
@@ -58,6 +59,7 @@ struct ggml_backend_dayan_graph_plan_slot {
     const struct ggml_tensor * outputs[GGML_DAYAN_SLOT_TRACE_MAX_OUTPUTS];
     size_t                     output_count;
     uint32_t                   output_mask;
+    uint32_t                   sort_k;
 };
 
 typedef void (*ggml_backend_dayan_graph_plan_callback)(const struct ggml_backend_dayan_graph_plan_slot * slot,

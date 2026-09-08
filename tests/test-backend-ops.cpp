@@ -9136,6 +9136,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_sin       (type));
         test_cases.emplace_back(new test_cos       (type));
         test_cases.emplace_back(new test_clamp     (type));
+        test_cases.emplace_back(new test_clamp     (type, {130, 2, 1, 1}, -0.75f, INFINITY));
+        test_cases.emplace_back(new test_clamp     (type, {130, 2, 1, 1}, -INFINITY, 0.625f));
         test_cases.emplace_back(new test_leaky_relu(type));
         test_cases.emplace_back(new test_floor     (type));
         test_cases.emplace_back(new test_ceil      (type));
@@ -9355,6 +9357,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
     }
 
+    for (bool ties : { false, true }) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {256, 5, 1, 1}, 8, ties));
+    }
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));

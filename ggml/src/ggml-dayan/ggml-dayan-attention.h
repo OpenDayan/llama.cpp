@@ -198,7 +198,6 @@ static inline void attention_reset_scratch() {
     for (uint32_t index = 0; index < 16; ++index) {
         zero[index] = 0;
     }
-    dayan_cache_flush(zero, 64);
     configure_attention_lsu<0>(kAttentionEnd / 64U, 0, 64, 64, 64);
     __tx_lsu_dma_u2u<0>(attention_uram(kAttentionRaw), attention_uram(kAttentionRaw));
     dayan_wait_lsu();
@@ -231,9 +230,6 @@ static inline void attention_initialize_constants(const DayanAttentionProjection
         factors[pair] = theta_factor * values[kAttentionFreqScale];
         theta_factor *= values[kAttentionThetaScale];
     }
-    dayan_cache_flush(axes, kAttentionPairBytes);
-    dayan_cache_flush(factors, kAttentionPairBytes);
-    dayan_cache_flush(constants, Constants::kVecBytes);
 }
 
 template <typename Format>
@@ -291,7 +287,6 @@ static inline void attention_select_positions(const DayanAttentionProjectionConf
     const int32_t * axes      = attention_uram_pointer<int32_t>(kAttentionAxes);
     const int32_t * positions = attention_uram_pointer<int32_t>(kAttentionPositions);
     float *         output    = attention_uram_pointer<float>(kAttentionPosition);
-    dayan_cache_invalidate(positions, Constants::kVecBytes);
     for (uint32_t pair = 0; pair < pair_count; ++pair) {
         const uint32_t axis = config->rope_mode == 8U ? (uint32_t) axes[pair_base + pair] : 0U;
         output[pair]        = (float) positions[axis];
@@ -299,11 +294,30 @@ static inline void attention_select_positions(const DayanAttentionProjectionConf
     for (uint32_t pair = pair_count; pair < Constants::kVecLanes; ++pair) {
         output[pair] = 0.0f;
     }
-    dayan_cache_flush(output, Constants::kVecBytes);
+}
+
+constexpr long kRopeReduceInstructions = 13;
+
+static inline void emit_rope_reduce_angle() {
+    // Q0[0] holds theta. SFU SIN/COS need an angle within one turn.
+    // Split 2*pi to keep the first two products exact for |theta| <= 2^22.
+    __tx_vec_lsu_g2v_broadcast32<1, 1>(0x3e22f983); // 1 / (2*pi)
+    __tx_vec_vv_fp32_mul<1, 0, 16, 0>();
+    __tx_vec_cvt_s32_fp32<1, 16, 0>();
+    __tx_vec_cvt_fp32_int32<1, 16, 0>();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>(0x40c80000); // 6.25
+    __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>(0x3d080000); // 0.033203125
+    __tx_vec_vv_fp32_mul<1, 16, 19, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>(0xb795777a); // 2*pi - 6.25 - 0.033203125
+    __tx_vec_vv_fp32_mul<1, 16, 21, 0>();
+    __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
 }
 
 static inline void issue_attention_theta(uint64_t position, uint64_t factors, uint64_t output) {
-    constexpr long instructions = 4;
+    constexpr long instructions = 4 + kRopeReduceInstructions;
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
@@ -314,6 +328,7 @@ static inline void issue_attention_theta(uint64_t position, uint64_t factors, ui
     __tx_vec_lsu_u2v<0, 0>(position);
     __tx_vec_lsu_u2v<1, 1>(factors);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    emit_rope_reduce_angle();
     __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
 }
@@ -586,7 +601,6 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
     const uint32_t cache_width = projection->heads * projection->head_dim;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         attention_load_i32(attention_uram(kAttentionPositions), indices + token, 1, sizeof(int32_t));
-        dayan_cache_invalidate(attention_uram_pointer<int32_t>(kAttentionPositions), 64);
         const int32_t cache_row = *attention_uram_pointer<int32_t>(kAttentionPositions);
         if (cache_row < 0 || (uint32_t) cache_row >= config->cache_rows) {
             DAYAN_PARAMS_ERROR();
@@ -621,7 +635,6 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
     const uint32_t cache_width = projection->heads * projection->head_dim;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         attention_load_i32(attention_uram(kAttentionPositions), indices + token, 1, sizeof(int32_t));
-        dayan_cache_invalidate(attention_uram_pointer<int32_t>(kAttentionPositions), 64);
         const int32_t cache_row = *attention_uram_pointer<int32_t>(kAttentionPositions);
         if (cache_row < 0 || (uint32_t) cache_row >= config->cache_rows) {
             DAYAN_PARAMS_ERROR();

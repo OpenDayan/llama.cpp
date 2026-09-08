@@ -46,7 +46,6 @@ static inline void layout_make_constant(uint32_t bits) {
     const uint64_t scratch = layout_scratch();
     uint32_t *     scalar  = (uint32_t *) ((uintptr_t) dayan_uram_base() + NormalizationLayout::kScalar);
     *scalar                = bits;
-    normalization_scalar_release(scalar);
 
     ggml_dayan_vec_detail::configure_vec_grid(NormalizationLayout::kTileElements / Constants::kVecLanes);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);

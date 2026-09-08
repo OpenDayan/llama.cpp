@@ -46,6 +46,8 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
     if (config == nullptr || activation == nullptr || weight == nullptr || ids == nullptr || output == nullptr ||
         perf == nullptr || config->k == 0 || config->n == 0 || config->experts == 0 || config->experts > INT32_MAX ||
         config->experts_used == 0 || config->tokens == 0 || config->activation_slots == 0 ||
+        config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
+        config->ids_row_stride > UINT64_MAX / config->tokens ||
         config->experts_used % config->activation_slots != 0 ||
         !moe_allocation_fits(sizeof(uint16_t), config->k, config->n, config->experts) ||
         !moe_allocation_fits(sizeof(uint16_t), config->k, config->activation_slots, config->tokens) ||
@@ -63,9 +65,11 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
         (uint64_t) config->n * sizeof(float),
     };
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
+    uint64_t resource_phases = 0;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
-            const int32_t expert = moe_read_expert(ids, (uint64_t) token * config->experts_used + used);
+            const int32_t * row_ids = (const int32_t *) ((const char *) ids + token * config->ids_row_stride);
+            const int32_t expert = moe_read_expert(row_ids, used);
             if (expert < 0 || expert >= (int32_t) config->experts) {
                 DAYAN_PARAMS_ERROR();
             }
@@ -76,7 +80,7 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
             const uint64_t output_offset = ((uint64_t) token * config->experts_used + used) * config->n;
             run_matmul_kernel<Format, 1, sizeof(float), false, epilogue_identity, epilogue_identity, epilogue_identity,
                               epilogue_identity, epilogue_identity, epilogue_identity>(
-                &matmul, activation + activation_offset, weight + weight_offset, nullptr, output + output_offset, perf);
+                &matmul, activation + activation_offset, weight + weight_offset, nullptr, output + output_offset, perf, nullptr, &resource_phases);
         }
     }
 }
@@ -98,6 +102,8 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
     if (config == nullptr || activation == nullptr || gate_weight == nullptr || up_weight == nullptr ||
         ids == nullptr || output == nullptr || perf == nullptr || config->k == 0 || config->n == 0 ||
         config->experts == 0 || config->experts > INT32_MAX || config->experts_used == 0 || config->tokens == 0 ||
+        config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
+        config->ids_row_stride > UINT64_MAX / config->tokens ||
         config->activation_slots == 0 || config->experts_used % config->activation_slots != 0 ||
         !moe_allocation_fits(sizeof(uint16_t), config->k, config->n, config->experts) ||
         !moe_allocation_fits(sizeof(uint16_t), config->k, config->activation_slots, config->tokens) ||
@@ -115,9 +121,11 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
         (uint64_t) config->n * sizeof(uint16_t),
     };
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
+    uint64_t resource_phases = 0;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
-            const int32_t expert = moe_read_expert(ids, (uint64_t) token * config->experts_used + used);
+            const int32_t * row_ids = (const int32_t *) ((const char *) ids + token * config->ids_row_stride);
+            const int32_t expert = moe_read_expert(row_ids, used);
             if (expert < 0 || expert >= (int32_t) config->experts) {
                 DAYAN_PARAMS_ERROR();
             }
@@ -129,7 +137,7 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
             run_matmul_kernel<Format, 2, sizeof(uint16_t), true, AProducerEpilogue0, AProducerEpilogue1,
                               AProducerEpilogue2, BProducerEpilogue0, BProducerEpilogue1, BProducerEpilogue2>(
                 &matmul, activation + activation_offset, gate_weight + weight_offset, up_weight + weight_offset,
-                output + output_offset, perf);
+                output + output_offset, perf, nullptr, &resource_phases);
         }
     }
 }
@@ -190,6 +198,7 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
     memory_validate(config);
     if (input == nullptr || output == nullptr || config->width == 0 || config->rows == 0 || config->output_width == 0 ||
         config->width > kDayanSortMaxWidth || config->output_width > config->width || config->order > 1U ||
+        config->output_stride < config->output_width ||
         (TopK && config->order != kDayanSortOrderDesc)) {
         DAYAN_PARAMS_ERROR();
     }
@@ -232,7 +241,7 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
                 indices[1]          = first;
             }
         }
-        memory_store_bytes(output + (uint64_t) row * config->output_width, uram + SortUramLayout::kIndices,
+        memory_store_bytes(output + (uint64_t) row * config->output_stride, uram + SortUramLayout::kIndices,
                            (uint64_t) config->output_width * sizeof(int32_t));
     }
 }

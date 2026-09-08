@@ -259,6 +259,8 @@ static inline void begin_vec_block(long instructions) {
 }
 
 static inline void start_vec_block(long instructions) {
+    // Keep CPU URAM stores before VEC submission.
+    __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<VEC_CONTROL>(vec_control(instructions));
 }
 
@@ -505,7 +507,6 @@ static inline bool prepare_softmax_mask(long ctx_base,
         masks[(row * kMaskRowStride + kScalarStride) / sizeof(uint64_t)] =
             low_bits(clamp_long(valid - kVecLanes, 0, kVecLanes));
     }
-    dayan_cache_flush(masks, rows * kMaskRowStride);
     return true;
 }
 
@@ -744,11 +745,7 @@ static inline int remember_error(RenewAttentionState * state, int status) {
 static inline int wait_for_generation(RenewAttentionBuffer * buffer, uint64_t expected_generation) {
     for (;;) {
         if (buffer->generation == expected_generation) {
-            return dayan_resource_wait_ready(&buffer->resource);
-        }
-        const int status = dayan_resource_wait_free(&buffer->resource);
-        if (status < 0) {
-            return status;
+            return dayan_resource_wait_ready(buffer->resource, (expected_generation / 2U) & 1U);
         }
         dayan_yield();
     }
@@ -827,7 +824,7 @@ static void attention_consumer(void * argument) {
 
                     issue_pv<mat_pv>(ctx_base, buffer->k_offset + kKvVtOffset);
                     dayan_wait_mat();
-                    status = dayan_resource_consume(&buffer->resource);
+                    status = dayan_resource_consume_mat(DAYAN_RESOURCE_MASK(buffer->resource));
                     if (status < 0) {
                         remember_error(state, status);
                         return;
@@ -847,6 +844,7 @@ static void attention_consumer(void * argument) {
             generation_base += static_cast<uint64_t>(producer_keys);
         }
     }
+    dayan_wait_mat();
 }
 
 static void attention_producer(void * argument) {
@@ -879,18 +877,11 @@ static void attention_producer(void * argument) {
             const long producer_keys = state->producer_key_tile_count(q_group);
             for (long ki = 0; ki < producer_keys; ++ki) {
                 RenewAttentionBuffer * buffer = &state->buffers[generation & 1U];
-                status                        = dayan_resource_wait_free(&buffer->resource);
+                status                        = dayan_resource_wait_free(buffer->resource);
                 if (status < 0) {
                     remember_error(state, status);
                     return;
                 }
-                status = dayan_resource_alloc(&buffer->resource, 1,
-                                              static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)));
-                if (status < 0) {
-                    remember_error(state, status);
-                    return;
-                }
-
                 buffer->generation = generation;
                 const long k_row   = ki * kBc;
                 const long cols    = min_long(kBc, static_cast<long>(state->kv_len) - k_row);
@@ -898,9 +889,7 @@ static void attention_producer(void * argument) {
                 __tx_lsu_dma_d2u<lsu_k>(uram_addr(buffer->k_offset), state->k_row_address(b, qh, k_row));
                 load_v_transposed<lsu_vt>(state->v_row_address(b, qh, k_row), buffer->k_offset + kKvVtOffset, cols,
                                           state->v_row_stride);
-                dayan_wait_lsu();
-
-                status = dayan_resource_produce(&buffer->resource);
+                status = dayan_resource_produce_lsu(buffer->resource, static_cast<uint32_t>(state->users_for_key_tile(q_group, ki)), 0);
                 if (status < 0) {
                     remember_error(state, status);
                     return;
@@ -910,19 +899,18 @@ static void attention_producer(void * argument) {
             }
         }
     }
+    dayan_wait_lsu();
 }
 
 template <typename Format, void (*ConvertP0)(), void (*ConvertP1)()>
 static inline int run_pipeline(RenewAttentionState * state) {
     for (long index = 0; index < 2; ++index) {
-        const int status = dayan_resource_init(&state->buffers[index].resource);
-        if (status < 0) {
-            return status;
-        }
+        state->buffers[index].resource = DAYAN_LOCAL_RESOURCE(index);
     }
 
     dayan_thread_resources_t resources;
     dayan_thread_resources_init(&resources);
+    resources.local_resource_count = 2;
     resources.lsu_tcsr_count = 2;
     resources.vec_tcsr_count = 1;
     int status               = dayan_create_thread("renew-producer", attention_producer, state, &resources);

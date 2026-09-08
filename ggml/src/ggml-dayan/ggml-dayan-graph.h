@@ -73,6 +73,7 @@ struct ggml_backend_dayan_graph_slot {
     std::array<ggml_tensor *, 5> nodes      = { nullptr, nullptr, nullptr, nullptr, nullptr };
     size_t                       node_count  = 0;
     uint32_t                     output_mask = 0;
+    uint32_t                     sort_k      = 0;
 };
 
 struct ggml_backend_dayan_graph_plan {

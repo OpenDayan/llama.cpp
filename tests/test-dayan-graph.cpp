@@ -1209,7 +1209,8 @@ static int run_strided_rms_case(ggml_backend_t dayan) {
 static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
     constexpr int64_t width       = 130;
     constexpr int64_t heads       = 2;
-    constexpr int64_t tokens      = 3;
+    constexpr int32_t test_positions[] = { 0, 1, 6, 7, 359, -359, 32768, -32768 };
+    constexpr int64_t tokens      = sizeof(test_positions) / sizeof(test_positions[0]);
     constexpr int     n_dims      = 64;
     constexpr int     graph_size  = 8;
     int               sections[4] = { 11, 11, 10, 0 };
@@ -1246,7 +1247,7 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
     }
     for (int axis = 0; axis < position_axes; ++axis) {
         for (int token = 0; token < tokens; ++token) {
-            position_data[(size_t) axis * tokens + token] = token + 3 * axis;
+            position_data[(size_t) axis * tokens + token] = test_positions[token] + 3 * axis;
         }
     }
     ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
@@ -2094,18 +2095,25 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
     ggml_tensor * mask         = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, width, mask_rows, 1, 1);
     ggml_tensor * sinks        = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, heads);
     ggml_tensor * clamp_input  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, 2);
+    ggml_tensor * lower_clamp_input = ggml_dup_tensor(ctx.get(), clamp_input);
+    ggml_tensor * upper_clamp_input = ggml_dup_tensor(ctx.get(), clamp_input);
     ggml_set_input(plain_input);
     ggml_set_input(masked_input);
     ggml_set_input(mask);
     ggml_set_input(sinks);
     ggml_set_input(clamp_input);
+    ggml_set_input(lower_clamp_input);
+    ggml_set_input(upper_clamp_input);
     ggml_tensor * plain  = ggml_soft_max(ctx.get(), plain_input);
     ggml_tensor * masked = ggml_soft_max_ext(ctx.get(), masked_input, mask, scale, max_bias);
     ggml_soft_max_add_sinks(masked, sinks);
     ggml_tensor * clamped = ggml_clamp(ctx.get(), clamp_input, clamp_min, clamp_max);
+    ggml_tensor * lower_clamped = ggml_clamp(ctx.get(), lower_clamp_input, clamp_min, INFINITY);
+    ggml_tensor * upper_clamped = ggml_clamp(ctx.get(), upper_clamp_input, -INFINITY, clamp_max);
 
     if (!ggml_backend_supports_op(dayan, plain) || !ggml_backend_supports_op(dayan, masked) ||
-        !ggml_backend_supports_op(dayan, clamped)) {
+        !ggml_backend_supports_op(dayan, clamped) || !ggml_backend_supports_op(dayan, lower_clamped) ||
+        !ggml_backend_supports_op(dayan, upper_clamped)) {
         return fail("DAYAN rejected Softmax or Clamp");
     }
 
@@ -2113,6 +2121,8 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
     ggml_build_forward_expand(graph, plain);
     ggml_build_forward_expand(graph, masked);
     ggml_build_forward_expand(graph, clamped);
+    ggml_build_forward_expand(graph, lower_clamped);
+    ggml_build_forward_expand(graph, upper_clamped);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
     if (!buffer) {
         return fail("cannot allocate Softmax tensors");
@@ -2141,6 +2151,8 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
     ggml_backend_tensor_set(mask, mask_data.data(), 0, ggml_nbytes(mask));
     ggml_backend_tensor_set(sinks, sink_data.data(), 0, ggml_nbytes(sinks));
     ggml_backend_tensor_set(clamp_input, clamp_data.data(), 0, ggml_nbytes(clamp_input));
+    ggml_backend_tensor_set(lower_clamp_input, clamp_data.data(), 0, ggml_nbytes(lower_clamp_input));
+    ggml_backend_tensor_set(upper_clamp_input, clamp_data.data(), 0, ggml_nbytes(upper_clamp_input));
 
     if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
         return fail("DAYAN Softmax graph failed");
@@ -2149,9 +2161,13 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
     std::vector<float> plain_result(plain_data.size());
     std::vector<float> masked_result(masked_data.size());
     std::vector<float> clamp_result(clamp_data.size());
+    std::vector<float> lower_clamp_result(clamp_data.size());
+    std::vector<float> upper_clamp_result(clamp_data.size());
     ggml_backend_tensor_get(plain, plain_result.data(), 0, ggml_nbytes(plain));
     ggml_backend_tensor_get(masked, masked_result.data(), 0, ggml_nbytes(masked));
     ggml_backend_tensor_get(clamped, clamp_result.data(), 0, ggml_nbytes(clamped));
+    ggml_backend_tensor_get(lower_clamped, lower_clamp_result.data(), 0, ggml_nbytes(lower_clamped));
+    ggml_backend_tensor_get(upper_clamped, upper_clamp_result.data(), 0, ggml_nbytes(upper_clamped));
 
     float plain_max_abs  = 0.0f;
     float masked_max_abs = 0.0f;
@@ -2190,6 +2206,11 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
     for (size_t index = 0; index < clamp_data.size(); ++index) {
         const float expected = std::max(clamp_min, std::min(clamp_max, clamp_data[index]));
         clamp_max_abs        = std::max(clamp_max_abs, std::abs(clamp_result[index] - expected));
+        if (lower_clamp_result[index] != std::max(clamp_min, clamp_data[index]) ||
+            upper_clamp_result[index] != std::min(clamp_max, clamp_data[index])) {
+            std::printf("clamp[%zu] input=%g lower=%g upper=%g\n", index, clamp_data[index], lower_clamp_result[index], upper_clamp_result[index]);
+            return fail("DAYAN Clamp with an infinite bound mismatch");
+        }
     }
     std::printf("softmax plain=%g masked=%g clamp=%g\n", plain_max_abs, masked_max_abs, clamp_max_abs);
     if (plain_max_abs > 2.0e-5f || masked_max_abs > 2.0e-5f || clamp_max_abs != 0.0f) {

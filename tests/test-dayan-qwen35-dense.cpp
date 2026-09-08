@@ -137,7 +137,6 @@ static ggml_tensor * build_linear_attention(ggml_context *     ctx,
                                             const model_case & config,
                                             ggml_tensor *      input,
                                             int                layer,
-                                            bool               cpu_reference,
                                             layer_graph *      result) {
     char name[64];
 
@@ -174,12 +173,7 @@ static ggml_tensor * build_linear_attention(ggml_context *     ctx,
     qkv                             = ggml_reshape_3d(ctx, qkv, kConvChannels, config.n_tokens, 1);
     qkv                             = ggml_transpose(ctx, qkv);
     ggml_tensor * conv_input        = ggml_concat(ctx, history, qkv, 0);
-    ggml_tensor * conv_weight_input = conv_weight;
-    if (cpu_reference) {
-        conv_input        = quantize_to_f32(ctx, conv_input, GGML_TYPE_BF16);
-        conv_weight_input = quantize_to_f32(ctx, conv_weight_input, GGML_TYPE_BF16);
-    }
-    ggml_tensor * conv = ggml_ssm_conv(ctx, conv_input, conv_weight_input);
+    ggml_tensor * conv = ggml_ssm_conv(ctx, conv_input, conv_weight);
     result->conv_silu  = ggml_silu(ctx, conv);
     ggml_format_name(result->conv_silu, "blk.%d.ssm_conv_silu", layer);
     ggml_set_output(result->conv_silu);
@@ -350,7 +344,7 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
         ggml_set_output(layer_graph.attention_norm);
         ggml_tensor * attention =
             layer_graph.recurrent ?
-                build_linear_attention(ctx, config, normalized, layer, cpu_reference, &layer_graph) :
+                build_linear_attention(ctx, config, normalized, layer, &layer_graph) :
                 build_full_attention(ctx, config, normalized, result.positions, result.mask, layer, cpu_reference,
                                      &layer_graph);
         layer_graph.attention_residual = ggml_add(ctx, attention, residual);

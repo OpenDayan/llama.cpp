@@ -96,6 +96,8 @@ static inline void begin_vec_block(long instructions) {
 }
 
 static inline void start_vec_block(long prologue0, long prologue1, long loop, long epilogue1, long epilogue0) {
+    // Keep CPU URAM stores before VEC submission.
+    __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<kVecSync>(0);
     __tx_vec_tcsr_write<kVecControl>(vec_control(prologue0, prologue1, loop, epilogue1, epilogue0));
 }
@@ -239,7 +241,7 @@ static inline void emit_recurrence_row(uint32_t scale_bits) {
     __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_lsu_u2s<0, 3>(uram_address(kUramMaskTable));
-    __tx_vec_vv_mux2<1, 0, 20, 0>();
+    __tx_vec_vv_mux2<1, 20, 0, 0>();
     __tx_vec_shuffle_xor<1, 20>(0);
 }
 
@@ -306,15 +308,12 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
 
     *uram_pointer<float>(kUramLog2E) = 1.4426950408889634f;
 
-    dayan_cache_flush(uram_pointer<float>(kUramLog2E), 64);
-
     for (long group = 0; group < kRowGroups; ++group) {
         for (long lane = 0; lane < kRowsPerGroup; ++lane) {
             *uram_pointer<uint64_t>(kUramMaskTable + group * kMaskGroupBytes + lane * kScalarStride) =
                 uint64_t{ 1 } << lane;
         }
     }
-    dayan_cache_flush(uram_pointer<void>(kUramMaskTable), kRowGroups * kMaskGroupBytes);
 
     configure_lsu_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
                                  kHeadDim * sizeof(float));

@@ -12,7 +12,7 @@
 #endif
 
 #ifndef MATMUL_DAYAN_4C_WORKERS
-#    define MATMUL_DAYAN_4C_WORKERS 5U
+#    define MATMUL_DAYAN_4C_WORKERS 3U
 #endif
 
 #ifndef MATMUL_DAYAN_4C_ATOMIC_BYTES
@@ -217,6 +217,7 @@ struct DayanRowsConfig {
     uint32_t index_type;
     uint32_t flags;
     uint32_t index_ne[3];
+    uint64_t index_nb[3];
     uint32_t source_ne[3];
     uint32_t destination_ne[3];
 };
@@ -263,6 +264,7 @@ struct DayanMulMatIdConfig {
     uint32_t experts_used;
     uint32_t tokens;
     uint32_t activation_slots;
+    uint64_t ids_row_stride;
 };
 
 struct DayanMulMatIdPairConfig {
@@ -283,6 +285,7 @@ struct DayanSortConfig {
     uint32_t rows;
     uint32_t output_width;
     uint32_t order;
+    uint32_t output_stride;
 };
 
 enum : uint32_t {
