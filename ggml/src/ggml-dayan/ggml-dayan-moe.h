@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-dayan-memory.h"
+#include "ggml-dayan-ffn.h"
 
 #if defined(__DAYAN_DEVICE__)
 
@@ -41,10 +42,9 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
                            const uint16_t *            activation,
                            const uint16_t *            weight,
                            const int32_t *             ids,
-                           float *                     output,
-                           DayanMatmulPerf *           perf) {
+                           float *                     output) {
     if (config == nullptr || activation == nullptr || weight == nullptr || ids == nullptr || output == nullptr ||
-        perf == nullptr || config->k == 0 || config->n == 0 || config->experts == 0 || config->experts > INT32_MAX ||
+        config->k == 0 || config->n == 0 || config->experts == 0 || config->experts > INT32_MAX ||
         config->experts_used == 0 || config->tokens == 0 || config->activation_slots == 0 ||
         config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
         config->ids_row_stride > UINT64_MAX / config->tokens ||
@@ -65,7 +65,7 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
         (uint64_t) config->n * sizeof(float),
     };
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
-    uint64_t resource_phases = 0;
+    MatmulPhases resource_phases;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
             const int32_t * row_ids = (const int32_t *) ((const char *) ids + token * config->ids_row_stride);
@@ -78,29 +78,21 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
                 ((uint64_t) token * config->activation_slots + activation_slot) * config->k;
             const uint64_t weight_offset = (uint64_t) expert * weight_elements;
             const uint64_t output_offset = ((uint64_t) token * config->experts_used + used) * config->n;
-            run_matmul_kernel<Format, 1, sizeof(float), false, epilogue_identity, epilogue_identity, epilogue_identity,
-                              epilogue_identity, epilogue_identity, epilogue_identity>(
-                &matmul, activation + activation_offset, weight + weight_offset, nullptr, output + output_offset, perf, nullptr, &resource_phases);
+            matmul_check(run_matmul<Format, 1, 1, sizeof(float), false, epilogue_identity, nullptr, 0, true>(
+                &matmul, activation + activation_offset, weight + weight_offset, nullptr, output + output_offset, nullptr, &resource_phases));
         }
     }
 }
 
-template <typename Format,
-          MatmulEpilogue AProducerEpilogue0,
-          MatmulEpilogue AProducerEpilogue1,
-          MatmulEpilogue AProducerEpilogue2,
-          MatmulEpilogue BProducerEpilogue0,
-          MatmulEpilogue BProducerEpilogue1,
-          MatmulEpilogue BProducerEpilogue2>
+template <typename Format, bool GeGLU>
 static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
                                const uint16_t *            activation,
                                const uint16_t *            gate_weight,
                                const uint16_t *            up_weight,
                                const int32_t *             ids,
-                               uint16_t *                  output,
-                               DayanMatmulPerf *           perf) {
+                               uint16_t *                  output) {
     if (config == nullptr || activation == nullptr || gate_weight == nullptr || up_weight == nullptr ||
-        ids == nullptr || output == nullptr || perf == nullptr || config->k == 0 || config->n == 0 ||
+        ids == nullptr || output == nullptr || config->k == 0 || config->n == 0 ||
         config->experts == 0 || config->experts > INT32_MAX || config->experts_used == 0 || config->tokens == 0 ||
         config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
         config->ids_row_stride > UINT64_MAX / config->tokens ||
@@ -121,7 +113,7 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
         (uint64_t) config->n * sizeof(uint16_t),
     };
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
-    uint64_t resource_phases = 0;
+    MatmulPhases resource_phases;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
             const int32_t * row_ids = (const int32_t *) ((const char *) ids + token * config->ids_row_stride);
@@ -134,10 +126,9 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
                 ((uint64_t) token * config->activation_slots + activation_slot) * config->k;
             const uint64_t weight_offset = (uint64_t) expert * weight_elements;
             const uint64_t output_offset = ((uint64_t) token * config->experts_used + used) * config->n;
-            run_matmul_kernel<Format, 2, sizeof(uint16_t), true, AProducerEpilogue0, AProducerEpilogue1,
-                              AProducerEpilogue2, BProducerEpilogue0, BProducerEpilogue1, BProducerEpilogue2>(
+            matmul_check(ggml_dayan_ffn_detail::run<Format, 1, GeGLU, true>(
                 &matmul, activation + activation_offset, gate_weight + weight_offset, up_weight + weight_offset,
-                output + output_offset, perf, nullptr, &resource_phases);
+                output + output_offset, &resource_phases));
         }
     }
 }

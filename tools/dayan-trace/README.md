@@ -36,3 +36,7 @@ The four-layer GGUF is about 8.8 GB. Start cmodel with `NPU_CMODEL_MEMORY_MIB=16
 ## Top-8 benchmark
 
 [topk-bench.cpp](topk-bench.cpp) compares Device RISC-V selection from DRAM with VEC radix selection and the URAM insertion baseline. See [topk-bench.md](topk-bench.md) for build commands, input limits, cache handling, and the Device cycle timer scope.
+
+## Limited RTL operator measurements
+
+[limited-perf.py](limited-perf.md) runs 16 selected MatMul, FFN, attention, and vector cases against an existing server and dyperf, then reports wall time, cycle spans, and a Qwen3.5-0.8B prefill/decode estimate. It does not load a full model and supports cmodel validation, case selection, and offline reporting.

@@ -69,6 +69,7 @@ add_custom_command(
         ggml-dayan-attention.h
         ggml-dayan-conv.h
         ggml-dayan-elementwise.h
+        ggml-dayan-ffn.h
         ggml-dayan-flash-attention.h
         ggml-dayan-gated-delta-net.h
         ggml-dayan-layout.h
@@ -104,6 +105,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-attention.h
     ggml-dayan-conv.h
     ggml-dayan-elementwise.h
+    ggml-dayan-ffn.h
     ggml-dayan-flash-attention.h
     ggml-dayan-gated-delta-net.h
     ggml-dayan-layout.h

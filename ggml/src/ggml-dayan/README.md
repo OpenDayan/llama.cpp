@@ -10,9 +10,11 @@ Each ggml Dayan arena has one Device allocation, and each tensor owns a Device v
 
 URAM bypasses the CPU cache. CPU accesses to URAM need no cache flush or invalidate. LSU, MAT, and VEC dependencies still require the corresponding unit waits or Named Resources. Cache maintenance applies to cached DRAM, including shared kernel configurations.
 
-The graph executor lowers a Dayan split to execution slots. Two adjacent matrix multiplications with the same activation use one pair slot and one activation upload. A matching `MUL_MAT + MUL_MAT + SWIGLU/GEGLU + CPY` sequence uses one fused slot. The common matrix multiplication template accepts a compile-time epilogue function pointer, evaluates the activation with VEC before the final writeback, and quantizes the result to the weight type.
+The graph executor lowers a Dayan split to execution slots. Two adjacent matrix multiplications with the same activation use one pair slot and one activation upload. A matching `MUL_MAT + MUL_MAT + SWIGLU/GEGLU + CPY` sequence uses one fused slot and the dedicated FFN pipeline in `ggml-dayan-ffn.h`. Each K step loads gate and up weight rows into one B tile, then issues one MAT operation per slice. Each F32 accumulator row holds the gate columns followed by the up columns. N tails move the up half to the next 64-column boundary and reduce MAT_N. VEC hardware loops cover rows and 64-column chunks, evaluate SwiGLU or GeGLU, convert to BF16/FP16, and use Shuffle Compress with a half-vector store mask to write packed URAM output directly. LSU writes only valid columns to DRAM; no second URAM packing copy is needed.
 
-The MoE path has separate kernels for `MUL_MAT_ID`, `ADD_ID`, `ARGSORT`, and `TOP_K`. The graph compiler also recognizes `MUL_MAT_ID + MUL_MAT_ID + SWIGLU/GEGLU + CPY`. This fused slot selects both expert matrices, accumulates both products in F32 URAM buffers, calls the same compile-time VEC epilogue function pointer, and uses the common low-precision writeback. Expert ID views are read with their actual row strides, and routing rows support up to 4096 entries.
+Both one-core and four-core FFN entries use the same shape-dependent pipeline and a 1536 KiB URAM budget. Four-core FFN partitions N evenly and broadcasts A from core 0. For M<=128, each output tile has a fixed 128-row A allocation and two N slices of 192 output columns; each B slice holds 192 gate and 192 up columns, and A is double-buffered. For M>128, each output tile has two 256-row M slices; B is double-buffered with 128 gate and 128 up columns per buffer, shared by the active M slices. MAT and LSU process only actual rows, including M<32. Gate and Up loads share one Resource, and the buffered operand is released only after all active slices consume it. Each slice has one C allocation. A single packed output buffer is reused after LSU finishes its store. Down projection uses the following MatMul slot and returns F32. It has no GLU activation; matching residual ADD, RMSNorm, scale, and conversion operations use the subsequent normalization pipeline slot.
+
+The MoE path has separate kernels for `MUL_MAT_ID`, `ADD_ID`, `ARGSORT`, and `TOP_K`. The graph compiler also recognizes `MUL_MAT_ID + MUL_MAT_ID + SWIGLU/GEGLU + CPY`. This fused slot selects both expert matrices and runs the same dedicated FFN pipeline for each selected expert. Expert ID views are read with their actual row strides, and routing rows support up to 4096 entries.
 
 Graphs containing `MUL_MAT_ID` retain F32 residual storage. Rounding the residual stream to BF16 can change close router scores and select different experts in later layers.
 
@@ -20,9 +22,13 @@ When an `ARGSORT` result is used only by zero-offset prefix views, the slot sele
 
 F32 binary operators pack strided inputs with the existing Device copy kernel before arithmetic or broadcast. This covers the expert output views used in MoE aggregation. These copies are runtime staging within the binary slot. CLAMP accepts infinite bounds, including the lower-only clamp used to normalize selected routing weights.
 
-The four-core MatMul pipeline uses one root MAT worker and three child Threads for DRAM loads, peer copies, and output stores. Named Resources bind buffer reuse to LSU/MAT completion. A shared source has consumer credits for both its local MAT uses and the peer copy. Resource phases persist across repeated batch and expert products within a launch. LSU supports partial output rows, including the single-column shared expert gate.
+The one-core and four-core MatMul entries use the same pipeline: two input loader Threads, the root MAT worker, and a post Thread. The general four-core loaders use DAPI Resource producer election to share A across columns and B across rows. Local Resources protect MAT inputs and accumulators; Shared Resources keep each source alive until the peer copy finishes. Each worker tracks Resource phases across batches and repeated expert products. LSU supports partial output rows, including the single-column shared expert gate.
 
-For the four-core tiles, VisualSwizzle selects `M=7,B=2,S=3` for the 512-byte A/B row strides. The 384-byte C row stride uses linear storage; the 1536-byte C row stride uses `M=7,B=2,S=3`. These layouts have no per-cycle Bank conflicts and cover all 32 Banks across four consecutive blocks. SiLU keeps C linear for VEC access. These are address-mapping results, not measured RTL throughput.
+The `matmul[_quantized|_silu]_inference_*` entries specialize small-M inference. For `1 <= M <= 512`, the graph executor selects the inference entry; pair, expert, and attention projection slots use the same layout internally. Four-core inference assigns core `c` the contiguous N interval `[N*c/4, N*(c+1)/4)`, so shard widths differ by at most one column. Core 0 loads each A tile once and broadcasts it through URAM, with three Shared Resource copy credits. Each core loads its own weight rows and computes the full M range. Cores with empty N shards still retire their A copy credits. Larger MatMuls retain the general 2x2 cooperative layout; FFN keeps its N partition.
+
+For `M < 32`, both one-core and four-core inference use exactly M rows per A tile, including odd sizes. The A row stride is 512 bytes (`K_tile=256`, BF16/FP16), so the two A buffers occupy `2*M*512` bytes; decode with M=1 uses 1 KiB. No padding to 32 or 128 rows is needed. For the MatMul entries, the small A allocation leaves room for larger B slices: M<32 uses four 384-column slices on four cores, or four 192-column slices on one core. M>=32 uses four 96-column slices. Partial K and N dimensions go directly to MAT, and LSU stores only valid output bytes.
+
+VisualSwizzle selects `M=7,B=2,S=3` for the 512-byte A/B row strides. Plain C uses linear storage at a 384-byte row stride and `M=7,B=2,S=3` at a 1536-byte row stride. Epilogues use linear C with a 640-byte or 1664-byte row stride. Small-M MatMul inference uses a linear C row stride of 896 bytes on one core or 1664 bytes on four cores. Dedicated FFN uses a 1664-byte linear accumulator row stride for 192+192 columns or a 1152-byte stride for 128+128 columns, including 32 padding floats, so MAT and VEC share the same layout. For full eight-row access groups, the selected FFN A/B mapping reduces peak Bank pressure from 4 to 1; linear FFN C already has peak pressure 1. Both cover all 32 Banks across four consecutive 32-byte blocks. The FFN buffers use 976 KiB per core for M<=128 and 1152 KiB for M>128, within the 1536 KiB budgets. These are address-mapping results, not measured hardware throughput.
 
 Contiguous F32 residual adds and RMSNorm execute on Dayan. One parameterized normalization pipeline slot handles optional residual ADD, RMSNorm, scale multiplication, and BF16/FP16 quantization. Matrix multiplication remains a separate slot. The graph rewrite keeps every fused input live through the final logical node so the allocator cannot overlap a cast output with an input that another native Task still reads. VEC tensor dimensions expand complete 64-lane chunks into padded URAM scratch space, while LSU tail stores limit the final DRAM write to the valid byte count.
 
@@ -36,6 +42,18 @@ Configure the firmware SDK explicitly:
 cmake -S . -B build-dayan -DGGML_DAYAN=ON -DDAYAN_ROOT=/path/to/npu-firmware
 cmake --build build-dayan --target test-backend-ops -j
 ```
+
+## Profiling
+
+Device operators contain no custom cycle counters or performance buffers. Use the firmware profiler for scheduling traces:
+
+```sh
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock "$DAYAN_ROOT/build/host/dyperf/dyperf" -o /tmp/dayan-trace.json -- ./build-dayan/bin/test-dayan-matmul
+```
+
+Use `llama-bench` for actual host elapsed time and tokens per second on cmodel. Record the model, prompt/generation lengths, batch sizes, repetitions, and simulator configuration. Keep the profiler disabled for these wall-clock measurements and run one client at a time.
+
+For a limited TestCluster operator sample with an existing server and dyperf, use [limited-perf.py](../../../tools/dayan-trace/limited-perf.md). It reports measured host wall time and profiler cycle spans by shape, plus an explicit Qwen3.5-0.8B prefill/decode extrapolation, without loading a whole model or running a shape sweep.
 
 ## Test a specific operator
 
@@ -83,7 +101,7 @@ The standalone BF16 matrix multiplication smoke test defaults to `M=1`, `N=8064`
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-matmul
 ```
 
-The focused graph test checks all BF16/FP16 SWIGLU/GEGLU fused matrix multiplication variants, including both matrix producer paths, low-precision output quantization, the following matrix multiplication, and the Qwen3.5 0.8B `M=8, N=3584, K=1024` FFN shape:
+The focused graph test checks BF16/FP16 SWIGLU/GEGLU fused matrix multiplication variants, low-precision output quantization, the following matrix multiplication, and the Qwen3.5 0.8B `M=8, N=3584, K=1024` FFN shape:
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-graph
@@ -110,6 +128,12 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-graph ro
 
 The standalone test executables below have matching CMake build targets, for example `cmake --build build-dayan --target test-dayan-attention-projection -j`.
 
+The `glu` selector checks generic and inference 1c/4c SWIGLU and GEGLU entries in BF16/FP16. Cases cover M=1,2,3,7,8,15,16,31,32,128,129,257,512,513, N shards with different widths or no columns, K tails, repeated output tiles, repeated launches, and broadcast batches with padded row and batch strides in both slice regimes. N=769 exercises one or two active small-M N slices across different cores. M=513 exercises two M slices followed by one active tail slice. Output padding and trailing guards must remain unchanged. The MatMul test also checks the M=512/513 dispatch boundary and packed broadcast batches above 512 rows.
+
+```sh
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-projection glu
+```
+
 The attention projection test runs QG, K, and V projection, indexed KV-cache writes, causal Flash-Attention, gate fusion, low-precision quantization, and output projection as one numerical data flow for BF16 and FP16 model weights:
 
 ```sh
@@ -134,4 +158,4 @@ The MoE smoke test covers 512 experts, a narrow `ARGSORT` view, `TOP_K`, fused B
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-moe
 ```
 
-The single-core matrix kernel uses one consumer slice. `MUL_MAT_ID` still requires the expert output width to be a multiple of 16. Arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention has native BF16 and FP16 entries and requires Q/K/V to share one storage type. Full-model inference requires enough Device memory for all persistent weights and graph arenas; `run_cmodel_server.sh` defaults to a 4096 MiB memory window. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.
+Both matrix launch modes use four consumer slices. `MUL_MAT_ID` still requires the expert output width to be a multiple of 16. Arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention has native BF16 and FP16 entries and requires Q/K/V to share one storage type. Full-model inference requires enough Device memory for all persistent weights and graph arenas; `run_cmodel_server.sh` defaults to a 4096 MiB memory window. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.

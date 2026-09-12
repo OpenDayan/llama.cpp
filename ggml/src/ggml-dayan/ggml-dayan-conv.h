@@ -182,10 +182,8 @@ static inline void store_ssm_output(float *  output,
 static inline void run_ssm_conv(const DayanSSMConvConfig * config,
                                 const float *              input,
                                 const float *              weight,
-                                float *                    output,
-                                DayanSSMConvPerf *         perf) {
-    DAYAN_PARAMS_IF(config == nullptr || input == nullptr || weight == nullptr || output == nullptr || perf == nullptr ||
-                    config->input_length == 0 || config->channels == 0 || config->tokens == 0 ||
+                                float *                    output) {
+    DAYAN_PARAMS_IF(config == nullptr || input == nullptr || weight == nullptr || output == nullptr || config->input_length == 0 || config->channels == 0 || config->tokens == 0 ||
                     config->sequences == 0 || config->kernel_size == 0 ||
                     config->kernel_size > kDayanSSMConvMaxKernelSize ||
                     (uint64_t) config->input_length != (uint64_t) config->kernel_size - 1U + config->tokens ||
@@ -203,7 +201,6 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
 
     const uint32_t task         = dayan_task_id(DAYAN_TASK_X);
     const uint32_t tasks        = dayan_task_dim(DAYAN_TASK_X);
-    const uint64_t start_cycle  = read_cycle();
     const uint32_t token_tile   = config->tokens < kSSMConvTokenTile ? config->tokens : kSSMConvTokenTile;
     const uint64_t uram_size    = dayan_uram_size();
     const uint64_t uram_address = (uint64_t) (uintptr_t) uram;
@@ -258,15 +255,6 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
                              channel_count, tile_elements, sequence, token_base);
             dayan_wait_lsu();
         }
-    }
-
-    if (task == 0U) {
-        DayanSSMConvPerf * perf_uram = reinterpret_cast<DayanSSMConvPerf *>(uram_address);
-        perf_uram->magic             = kDayanSSMConvPerfMagic;
-        perf_uram->cycles            = read_cycle() - start_cycle;
-        configure_ssm_lsu<0>(1, 1, 0, 0, 0, 0, sizeof(*perf), sizeof(*perf));
-        __tx_lsu_dma_u2d<0>(reinterpret_cast<uint64_t>(perf), uram_address);
-        dayan_wait_lsu();
     }
 }
 

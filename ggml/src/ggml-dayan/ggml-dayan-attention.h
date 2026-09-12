@@ -404,22 +404,12 @@ template <typename Format>
 static inline void run_projection_matmul(const DayanMatmulConfig * config,
                                          const uint16_t *          activation,
                                          const uint16_t *          weight,
-                                         uint16_t *                output,
-                                         DayanMatmulPerf *         perf) {
-    run_matmul_kernel<Format, 1, sizeof(uint16_t), true, epilogue_identity_bf16<0>, epilogue_identity_bf16<4>,
-                      epilogue_identity_bf16<2>, epilogue_identity_bf16<0>, epilogue_identity_bf16<4>,
-                      epilogue_identity_bf16<2>>(config, activation, weight, nullptr, output, perf);
-}
-
-template <>
-inline void run_projection_matmul<Fp16Format>(const DayanMatmulConfig * config,
-                                              const uint16_t *          activation,
-                                              const uint16_t *          weight,
-                                              uint16_t *                output,
-                                              DayanMatmulPerf *         perf) {
-    run_matmul_kernel<Fp16Format, 1, sizeof(uint16_t), true, epilogue_identity_fp16<0>, epilogue_identity_fp16<4>,
-                      epilogue_identity_fp16<2>, epilogue_identity_fp16<0>, epilogue_identity_fp16<4>,
-                      epilogue_identity_fp16<2>>(config, activation, weight, nullptr, output, perf);
+                                         uint16_t *                output) {
+    if (config->m <= 512) {
+        matmul_check(run_matmul<Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Format>, nullptr, 0, true>(config, activation, weight, nullptr, output));
+    } else {
+        matmul_check(run_matmul<Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Format>>(config, activation, weight, nullptr, output));
+    }
 }
 
 template <typename Format>
@@ -520,14 +510,13 @@ static inline void run_attention_projection(const DayanAttentionProjectionConfig
                                             const float *                          norm,
                                             const int32_t *                        positions,
                                             uint16_t *                             raw_output,
-                                            uint16_t *                             output,
-                                            DayanMatmulPerf *                      perf) {
+                                            uint16_t *                             output) {
     if (!attention_projection_config_valid(config, HasGate) || activation == nullptr || weight == nullptr ||
-        norm == nullptr || positions == nullptr || raw_output == nullptr || output == nullptr || perf == nullptr) {
+        norm == nullptr || positions == nullptr || raw_output == nullptr || output == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
 
-    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output, perf);
+    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output);
     postprocess_attention_projection<Format, HasGate>(config, norm, positions, raw_output, output);
 }
 
@@ -536,10 +525,9 @@ static inline void run_value_projection(const DayanAttentionProjectionConfig * c
                                         const uint16_t *                       activation,
                                         const uint16_t *                       weight,
                                         uint16_t *                             raw_output,
-                                        uint16_t *                             output,
-                                        DayanMatmulPerf *                      perf) {
+                                        uint16_t *                             output) {
     if (!attention_projection_config_valid(config, false) || activation == nullptr || weight == nullptr ||
-        raw_output == nullptr || output == nullptr || perf == nullptr) {
+        raw_output == nullptr || output == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
 
@@ -550,7 +538,7 @@ static inline void run_value_projection(const DayanAttentionProjectionConfig * c
         DAYAN_PARAMS_ERROR();
     }
 
-    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output, perf);
+    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output);
     const uint32_t full_blocks = row_bytes / 64U;
     const uint32_t tail        = row_bytes % 64U;
     bool           issued = false;
@@ -584,17 +572,16 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
                                           const float *                   norm,
                                           const int32_t *                 positions_indices,
                                           uint16_t *                      workspace,
-                                          uint16_t *                      cache,
-                                          DayanMatmulPerf *               perf) {
+                                          uint16_t *                      cache) {
     if (!kv_projection_config_valid(config) || activation == nullptr || weight == nullptr || norm == nullptr ||
-        positions_indices == nullptr || workspace == nullptr || cache == nullptr || perf == nullptr) {
+        positions_indices == nullptr || workspace == nullptr || cache == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
 
     const DayanAttentionProjectionConfig * projection    = &config->projection;
     const uint32_t                         position_axes = projection->rope_mode == 8U ? 4U : 1U;
     const int32_t *                        indices = positions_indices + (uint64_t) position_axes * projection->tokens;
-    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace, perf);
+    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace);
     attention_reset_scratch();
     attention_initialize_constants(projection);
     attention_load_bytes(attention_uram(kAttentionNorm), norm, projection->head_dim * sizeof(float));
@@ -623,15 +610,14 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
                                           const uint16_t *                weight,
                                           const int32_t *                 indices,
                                           uint16_t *                      workspace,
-                                          uint16_t *                      cache,
-                                          DayanMatmulPerf *               perf) {
+                                          uint16_t *                      cache) {
     if (!kv_projection_config_valid(config) || activation == nullptr || weight == nullptr || indices == nullptr ||
-        workspace == nullptr || cache == nullptr || perf == nullptr) {
+        workspace == nullptr || cache == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
 
     const DayanAttentionProjectionConfig * projection = &config->projection;
-    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace, perf);
+    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace);
     const uint32_t cache_width = projection->heads * projection->head_dim;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         attention_load_i32(attention_uram(kAttentionPositions), indices + token, 1, sizeof(int32_t));
@@ -804,10 +790,9 @@ static inline void run_gated_output_projection(const DayanGatedProjectionConfig 
                                                const float *                      attention,
                                                const uint16_t *                   gate,
                                                const uint16_t *                   weight,
-                                               float *                            output,
-                                               DayanMatmulPerf *                  perf) {
+                                               float *                            output) {
     DAYAN_PARAMS_IF(config == nullptr || attention == nullptr || gate == nullptr || weight == nullptr ||
-                    output == nullptr || perf == nullptr || config->tokens == 0 || config->heads == 0 ||
+                    output == nullptr || config->tokens == 0 || config->heads == 0 ||
                     config->head_dim == 0 || config->matmul.m != config->tokens ||
                     config->matmul.k != (uint64_t) config->heads * config->head_dim ||
                     config->head_dim > Constants::kTileK || config->head_dim % Constants::kVecLanes != 0 ||
@@ -816,10 +801,11 @@ static inline void run_gated_output_projection(const DayanGatedProjectionConfig 
     }
 
     const GatedInputContext input_context = { config, attention, gate };
-    run_matmul_kernel<Format, 1, sizeof(float), false, epilogue_identity, epilogue_identity, epilogue_identity,
-                      epilogue_identity, epilogue_identity, epilogue_identity, load_gated_input<Format, Convert>,
-                      kGatedInputScratchBytes>(&config->matmul, (const uint16_t *) attention, weight, nullptr, output,
-                                               perf, &input_context);
+    if (config->matmul.m <= 512) {
+        matmul_check(run_matmul<Format, 1, 1, sizeof(float), false, epilogue_identity, load_gated_input<Format, Convert>, kGatedInputScratchBytes, true>(&config->matmul, (const uint16_t *) attention, weight, nullptr, output, &input_context));
+    } else {
+        matmul_check(run_matmul<Format, 1, 1, sizeof(float), false, epilogue_identity, load_gated_input<Format, Convert>, kGatedInputScratchBytes>(&config->matmul, (const uint16_t *) attention, weight, nullptr, output, &input_context));
+    }
 }
 
 }  // namespace ggml_dayan_matmul_detail

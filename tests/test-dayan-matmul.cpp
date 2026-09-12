@@ -232,6 +232,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (argc == 1) {
+        for (int64_t rows : {1, 3, 7, 8, 15, 16, 31, 32, 511, 512, 513}) {
+            if (run_case(dayan.get(), GGML_TYPE_BF16, rows, 1541, 257, 1, 1, 1, 1, false) != 0) {
+                return 1;
+            }
+        }
+        if (run_case(dayan.get(), GGML_TYPE_BF16, 31, 6149, 257, 1, 1, 1, 1, false) != 0 ||
+            run_case(dayan.get(), GGML_TYPE_F16, 257, 33, 65, 1, 1, 2, 2, false) != 0) {
+            return 1;
+        }
+    }
+
     std::puts("test-dayan-matmul: PASS");
     return 0;
 }

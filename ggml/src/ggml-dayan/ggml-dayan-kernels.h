@@ -3,20 +3,12 @@
 #include <dayan_kernel.h>
 #include <stdint.h>
 
-#ifndef MATMUL_DAYAN_1C_SLICES
-#    define MATMUL_DAYAN_1C_SLICES 1
-#endif
-
 #ifndef MATMUL_DAYAN_1C_URAM_BYTES
-#    define MATMUL_DAYAN_1C_URAM_BYTES (1024U * 1024U)
-#endif
-
-#ifndef MATMUL_DAYAN_4C_WORKERS
-#    define MATMUL_DAYAN_4C_WORKERS 3U
+#    define MATMUL_DAYAN_1C_URAM_BYTES (1536U * 1024U)
 #endif
 
 #ifndef MATMUL_DAYAN_4C_ATOMIC_BYTES
-#    define MATMUL_DAYAN_4C_ATOMIC_BYTES (2U * 1024U)
+#    define MATMUL_DAYAN_4C_ATOMIC_BYTES 256U
 #endif
 
 #ifndef MATMUL_DAYAN_4C_URAM_BYTES
@@ -75,20 +67,6 @@ struct DayanMatmulConfig {
 struct DayanMatmulPairConfig {
     DayanMatmulConfig first;
     DayanMatmulConfig second;
-};
-
-enum : uint64_t {
-    kDayanMatmulPerfMagic = 0x4d4d314350455246ULL,
-    kDayanMatmulWorkspaceOffset = 64U,
-};
-
-struct DayanMatmulPerf {
-    uint64_t magic;
-    uint64_t m;
-    uint64_t n;
-    uint64_t k;
-    uint64_t kernel_cycles;
-    uint64_t pipeline_cycles;
 };
 
 struct DayanFlashAttentionConfig {
@@ -171,15 +149,6 @@ struct DayanSSMConvConfig {
 
 enum : uint32_t {
     kDayanSSMConvMaxKernelSize = 63,
-};
-
-enum : uint64_t {
-    kDayanSSMConvPerfMagic = 0x434f4e5631435046ULL,
-};
-
-struct DayanSSMConvPerf {
-    uint64_t magic;
-    uint64_t cycles;
 };
 
 struct DayanElementwiseConfig {
@@ -387,37 +356,61 @@ int matmul_bf16_1c(npu_buffer_t *                    config,
                    npu_buffer_t *                    a,
                    npu_buffer_t *                    bt,
                    npu_buffer_t *                    output,
-                   npu_buffer_t *                    perf,
+                   const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_inference_bf16_1c(npu_buffer_t *                    config,
+                   npu_buffer_t *                    a,
+                   npu_buffer_t *                    bt,
+                   npu_buffer_t *                    output,
                    const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_fp16_1c(npu_buffer_t *                    config,
                    npu_buffer_t *                    a,
                    npu_buffer_t *                    bt,
                    npu_buffer_t *                    output,
-                   npu_buffer_t *                    perf,
+                   const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_inference_fp16_1c(npu_buffer_t *                    config,
+                   npu_buffer_t *                    a,
+                   npu_buffer_t *                    bt,
+                   npu_buffer_t *                    output,
                    const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_bf16_4c(npu_buffer_t *                    config,
                    npu_buffer_t *                    a,
                    npu_buffer_t *                    bt,
                    npu_buffer_t *                    output,
-                   npu_buffer_t *                    perf,
+                   const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_inference_bf16_4c(npu_buffer_t *                    config,
+                   npu_buffer_t *                    a,
+                   npu_buffer_t *                    bt,
+                   npu_buffer_t *                    output,
                    const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_fp16_4c(npu_buffer_t *                    config,
                    npu_buffer_t *                    a,
                    npu_buffer_t *                    bt,
                    npu_buffer_t *                    output,
-                   npu_buffer_t *                    perf,
+                   const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_inference_fp16_4c(npu_buffer_t *                    config,
+                   npu_buffer_t *                    a,
+                   npu_buffer_t *                    bt,
+                   npu_buffer_t *                    output,
                    const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_silu_bf16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
                         npu_buffer_t *                    bt,
                         npu_buffer_t *                    output,
-                        npu_buffer_t *                    perf,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_inference_bf16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
                         const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_silu_fp16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
                         npu_buffer_t *                    bt,
                         npu_buffer_t *                    output,
-                        npu_buffer_t *                    perf,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_inference_fp16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
                         const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_pair_bf16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
@@ -425,7 +418,6 @@ int matmul_pair_bf16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    second_bt,
                         npu_buffer_t *                    first,
                         npu_buffer_t *                    second,
-                        npu_buffer_t *                    perf,
                         const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_pair_fp16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
@@ -433,115 +425,166 @@ int matmul_pair_fp16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    second_bt,
                         npu_buffer_t *                    first,
                         npu_buffer_t *                    second,
-                        npu_buffer_t *                    perf,
                         const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_quantized_bf16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    a,
                              npu_buffer_t *                    bt,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
+                             const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_quantized_inference_bf16_1c(npu_buffer_t *                    config,
+                             npu_buffer_t *                    a,
+                             npu_buffer_t *                    bt,
+                             npu_buffer_t *                    output,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_quantized_fp16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    a,
                              npu_buffer_t *                    bt,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
+                             const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_quantized_inference_fp16_1c(npu_buffer_t *                    config,
+                             npu_buffer_t *                    a,
+                             npu_buffer_t *                    bt,
+                             npu_buffer_t *                    output,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_quantized_bf16_4c(npu_buffer_t *                    config,
                              npu_buffer_t *                    a,
                              npu_buffer_t *                    bt,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
+                             const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_quantized_inference_bf16_4c(npu_buffer_t *                    config,
+                             npu_buffer_t *                    a,
+                             npu_buffer_t *                    bt,
+                             npu_buffer_t *                    output,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_quantized_fp16_4c(npu_buffer_t *                    config,
                              npu_buffer_t *                    a,
                              npu_buffer_t *                    bt,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
+                             const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_quantized_inference_fp16_4c(npu_buffer_t *                    config,
+                             npu_buffer_t *                    a,
+                             npu_buffer_t *                    bt,
+                             npu_buffer_t *                    output,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_swiglu_bf16_1c(npu_buffer_t *                    config,
                           npu_buffer_t *                    a,
                           npu_buffer_t *                    gate_bt,
                           npu_buffer_t *                    up_bt,
                           npu_buffer_t *                    output,
-                          npu_buffer_t *                    perf,
+                          const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_swiglu_inference_bf16_1c(npu_buffer_t *                    config,
+                          npu_buffer_t *                    a,
+                          npu_buffer_t *                    gate_bt,
+                          npu_buffer_t *                    up_bt,
+                          npu_buffer_t *                    output,
                           const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_swiglu_fp16_1c(npu_buffer_t *                    config,
                           npu_buffer_t *                    a,
                           npu_buffer_t *                    gate_bt,
                           npu_buffer_t *                    up_bt,
                           npu_buffer_t *                    output,
-                          npu_buffer_t *                    perf,
+                          const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_swiglu_inference_fp16_1c(npu_buffer_t *                    config,
+                          npu_buffer_t *                    a,
+                          npu_buffer_t *                    gate_bt,
+                          npu_buffer_t *                    up_bt,
+                          npu_buffer_t *                    output,
                           const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_geglu_bf16_1c(npu_buffer_t *                    config,
                          npu_buffer_t *                    a,
                          npu_buffer_t *                    gate_bt,
                          npu_buffer_t *                    up_bt,
                          npu_buffer_t *                    output,
-                         npu_buffer_t *                    perf,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_geglu_inference_bf16_1c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    a,
+                         npu_buffer_t *                    gate_bt,
+                         npu_buffer_t *                    up_bt,
+                         npu_buffer_t *                    output,
                          const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_geglu_fp16_1c(npu_buffer_t *                    config,
                          npu_buffer_t *                    a,
                          npu_buffer_t *                    gate_bt,
                          npu_buffer_t *                    up_bt,
                          npu_buffer_t *                    output,
-                         npu_buffer_t *                    perf,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_geglu_inference_fp16_1c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    a,
+                         npu_buffer_t *                    gate_bt,
+                         npu_buffer_t *                    up_bt,
+                         npu_buffer_t *                    output,
                          const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_swiglu_bf16_4c(npu_buffer_t *                    config,
                           npu_buffer_t *                    a,
                           npu_buffer_t *                    gate_bt,
                           npu_buffer_t *                    up_bt,
                           npu_buffer_t *                    output,
-                          npu_buffer_t *                    perf,
+                          const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_swiglu_inference_bf16_4c(npu_buffer_t *                    config,
+                          npu_buffer_t *                    a,
+                          npu_buffer_t *                    gate_bt,
+                          npu_buffer_t *                    up_bt,
+                          npu_buffer_t *                    output,
                           const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_swiglu_fp16_4c(npu_buffer_t *                    config,
                           npu_buffer_t *                    a,
                           npu_buffer_t *                    gate_bt,
                           npu_buffer_t *                    up_bt,
                           npu_buffer_t *                    output,
-                          npu_buffer_t *                    perf,
+                          const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_swiglu_inference_fp16_4c(npu_buffer_t *                    config,
+                          npu_buffer_t *                    a,
+                          npu_buffer_t *                    gate_bt,
+                          npu_buffer_t *                    up_bt,
+                          npu_buffer_t *                    output,
                           const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_geglu_bf16_4c(npu_buffer_t *                    config,
                          npu_buffer_t *                    a,
                          npu_buffer_t *                    gate_bt,
                          npu_buffer_t *                    up_bt,
                          npu_buffer_t *                    output,
-                         npu_buffer_t *                    perf,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_geglu_inference_bf16_4c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    a,
+                         npu_buffer_t *                    gate_bt,
+                         npu_buffer_t *                    up_bt,
+                         npu_buffer_t *                    output,
                          const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_geglu_fp16_4c(npu_buffer_t *                    config,
                          npu_buffer_t *                    a,
                          npu_buffer_t *                    gate_bt,
                          npu_buffer_t *                    up_bt,
                          npu_buffer_t *                    output,
-                         npu_buffer_t *                    perf,
+                         const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_geglu_inference_fp16_4c(npu_buffer_t *                    config,
+                         npu_buffer_t *                    a,
+                         npu_buffer_t *                    gate_bt,
+                         npu_buffer_t *                    up_bt,
+                         npu_buffer_t *                    output,
                          const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_bf16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
                        npu_buffer_t *                    weight,
                        npu_buffer_t *                    ids,
                        npu_buffer_t *                    output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_fp16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
                        npu_buffer_t *                    weight,
                        npu_buffer_t *                    ids,
                        npu_buffer_t *                    output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_bf16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
                        npu_buffer_t *                    weight,
                        npu_buffer_t *                    ids,
                        npu_buffer_t *                    output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_fp16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
                        npu_buffer_t *                    weight,
                        npu_buffer_t *                    ids,
                        npu_buffer_t *                    output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_pair_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -550,7 +593,6 @@ int mul_mat_id_pair_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    ids,
                             npu_buffer_t *                    first_output,
                             npu_buffer_t *                    second_output,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_pair_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -559,7 +601,6 @@ int mul_mat_id_pair_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    ids,
                             npu_buffer_t *                    first_output,
                             npu_buffer_t *                    second_output,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_swiglu_bf16_1c(npu_buffer_t *                    config,
                               npu_buffer_t *                    activation,
@@ -567,7 +608,6 @@ int mul_mat_id_swiglu_bf16_1c(npu_buffer_t *                    config,
                               npu_buffer_t *                    up_weight,
                               npu_buffer_t *                    ids,
                               npu_buffer_t *                    output,
-                              npu_buffer_t *                    perf,
                               const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_swiglu_fp16_1c(npu_buffer_t *                    config,
                               npu_buffer_t *                    activation,
@@ -575,7 +615,6 @@ int mul_mat_id_swiglu_fp16_1c(npu_buffer_t *                    config,
                               npu_buffer_t *                    up_weight,
                               npu_buffer_t *                    ids,
                               npu_buffer_t *                    output,
-                              npu_buffer_t *                    perf,
                               const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_geglu_bf16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    activation,
@@ -583,7 +622,6 @@ int mul_mat_id_geglu_bf16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    up_weight,
                              npu_buffer_t *                    ids,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_geglu_fp16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    activation,
@@ -591,7 +629,6 @@ int mul_mat_id_geglu_fp16_1c(npu_buffer_t *                    config,
                              npu_buffer_t *                    up_weight,
                              npu_buffer_t *                    ids,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_swiglu_bf16_4c(npu_buffer_t *                    config,
                               npu_buffer_t *                    activation,
@@ -599,7 +636,6 @@ int mul_mat_id_swiglu_bf16_4c(npu_buffer_t *                    config,
                               npu_buffer_t *                    up_weight,
                               npu_buffer_t *                    ids,
                               npu_buffer_t *                    output,
-                              npu_buffer_t *                    perf,
                               const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_swiglu_fp16_4c(npu_buffer_t *                    config,
                               npu_buffer_t *                    activation,
@@ -607,7 +643,6 @@ int mul_mat_id_swiglu_fp16_4c(npu_buffer_t *                    config,
                               npu_buffer_t *                    up_weight,
                               npu_buffer_t *                    ids,
                               npu_buffer_t *                    output,
-                              npu_buffer_t *                    perf,
                               const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_geglu_bf16_4c(npu_buffer_t *                    config,
                              npu_buffer_t *                    activation,
@@ -615,7 +650,6 @@ int mul_mat_id_geglu_bf16_4c(npu_buffer_t *                    config,
                              npu_buffer_t *                    up_weight,
                              npu_buffer_t *                    ids,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_geglu_fp16_4c(npu_buffer_t *                    config,
                              npu_buffer_t *                    activation,
@@ -623,7 +657,6 @@ int mul_mat_id_geglu_fp16_4c(npu_buffer_t *                    config,
                              npu_buffer_t *                    up_weight,
                              npu_buffer_t *                    ids,
                              npu_buffer_t *                    output,
-                             npu_buffer_t *                    perf,
                              const npu_kernel_launch_attrs_t * launch_attrs);
 int flash_attention_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    q,
@@ -669,7 +702,6 @@ int project_qg_bf16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    positions,
                        npu_buffer_t *                    qg_output,
                        npu_buffer_t *                    q_output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int project_qg_fp16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
@@ -678,7 +710,6 @@ int project_qg_fp16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    positions,
                        npu_buffer_t *                    qg_output,
                        npu_buffer_t *                    q_output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int project_qg_bf16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
@@ -687,7 +718,6 @@ int project_qg_bf16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    positions,
                        npu_buffer_t *                    qg_output,
                        npu_buffer_t *                    q_output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int project_qg_fp16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
@@ -696,7 +726,6 @@ int project_qg_fp16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    positions,
                        npu_buffer_t *                    qg_output,
                        npu_buffer_t *                    q_output,
-                       npu_buffer_t *                    perf,
                        const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_bf16_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
@@ -705,7 +734,6 @@ int project_k_bf16_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    positions,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    k_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_fp16_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
@@ -714,7 +742,6 @@ int project_k_fp16_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    positions,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    k_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_bf16_4c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
@@ -723,7 +750,6 @@ int project_k_bf16_4c(npu_buffer_t *                    config,
                       npu_buffer_t *                    positions,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    k_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_fp16_4c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
@@ -732,35 +758,30 @@ int project_k_fp16_4c(npu_buffer_t *                    config,
                       npu_buffer_t *                    positions,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    k_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_bf16_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
                       npu_buffer_t *                    weight,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    v_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_fp16_1c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
                       npu_buffer_t *                    weight,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    v_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_bf16_4c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
                       npu_buffer_t *                    weight,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    v_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_fp16_4c(npu_buffer_t *                    config,
                       npu_buffer_t *                    activation,
                       npu_buffer_t *                    weight,
                       npu_buffer_t *                    raw_output,
                       npu_buffer_t *                    v_output,
-                      npu_buffer_t *                    perf,
                       const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_cache_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -769,7 +790,6 @@ int project_k_cache_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    positions_indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_cache_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -778,7 +798,6 @@ int project_k_cache_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    positions_indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_cache_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -787,7 +806,6 @@ int project_k_cache_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    positions_indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_k_cache_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -796,7 +814,6 @@ int project_k_cache_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    positions_indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_cache_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -804,7 +821,6 @@ int project_v_cache_bf16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_cache_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -812,7 +828,6 @@ int project_v_cache_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_cache_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -820,7 +835,6 @@ int project_v_cache_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_v_cache_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
@@ -828,55 +842,51 @@ int project_v_cache_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    indices,
                             npu_buffer_t *                    workspace,
                             npu_buffer_t *                    cache,
-                            npu_buffer_t *                    perf,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_bf16_1c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    attention,
                                  npu_buffer_t *                    gate,
                                  npu_buffer_t *                    weight,
                                  npu_buffer_t *                    output,
-                                 npu_buffer_t *                    perf,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_fp16_1c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    attention,
                                  npu_buffer_t *                    gate,
                                  npu_buffer_t *                    weight,
                                  npu_buffer_t *                    output,
-                                 npu_buffer_t *                    perf,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_bf16_4c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    attention,
                                  npu_buffer_t *                    gate,
                                  npu_buffer_t *                    weight,
                                  npu_buffer_t *                    output,
-                                 npu_buffer_t *                    perf,
+                                 npu_buffer_t *                    scratch,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_fp16_4c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    attention,
                                  npu_buffer_t *                    gate,
                                  npu_buffer_t *                    weight,
                                  npu_buffer_t *                    output,
-                                 npu_buffer_t *                    perf,
+                                 npu_buffer_t *                    scratch,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_f32_gate_bf16_4c(npu_buffer_t *                    config,
                                           npu_buffer_t *                    attention,
                                           npu_buffer_t *                    gate,
                                           npu_buffer_t *                    weight,
                                           npu_buffer_t *                    output,
-                                          npu_buffer_t *                    perf,
+                                          npu_buffer_t *                    scratch,
                                           const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_f32_gate_fp16_4c(npu_buffer_t *                    config,
                                           npu_buffer_t *                    attention,
                                           npu_buffer_t *                    gate,
                                           npu_buffer_t *                    weight,
                                           npu_buffer_t *                    output,
-                                          npu_buffer_t *                    perf,
+                                          npu_buffer_t *                    scratch,
                                           const npu_kernel_launch_attrs_t * launch_attrs);
 int ssm_conv_f32_1c(npu_buffer_t *                    config,
                     npu_buffer_t *                    input,
                     npu_buffer_t *                    weight,
                     npu_buffer_t *                    output,
-                    npu_buffer_t *                    perf,
                     const npu_kernel_launch_attrs_t * launch_attrs);
 int residual_add_f32_1c(npu_buffer_t *                    config,
                         npu_buffer_t *                    left,

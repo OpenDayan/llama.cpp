@@ -247,38 +247,13 @@ static inline void configure_activation(const F32Tensor &  input0,
 
 template <long Group>
 static inline void copy_packed_lowp(const F32Tensor & scratch, const LowpTensor & output, long rows, long chunks) {
-    enum : long {
-        kLowpBytes = kVecLanes * sizeof(uint16_t),
-    };
-
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(kLowpBytes / 64 - 1);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(64);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(64);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(6);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_PADDINGVALUE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESIZE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(64);
-    for (long row = 0; row < rows; ++row) {
-        for (long chunk = 0; chunk < chunks; ++chunk) {
-            __tx_lsu_dma_u2u<Group>(output.address + row * output.row_stride + chunk * kLowpBytes,
-                                    scratch.address + row * scratch.row_stride + chunk * kVecBytes);
-            dayan_wait_lsu();
-        }
-    }
+    long checksum = 0;
+    set_lsu_matrix<Group>(checksum, chunks, kVecLanes * sizeof(uint16_t), kVecBytes, kVecLanes * sizeof(uint16_t));
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(rows - 1);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(scratch.row_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(output.row_stride);
+    __tx_lsu_dma_u2u<Group>(output.address, scratch.address);
+    dayan_wait_lsu();
 }
 
 template <long MatDataType, long LsuGroup>
@@ -359,90 +334,114 @@ static inline void issue_silu(const F32Tensor &           input,
     issue_silu_configured(input, output, constants);
 }
 
+template <long MatDataType = -1, bool PackedOutput = false>
 static inline void issue_swiglu_configured(const F32Tensor &           gate,
                                            const F32Tensor &           up,
-                                           const F32Tensor &           output,
-                                           const ActivationConstants & constants) {
+                                           const F32Tensor &           output) {
     enum : long {
-        kInstructions = 12,
+        kInstructions = 11 + (MatDataType == -1 ? 0 : 2) + (PackedOutput ? 1 : 0),
     };
 
     begin_vec_block(kInstructions);
     __tx_vec_lsu_u2v<0, 0>(gate.address);
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.neg_log2e);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(-1.4426950408889634f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 1>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.one);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 5>();
-    __tx_vec_lsu_u2v<1, 0>(gate.address);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_mul<0, 0, 4, 0>();
     __tx_vec_lsu_u2v<1, 1>(up.address);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(output.address);
+    if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+    } else if constexpr (MatDataType == BaseNPUInstBuilder::DT_FP16) {
+        __tx_vec_cvt_fp16_fp32<0, 0, 0>();
+    }
+    if constexpr (MatDataType != -1) {
+        __tx_vec_shuffle_compress<0, 0>(0);
+    }
+    if constexpr (PackedOutput) {
+        static_assert(MatDataType != -1, "Packed output requires low precision");
+        __tx_vec_lsu_g2s<0>(0xffffffffU);
+        __tx_vec_lsu_v2u_mask<0, 3, 0>(output.address);
+    } else {
+        __tx_vec_lsu_v2u<0, 3>(output.address);
+    }
     start_vec_block(kInstructions);
 }
 
+template <long MatDataType = -1>
 static inline void issue_swiglu(const F32Tensor &           gate,
                                 const F32Tensor &           up,
                                 const F32Tensor &           output,
-                                const ActivationConstants & constants,
                                 long                        rows,
                                 long                        columns) {
     configure_activation(gate, up, output, rows, columns);
-    issue_swiglu_configured(gate, up, output, constants);
+    issue_swiglu_configured<MatDataType>(gate, up, output);
 }
 
+template <long MatDataType = -1, bool PackedOutput = false>
 static inline void issue_geglu_configured(const F32Tensor &           gate,
                                           const F32Tensor &           up,
-                                          const F32Tensor &           output,
-                                          const ActivationConstants & constants) {
+                                          const F32Tensor &           output) {
     enum : long {
-        kInstructions = 30,
+        kInstructions = 27 + (MatDataType == -1 ? 0 : 2) + (PackedOutput ? 1 : 0),
     };
 
     begin_vec_block(kInstructions);
     __tx_vec_lsu_u2v<0, 0>(gate.address);
-    __tx_vec_lsu_u2v<1, 0>(gate.address);
+    __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(0.044715f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.gelu_a);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.one);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 0>(gate.address);
+    __tx_vec_vv_fp32_mul<0, 0, 3, 0>();
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(0.7978845608028654f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.sqrt_2_over_pi);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.neg_2_log2e);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(-2.8853900817779268f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 1>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.one);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 5>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.two);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(2.0f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.one);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
     __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.one);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v_broadcast32<1, 2>(constants.half);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(0.5f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_u2v<1, 0>(gate.address);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_mul<0, 0, 13, 0>();
     __tx_vec_lsu_u2v<1, 1>(up.address);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(output.address);
+    if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+    } else if constexpr (MatDataType == BaseNPUInstBuilder::DT_FP16) {
+        __tx_vec_cvt_fp16_fp32<0, 0, 0>();
+    }
+    if constexpr (MatDataType != -1) {
+        __tx_vec_shuffle_compress<0, 0>(0);
+    }
+    if constexpr (PackedOutput) {
+        static_assert(MatDataType != -1, "Packed output requires low precision");
+        __tx_vec_lsu_g2s<0>(0xffffffffU);
+        __tx_vec_lsu_v2u_mask<0, 3, 0>(output.address);
+    } else {
+        __tx_vec_lsu_v2u<0, 3>(output.address);
+    }
     start_vec_block(kInstructions);
 }
 
+template <long MatDataType = -1>
 static inline void issue_geglu(const F32Tensor &           gate,
                                const F32Tensor &           up,
                                const F32Tensor &           output,
-                               const ActivationConstants & constants,
                                long                        rows,
                                long                        columns) {
     configure_activation(gate, up, output, rows, columns);
-    issue_geglu_configured(gate, up, output, constants);
+    issue_geglu_configured<MatDataType>(gate, up, output);
 }
 
 }  // namespace ggml_dayan_vec_detail
