@@ -25,7 +25,7 @@ static int fail(const char * message) {
     return 1;
 }
 
-static gdn_graph build_graph(int64_t heads, int64_t tokens, int64_t sequences, bool kda) {
+static gdn_graph build_graph(int64_t heads, int64_t tokens, int64_t sequences, bool kda, int64_t qk_heads, int64_t qk_sequences, int snapshots) {
     constexpr int64_t head_dim   = 128;
     constexpr int     graph_size = 16;
     ggml_init_params  params     = {
@@ -40,8 +40,8 @@ static gdn_graph build_graph(int64_t heads, int64_t tokens, int64_t sequences, b
         return result;
     }
 
-    result.q     = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, head_dim, heads, tokens, sequences);
-    result.k     = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, head_dim, heads, tokens, sequences);
+    result.q     = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, head_dim, qk_heads, tokens, qk_sequences);
+    result.k     = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, head_dim, qk_heads, tokens, qk_sequences);
     result.v     = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, head_dim, heads, tokens, sequences);
     result.g     = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, kda ? head_dim : 1, heads, tokens, sequences);
     result.beta  = ggml_new_tensor_4d(result.ctx.get(), GGML_TYPE_F32, 1, heads, tokens, sequences);
@@ -53,7 +53,7 @@ static gdn_graph build_graph(int64_t heads, int64_t tokens, int64_t sequences, b
     ggml_set_input(result.beta);
     ggml_set_input(result.state);
     result.output =
-        ggml_gated_delta_net(result.ctx.get(), result.q, result.k, result.v, result.g, result.beta, result.state, 1);
+        ggml_gated_delta_net(result.ctx.get(), result.q, result.k, result.v, result.g, result.beta, result.state, snapshots);
     ggml_set_output(result.output);
     result.graph = ggml_new_graph_custom(result.ctx.get(), graph_size, false);
     ggml_build_forward_expand(result.graph, result.output);
@@ -81,9 +81,16 @@ static int run_case(ggml_backend_t dayan,
                     int64_t        tokens,
                     int64_t        sequences,
                     bool           kda,
-                    uint32_t       seed) {
-    gdn_graph reference = build_graph(heads, tokens, sequences, kda);
-    gdn_graph actual    = build_graph(heads, tokens, sequences, kda);
+                    uint32_t       seed,
+                    float          gate_min = -2.0f,
+                    float          gate_max = -0.05f,
+                    int64_t        qk_heads = 0,
+                    int64_t        qk_sequences = 0,
+                    int            snapshots = 1) {
+    qk_heads = qk_heads ? qk_heads : heads;
+    qk_sequences = qk_sequences ? qk_sequences : sequences;
+    gdn_graph reference = build_graph(heads, tokens, sequences, kda, qk_heads, qk_sequences, snapshots);
+    gdn_graph actual    = build_graph(heads, tokens, sequences, kda, qk_heads, qk_sequences, snapshots);
     if (!reference.ctx || !actual.ctx) {
         return fail("cannot create graph contexts");
     }
@@ -97,7 +104,7 @@ static int run_case(ggml_backend_t dayan,
     std::mt19937                          generator(seed);
     std::uniform_real_distribution<float> qk_distribution(-1.0f, 1.0f);
     std::uniform_real_distribution<float> v_distribution(-0.25f, 0.25f);
-    std::uniform_real_distribution<float> gate_distribution(-2.0f, -0.05f);
+    std::uniform_real_distribution<float> gate_distribution(gate_min, gate_max);
     std::uniform_real_distribution<float> beta_distribution(0.1f, 0.9f);
     std::uniform_real_distribution<float> state_distribution(-0.02f, 0.02f);
     std::vector<float>                    q((size_t) ggml_nelements(reference.q));
@@ -112,8 +119,8 @@ static int run_case(ggml_backend_t dayan,
     for (float & value : k) {
         value = qk_distribution(generator);
     }
-    normalize_rows(&q, heads * tokens * sequences);
-    normalize_rows(&k, heads * tokens * sequences);
+    normalize_rows(&q, qk_heads * tokens * qk_sequences);
+    normalize_rows(&k, qk_heads * tokens * qk_sequences);
     for (float & value : v) {
         value = v_distribution(generator);
     }
@@ -152,10 +159,20 @@ static int run_case(ggml_backend_t dayan,
     float  max_rel       = 0.0f;
     size_t max_abs_index = 0;
     bool   close         = true;
+    double squared_error[2] = {};
+    double squared_expected[2] = {};
+    const size_t output_elements = (size_t) heads * tokens * sequences * 128;
+    const bool chunked = !kda && snapshots == 1 && tokens >= 16;
+    // MAT truncates its TF32 inputs; the recurrent VEC path uses FP32.
+    const float rtol = chunked ? 3.0e-3f : 1.0e-4f;
     for (size_t index = 0; index < expected.size(); ++index) {
         const float abs_error = std::abs(observed[index] - expected[index]);
         const float rel_error = abs_error / std::max(std::abs(expected[index]), 1.0e-6f);
-        close                 = close && abs_error <= 1.0e-6f + 1.0e-4f * std::abs(expected[index]);
+        const int part = index < output_elements ? 0 : 1;
+        const float atol = chunked ? (part == 0 ? 2.0e-5f : 2.0e-4f) : 1.0e-6f;
+        close = close && std::isfinite(observed[index]) && abs_error <= atol + rtol * std::abs(expected[index]);
+        squared_error[part] += (double) abs_error * abs_error;
+        squared_expected[part] += (double) expected[index] * expected[index];
         if (abs_error > max_abs) {
             max_abs       = abs_error;
             max_abs_index = index;
@@ -163,9 +180,14 @@ static int run_case(ggml_backend_t dayan,
         max_rel = std::max(max_rel, rel_error);
     }
 
-    std::printf("heads=%lld tokens=%lld sequences=%lld kda=%d elements=%zu max_abs=%g max_rel=%g index=%zu\n",
-                (long long) heads, (long long) tokens, (long long) sequences, kda ? 1 : 0, expected.size(), max_abs,
-                max_rel, max_abs_index);
+    const double output_l2 = std::sqrt(squared_error[0] / std::max(squared_expected[0], 1.0e-30));
+    const double state_l2 = std::sqrt(squared_error[1] / std::max(squared_expected[1], 1.0e-30));
+    close = close && output_l2 <= rtol && state_l2 <= rtol;
+    std::printf("heads=%lld tokens=%lld sequences=%lld qk_heads=%lld qk_sequences=%lld snapshots=%d kda=%d path=%s elements=%zu max_abs=%g max_rel=%g output_l2=%g state_l2=%g index=%zu\n",
+                (long long) heads, (long long) tokens, (long long) sequences, (long long) qk_heads,
+                (long long) qk_sequences, snapshots, kda ? 1 : 0, chunked ? "chunk" : "recurrent", expected.size(), max_abs,
+                max_rel, output_l2, state_l2, max_abs_index);
+    std::fflush(stdout);
     if (!close) {
         std::fprintf(stderr, "expected=%g observed=%g\n", expected[max_abs_index], observed[max_abs_index]);
         return fail("numerical comparison failed");
@@ -185,7 +207,17 @@ int main() {
         run_case(dayan.get(), cpu.get(), 2, 3, 1, false, 0x35d18U) != 0 ||
         run_case(dayan.get(), cpu.get(), 1, 2, 1, true, 0x35d19U) != 0 ||
         run_case(dayan.get(), cpu.get(), 16, 1, 1, false, 0x35d1aU) != 0 ||
-        run_case(dayan.get(), cpu.get(), 16, 16, 1, false, 0x35d1bU) != 0) {
+        run_case(dayan.get(), cpu.get(), 16, 16, 1, false, 0x35d1bU) != 0 ||
+        run_case(dayan.get(), cpu.get(), 5, 15, 1, false, 0x35d1cU) != 0 ||
+        run_case(dayan.get(), cpu.get(), 1, 17, 1, false, 0x35d1dU) != 0 ||
+        run_case(dayan.get(), cpu.get(), 4, 64, 1, false, 0x35d1eU) != 0 ||
+        run_case(dayan.get(), cpu.get(), 5, 65, 1, false, 0x35d1fU, -0.02f, -0.001f) != 0 ||
+        run_case(dayan.get(), cpu.get(), 4, 128, 1, false, 0x35d20U) != 0 ||
+        run_case(dayan.get(), cpu.get(), 16, 1024, 1, false, 0x35d21U, -0.02f, -0.001f) != 0 ||
+        run_case(dayan.get(), cpu.get(), 8, 65, 3, false, 0x35d22U, -2.0f, -0.05f, 2, 1) != 0 ||
+        run_case(dayan.get(), cpu.get(), 4, 17, 1, false, 0x35d23U, -2.0f, -0.05f, 0, 0, 2) != 0 ||
+        run_case(dayan.get(), cpu.get(), 4, 16, 1, true, 0x35d24U) != 0 ||
+        run_case(dayan.get(), cpu.get(), 1, 64, 1, false, 0x35d25U, -4.0f, -3.0f) != 0) {
         return 1;
     }
 

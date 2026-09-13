@@ -36,6 +36,10 @@ The attention operator package provides dedicated BF16 and FP16 QG, K, and V pro
 
 For Qwen3.5 linear-attention layers, `SSM_CONV` followed by SiLU uses one dedicated device function. LSU gathers the F32 channel-major input and depthwise weights into tap-major URAM tiles. VEC performs one elementwise multiply per tap, accumulates the taps in F32, and optionally applies the common SiLU implementation before one output writeback. The kernel does not construct diagonal matrices or use MAT convolution. It supports kernel widths up to 63 and uses 64-token tiles. The convolution remains a separate operator from the delta-net core.
 
+Gated Delta Net assigns heads and sequences to at most 16 root tasks, with up to four resident tasks per core. Decode and short prefill update state with VEC hardware loops: DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Scalar-gate prefill with at least 16 tokens and one final state snapshot uses 64-token chunks. MAT computes block correlations, output contributions, and state updates; VEC computes gate prefixes and triangular corrections with 128 independent value rows. Only the complete FP32 state crosses chunk boundaries. Vector gates (KDA) and multiple state snapshots use the recurrent VEC path.
+
+Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The chunk layout uses 345.5 KiB within a 352 KiB task reservation, or 1408 KiB for four resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation.
+
 Configure the firmware SDK explicitly:
 
 ```sh
@@ -138,6 +142,13 @@ The attention projection test runs QG, K, and V projection, indexed KV-cache wri
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-projection
+```
+
+The Gated Delta Net test compares outputs and state snapshots with the CPU reference. It covers decode, 16/17/64/65/128/1024-token prefill, weak and strong gates, shared Q/K heads and sequences, repeated task work, KDA, and multiple state snapshots. Chunk tests check TF32 error separately for outputs and final state; recurrent tests retain FP32 tolerances.
+
+```sh
+cmake --build build-dayan --target test-dayan-gated-delta-net -j4
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-gated-delta-net
 ```
 
 The standalone Flash-Attention test checks GQA with a right-aligned causal mask where `q_len < kv_len`:

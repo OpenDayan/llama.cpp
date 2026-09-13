@@ -509,7 +509,7 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
         } break;
         case ggml_backend_dayan_slot_kind::gated_delta_net:
             result = { "ggml_backend_dayan_gated_delta_net", "ggml-gdn", "gated_delta_net_f32_1c", "single-core",
-                       kDayanNativeMaxTasks };
+                       (uint32_t) std::min<uint64_t>(node->src[2]->ne[1] * node->src[2]->ne[3], kDayanGatedDeltaNetMaxTasks) };
             break;
         case ggml_backend_dayan_slot_kind::gated_output_projection: {
             const ggml_tensor * projection = slot.nodes[2];
@@ -2641,7 +2641,8 @@ static int ggml_backend_dayan_gated_delta_net(ggml_backend_dayan_context * ctx, 
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        ggml_backend_dayan_init_native_launch_attrs(ctx, "ggml-gdn", 2, &attrs);
+        ggml_backend_dayan_init_launch_attrs(ctx, "ggml-gdn", &attrs);
+        attrs.config.task_dim = NPUTaskDim3{ (uint32_t) std::min<uint64_t>((uint64_t) config.heads * config.sequences, kDayanGatedDeltaNetMaxTasks), 1, 1 };
         status = gated_delta_net_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
                                         ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
                                         ggml_backend_dayan_tensor_buffer(g), ggml_backend_dayan_tensor_buffer(beta),

@@ -23,6 +23,7 @@ enum : uint32_t {
     kDayanNativeTaskTileElements = 256U,
     kDayanNativeMaxTasks         = 4U,
     kDayanSSMConvMaxTasks        = 4U,
+    kDayanGatedDeltaNetMaxTasks   = 16U,
 };
 
 #ifndef DAYAN_SORT_TASK_URAM_BYTES
@@ -34,7 +35,7 @@ enum : uint32_t {
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES
-#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (120U * 1024U)
+#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (352U * 1024U)
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_URAM_BYTES

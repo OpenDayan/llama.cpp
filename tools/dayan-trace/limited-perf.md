@@ -89,7 +89,9 @@ Resume with the original options plus `--resume`. It skips completed cases and r
 
 The launch wall time is a real host `steady_clock` duration around the synchronous DAPI kernel call. It includes lazy module loading, submission, Device execution, profiler overhead, and completion waiting. Input/config/weight upload and output validation are outside this interval. A separate process wall time includes all host-client setup and data transfer. Neither measurement includes simulator or server startup.
 
-Cycles come only from firmware dyperf proc-state records. For each unique launch name the script requires four complete root lifetimes, then computes:
+GDN follows the backend launch policy: the preset runs 16 independent head tasks, with at most four resident tasks per core. Prefill uses 64-token TF32 MAT/VEC chunks, and decode uses the FP32 VEC recurrence.
+
+Cycles come only from firmware dyperf proc-state records. For each unique launch name the script requires one complete root lifetime per launched task (16 for GDN and four for the other presets), then computes:
 
 ```text
 launch_cycles = max(root WAIT_EXIT begin) - min(root first RUNNING begin)

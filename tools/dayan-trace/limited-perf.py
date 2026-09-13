@@ -183,7 +183,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
     notes = [
         "Wall time is host steady_clock around a synchronous kernel launch, including module loading and device wait; it excludes input/config uploads, validation, and runtime setup.",
         "Process wall time includes setup, uploads, launches, output download, validation, and teardown. Both wall measurements include the cost of the active profiler.",
-        "Cycles are max(root WAIT_EXIT begin) - min(root first RUNNING begin) across all four tasks, using dyperf 48-bit counters. Child threads and overlapping cores are not summed. Host/device submission and the final RPC reply are outside this span.",
+        "Cycles are max(root WAIT_EXIT begin) - min(root first RUNNING begin) across the launched root tasks, using dyperf 48-bit counters. Child threads and overlapping cores are not summed. Host/device submission and the final RPC reply are outside this span.",
         "Cross-core counters must share a time origin. A launch must last less than half the 48-bit counter period. No PCU counters or kernel-side instrumentation are required.",
         "Model preset: Qwen3.5-0.8B BF16, 24 inference blocks (18 linear, 6 full attention), hidden=1024, FFN=3584, vocab=248320; excludes the MTP block. Batch=1, one final-token logit row, empty-cache prefill and one decode token at the specified prior context.",
         "Predictions are a serial weighted sum of representative kernels, not an executed model. N scaling assumes linear cost, including the large vocabulary projection; pair/projection fusion and final-layer token pruning can change that cost.",

@@ -175,6 +175,7 @@ int main(int argc, char ** argv) {
             config.tokens = m;
             config.sequences = config.snapshots = config.gate_width = config.q_sequences = config.k_sequences = 1;
             config.scale_bits = float_bits(1.0f / std::sqrt(128.0f));
+            attrs.config.task_dim = NPUTaskDim3{std::min(config.heads * config.sequences, (uint32_t) kDayanGatedDeltaNetMaxTasks), 1, 1};
             for (auto nb : {config.q_nb, config.k_nb, config.v_nb}) { strides(nb, 128, 16, m); }
             for (auto nb : {config.g_nb, config.beta_nb}) { strides(nb, 1, 16, m); }
             auto cfg = device.upload(&config, sizeof(config));
@@ -255,7 +256,7 @@ int main(int argc, char ** argv) {
             const auto start = std::chrono::steady_clock::now();
             const int status = launch();
             const double wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-            result["samples"].push_back({{"tag", name}, {"warmup", iteration < warmup}, {"wall_s", wall_s}, {"status", status}, {"tasks", 4}});
+            result["samples"].push_back({{"tag", name}, {"warmup", iteration < warmup}, {"wall_s", wall_s}, {"status", status}, {"tasks", attrs.config.task_dim.x * attrs.config.task_dim.y * attrs.config.task_dim.z}});
             check(status, "kernel launch " + name);
         }
         if (kernel_result) {

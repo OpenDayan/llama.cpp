@@ -1688,8 +1688,8 @@ DAYAN_KERNEL_RESOURCE_DESC_EX(renew_attention_bf16_1c, 1U, 4, DAYAN_KERNEL_RESOU
                               8, 6, 4, 0, 2, 0);
 DAYAN_KERNEL_RESOURCE_DESC_EX(renew_attention_fp16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
                               8, 6, 4, 0, 2, 0);
-DAYAN_KERNEL_LOCKED_TASK_DESC(gated_delta_net_f32_1c, 0, 0,
-                              DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 0, 0,
+                       DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 1, 1, 0);
 DAYAN_MATMUL_1C_DESC(project_qg_bf16_1c);
 DAYAN_MATMUL_1C_DESC(project_qg_fp16_1c);
 DAYAN_MATMUL_4C_DESC(project_qg_bf16_4c);
