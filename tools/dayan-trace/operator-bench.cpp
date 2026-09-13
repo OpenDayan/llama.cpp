@@ -225,10 +225,12 @@ int main(int argc, char ** argv) {
             kernel_result = device.upload(&initial_status, sizeof(initial_status));
             launch = [&, cfg, q, key, v]() { return renew_attention_bf16_1c(cfg, q, key, v, output, kernel_result, &attrs); };
         } else if (op == "norm") {
+            attrs.config.task_dim.x = std::min<uint32_t>(m, kDayanNativeMaxTasks);
             DayanNormPipelineConfig config{};
             config.norm.width = n;
             config.norm.rows = m;
             config.norm.epsilon_bits = float_bits(1e-6f);
+            config.norm.inv_width_bits = float_bits(1.0f / (float) n);
             config.norm.input_ne[0] = n;
             config.norm.input_ne[1] = m;
             config.norm.input_ne[2] = config.norm.input_ne[3] = 1;

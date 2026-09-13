@@ -350,8 +350,7 @@ static int run_layout_cast_hoist_case(ggml_backend_t dayan, enum ggml_type type)
     return close ? 0 : fail("layout cast hoist numerical comparison failed");
 }
 
-static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64_t width, bool has_residual) {
-    constexpr int64_t rows       = 3;
+static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64_t width, bool has_residual, int64_t rows = 3) {
     constexpr int64_t output_dim = 16;
     constexpr float   epsilon    = 1.0e-6f;
     constexpr int     graph_size = 16;
@@ -497,10 +496,8 @@ static int run_norm_matmul_case(ggml_backend_t dayan, enum ggml_type type, int64
     return close ? 0 : fail("RMSNorm matrix multiplication numerical comparison failed");
 }
 
-static int run_embedding_norm_case(ggml_backend_t dayan, enum ggml_type type) {
-    constexpr int64_t width       = 130;
+static int run_embedding_norm_case(ggml_backend_t dayan, enum ggml_type type, int64_t width = 130, int64_t rows = 3) {
     constexpr int64_t source_rows = 5;
-    constexpr int64_t rows        = 3;
     constexpr int64_t output_dim  = 16;
     constexpr float   epsilon     = 1.0e-6f;
     constexpr int     graph_size  = 40;
@@ -574,7 +571,10 @@ static int run_embedding_norm_case(ggml_backend_t dayan, enum ggml_type type) {
     std::vector<float>    scale_data((size_t) width);
     std::vector<uint16_t> weight_data((size_t) width * output_dim);
     std::vector<float>    branch_data((size_t) width * rows);
-    const int32_t         row_data[rows] = { 4, 1, 3 };
+    std::vector<int32_t>  row_data((size_t) rows);
+    for (int64_t row = 0; row < rows; ++row) {
+        row_data[(size_t) row] = (int32_t) ((2 * row + 4) % source_rows);
+    }
     for (size_t index = 0; index < embedding_data.size(); ++index) {
         embedding_data[index] = encode_lowp(type, ((int) (index % 37) - 18) / 64.0f);
     }
@@ -588,7 +588,7 @@ static int run_embedding_norm_case(ggml_backend_t dayan, enum ggml_type type) {
         branch_data[index] = ((int) (index % 19) - 9) / 96.0f;
     }
     ggml_backend_tensor_set(embedding, embedding_data.data(), 0, ggml_nbytes(embedding));
-    ggml_backend_tensor_set(row_ids, row_data, 0, sizeof(row_data));
+    ggml_backend_tensor_set(row_ids, row_data.data(), 0, ggml_nbytes(row_ids));
     ggml_backend_tensor_set(scale, scale_data.data(), 0, ggml_nbytes(scale));
     ggml_backend_tensor_set(weight, weight_data.data(), 0, ggml_nbytes(weight));
     ggml_backend_tensor_set(branch, branch_data.data(), 0, ggml_nbytes(branch));
@@ -1008,8 +1008,7 @@ static int run_math_case(ggml_backend_t dayan) {
     return close ? 0 : fail("math operator numerical comparison failed");
 }
 
-static int run_reduction_norm_case(ggml_backend_t dayan) {
-    constexpr int64_t width      = 130;
+static int run_reduction_norm_case(ggml_backend_t dayan, int64_t width = 130) {
     constexpr int64_t height     = 3;
     constexpr int64_t channels   = 5;
     constexpr int64_t batches    = 2;
@@ -1130,11 +1129,10 @@ static int run_reduction_norm_case(ggml_backend_t dayan) {
     return close ? 0 : fail("reduction or normalization numerical comparison failed");
 }
 
-static int run_strided_rms_case(ggml_backend_t dayan) {
-    constexpr int64_t width      = 130;
+static int run_strided_rms_case(ggml_backend_t dayan, int64_t width = 130) {
     constexpr int64_t heads      = 2;
     constexpr int64_t tokens     = 3;
-    constexpr int64_t full_width = 2 * width * heads;
+    const int64_t full_width = 2 * width * heads;
     constexpr float   epsilon    = 1.0e-6f;
     constexpr int     graph_size = 8;
 
@@ -2251,6 +2249,18 @@ static int run_softmax_clamp_case(ggml_backend_t dayan) {
                fail("Softmax comparison failed");
 }
 
+static int run_norm_cached_cases(ggml_backend_t dayan) {
+    for (ggml_type type : { GGML_TYPE_BF16, GGML_TYPE_F16 }) {
+        if (run_norm_matmul_case(dayan, type, 1024, false, 73) != 0 ||
+            run_norm_matmul_case(dayan, type, 1024, true, 73) != 0 ||
+            run_norm_matmul_case(dayan, type, 64, true, 19) != 0 ||
+            run_embedding_norm_case(dayan, type, 1024, 73) != 0) {
+            return 1;
+        }
+    }
+    return run_reduction_norm_case(dayan, 1024) != 0 || run_strided_rms_case(dayan, 1024) != 0 ? 1 : 0;
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
@@ -2290,14 +2300,18 @@ int main(int argc, char ** argv) {
                    1 :
                    0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "norm") == 0) {
+        return run_norm_cached_cases(dayan.get());
+    }
     if (argc == 2 && std::strcmp(argv[1], "memory") == 0) {
         return run_memory_case(dayan.get());
     }
     if (argc != 1) {
-        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output|copy|get-rows|embedding-norm|memory]");
+        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output|copy|get-rows|embedding-norm|norm|memory]");
     }
 
-    if (run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 256, false) != 0 ||
+    if (run_norm_cached_cases(dayan.get()) != 0 ||
+        run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 256, false) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 256, true) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 128, false) != 0 ||
         run_norm_matmul_case(dayan.get(), GGML_TYPE_F16, 128, true) != 0 ||

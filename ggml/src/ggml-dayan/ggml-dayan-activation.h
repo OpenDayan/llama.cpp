@@ -122,12 +122,14 @@ static inline void swap_vec_lane_bits() {
 }
 
 template <void (*Convert)()>
-static inline void issue_lowp_to_f32(uint64_t output, uint64_t input, long elements) {
+static inline void issue_lowp_to_f32(uint64_t output, uint64_t input, long elements,
+                                    long rows = 1, long input_row_stride = 0, long output_row_stride = 0) {
     constexpr long instructions = 28;
     const long     blocks       = (elements + 2 * kVecLanes - 1) / (2 * kVecLanes);
 
-    configure_vec_grid(blocks);
-    __tx_vec_tcsr_write<kVecV3Base + 3>(2 * kVecBytes);
+    configure_vec_grid(blocks, rows);
+    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, input_row_stride);
+    configure_vec_iterator<kVecV3Base>(0, 0, 2 * kVecBytes, output_row_stride);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>((long) input);
     swap_vec_lane_bits<0x0000ffffffff0000ULL, 48>();

@@ -164,119 +164,81 @@ static inline const void * normalization_input_row(const DayanNormConfig * confi
            (uint64_t) index2 * config->input_nb[2] + (uint64_t) index3 * config->input_nb[3];
 }
 
-static inline void normalization_sum_accumulate(uint64_t accumulator,
-                                                uint64_t input,
-                                                uint32_t elements,
-                                                bool initialize) {
-    const long chunks       = ggml_dayan_vec_detail::f32_chunks(elements);
-    const long instructions = 2 + 14 * chunks;
-
-    ggml_dayan_vec_detail::configure_vec_grid(1);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::begin_vec_block(instructions);
-    if (initialize) {
-        __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-    } else {
-        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
-    }
-    for (long chunk = 0; chunk < chunks; ++chunk) {
-        __tx_vec_lsu_u2v<0, 0>((long) (input + (uint64_t) chunk * Constants::kVecBytes));
-        ggml_dayan_vec_detail::emit_f32_sum_stages();
-        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
-    }
-    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
-    ggml_dayan_vec_detail::start_vec_block(instructions);
-    dayan_wait_vec();
+static inline void normalization_start_loop(long prologue, long loop_end, long instructions) {
+    __asm__ volatile("" ::: "memory");
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecSync>(0);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecControl>(
+        prologue | (prologue << 8) | (loop_end << 16) | (instructions << 24) | (instructions << 32));
 }
 
-static inline void normalization_square_sum_accumulate(uint64_t accumulator,
-                                                       uint64_t input,
-                                                       uint32_t elements,
-                                                       bool initialize) {
-    const long chunks       = ggml_dayan_vec_detail::f32_chunks(elements);
-    const long instructions = 2 + 15 * chunks;
+template <bool Square, bool Centered = false>
+static inline void normalization_accumulate(uint64_t accumulator, uint64_t input, uint64_t mean,
+                                            uint32_t elements, bool initialize) {
+    constexpr long loop_end = 3 + (Square ? 1 : 0) + (Centered ? 2 : 0);
+    const long instructions = loop_end + 14 + (initialize ? 0 : 2);
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::begin_vec_block(instructions);
-    if (initialize) {
-        __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-    } else {
-        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
+    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+    begin_vec_block(instructions);
+    // Q1 holds lane sums across DIM1; Q0 holds the current input.
+    __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+    __tx_vec_lsu_u2v<0, 0>((long) input);
+    if constexpr (Centered) {
+        __tx_vec_lsu_u2v_broadcast32<0, 1>((long) mean);
+        __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
     }
-    for (long chunk = 0; chunk < chunks; ++chunk) {
-        __tx_vec_lsu_u2v<0, 0>((long) (input + (uint64_t) chunk * Constants::kVecBytes));
+    if constexpr (Square) {
         __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
-        ggml_dayan_vec_detail::emit_f32_sum_stages();
-        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
     }
-    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
-    ggml_dayan_vec_detail::start_vec_block(instructions);
-    dayan_wait_vec();
-}
-
-static inline void normalization_centered_square_sum_accumulate(uint64_t accumulator,
-                                                                 uint64_t input,
-                                                                 uint64_t mean,
-                                                                 uint32_t elements,
-                                                                 bool initialize) {
-    const long chunks       = ggml_dayan_vec_detail::f32_chunks(elements);
-    const long instructions = 2 + 17 * chunks;
-
-    ggml_dayan_vec_detail::configure_vec_grid(1);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::begin_vec_block(instructions);
-    if (initialize) {
-        __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-    } else {
+    __tx_vec_vv_fp32_add<1, 16, 0, 0>();
+    __tx_vec_shuffle_xor<0, 16>(0);
+    ggml_dayan_vec_detail::emit_f32_sum_stages();
+    if (!initialize) {
         __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
     }
-    for (long chunk = 0; chunk < chunks; ++chunk) {
-        __tx_vec_lsu_u2v<0, 0>((long) (input + (uint64_t) chunk * Constants::kVecBytes));
-        __tx_vec_lsu_u2v_broadcast32<0, 0>((long) mean);
-        __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
-        __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
-        ggml_dayan_vec_detail::emit_f32_sum_stages();
-        __tx_vec_vv_fp32_add<1, 0, 22, 0>();
-    }
-    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
-    ggml_dayan_vec_detail::start_vec_block(instructions);
+    __tx_vec_lsu_v2u<0, 3>((long) accumulator);
+    normalization_start_loop(1, loop_end, instructions);
     dayan_wait_vec();
 }
 
-static inline void normalization_mean(uint64_t output, uint64_t sum, uint32_t width) {
-    constexpr long instructions = 6;
+static inline void normalization_sum_accumulate(uint64_t accumulator, uint64_t input, uint32_t elements, bool initialize) {
+    normalization_accumulate<false>(accumulator, input, 0, elements, initialize);
+}
+
+static inline void normalization_square_sum_accumulate(uint64_t accumulator, uint64_t input, uint32_t elements, bool initialize) {
+    normalization_accumulate<true>(accumulator, input, 0, elements, initialize);
+}
+
+static inline void normalization_centered_square_sum_accumulate(uint64_t accumulator, uint64_t input, uint64_t mean,
+                                                                 uint32_t elements, bool initialize) {
+    normalization_accumulate<true, true>(accumulator, input, mean, elements, initialize);
+}
+
+static inline void normalization_mean(uint64_t output, uint64_t sum, uint32_t inv_width_bits) {
+    constexpr long instructions = 4;
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
     ggml_dayan_vec_detail::begin_vec_block(instructions);
     __tx_vec_lsu_u2v_broadcast32<0, 0>((long) sum);
-    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) width);
-    __tx_vec_cvt_fp32_int32<1, 16, 0>();
-    __tx_vec_v_fp32_sfu<1, 16, 5>();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) inv_width_bits);
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_lsu_v2u<0, 3>((long) output);
     ggml_dayan_vec_detail::start_vec_block(instructions);
     dayan_wait_vec();
 }
 
-static inline void normalization_inverse_rms_finalize(uint64_t inverse, uint32_t width, uint32_t epsilon_bits) {
-    constexpr long instructions = 9;
+static inline void normalization_inverse_rms_finalize(uint64_t inverse, uint32_t inv_width_bits, uint32_t epsilon_bits) {
+    constexpr long instructions = 7;
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
     ggml_dayan_vec_detail::begin_vec_block(instructions);
     __tx_vec_lsu_u2v_broadcast32<0, 0>((long) inverse);
-    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) width);
-    __tx_vec_cvt_fp32_int32<1, 16, 0>();
-    __tx_vec_v_fp32_sfu<1, 16, 5>();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) inv_width_bits);
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_lsu_g2v_broadcast32<1, 1>((long) epsilon_bits);
     __tx_vec_vv_fp32_add<0, 0, 16, 0>();
@@ -348,6 +310,216 @@ static inline void normalization_center_scale(uint64_t output,
     dayan_wait_vec();
 }
 
+template <typename Format, void (*Convert)(), uint32_t InputType>
+static inline void normalization_cached_reduce(uint64_t values, uint64_t right, uint64_t mean, uint64_t result,
+                                               uint32_t width, uint32_t rows, uint32_t inv_width_bits,
+                                               uint32_t epsilon_bits, bool square, bool centered, bool residual) {
+    const long loop_end = 3 + (square ? 1 : 0) + (centered ? 3 : 0) +
+                          (residual ? 3 + (InputType == kDayanDataTypeF32 ? 0 : 2) : 0);
+    const long instructions = loop_end + 16 + (square ? 3 : 0);
+    const long row_bytes = (long) width * sizeof(float);
+    ggml_dayan_vec_detail::configure_vec_grid(rows);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(width / Constants::kVecLanes - 1);
+    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, row_bytes, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, Constants::kVecBytes, 0);
+    configure_vec_iterator<kVecV2Base>(0, Constants::kVecBytes, row_bytes, 0);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+    __tx_vec_lsu_u2v<0, 0>((long) values);
+    if (residual) {
+        __tx_vec_lsu_u2v<0, 2>((long) right);
+        __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+        if constexpr (InputType != kDayanDataTypeF32) {
+            if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
+                __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+            } else {
+                __tx_vec_cvt_fp16_fp32<0, 0, 0>();
+            }
+            Convert();
+        }
+        __tx_vec_lsu_v2u<0, 0>((long) values);
+    }
+    if (centered) {
+        __tx_vec_lsu_u2v_broadcast32<0, 1>((long) mean);
+        __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
+        __tx_vec_lsu_v2u<0, 0>((long) values);
+    }
+    if (square) {
+        __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
+    }
+    __tx_vec_vv_fp32_add<1, 16, 0, 0>();
+    __tx_vec_shuffle_xor<0, 16>(0);
+    ggml_dayan_vec_detail::emit_f32_sum_stages();
+    __tx_vec_lsu_g2v_broadcast32<1, 1>((long) inv_width_bits);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    if (square) {
+        __tx_vec_lsu_g2v_broadcast32<1, 1>((long) epsilon_bits);
+        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+        __tx_vec_v_fp32_sfu<0, 0, 4>();
+    }
+    __tx_vec_lsu_v2u<0, 1>((long) result);
+    normalization_start_loop(1, loop_end, instructions);
+    dayan_wait_vec();
+}
+
+template <uint32_t InputType, void (*Convert)()>
+static inline void normalization_cached_load(const DayanNormConfig * config, const void * source,
+                                             uint32_t row, uint32_t rows, uint64_t values, uint64_t packed) {
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t bytes = (uint64_t) config->width * input_bytes;
+    long checksum = 0;
+    set_lsu_matrix<0>(checksum, rows, bytes, config->input_nb[1], bytes);
+    load_matrix<0>(bytes, rows, bytes, rows, InputType == kDayanDataTypeF32 ? values : packed,
+                   (uint64_t) (uintptr_t) normalization_input_row(config, source, row));
+    dayan_wait_lsu();
+    if constexpr (InputType != kDayanDataTypeF32) {
+        ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(values, packed, config->width, rows, bytes,
+                                                         (long) config->width * sizeof(float));
+    }
+}
+
+static inline void normalization_cached_store(void * destination, uint64_t source, uint32_t width, uint32_t rows, bool packed) {
+    long checksum = 0;
+    if (packed) {
+        set_lsu_matrix<0>(checksum, width / Constants::kVecLanes, Constants::kVecBytes / 2,
+                          Constants::kVecBytes, Constants::kVecBytes / 2);
+        __tx_lsu_tcsr_write<LSU_DIM2>(rows - 1);
+        __tx_lsu_tcsr_write<LSU_INDIM2STRIDE>((long) width * sizeof(float));
+        __tx_lsu_tcsr_write<LSU_OUTDIM2STRIDE>((long) width * sizeof(uint16_t));
+    } else {
+        set_lsu_matrix<0>(checksum, rows, (long) width * sizeof(float),
+                          (long) width * sizeof(float), (long) width * sizeof(float));
+    }
+    __tx_lsu_dma_u2d<0>((long) (uintptr_t) destination, (long) source);
+    dayan_wait_lsu();
+}
+
+template <typename Format>
+static inline void normalization_cached_pack(uint64_t output, uint64_t input, uint32_t width, uint32_t rows) {
+    ggml_dayan_vec_detail::configure_vec_grid(width / Constants::kVecLanes, rows);
+    configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, (long) width * sizeof(float));
+    begin_vec_block(4);
+    __tx_vec_lsu_u2v<0, 0>((long) input);
+    if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+    } else {
+        __tx_vec_cvt_fp16_fp32<0, 0, 0>();
+    }
+    __tx_vec_shuffle_compress<0, 0>(0);
+    __tx_vec_lsu_v2u<0, 0>((long) output);
+    start_vec_block(4);
+    dayan_wait_vec();
+}
+
+template <typename Format>
+static inline void normalization_cached_apply(uint64_t values, uint64_t output, uint64_t scale, uint64_t inverse,
+                                              uint32_t width, uint32_t rows, bool write_rms, bool pack) {
+    const long instructions = 4 + (scale != 0 ? 2 : 0) + (write_rms ? 1 : 0) + (pack ? 2 : 0);
+    ggml_dayan_vec_detail::configure_vec_grid(rows);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(width / Constants::kVecLanes - 1);
+    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, (long) width * sizeof(float), 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, Constants::kVecBytes, 0);
+    configure_vec_iterator<kVecV2Base>(0, Constants::kVecBytes, 0, 0);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2v_broadcast32<1, 1>((long) inverse);
+    __tx_vec_lsu_u2v<0, 0>((long) values);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+    if (write_rms) {
+        __tx_vec_lsu_v2u<0, 0>((long) values);
+    }
+    if (scale != 0) {
+        __tx_vec_lsu_u2v<0, 2>((long) scale);
+        __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    }
+    if (pack) {
+        if constexpr (Format::kMatDataType == BaseNPUInstBuilder::DT_BF16) {
+            __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+        } else {
+            __tx_vec_cvt_fp16_fp32<0, 0, 0>();
+        }
+        __tx_vec_shuffle_compress<0, 0>(0);
+    }
+    __tx_vec_lsu_v2u<0, 0>((long) output);
+    normalization_start_loop(1, instructions, instructions);
+    dayan_wait_vec();
+}
+
+template <typename Format, void (*Convert)(), uint32_t InputType>
+static bool run_normalization_cached(const DayanNormConfig * config, const void * left, const void * right,
+                                     const float * scale, void * residual, float * rms, float * scaled, uint16_t * lowp,
+                                     uint32_t flags, bool centered) {
+    constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
+    const uint64_t row_bytes = (uint64_t) config->width * sizeof(float);
+    const uint64_t scale_bytes = scale != nullptr ? row_bytes : 0;
+    const uint64_t packed_bytes = InputType == kDayanDataTypeF32 ? 0 : row_bytes / 2;
+    const uint64_t bytes_per_row = 2 * row_bytes + packed_bytes + 2 * Constants::kVecBytes;
+    const uint32_t alignment = InputType == kDayanDataTypeF32 ? Constants::kVecLanes : 2 * Constants::kVecLanes;
+    const uint64_t capacity = dayan_uram_size() < DAYAN_NORM_TASK_URAM_BYTES ? dayan_uram_size() : DAYAN_NORM_TASK_URAM_BYTES;
+    if (config->width % alignment != 0 || scale_bytes + bytes_per_row > capacity) {
+        return false;
+    }
+    const uint32_t batch_rows = (uint32_t) ((capacity - scale_bytes) / bytes_per_row);
+    const uint64_t values = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t work = values + batch_rows * row_bytes;
+    const uint64_t packed = work + batch_rows * row_bytes;
+    const uint64_t mean = packed + batch_rows * packed_bytes;
+    const uint64_t inverse = mean + batch_rows * Constants::kVecBytes;
+    const uint64_t scale_uram = inverse + batch_rows * Constants::kVecBytes;
+    const bool has_residual = (flags & kDayanNormHasResidual) != 0;
+    const bool write_residual = (flags & kDayanNormWriteResidual) != 0;
+    const bool write_rms = (flags & kDayanNormWriteRms) != 0;
+    const bool write_scaled = (flags & kDayanNormWriteScaled) != 0;
+    const bool write_lowp = (flags & kDayanNormWriteLowp) != 0;
+    if (scale != nullptr) {
+        long checksum = 0;
+        set_lsu_matrix<0>(checksum, 1, row_bytes, row_bytes, row_bytes);
+        __tx_lsu_dma_d2u<0>((long) scale_uram, (long) (uintptr_t) scale);
+        dayan_wait_lsu();
+    }
+    const uint32_t task = dayan_native_task_id();
+    const uint32_t tasks = dayan_native_task_count();
+    const uint32_t end = (uint32_t) ((uint64_t) config->rows * (task + 1) / tasks);
+    for (uint32_t row = (uint32_t) ((uint64_t) config->rows * task / tasks); row < end;) {
+        uint32_t rows = min_int((int) (end - row), (int) batch_rows);
+        rows = min_int((int) rows, (int) (config->input_ne[1] - row % config->input_ne[1]));
+        normalization_cached_load<InputType, Convert>(config, left, row, rows, values, packed);
+        if (has_residual) {
+            normalization_cached_load<InputType, Convert>(config, right, row, rows, work, packed);
+        }
+        if (centered) {
+            normalization_cached_reduce<Format, Convert, InputType>(values, work, 0, mean, config->width, rows,
+                config->inv_width_bits, config->epsilon_bits, false, false, false);
+        }
+        normalization_cached_reduce<Format, Convert, InputType>(values, work, mean, inverse, config->width, rows,
+            config->inv_width_bits, config->epsilon_bits, true, centered, has_residual);
+        const uint64_t offset = (uint64_t) row * config->width;
+        if (write_residual) {
+            if constexpr (InputType == kDayanDataTypeF32) {
+                normalization_cached_store((char *) residual + offset * input_bytes, values, config->width, rows, false);
+            } else {
+                normalization_cached_pack<Format>(work, values, config->width, rows);
+                normalization_cached_store((char *) residual + offset * input_bytes, work, config->width, rows, true);
+            }
+        }
+        normalization_cached_apply<Format>(values, work, scale != nullptr ? scale_uram : 0, inverse,
+            config->width, rows, write_rms, write_lowp && !write_scaled);
+        if (write_rms) {
+            normalization_cached_store(rms + offset, values, config->width, rows, false);
+        }
+        if (write_scaled) {
+            normalization_cached_store(scaled + offset, work, config->width, rows, false);
+        }
+        if (write_lowp) {
+            if (write_scaled) {
+                normalization_cached_pack<Format>(work, work, config->width, rows);
+            }
+            normalization_cached_store(lowp + offset, work, config->width, rows, true);
+        }
+        row += rows;
+    }
+    return true;
+}
+
 template <typename Format, void (*Convert)(), uint32_t InputType, NormalizationLoad Load, bool HasResidual>
 static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
                                           const void *            left,
@@ -387,7 +559,7 @@ static uint64_t normalization_inverse_rms(const DayanNormConfig * config,
         normalization_square_sum_accumulate(inverse, value, elements, offset == 0);
     }
 
-    normalization_inverse_rms_finalize(inverse, config->width, config->epsilon_bits);
+    normalization_inverse_rms_finalize(inverse, config->inv_width_bits, config->epsilon_bits);
     return inverse;
 }
 
@@ -411,6 +583,11 @@ static void run_rms_norm_scale(const DayanNormPipelineConfig * config,
         (write_residual && residual == nullptr) || (write_rms && rms == nullptr) ||
         (write_scaled && scaled == nullptr) || (Quantize && lowp == nullptr)) {
         DAYAN_PARAMS_ERROR();
+    }
+
+    if (run_normalization_cached<Format, Convert, InputType>(norm, left, right, scale, residual, rms, scaled, lowp,
+                                                             config->flags, false)) {
+        return;
     }
 
     configure_normalization_lsu();
@@ -486,6 +663,18 @@ static inline void run_rms_norm_typed(const DayanNormConfig * config, const void
         DAYAN_PARAMS_ERROR();
     }
 
+    if constexpr (InputType == kDayanDataTypeF16) {
+        if (run_normalization_cached<Fp16Format, __tx_vec_cvt_fp32_fp16<0, 0, 0>, InputType>(
+                config, input, nullptr, nullptr, nullptr, nullptr, output, nullptr, kDayanNormWriteScaled, false)) {
+            return;
+        }
+    } else {
+        if (run_normalization_cached<Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, InputType>(
+                config, input, nullptr, nullptr, nullptr, nullptr, output, nullptr, kDayanNormWriteScaled, false)) {
+            return;
+        }
+    }
+
     configure_normalization_lsu();
     ggml_dayan_vec_detail::configure_f32_iterators();
     for (uint32_t row = dayan_native_task_id(); row < config->rows; row += dayan_native_task_count()) {
@@ -524,7 +713,8 @@ static inline void run_rms_norm(const DayanNormConfig * config, const void * inp
 static inline void normalization_centered(const float * input,
                                           float *       output,
                                           uint64_t      elements,
-                                          uint32_t      epsilon_bits) {
+                                          uint32_t      epsilon_bits,
+                                          uint32_t      inv_width_bits) {
     const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t mean       = uram + NormalizationLayout::kRms;
@@ -539,7 +729,7 @@ static inline void normalization_centered(const float * input,
         normalization_sum_accumulate(inverse, input_uram, count, offset == 0);
     }
 
-    normalization_mean(mean, inverse, (uint32_t) elements);
+    normalization_mean(mean, inverse, inv_width_bits);
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
             (uint32_t) (elements - offset < NormalizationLayout::kTileElements ? elements - offset :
@@ -548,7 +738,7 @@ static inline void normalization_centered(const float * input,
         normalization_centered_square_sum_accumulate(inverse, input_uram, mean, count, offset == 0);
     }
 
-    normalization_inverse_rms_finalize(inverse, (uint32_t) elements, epsilon_bits);
+    normalization_inverse_rms_finalize(inverse, inv_width_bits, epsilon_bits);
 
     for (uint64_t offset = 0; offset < elements; offset += NormalizationLayout::kTileElements) {
         const uint32_t count =
@@ -567,13 +757,18 @@ static inline void run_norm(const DayanNormConfig * config, const float * input,
         DAYAN_PARAMS_ERROR();
     }
 
+    if (run_normalization_cached<Bf16Format, __tx_vec_cvt_fp32_bf16<0, 0, 0>, kDayanDataTypeF32>(
+            config, input, nullptr, nullptr, nullptr, nullptr, output, nullptr, kDayanNormWriteScaled, true)) {
+        return;
+    }
+
     configure_normalization_lsu();
     ggml_dayan_vec_detail::configure_f32_iterators();
     for (uint32_t row = dayan_native_task_id(); row < config->rows; row += dayan_native_task_count()) {
         const uint64_t offset = (uint64_t) row * config->width;
         normalization_centered(
             (const float *) normalization_input_row(config, input, row), output + offset, config->width,
-            config->epsilon_bits);
+            config->epsilon_bits, config->inv_width_bits);
     }
 }
 
@@ -603,7 +798,8 @@ static inline void run_group_norm(const DayanGroupNormConfig * config, const flo
                                            config->channels;
         const uint64_t offset        = ((uint64_t) batch * config->channels + channel_start) * channel_elements;
         const uint64_t elements      = (uint64_t) (channel_end - channel_start) * channel_elements;
-        normalization_centered(input + offset, output + offset, elements, config->epsilon_bits);
+        normalization_centered(input + offset, output + offset, elements, config->epsilon_bits,
+            channel_end - channel_start == channels_per_group ? config->inv_group_bits : config->inv_last_group_bits);
     }
 }
 

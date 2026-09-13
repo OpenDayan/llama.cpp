@@ -19,6 +19,10 @@
 #    define DAYAN_NATIVE_TASK_URAM_BYTES (8U * 1024U)
 #endif
 
+#ifndef DAYAN_NORM_TASK_URAM_BYTES
+#    define DAYAN_NORM_TASK_URAM_BYTES (128U * 1024U)
+#endif
+
 enum : uint32_t {
     kDayanNativeTaskTileElements = 256U,
     kDayanNativeMaxTasks         = 4U,
@@ -334,6 +338,7 @@ struct DayanNormConfig {
     uint32_t width;
     uint32_t rows;
     uint32_t epsilon_bits;
+    uint32_t inv_width_bits;
     uint32_t input_type;
     uint32_t input_ne[4];
     uint64_t input_nb[4];
@@ -360,6 +365,8 @@ struct DayanGroupNormConfig {
     uint32_t batches;
     uint32_t groups;
     uint32_t epsilon_bits;
+    uint32_t inv_group_bits;
+    uint32_t inv_last_group_bits;
 };
 
 #if !defined(__DAYAN_DEVICE__)

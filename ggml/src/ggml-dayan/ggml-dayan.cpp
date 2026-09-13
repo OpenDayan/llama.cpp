@@ -487,11 +487,11 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
             break;
         case ggml_backend_dayan_slot_kind::rms_norm:
             result = { "ggml_backend_dayan_norm_raw", "rms-norm", "rms_norm_f32_1c", "single-core",
-                       kDayanNativeMaxTasks };
+                       (uint32_t) std::min<int64_t>(ggml_nrows(node), kDayanNativeMaxTasks) };
             break;
         case ggml_backend_dayan_slot_kind::norm:
             result = { "ggml_backend_dayan_norm_raw", "norm", "norm_f32_1c", "single-core",
-                       kDayanNativeMaxTasks };
+                       (uint32_t) std::min<int64_t>(ggml_nrows(node), kDayanNativeMaxTasks) };
             break;
         case ggml_backend_dayan_slot_kind::group_norm:
             result = { "ggml_backend_dayan_group_norm", "group-norm", "group_norm_f32_1c", "single-core",
@@ -499,7 +499,8 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
             break;
         case ggml_backend_dayan_slot_kind::norm_pipeline:
             result = { "ggml_backend_dayan_norm_pipeline", slot.nodes[0] != nullptr ? "add-rms" : "rms-scale",
-                       "rms_norm_pipeline_1c", "single-core", kDayanNativeMaxTasks };
+                       "rms_norm_pipeline_1c", "single-core",
+                       (uint32_t) std::min<int64_t>(ggml_nrows(slot.nodes[1]), kDayanNativeMaxTasks) };
             break;
         case ggml_backend_dayan_slot_kind::flash_attention: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
@@ -1628,6 +1629,8 @@ static DayanNormConfig ggml_backend_dayan_norm_config(const ggml_tensor * rms) {
     DayanNormConfig     config = {};
     config.width               = (uint32_t) rms->ne[0];
     config.rows                = (uint32_t) ggml_nrows(rms);
+    const float inv_width      = 1.0f / (float) config.width;
+    std::memcpy(&config.inv_width_bits, &inv_width, sizeof(config.inv_width_bits));
     GGML_ASSERT(ggml_backend_dayan_type_code(input->type, &config.input_type));
     for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
         config.input_ne[dimension] = (uint32_t) input->ne[dimension];
@@ -2438,6 +2441,7 @@ static int ggml_backend_dayan_norm_raw(ggml_backend_dayan_context * ctx, const g
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(ctx, rms ? "rms-norm" : "norm", config.rows, &attrs);
+        attrs.config.task_dim.x = std::min<uint32_t>(config.rows, kDayanNativeMaxTasks);
         status = rms ? rms_norm_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(output->src[0]),
                                        ggml_backend_dayan_tensor_buffer(output), &attrs) :
                        norm_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(output->src[0]),
@@ -2460,9 +2464,17 @@ static int ggml_backend_dayan_group_norm(ggml_backend_dayan_context * ctx, const
         (uint32_t) output->ne[3],
         (uint32_t) ggml_get_op_params_i32(output, 0),
         0,
+        0,
+        0,
     };
     const float epsilon = ggml_get_op_params_f32(output, 1);
     std::memcpy(&config.epsilon_bits, &epsilon, sizeof(epsilon));
+    const uint32_t channels_per_group = (config.channels + config.groups - 1U) / config.groups;
+    const uint32_t last_channels = (config.channels - 1U) % channels_per_group + 1U;
+    const float inv_group = 1.0f / ((float) config.width * config.height * channels_per_group);
+    const float inv_last_group = 1.0f / ((float) config.width * config.height * last_channels);
+    std::memcpy(&config.inv_group_bits, &inv_group, sizeof(inv_group));
+    std::memcpy(&config.inv_last_group_bits, &inv_last_group, sizeof(inv_last_group));
 
     ggml_backend_dayan_buffers buffers;
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
@@ -2531,6 +2543,7 @@ static int ggml_backend_dayan_norm_pipeline(ggml_backend_dayan_context *        
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_native_launch_attrs(
             ctx, has_add ? "add-rms" : "rms-scale", config.norm.rows, &attrs);
+        attrs.config.task_dim.x = std::min<uint32_t>(config.norm.rows, kDayanNativeMaxTasks);
         status = rms_norm_pipeline_1c(buffers.config, input_buffer, right_buffer, scale_buffer, residual_buffer,
                                       rms_buffer, scaled_buffer, lowp_buffer, &attrs);
     }
