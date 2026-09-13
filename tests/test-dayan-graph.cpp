@@ -1764,7 +1764,8 @@ static int run_ssm_conv_case(ggml_backend_t dayan,
                              int64_t        tokens,
                              int64_t        channels,
                              int64_t        sequences,
-                             bool           silu) {
+                             bool           silu,
+                             bool           fanout = false) {
     const int64_t input_length = kernel_size - 1 + tokens;
     constexpr int graph_size   = 8;
 
@@ -1783,6 +1784,9 @@ static int run_ssm_conv_case(ggml_backend_t dayan,
     ggml_set_input(weight);
     ggml_tensor * conv   = ggml_ssm_conv(ctx.get(), input, weight);
     ggml_tensor * output = silu ? ggml_silu(ctx.get(), conv) : conv;
+    if (fanout) {
+        output = ggml_add(ctx.get(), output, conv);
+    }
     ggml_cgraph * graph  = ggml_new_graph_custom(ctx.get(), graph_size, false);
     ggml_build_forward_expand(graph, output);
 
@@ -1820,7 +1824,7 @@ static int run_ssm_conv_case(ggml_backend_t dayan,
                 for (int64_t tap = 0; tap < kernel_size; ++tap) {
                     sum += input_data[input_base + tap] * weight_data[weight_base + tap];
                 }
-                const float  expected = silu ? sum / (1.0f + std::exp(-sum)) : sum;
+                const float  expected = (silu ? sum / (1.0f + std::exp(-sum)) : sum) + (fanout ? sum : 0.0f);
                 const size_t index    = ((size_t) sequence * tokens + token) * channels + channel;
                 const float  error    = std::abs(observed[index] - expected);
                 if (error > max_abs) {
@@ -1834,11 +1838,27 @@ static int run_ssm_conv_case(ggml_backend_t dayan,
         }
     }
     std::printf(
-        "SSM conv%s kernel=%lld tokens=%lld channels=%lld sequences=%lld max_abs=%g worst=%zu observed=%g "
+        "SSM conv%s%s kernel=%lld tokens=%lld channels=%lld sequences=%lld max_abs=%g worst=%zu observed=%g "
         "expected=%g\n",
-        silu ? " SiLU" : "", (long long) kernel_size, (long long) tokens, (long long) channels, (long long) sequences,
+        silu ? " SiLU" : "", fanout ? " fanout" : "", (long long) kernel_size, (long long) tokens, (long long) channels, (long long) sequences,
         max_abs, worst_index, worst_observed, worst_expected);
     return close ? 0 : fail("SSM convolution numerical comparison failed");
+}
+
+static int run_ssm_conv_cases(ggml_backend_t dayan) {
+    return run_ssm_conv_case(dayan, 1, 5, 128, 1, false) != 0 ||
+           run_ssm_conv_case(dayan, 4, 5, 130, 2, true) != 0 ||
+           run_ssm_conv_case(dayan, 4, 69, 384, 1, true) != 0 ||
+           run_ssm_conv_case(dayan, 4, 1, 6144, 1, false) != 0 ||
+           run_ssm_conv_case(dayan, 4, 1, 6144, 1, true) != 0 ||
+           run_ssm_conv_case(dayan, 4, 1, 130, 2, true) != 0 ||
+           run_ssm_conv_case(dayan, 4, 69, 6144, 1, true) != 0 ||
+           run_ssm_conv_case(dayan, 4, 129, 33, 3, true) != 0 ||
+           run_ssm_conv_case(dayan, 62, 5, 130, 1, true) != 0 ||
+           run_ssm_conv_case(dayan, 63, 69, 130, 1, true) != 0 ||
+           run_ssm_conv_case(dayan, 16, 1, 1041, 1, false) != 0 ||
+           run_ssm_conv_case(dayan, 4, 77, 130, 2, true) != 0 ||
+           run_ssm_conv_case(dayan, 4, 5, 130, 1, true, true) != 0;
 }
 
 static int run_layout_case(ggml_backend_t dayan) {
@@ -2248,11 +2268,7 @@ int main(int argc, char ** argv) {
         return run_rope_cases(dayan.get(), cpu.get());
     }
     if (argc == 2 && std::strcmp(argv[1], "ssm-conv") == 0) {
-        return run_ssm_conv_case(dayan.get(), 1, 5, 128, 1, false) != 0 ||
-                       run_ssm_conv_case(dayan.get(), 4, 5, 130, 2, true) != 0 ||
-                       run_ssm_conv_case(dayan.get(), 4, 69, 384, 1, true) != 0 ?
-                   1 :
-                   0;
+        return run_ssm_conv_cases(dayan.get());
     }
     if (argc == 2 && std::strcmp(argv[1], "gated-output") == 0) {
         return run_gated_output_case(dayan.get(), GGML_TYPE_BF16, false) != 0 ||
@@ -2309,9 +2325,7 @@ int main(int argc, char ** argv) {
         run_gated_output_case(dayan.get(), GGML_TYPE_BF16, true) != 0 ||
         run_gated_output_case(dayan.get(), GGML_TYPE_F16, false) != 0 ||
         run_gated_output_case(dayan.get(), GGML_TYPE_F16, true) != 0 ||
-        run_ssm_conv_case(dayan.get(), 1, 5, 128, 1, false) != 0 ||
-        run_ssm_conv_case(dayan.get(), 4, 5, 130, 2, true) != 0 ||
-        run_ssm_conv_case(dayan.get(), 4, 69, 384, 1, true) != 0) {
+        run_ssm_conv_cases(dayan.get()) != 0) {
         return 1;
     }
 

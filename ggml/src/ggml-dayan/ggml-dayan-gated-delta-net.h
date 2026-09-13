@@ -280,6 +280,24 @@ static inline const float * gdn_row(const float *  base,
                                            (uint64_t) token * nb[2] + (uint64_t) sequence * nb[3]);
 }
 
+static inline void load_gdn_pair(uint64_t destination0, uint64_t destination1,
+                                  const float * source0, const float * source1,
+                                  uint64_t stride0, uint64_t stride1) {
+    const uint64_t source_delta = (uint64_t) source1 - (uint64_t) source0;
+    // DIM2 joins two tensors with equal row strides; hardware strides are 28 bits.
+    if (stride0 == stride1 && source_delta < (uint64_t{1} << 28)) {
+        __tx_lsu_tcsr_write<LSU_DIM2>(1);
+        __tx_lsu_tcsr_write<LSU_INDIM2STRIDE>(source_delta);
+        __tx_lsu_tcsr_write<LSU_OUTDIM2STRIDE>(destination1 - destination0);
+        __tx_lsu_dma_d2u<0>(destination0, (uint64_t) source0);
+    } else {
+        __tx_lsu_tcsr_write<LSU_DIM2>(0);
+        __tx_lsu_dma_d2u<0>(destination0, (uint64_t) source0);
+        __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(stride1);
+        __tx_lsu_dma_d2u<0>(destination1, (uint64_t) source1);
+    }
+}
+
 constexpr long kChunkTokens = 64;
 constexpr long kHeadStride = kHeadDim * sizeof(float) + 64;
 constexpr long kChunkStride = kChunkTokens * sizeof(float) + 64;
@@ -458,7 +476,6 @@ static inline void run_chunked_head(const DayanGatedDeltaNetConfig * config, con
     long checksum = 0;
     configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadStride);
     __tx_lsu_dma_d2u<0>(uram_address(kChunkState), (uint64_t) (state + state_index));
-    dayan_wait_lsu();
     // Padded linear rows keep VEC access compatible and give MAT a 1x Bank peak.
     __tx_mat_tcsr_write<MAT_ASWIZZLEMBS>(0);
     __tx_mat_tcsr_write<MAT_BSWIZZLEMBS>(0);
@@ -468,6 +485,8 @@ static inline void run_chunked_head(const DayanGatedDeltaNetConfig * config, con
 
     for (uint64_t token = 0; token < config->tokens; token += kChunkTokens) {
         const long rows = config->tokens - token < kChunkTokens ? config->tokens - token : kChunkTokens;
+        const float * v_row = gdn_row(v, config->v_nb, head, token, sequence);
+        const bool v_transposed = rows == kChunkTokens && (((uint64_t) v_row | config->v_nb[2]) & 63) == 0;
         const uint64_t valid_mask = rows == kChunkTokens ? ~uint64_t{0} : (uint64_t{1} << rows) - 1;
         for (long j = 0; j < rows; ++j) {
             *uram_pointer<uint64_t>(kChunkLower + j * kScalarStride) = j == 63 ? 0 : valid_mask & (~uint64_t{0} << (j + 1));
@@ -491,17 +510,34 @@ static inline void run_chunked_head(const DayanGatedDeltaNetConfig * config, con
         dayan_wait_vec();
 
         configure_lsu_rows<0>(rows, kHeadDim * sizeof(float), config->q_nb[2], kHeadStride);
-        __tx_lsu_dma_d2u<0>(uram_address(kChunkQ), (uint64_t) gdn_row(q, config->q_nb, head % config->q_heads, token, q_sequence));
-        __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(config->k_nb[2]);
-        __tx_lsu_dma_d2u<0>(uram_address(kChunkK), (uint64_t) gdn_row(k, config->k_nb, head % config->k_heads, token, k_sequence));
-        __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(config->v_nb[2]);
-        __tx_lsu_dma_d2u<0>(uram_address(kChunkV), (uint64_t) gdn_row(v, config->v_nb, head, token, sequence));
-        configure_lsu_rows<0>(rows, 64, config->g_nb[2], sizeof(float));
-        __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(sizeof(float) - 1);
-        __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(sizeof(float) - 1);
-        __tx_lsu_dma_d2u<0>(uram_address(kChunkG), (uint64_t) gdn_row(g, config->g_nb, head, token, sequence));
-        __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(config->beta_nb[2]);
-        __tx_lsu_dma_d2u<0>(uram_address(kChunkBeta), (uint64_t) gdn_row(beta, config->beta_nb, head, token, sequence));
+        load_gdn_pair(uram_address(kChunkQ), uram_address(kChunkK),
+                       gdn_row(q, config->q_nb, head % config->q_heads, token, q_sequence),
+                       gdn_row(k, config->k_nb, head % config->k_heads, token, k_sequence), config->q_nb[2], config->k_nb[2]);
+        if (!v_transposed) {
+            configure_lsu_rows<0>(rows, kHeadDim * sizeof(float), config->v_nb[2], kHeadStride);
+            __tx_lsu_dma_d2u<0>(uram_address(kChunkV), (uint64_t) v_row);
+        }
+        const float * g_row = gdn_row(g, config->g_nb, head, token, sequence);
+        const float * beta_row = gdn_row(beta, config->beta_nb, head, token, sequence);
+        if (config->g_nb[2] == sizeof(float) && config->beta_nb[2] == sizeof(float)) {
+            const long full_rows = rows / 16 * 16;
+            configure_lsu_rows<0>(1, kVecBytes, kVecBytes, kVecBytes);
+            if (full_rows != 0) {
+                __tx_lsu_tcsr_write<LSU_DIM0>(full_rows / 16 - 1);
+                load_gdn_pair(uram_address(kChunkG), uram_address(kChunkBeta), g_row, beta_row, kVecBytes, kVecBytes);
+            }
+            if (rows != full_rows) {
+                __tx_lsu_tcsr_write<LSU_DIM0>(0);
+                __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>((rows - full_rows) * sizeof(float) - 1);
+                load_gdn_pair(uram_address(kChunkG + full_rows * sizeof(float)), uram_address(kChunkBeta + full_rows * sizeof(float)),
+                               g_row + full_rows, beta_row + full_rows, kVecBytes, kVecBytes);
+            }
+        } else {
+            configure_lsu_rows<0>(rows, 64, config->g_nb[2], sizeof(float));
+            __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(sizeof(float) - 1);
+            __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(sizeof(float) - 1);
+            load_gdn_pair(uram_address(kChunkG), uram_address(kChunkBeta), g_row, beta_row, config->g_nb[2], config->beta_nb[2]);
+        }
         dayan_wait_lsu();
 
         configure_chunk_mat(rows, rows, kHeadDim, kHeadStride, kHeadStride, kChunkStride);
@@ -510,8 +546,14 @@ static inline void run_chunked_head(const DayanGatedDeltaNetConfig * config, con
         configure_chunk_mat(kHeadDim, rows, kHeadDim, kHeadStride, kHeadStride, kChunkStride);
         __tx_mat_mm<0>(uram_address(kChunkR), uram_address(kChunkState), uram_address(kChunkK));
         __tx_mat_mm<0>(uram_address(kChunkO), uram_address(kChunkState), uram_address(kChunkQ));
-        set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
-        __tx_lsu_dma_u2u<0>(uram_address(kChunkTemp), uram_address(kChunkV));
+        if (v_transposed) {
+            // Load V in the transposed layout while MAT consumes Q, K and state.
+            set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), config->v_nb[2], kChunkStride);
+            __tx_lsu_dma_d2u<0>(uram_address(kChunkTemp), (uint64_t) v_row);
+        } else {
+            set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
+            __tx_lsu_dma_u2u<0>(uram_address(kChunkTemp), uram_address(kChunkV));
+        }
         issue_chunk_prefix(rows);
         dayan_wait_mat();
         dayan_wait_lsu();

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location("limited_perf", Path(__file__).with_name("limited-perf.py"))
@@ -24,6 +25,52 @@ def events(tag, intervals):
 
 
 class PerfReportTests(unittest.TestCase):
+    def test_case_from_starts_at_selected_case(self):
+        output = io.StringIO()
+        argv = ["limited-perf.py", "plan", "--cases", "prefill-conv", "decode-conv", "--case-from", "decode-conv"]
+        with patch("sys.argv", argv), contextlib.redirect_stdout(output):
+            self.assertEqual(perf.main(), 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line.split()[0] for line in lines[:-1]], ["decode-conv"])
+        self.assertIn("1 cases, 1 kernel launches", lines[-1])
+
+    def test_case_from_requires_selected_case(self):
+        with patch("sys.argv", ["limited-perf.py", "plan", "--cases", "decode-conv", "--case-from", "prefill-conv"]), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                perf.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_cases_selection_combines_options_without_duplicate_launches(self):
+        output = io.StringIO()
+        with patch("sys.argv", ["limited-perf.py", "plan", "--cases", "decode-conv", "prefill-conv", "--case", "decode-conv"]), contextlib.redirect_stdout(output):
+            self.assertEqual(perf.main(), 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual([line.split()[0] for line in lines[:-1]], ["prefill-conv", "decode-conv"])
+        self.assertIn("2 cases, 2 kernel launches", lines[-1])
+
+    def test_cases_reject_unknown_or_empty_selection(self):
+        for selection in ([], ["invalid"]):
+            with self.subTest(selection=selection), patch("sys.argv", ["limited-perf.py", "plan", "--cases", *selection]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    perf.main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_report_selection_preserves_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = perf.make_cases(1024, 1024)
+            manifest = dict(cases=cases, simulator="cmodel", run_id="unit", prefill=1024, context=1024, perf_trace=str(root / "trace.json"))
+            perf.write_json(root / "manifest.json", manifest)
+            perf.write_json(root / "decode-conv.result.json", dict(status="ok", samples=[
+                dict(tag="conv", warmup=False, wall_s=1, tasks=4, status=0)]))
+            perf.write_json(root / "trace.json", dict(traceEvents=events("conv", [(100, 200)] * 4)))
+            with patch("sys.argv", ["limited-perf.py", "report", "--output", directory, "--cases", "decode-conv"]), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(perf.main(), 0)
+            report = json.loads((root / "report.json").read_text())
+            self.assertEqual([case["id"] for case in report["cases"]], ["decode-conv"])
+            self.assertIsNone(report["predictions"][1]["predicted_wall_s"])
+            self.assertEqual(json.loads((root / "manifest.json").read_text()), manifest)
+
     def read(self, content, wanted=("sample",)):
         with tempfile.TemporaryDirectory() as directory:
             trace = Path(directory) / "trace.json"

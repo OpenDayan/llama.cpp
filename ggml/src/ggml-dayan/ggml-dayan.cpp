@@ -527,7 +527,7 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
         case ggml_backend_dayan_slot_kind::ssm_conv:
         case ggml_backend_dayan_slot_kind::ssm_conv_silu:
             result = { "ggml_backend_dayan_ssm_conv", "ssm-conv", "ssm_conv_f32_1c", "single-core",
-                       kDayanNativeMaxTasks };
+                       dayan_ssm_conv_task_count((uint32_t) node->ne[0], (uint32_t) node->ne[1], (uint32_t) node->ne[2]) };
             break;
     }
     return result;
@@ -2737,9 +2737,8 @@ static int ggml_backend_dayan_ssm_conv(ggml_backend_dayan_context * ctx, const g
         ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        const uint64_t work_items = std::min<uint64_t>(ggml_backend_dayan_native_tiles(config.channels),
-                                                       kDayanSSMConvMaxTasks);
-        ggml_backend_dayan_init_native_launch_attrs(ctx, "ssm-conv", work_items, &attrs);
+        ggml_backend_dayan_init_launch_attrs(ctx, "ssm-conv", &attrs);
+        attrs.config.task_dim = NPUTaskDim3{ dayan_ssm_conv_task_count(config.channels, config.tokens, config.sequences), 1, 1 };
         status = ssm_conv_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(input),
                                  ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(output), &attrs);
     }

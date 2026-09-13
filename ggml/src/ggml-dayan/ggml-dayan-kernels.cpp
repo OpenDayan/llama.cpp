@@ -1716,8 +1716,8 @@ DAYAN_MATMUL_4C_DESC(project_gated_output_bf16_4c);
 DAYAN_MATMUL_4C_DESC(project_gated_output_fp16_4c);
 DAYAN_MATMUL_4C_DESC(project_gated_output_f32_gate_bf16_4c);
 DAYAN_MATMUL_4C_DESC(project_gated_output_f32_gate_fp16_4c);
-DAYAN_KERNEL_LOCKED_TASK_DESC(ssm_conv_f32_1c, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
-                              1, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(ssm_conv_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
+                       1, 0, 1, 0);
 #define DAYAN_NATIVE_KERNEL_DESC(kernel) \
     DAYAN_KERNEL_TASK_DESC(kernel, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NATIVE_TASK_URAM_BYTES), 2, 0, 1, 0)
 

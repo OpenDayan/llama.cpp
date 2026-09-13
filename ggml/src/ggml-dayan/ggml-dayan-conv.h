@@ -6,115 +6,57 @@
 
 namespace ggml_dayan_matmul_detail {
 
-enum : uint32_t {
-    kSSMConvTokenTile = 64,
-};
-
 struct SSMConvUramLayout {
-    uint64_t constants;
-    uint64_t weight;
     uint64_t input;
     uint64_t output;
+    uint64_t staging;
     uint64_t total;
 };
 
 static inline SSMConvUramLayout ssm_conv_uram_layout(uint32_t tokens, uint32_t kernel_size, uint32_t channels) {
+    const uint64_t weight_rows = align_up(kernel_size, 16);
+    const uint64_t input_rows = align_up((uint64_t) tokens + kernel_size - 1U, 16);
     SSMConvUramLayout layout;
-    const uint64_t input_rows = (uint64_t) tokens + kernel_size - 1U;
-
-    layout.constants = 0;
-    layout.weight    = align_up(layout.constants + 2U * Constants::kConstantStride, Constants::kUramAlignment);
-    layout.input     = align_up(layout.weight + (uint64_t) kernel_size * channels * sizeof(float),
-                                Constants::kUramAlignment);
-    layout.output    = align_up(layout.input + input_rows * channels * sizeof(float), Constants::kUramAlignment);
-    layout.total     = align_up(layout.output + (uint64_t) tokens * channels * sizeof(float),
-                               Constants::kUramAlignment);
+    layout.input   = weight_rows * channels * sizeof(float);
+    layout.output  = layout.input + input_rows * channels * sizeof(float);
+    layout.staging = layout.output + (uint64_t) tokens * channels * sizeof(float);
+    layout.total   = layout.staging + input_rows * channels * sizeof(float);
     return layout;
 }
 
-static inline uint32_t ssm_conv_channel_tile(uint64_t uram_size,
-                                             uint32_t tokens,
-                                             uint32_t kernel_size,
-                                             uint32_t channels) {
-    const uint64_t bytes_per_channel = (2ULL * tokens + 2ULL * kernel_size - 1U) * sizeof(float);
-    uint64_t       channel_tile      = uram_size / bytes_per_channel;
-
-    channel_tile &= ~(uint64_t) (Constants::kVecLanes - 1U);
-    const uint64_t rounded_channels = align_up(channels, Constants::kVecLanes);
-    if (channel_tile > rounded_channels) {
-        channel_tile = rounded_channels;
+static inline void load_ssm_transposed(uint64_t destination,
+                                        uint64_t staging,
+                                        const float * source,
+                                        uint32_t columns,
+                                        uint32_t channels,
+                                        uint32_t channel_tile,
+                                        uint64_t source_stride) {
+    const uint64_t row_bytes = align_up(columns, 16) * sizeof(float);
+    const uint64_t source_address = (uint64_t) source;
+    const uint64_t output_stride = (uint64_t) channel_tile * sizeof(float);
+    long checksum = 0;
+    if (((source_address | source_stride) & 63U) == 0 && columns % 16U == 0 && channels % 16U == 0) {
+        set_lsu_matrix<0, true, 2>(checksum, channels, (uint64_t) columns * sizeof(float), source_stride, output_stride);
+        __tx_lsu_dma_d2u<0>(destination, source_address);
+        return;
     }
-    while (channel_tile >= Constants::kVecLanes &&
-           ssm_conv_uram_layout(tokens, kernel_size, (uint32_t) channel_tile).total > uram_size) {
-        channel_tile -= Constants::kVecLanes;
-    }
-    return (uint32_t) channel_tile;
+
+    // Stage unaligned rows and partial 16x16 blocks.
+    set_lsu_matrix<0>(checksum, channels, row_bytes, source_stride, row_bytes);
+    load_matrix<0>((uint64_t) columns * sizeof(float), channels, row_bytes, channels, staging, source_address);
+    dayan_wait_lsu();
+    set_lsu_matrix<0, true, 2>(checksum, align_up(channels, 16), row_bytes, row_bytes, output_stride);
+    __tx_lsu_dma_u2u<0>(destination, staging);
 }
 
-template <long Group>
-static inline void configure_ssm_lsu(uint32_t dim0,
-                                     uint32_t dim1,
-                                     uint64_t input_dim0_stride,
-                                     uint64_t input_dim1_stride,
-                                     uint64_t output_dim0_stride,
-                                     uint64_t output_dim1_stride,
-                                     uint32_t read_bytes,
-                                     uint32_t write_bytes) {
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(dim0 - 1U);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(dim1 - 1U);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM2>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INBLOCKSTRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM0STRIDE>(input_dim0_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(input_dim1_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM2STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTBLOCKSTRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM0STRIDE>(output_dim0_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(output_dim1_stride);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM2STRIDE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKTRANSPOSE>(6);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCKPADDING>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(read_bytes - 1U);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_PADDINGVALUE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_URAMREADSWIZZLEMBS>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(write_bytes - 1U);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESIZE>(0);
-    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_TABLESTRIDE>(64);
-}
-
-static inline void load_ssm_constants(uint64_t destination, const DayanSSMConvConfig * config) {
-    configure_ssm_lsu<0>(2, 1, sizeof(uint32_t), 0, Constants::kConstantStride, 0, sizeof(uint32_t),
-                         sizeof(uint32_t));
-    __tx_lsu_dma_d2u<0>(destination, reinterpret_cast<uint64_t>(&config->neg_log2e_bits));
-}
-
-static inline void load_ssm_weights(uint64_t      destination,
-                                    const float * weight,
-                                    uint32_t      kernel_size,
-                                    uint32_t      channel_base,
-                                    uint32_t      channel_count,
-                                    uint32_t      channel_tile) {
-    configure_ssm_lsu<0>(channel_count, kernel_size, (uint64_t) kernel_size * sizeof(float), sizeof(float),
-                         sizeof(float), (uint64_t) channel_tile * sizeof(float), sizeof(float), sizeof(float));
-    __tx_lsu_dma_d2u<0>(destination,
-                        reinterpret_cast<uint64_t>(weight + (uint64_t) channel_base * kernel_size));
-}
-
-static inline void load_ssm_input(uint64_t      destination,
-                                  const float * input,
-                                  uint32_t      input_length,
-                                  uint32_t      channels,
-                                  uint32_t      sequence,
-                                  uint32_t      token_base,
-                                  uint32_t      input_rows,
-                                  uint32_t      channel_base,
-                                  uint32_t      channel_count,
-                                  uint32_t      channel_tile) {
-    const float * source = input + ((uint64_t) sequence * channels + channel_base) * input_length + token_base;
-    configure_ssm_lsu<0>(channel_count, input_rows, (uint64_t) input_length * sizeof(float), sizeof(float),
-                         sizeof(float), (uint64_t) channel_tile * sizeof(float), sizeof(float), sizeof(float));
-    __tx_lsu_dma_d2u<0>(destination, reinterpret_cast<uint64_t>(source));
+static inline void issue_ssm_silu_registers(const DayanSSMConvConfig * config) {
+    __tx_vec_lsu_g2v_broadcast32<1, 2>(config->neg_log2e_bits);
+    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_g2v_broadcast32<1, 2>(config->one_bits);
+    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 5>();
+    __tx_vec_vv_fp32_mul<0, 0, 4, 0>();
 }
 
 static inline void issue_ssm_depthwise_f32(uint64_t input,
@@ -123,10 +65,12 @@ static inline void issue_ssm_depthwise_f32(uint64_t input,
                                            uint32_t tokens,
                                            uint32_t channels,
                                            uint32_t channel_tile,
-                                           uint32_t kernel_size) {
+                                           const DayanSSMConvConfig * config) {
+    const uint32_t kernel_size = config->kernel_size;
+    const bool silu = (config->flags & 1U) != 0 && kernel_size < kDayanSSMConvMaxKernelSize;
     const long chunks       = (channels + Constants::kVecLanes - 1U) / Constants::kVecLanes;
     const long row_stride   = (long) channel_tile * sizeof(float);
-    const long instructions = 4L * kernel_size;
+    const long instructions = 4L * kernel_size + (silu ? 7 : 0);
 
     ggml_dayan_vec_detail::configure_vec_grid(chunks, tokens);
     configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, row_stride);
@@ -144,20 +88,11 @@ static inline void issue_ssm_depthwise_f32(uint64_t input,
         __tx_vec_vv_fp32_mul<1, 16, 0, 0>();
         __tx_vec_vv_fp32_add<0, 16, 1, 0>();
     }
+    if (silu) {
+        issue_ssm_silu_registers(config);
+    }
     __tx_vec_lsu_v2u<0, 3>(output);
     start_vec_block(instructions);
-}
-
-static inline void issue_ssm_silu_f32(uint64_t input,
-                                       uint64_t output,
-                                       uint64_t constants,
-                                       uint32_t rows,
-                                       uint32_t columns,
-                                       uint32_t row_elements) {
-    const long row_stride = (long) row_elements * sizeof(float);
-    ggml_dayan_vec_detail::issue_silu({ input, row_stride }, { output, row_stride },
-                                      { constants, constants + Constants::kConstantStride, 0, 0, 0, 0, 0 }, rows,
-                                      columns);
 }
 
 static inline void store_ssm_output(float *  output,
@@ -194,65 +129,69 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
         DAYAN_PARAMS_ERROR();
     }
 
-    void * uram = dayan_uram_base();
-    if (uram == nullptr) {
+    const uint64_t uram_address = (uint64_t) (uintptr_t) dayan_uram_base();
+    if (uram_address == 0) {
         dayan_thread_exit(-12);
     }
 
-    const uint32_t task         = dayan_task_id(DAYAN_TASK_X);
-    const uint32_t tasks        = dayan_task_dim(DAYAN_TASK_X);
-    const uint32_t token_tile   = config->tokens < kSSMConvTokenTile ? config->tokens : kSSMConvTokenTile;
-    const uint64_t uram_size    = dayan_uram_size();
-    const uint64_t uram_address = (uint64_t) (uintptr_t) uram;
-    const uint32_t max_channel_tile =
-        ssm_conv_channel_tile(uram_size, token_tile, config->kernel_size, config->channels);
+    const uint32_t task = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
+    const uint32_t token_tile = config->tokens < kDayanSSMConvTokenTile ? config->tokens : kDayanSSMConvTokenTile;
+    const uint64_t channel_groups = ((uint64_t) config->channels + Constants::kVecLanes - 1U) / Constants::kVecLanes;
+    const uint32_t channel_tasks = channel_groups < tasks ? (uint32_t) channel_groups : tasks;
+    const uint32_t channel_task = task % channel_tasks;
+    const uint32_t row_task = task / channel_tasks;
+    const uint32_t row_tasks = (tasks - 1U - channel_task) / channel_tasks + 1U;
+    const uint64_t channel_begin = channel_groups * channel_task / channel_tasks * Constants::kVecLanes;
+    const uint64_t channel_limit = channel_groups * (channel_task + 1U) / channel_tasks * Constants::kVecLanes;
+    const uint64_t channel_end = channel_limit < config->channels ? channel_limit : config->channels;
+    const uint64_t shard_channels = channel_end - channel_begin;
+    const uint64_t bytes_per_channel = ssm_conv_uram_layout(token_tile, config->kernel_size, Constants::kVecLanes).total / Constants::kVecLanes;
+    const uint64_t max_channel_tile = dayan_uram_size() / bytes_per_channel / Constants::kVecLanes * Constants::kVecLanes;
     if (max_channel_tile == 0) {
         dayan_thread_exit(-12);
     }
-    const uint32_t balanced_channels = (config->channels + tasks - 1U) / tasks;
-    const uint32_t channel_tile = min_int((int) max_channel_tile,
-                                          (int) align_up(balanced_channels, Constants::kVecLanes));
+    const uint64_t channel_tiles = (shard_channels + max_channel_tile - 1U) / max_channel_tile;
+    const uint32_t channel_tile = (uint32_t) align_up((shard_channels + channel_tiles - 1U) / channel_tiles, Constants::kVecLanes);
+    const uint64_t token_tiles = ((uint64_t) config->tokens + token_tile - 1U) / token_tile;
 
-    load_ssm_constants(uram_address, config);
-    dayan_wait_lsu();
-
-    const uint32_t token_tiles = (config->tokens + token_tile - 1U) / token_tile;
-    const uint64_t channel_tiles = (config->channels + channel_tile - 1U) / channel_tile;
-    for (uint64_t channel_work = task; channel_work < channel_tiles; channel_work += tasks) {
-        const uint32_t channel_base = (uint32_t) (channel_work * channel_tile);
-        const uint32_t channel_count =
-            config->channels - channel_base < channel_tile ? config->channels - channel_base : channel_tile;
-        const uint32_t          tile_elements = (uint32_t) align_up(channel_count, Constants::kVecLanes);
+    for (uint64_t channel_base = channel_begin; channel_base < channel_end; channel_base += channel_tile) {
+        const uint32_t channel_count = (uint32_t) (channel_end - channel_base < channel_tile ? channel_end - channel_base : channel_tile);
+        const uint32_t tile_elements = (uint32_t) align_up(channel_count, Constants::kVecLanes);
         const SSMConvUramLayout layout = ssm_conv_uram_layout(token_tile, config->kernel_size, tile_elements);
-        const uint64_t          weight_uram = uram_address + layout.weight;
-        const uint64_t          input_uram  = uram_address + layout.input;
-        const uint64_t          output_uram = uram_address + layout.output;
+        const uint64_t weight_uram = uram_address;
+        const uint64_t input_uram = uram_address + layout.input;
+        const uint64_t output_uram = uram_address + layout.output;
+        const uint64_t staging_uram = uram_address + layout.staging;
 
-        load_ssm_weights(weight_uram, weight, config->kernel_size, channel_base, channel_count, tile_elements);
+        load_ssm_transposed(weight_uram, staging_uram, weight + channel_base * config->kernel_size,
+                             config->kernel_size, channel_count, tile_elements, (uint64_t) config->kernel_size * sizeof(float));
         dayan_wait_lsu();
 
-        for (uint32_t work = 0; work < config->sequences * token_tiles; ++work) {
-            const uint32_t sequence   = work / token_tiles;
-            const uint32_t token_base = (work % token_tiles) * token_tile;
-            const uint32_t token_count =
-                config->tokens - token_base < token_tile ? config->tokens - token_base : token_tile;
+        for (uint64_t work = row_task; work < (uint64_t) config->sequences * token_tiles; work += row_tasks) {
+            const uint32_t sequence = (uint32_t) (work / token_tiles);
+            const uint32_t token_base = (uint32_t) ((work % token_tiles) * token_tile);
+            const uint32_t token_count = config->tokens - token_base < token_tile ? config->tokens - token_base : token_tile;
             const uint32_t input_rows = token_count + config->kernel_size - 1U;
+            const float * source = input + ((uint64_t) sequence * config->channels + channel_base) * config->input_length + token_base;
 
-            load_ssm_input(input_uram, input, config->input_length, config->channels, sequence, token_base,
-                           input_rows, channel_base, channel_count, tile_elements);
+            load_ssm_transposed(input_uram, staging_uram, source, input_rows, channel_count, tile_elements,
+                                 (uint64_t) config->input_length * sizeof(float));
             dayan_wait_lsu();
 
-            issue_ssm_depthwise_f32(input_uram, weight_uram, output_uram, token_count, channel_count, tile_elements,
-                                     config->kernel_size);
-            dayan_wait_vec();
-
-            if ((config->flags & 1U) != 0) {
-                issue_ssm_silu_f32(output_uram, output_uram, uram_address, token_count, channel_count, tile_elements);
+            issue_ssm_depthwise_f32(input_uram, weight_uram, output_uram, token_count, channel_count, tile_elements, config);
+            if ((config->flags & 1U) != 0 && config->kernel_size == kDayanSSMConvMaxKernelSize) {
+                // The 63-tap convolution leaves no room for SiLU in the 255-instruction block.
                 dayan_wait_vec();
+                begin_vec_block(9);
+                __tx_vec_lsu_u2v<0, 0>(output_uram);
+                issue_ssm_silu_registers(config);
+                __tx_vec_lsu_v2u<0, 3>(output_uram);
+                start_vec_block(9);
             }
-
-            store_ssm_output(output, output_uram, config->tokens, token_count, config->channels, channel_base,
-                             channel_count, tile_elements, sequence, token_base);
+            dayan_wait_vec();
+            store_ssm_output(output, output_uram, config->tokens, token_count, config->channels, (uint32_t) channel_base,
+                               channel_count, tile_elements, sequence, token_base);
             dayan_wait_lsu();
         }
     }

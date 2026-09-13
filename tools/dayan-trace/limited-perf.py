@@ -248,7 +248,10 @@ def main():
     parser.add_argument("--simulator", choices=("testcluster", "cmodel"), default="testcluster")
     parser.add_argument("--prefill", type=int, default=1024, help="prefill tokens (default: 1024)")
     parser.add_argument("--context", type=int, default=1024, help="decode prefix tokens, excluding the new token (default: 1024)")
-    parser.add_argument("--case", action="append", help="select a case ID from plan; repeat to select several")
+    case_ids = [case["id"] for case in make_cases(1024, 1024)]
+    parser.add_argument("--case", dest="cases", action="append", choices=case_ids, help="select one case; repeat to select several")
+    parser.add_argument("--cases", action="extend", nargs="+", choices=case_ids, help="select a group of cases; defaults to all cases")
+    parser.add_argument("--case-from", choices=case_ids, help="start at this case, inclusive, in plan order after case selection")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=86400, help="per-case wall deadline in seconds (default: 24 hours)")
@@ -262,20 +265,30 @@ def main():
     if (args.overhead_percent is not None and (not math.isfinite(args.overhead_percent) or args.overhead_percent < 0)) or (
             args.clock_hz is not None and (not math.isfinite(args.clock_hz) or args.clock_hz <= 0)):
         parser.error("invalid overhead or clock")
-    cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000)
-    if args.case:
-        if set(args.case) - {case["id"] for case in cases}:
-            parser.error("unknown --case; see plan")
-        cases = [case for case in cases if case["id"] in args.case]
+    directory = args.output.resolve()
+    manifest_path = directory / "manifest.json"
+    if args.command == "report":
+        manifest = json.loads(manifest_path.read_text())
+        cases = manifest["cases"]
+    else:
+        cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000)
+    if args.cases:
+        missing = set(args.cases) - {case["id"] for case in cases}
+        if missing:
+            parser.error("cases are not in the saved run: " + ", ".join(sorted(missing)))
+        cases = [case for case in cases if case["id"] in args.cases]
+    if args.case_from:
+        selected_ids = [case["id"] for case in cases]
+        if args.case_from not in selected_ids:
+            parser.error("--case-from must be in the selected cases: " + args.case_from)
+        cases = cases[selected_ids.index(args.case_from):]
     if args.command == "plan":
         for case in cases:
             print(f"{case['id']:20} {case['op']:10} {shape_text(case)}")
         print(f"{len(cases)} cases, {len(cases) * (args.repeats + args.warmup)} kernel launches; no server access.")
         return 0
-    directory = args.output.resolve()
-    manifest_path = directory / "manifest.json"
     if args.command == "report":
-        manifest = json.loads(manifest_path.read_text())
+        manifest["cases"] = cases
         trace = (args.perf_trace or Path(manifest["perf_trace"])).resolve()
         overhead = args.overhead_percent if args.overhead_percent is not None else manifest.get("overhead_percent", 20)
         return make_report(directory, manifest, trace, overhead, args.clock_hz or manifest.get("clock_hz"))

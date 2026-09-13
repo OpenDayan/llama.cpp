@@ -1743,7 +1743,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
             slot.node_count      = 1;
             const int silu_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
             if (silu_index < cgraph->n_nodes && ggml_backend_dayan_supports_ssm_conv_silu(cgraph->nodes[silu_index]) &&
-                cgraph->nodes[silu_index]->src[0] == node) {
+                cgraph->nodes[silu_index]->src[0] == node && ggml_node_has_n_uses(cgraph, i, 1)) {
                 slot.kind       = ggml_backend_dayan_slot_kind::ssm_conv_silu;
                 slot.nodes[1]   = cgraph->nodes[silu_index];
                 slot.node_count = 2;

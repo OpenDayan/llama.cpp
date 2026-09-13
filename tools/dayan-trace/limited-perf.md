@@ -71,13 +71,37 @@ Inspect a proposed change without contacting the server:
 python3 tools/dayan-trace/limited-perf.py plan --prefill 128 --context 512
 ```
 
+Select a group of case IDs with `--cases`. `plan` lists the available IDs. Selection preserves the plan order and runs each case once, even if an ID is repeated. The existing repeatable `--case` option remains supported and can be combined with `--cases`.
+
 Run just decode FFN and down projection:
 
 ```sh
 python3 tools/dayan-trace/limited-perf.py run \
     --perf-trace /tmp/dayan-perf.json --output build-dayan/rtl-ffn \
-    --case decode-ffn --case decode-down
+    --cases decode-ffn decode-down
 ```
+
+Preview and run the two convolution cases:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py plan --cases prefill-conv decode-conv
+python3 tools/dayan-trace/limited-perf.py run \
+    --perf-trace /tmp/dayan-perf.json --output build-dayan/rtl-conv \
+    --cases prefill-conv decode-conv
+```
+
+Start at a case and run all later cases in plan order, including the named case:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py plan --case-from prefill-conv
+python3 tools/dayan-trace/limited-perf.py run \
+    --perf-trace /tmp/dayan-perf.json --output build-dayan/rtl-from-conv \
+    --case-from prefill-conv
+```
+
+With `--case` or `--cases`, `--case-from` applies after selection; the starting case must be selected. For example, `--cases prefill-conv decode-conv --case-from decode-conv` runs only `decode-conv`.
+
+`--resume` requires the same resulting selection, including the `--case-from` starting point. `report --cases ...` and `report --case-from ...` restrict the generated reports to cases present in the saved run without changing its manifest. End-to-end predictions remain `N/A` when the selected group lacks required samples.
 
 Use `--warmup 1 --repeats 1` for one unmeasured warmup and one measured launch per case. The profiler still records the warmup, but the report excludes it by task name. With multiple measured repetitions, the report gives the median and retains each sample in JSON. Defaults favor minimum RTL runtime; without warmup, the wall measurement includes first-use module loading.
 
@@ -89,9 +113,9 @@ Resume with the original options plus `--resume`. It skips completed cases and r
 
 The launch wall time is a real host `steady_clock` duration around the synchronous DAPI kernel call. It includes lazy module loading, submission, Device execution, profiler overhead, and completion waiting. Input/config/weight upload and output validation are outside this interval. A separate process wall time includes all host-client setup and data transfer. Neither measurement includes simulator or server startup.
 
-GDN follows the backend launch policy: the preset runs 16 independent head tasks, with at most four resident tasks per core. Prefill uses 64-token TF32 MAT/VEC chunks, and decode uses the FP32 VEC recurrence.
+GDN follows the backend launch policy: the preset runs 16 independent head tasks, with at most four resident tasks per core. Prefill uses 64-token TF32 MAT/VEC chunks, and decode uses the FP32 VEC recurrence. SSM Conv also permits four resident tasks per core; its task count follows the backend channel/token partition and reaches 16 for the preset shape. SSM Conv loads and transposes complete 16x16 blocks directly when the source address and row stride are 64B-aligned. Unaligned rows and partial blocks use a staging buffer before the LSU transpose. Conv and SiLU share one VEC block for this shape; kernel width 63 requires a separate SiLU block.
 
-Cycles come only from firmware dyperf proc-state records. For each unique launch name the script requires one complete root lifetime per launched task (16 for GDN and four for the other presets), then computes:
+Cycles come only from firmware dyperf proc-state records. For each unique launch name the script requires one complete root lifetime per launched task (16 for GDN and SSM Conv, and four for the other presets), then computes:
 
 ```text
 launch_cycles = max(root WAIT_EXIT begin) - min(root first RUNNING begin)

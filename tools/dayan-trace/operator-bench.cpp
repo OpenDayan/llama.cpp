@@ -161,6 +161,7 @@ int main(int argc, char ** argv) {
             reference.assign((size_t) m * n, value);
         } else if (op == "ssm_conv") {
             DayanSSMConvConfig config{m + 3, 6144, m, 1, 4, 1, float_bits(-1.4426950408889634f), float_bits(1.0f)};
+            attrs.config.task_dim = NPUTaskDim3{dayan_ssm_conv_task_count(config.channels, config.tokens, config.sequences), 1, 1};
             auto cfg = device.upload(&config, sizeof(config));
             auto a = device.filled((size_t) (m + 3) * config.channels, 1.0f / 64);
             auto b = device.filled(4 * config.channels, 1.0f / 32);
