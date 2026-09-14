@@ -289,7 +289,8 @@ int main() {
         return fail("numerical comparison failed");
     }
     if (test_permuted_cache_layout(dayan.get(), cpu.get(), 3, 64, 9, 0x35f17U) != 0 ||
-        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 1, 0x35f18U) != 0) {
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 1, 0x35f18U) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 65, 256, 151, 0x35f19U) != 0) {
         return 1;
     }
 

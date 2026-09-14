@@ -38,10 +38,12 @@ struct attention_case {
     bool           causal;
     bool           interleaved_kv = false;
     uint32_t       tasks          = 1;
+    bool           four_core      = false;
+    float          qk_range       = 0.25f;
 };
 
 static int fail(const char * message) {
-    std::fprintf(stderr, "test-dayan-renew-attention: %s\n", message);
+    std::fprintf(stderr, "test-dayan-attention-pipeline: %s\n", message);
     return 1;
 }
 
@@ -174,15 +176,16 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
     std::vector<uint16_t> k(kv_elements);
     std::vector<uint16_t> v(kv_elements);
     std::vector<float>    expected(output_elements);
-    std::vector<float>    observed(output_elements);
+    std::vector<float>    observed(output_elements, std::numeric_limits<float>::quiet_NaN());
 
     std::mt19937                          generator(seed);
     std::uniform_real_distribution<float> distribution(-0.25f, 0.25f);
+    std::uniform_real_distribution<float> qk_distribution(-test.qk_range, test.qk_range);
     for (uint16_t & value : q) {
-        value = encode_lowp(test.type, distribution(generator));
+        value = encode_lowp(test.type, qk_distribution(generator));
     }
     for (uint16_t & value : k) {
-        value = encode_lowp(test.type, distribution(generator));
+        value = encode_lowp(test.type, qk_distribution(generator));
     }
     for (uint16_t & value : v) {
         value = encode_lowp(test.type, distribution(generator));
@@ -249,19 +252,22 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
         status = upload(runtime->stream, buffers.v, v.data(), v.size() * sizeof(uint16_t));
     }
     if (status == 0) {
+        status = upload(runtime->stream, buffers.output, observed.data(), observed.size() * sizeof(float));
+    }
+    if (status == 0) {
         status = upload(runtime->stream, buffers.result, &device_result, sizeof(device_result));
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        const char *              launch_name = test.type == GGML_TYPE_BF16 ? "renew-attn-bf16" : "renew-attn-fp16";
+        const char *              launch_name = test.type == GGML_TYPE_BF16 ? "flash-attn-bf16" : "flash-attn-fp16";
         npu_kernel_launch_attrs_init(&attrs, runtime->context, runtime->stream, launch_name);
-        attrs.config.task_dim  = NPUTaskDim3{ test.tasks, 1, 1 };
-        attrs.config.task_mode = NPUTaskMode::kSingleCore;
+        attrs.config.task_dim  = NPUTaskDim3{ test.four_core ? 4U : test.tasks, 1, 1 };
+        attrs.config.task_mode = test.four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
-        status = test.type == GGML_TYPE_BF16 ? renew_attention_bf16_1c(buffers.config, buffers.q, buffers.k, buffers.v,
-                                                                       buffers.output, buffers.result, &attrs) :
-                                               renew_attention_fp16_1c(buffers.config, buffers.q, buffers.k, buffers.v,
-                                                                       buffers.output, buffers.result, &attrs);
+        const auto kernel = test.type == GGML_TYPE_BF16 ?
+            (test.four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c) :
+            (test.four_core ? flash_attention_fp16_4c : flash_attention_fp16_1c);
+        status = kernel(buffers.config, buffers.q, buffers.k, buffers.v, buffers.output, buffers.result, &attrs);
     }
     if (status == 0) {
         status = download(runtime->stream, &device_result, buffers.result, sizeof(device_result));
@@ -276,7 +282,7 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
     if (status < 0) {
         std::fprintf(stderr, "case=%s launch_status=%d device_status=%lld\n", test.name, status,
                      static_cast<long long>(device_result));
-        return fail("Renew Attention kernel launch failed");
+        return fail("Attention kernel launch failed");
     }
 
     float  max_abs   = 0.0f;
@@ -292,7 +298,7 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
             close = false;
             continue;
         }
-        if (abs_error > 0.01f + 0.02f * std::abs(expected[index])) {
+        if (abs_error > 0.001f + 0.01f * std::abs(expected[index])) {
             close = false;
         }
         if (abs_error > max_abs) {
@@ -318,7 +324,7 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
             std::printf("case=%s row=%u max_abs=%g\n", test.name, row, row_max);
         }
     }
-    return close ? 0 : fail("Renew Attention numerical comparison failed");
+    return close ? 0 : fail("Attention numerical comparison failed");
 }
 
 int main(int argc, char ** argv) {
@@ -344,13 +350,20 @@ int main(int argc, char ** argv) {
     }
 
     const attention_case cases[] = {
-        { "renew-full-bf16", GGML_TYPE_BF16, 1, 2, 1, 64, 128, 64, 0, false },
-        { "renew-two-full-bf16", GGML_TYPE_BF16, 1, 1, 1, 1, 256, 64, 0, false },
-        { "renew-tail-bf16", GGML_TYPE_BF16, 1, 1, 1, 17, 64, 64, 0, false },
-        { "renew-mask-bf16", GGML_TYPE_BF16, 1, 1, 1, 17, 64, 64, 47, true },
-        { "renew-pipeline-bf16", GGML_TYPE_BF16, 1, 1, 1, 129, 256, 64, 127, true },
-        { "renew-batch-gqa-fp16", GGML_TYPE_F16, 2, 4, 2, 17, 151, 64, 134, true },
-        { "renew-trace-fp16", GGML_TYPE_F16, 1, 8, 2, 128, 256, 256, 128, true, true, 4 },
+        { "pipeline-full-bf16", GGML_TYPE_BF16, 1, 2, 1, 64, 128, 64, 0, false },
+        { "pipeline-two-full-bf16", GGML_TYPE_BF16, 1, 1, 1, 1, 256, 64, 0, false },
+        { "pipeline-tail-bf16", GGML_TYPE_BF16, 1, 1, 1, 17, 64, 64, 0, false },
+        { "pipeline-mask-bf16", GGML_TYPE_BF16, 1, 1, 1, 17, 64, 64, 47, true },
+        { "pipeline-causal-bf16", GGML_TYPE_BF16, 1, 1, 1, 129, 256, 64, 127, true },
+        { "pipeline-batch-gqa-fp16", GGML_TYPE_F16, 2, 4, 2, 17, 151, 64, 134, true },
+        { "pipeline-trace-fp16", GGML_TYPE_F16, 1, 8, 2, 128, 256, 256, 128, true, true, 4 },
+        { "pipeline-wrap-bf16-1c", GGML_TYPE_BF16, 1, 1, 1, 257, 641, 128, 384, true },
+        { "pipeline-partial-fp16-4c", GGML_TYPE_F16, 1, 2, 1, 65, 151, 192, 86, true, true, 1, true },
+        { "pipeline-wrap-bf16-4c", GGML_TYPE_BF16, 1, 1, 1, 1025, 1153, 64, 128, true, false, 1, true },
+        { "pipeline-wide-fp16-4c", GGML_TYPE_F16, 1, 2, 1, 513, 641, 256, 0, false, true, 1, true },
+        { "pipeline-rescale-bf16-1c", GGML_TYPE_BF16, 1, 1, 1, 129, 385, 128, 0, false, false, 1, false, 2.0f },
+        { "pipeline-rescale-fp16-4c", GGML_TYPE_F16, 1, 1, 1, 257, 641, 64, 384, true, false, 1, true, 2.0f },
+        { "pipeline-short-fp16-1c", GGML_TYPE_F16, 2, 4, 2, 17, 23, 64, 6, true, false, 4 },
     };
 
     int      result = 0;
@@ -374,6 +387,6 @@ int main(int argc, char ** argv) {
     if (result != 0) {
         return result;
     }
-    std::puts("test-dayan-renew-attention: PASS");
+    std::puts("test-dayan-attention-pipeline: PASS");
     return 0;
 }

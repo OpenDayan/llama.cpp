@@ -34,6 +34,26 @@ Contiguous F32 residual adds and RMSNorm execute on Dayan. One parameterized nor
 
 The attention operator package provides dedicated BF16 and FP16 QG, K, and V projection entry points. Q and K fuse low-precision matrix writeback, RMSNorm, RoPE or MRoPE, and output layout conversion. K and V also have indexed KV-cache variants that write directly to cache rows. Flash-Attention has native BF16 and FP16 entries, uses `dayan_uram_base()` directly, and has an explicit causal offset for KV-cache decode. It supports GQA and right-aligned causal masking. The output path fuses `attention * sigmoid(gate)`, low-precision quantization, and the output projection. The graph compiler recognizes the Qwen3.5 gate view, sigmoid, multiply, and output matrix multiplication pattern.
 
+Flash-Attention uses 64-query tiles and 128-key tiles. Each core owns four Q slices; Q remains resident across the KV traversal. K and transposed V each have two buffers. Four-core mode splits Q tiles between cores and elects one active core to load each K or V tile, then copies its URAM tile to the other active cores. Every core retires its Shared Resource credit, including cores with no query rows. Single-core mode uses private KV loaders. The graph executor selects four-core mode for more than 64 query rows and single-core tasks for shorter queries.
+
+The root issues QK MAT; six child Threads load Q, load K, load V, compute online softmax, issue PV MAT, and update/store O. Each Q slice has its own intermediate buffers, allowing the four compute stages to overlap across slices. Score and P share one FP32 buffer; both Resource tokens must be free before QK can overwrite it. P is read directly as TF32 by the mixed TF32/BF16 or TF32/FP16 PV product. Alpha stays reserved until O update completes, protecting the M/L recurrence. There are 24 Local Resources and, in four-core mode, four Shared Resources plus 128 bytes of shared metadata.
+
+Each core reserves 1088 KiB of URAM:
+
+| Buffer | Count | KiB per buffer | Lifetime |
+| --- | ---: | ---: | --- |
+| Q | 4 | 32 | All KV tiles for one query slice |
+| Score/P | 4 | 32 | QK write through PV read |
+| PV | 4 | 64 | PV write through O update |
+| O | 4 | 64 | All KV tiles through output store |
+| M, L, alpha | 4 each | 2 | Per-row online state |
+| Mask | 4 | 4 | One softmax tile |
+| K, transposed V | 2 each | 64 | Local MAT and peer-copy consumers |
+
+The buffers occupy 1064 KiB plus a 256-byte zero source. Maximum sizes support head dimensions 64, 128, 192, and 256. Q/K use identity swizzling for dimensions 64/192 and `(5,1,5)`/`(5,2,5)` for 128/256. Transposed V uses `(5,1,5)`; VEC-visible buffers use identity swizzling.
+
+Online softmax follows `FlexVecAttentionSpec.scala`: each 64-lane VEC context processes eight rows, with eight lanes per row, two scans of 128 columns, native FP32 max, and XOR reductions by 4, 2, and 1. The unmasked block has 167 instructions: the test's 131 plus 32 scale multiplies, three constant broadcasts, and one alpha store. Causal/tail masks add 64 instructions. FP32 M/L remain in registers between the scans. The firmware SDK must provide `__tx_vec_v_fp32_eru` and `MAT_DATATYPE_PAIR` with mixed TF32 operand support.
+
 For Qwen3.5 linear-attention layers, `SSM_CONV` followed by SiLU uses one dedicated device function. LSU gathers the F32 channel-major input and depthwise weights into tap-major URAM tiles. VEC performs one elementwise multiply per tap, accumulates the taps in F32, and optionally applies the common SiLU implementation before one output writeback. The kernel does not construct diagonal matrices or use MAT convolution. It supports kernel widths up to 63 and uses 64-token tiles. The convolution remains a separate operator from the delta-net core.
 
 Gated Delta Net assigns heads and sequences to at most 16 root tasks, with up to four resident tasks per core. Decode and short prefill update state with VEC hardware loops: DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Scalar-gate prefill with at least 16 tokens and one final state snapshot uses 64-token chunks. MAT computes block correlations, output contributions, and state updates; VEC computes gate prefixes and triangular corrections with 128 independent value rows. Only the complete FP32 state crosses chunk boundaries. Vector gates (KDA) and multiple state snapshots use the recurrent VEC path.
@@ -155,6 +175,12 @@ The standalone Flash-Attention test checks GQA with a right-aligned causal mask 
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-flash-attention
+```
+
+The direct attention pipeline test covers both launch modes, BF16/FP16, all supported head dimensions, GQA, strided KV, causal/tail masks, buffer reuse across query groups, and changing online maxima. It compares with an FP32 host reference using `abs_error <= 0.001 + 0.01 * abs(reference)` and rejects nonfinite output. Pass one printed case name to select it:
+
+```sh
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-pipeline
 ```
 
 The Qwen3.5 dense test builds the minimum four-layer hybrid cycle with three gated DeltaNet layers and one causal full-attention layer. Every layer also contains RMSNorm, dense SWIGLU FFN, and residual paths. It compares Dayan outputs and final logits against a CPU graph with the same low-precision boundaries. Gated Delta Net uses a 128-element head so the test exercises the device kernel instead of CPU fallback:

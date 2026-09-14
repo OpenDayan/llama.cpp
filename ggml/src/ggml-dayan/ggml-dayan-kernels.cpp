@@ -54,7 +54,6 @@ static inline float u32_as_float(uint32_t value) {
 
 #    include "ggml-dayan-flash-attention.h"
 #    include "ggml-dayan-gated-delta-net.h"
-#    include "ggml-dayan-renew-attention.h"
 #endif
 
 __kernel__ void matmul_bf16_1c(const DayanMatmulConfig * config,
@@ -737,12 +736,8 @@ __kernel__ void flash_attention_bf16_1c(const DayanFlashAttentionConfig * config
         return;
     }
 
-    const long status = flash_attention_lowp_f32<ggml_dayan_matmul_detail::Bf16Format>(
-        (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
-        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
-        config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
-        config->k_head_stride, config->k_batch_stride, config->v_row_stride, config->v_head_stride,
-        config->v_batch_stride);
+    const int status = ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Bf16Format, 1>(
+        config, q, k, v, output);
     if (status < 0) {
         dayan_thread_exit(status);
     }
@@ -777,12 +772,8 @@ __kernel__ void flash_attention_fp16_1c(const DayanFlashAttentionConfig * config
         return;
     }
 
-    const long status = flash_attention_lowp_f32<ggml_dayan_matmul_detail::Fp16Format>(
-        (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
-        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
-        config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
-        config->k_head_stride, config->k_batch_stride, config->v_row_stride, config->v_head_stride,
-        config->v_batch_stride);
+    const int status = ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 1>(
+        config, q, k, v, output);
     if (status < 0) {
         dayan_thread_exit(status);
     }
@@ -799,7 +790,7 @@ __kernel__ void flash_attention_fp16_1c(const DayanFlashAttentionConfig * config
 #endif
 }
 
-__kernel__ void renew_attention_bf16_1c(const DayanFlashAttentionConfig * config,
+__kernel__ void flash_attention_bf16_4c(const DayanFlashAttentionConfig * config,
                                         const uint16_t *                  q,
                                         const uint16_t *                  k,
                                         const uint16_t *                  v,
@@ -817,15 +808,8 @@ __kernel__ void renew_attention_bf16_1c(const DayanFlashAttentionConfig * config
         return;
     }
 
-    using namespace ggml_dayan_renew_attention_detail;
-    const long status = renew_attention_lowp_f32<
-        ggml_dayan_matmul_detail::Bf16Format, __tx_vec_cvt_bf16_fp32<0, 3, 0>,
-        __tx_vec_cvt_bf16_fp32<1, 16, 0>>(
-        (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
-        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
-        config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
-        config->k_head_stride, config->k_batch_stride, config->v_row_stride, config->v_head_stride,
-        config->v_batch_stride);
+    const int status = ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Bf16Format, 4>(
+        config, q, k, v, output);
     if (status < 0) {
         dayan_thread_exit(status);
     }
@@ -842,7 +826,7 @@ __kernel__ void renew_attention_bf16_1c(const DayanFlashAttentionConfig * config
 #endif
 }
 
-__kernel__ void renew_attention_fp16_1c(const DayanFlashAttentionConfig * config,
+__kernel__ void flash_attention_fp16_4c(const DayanFlashAttentionConfig * config,
                                         const uint16_t *                  q,
                                         const uint16_t *                  k,
                                         const uint16_t *                  v,
@@ -860,15 +844,8 @@ __kernel__ void renew_attention_fp16_1c(const DayanFlashAttentionConfig * config
         return;
     }
 
-    using namespace ggml_dayan_renew_attention_detail;
-    const long status = renew_attention_lowp_f32<
-        ggml_dayan_matmul_detail::Fp16Format, __tx_vec_cvt_fp16_fp32<0, 3, 0>,
-        __tx_vec_cvt_fp16_fp32<1, 16, 0>>(
-        (void *) q, (void *) k, (void *) v, output, config->batch, config->q_heads, config->kv_heads, config->q_len,
-        config->kv_len, config->head_dim, config->scale_bits, config->causal_offset, config->flags,
-        config->q_row_stride, config->q_head_stride, config->q_batch_stride, config->k_row_stride,
-        config->k_head_stride, config->k_batch_stride, config->v_row_stride, config->v_head_stride,
-        config->v_batch_stride);
+    const int status = ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 4>(
+        config, q, k, v, output);
     if (status < 0) {
         dayan_thread_exit(status);
     }
@@ -1680,14 +1657,14 @@ DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_fp16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_fp16_4c);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 3, 0, 2, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 3, 0, 2, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(renew_attention_bf16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 4, 0, 2, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(renew_attention_fp16_1c, 1U, 4, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
-                              8, 6, 4, 0, 2, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
+                              6, 2, 2, 0, 24, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
+                              6, 2, 2, 0, 24, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
+                              6, 2, 2, 0, 24, 4);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
+                              6, 2, 2, 0, 24, 4);
 DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 0, 0,
                        DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 1, 1, 0);
 DAYAN_MATMUL_1C_DESC(project_qg_bf16_1c);

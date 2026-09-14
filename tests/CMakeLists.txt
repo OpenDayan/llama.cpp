@@ -272,8 +272,8 @@ if (GGML_DAYAN)
     llama_build(test-dayan-matmul.cpp)
     llama_build(test-dayan-graph.cpp)
     llama_build(test-dayan-flash-attention.cpp)
-    llama_build(test-dayan-renew-attention.cpp)
-    target_include_directories(test-dayan-renew-attention PRIVATE
+    llama_build(test-dayan-attention-pipeline.cpp)
+    target_include_directories(test-dayan-attention-pipeline PRIVATE
         "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan"
         "${DAYAN_ROOT}/host/include")
     llama_build(test-dayan-gated-delta-net.cpp)

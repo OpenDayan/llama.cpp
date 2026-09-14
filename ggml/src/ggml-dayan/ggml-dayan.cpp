@@ -504,9 +504,11 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
             break;
         case ggml_backend_dayan_slot_kind::flash_attention: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
-            result = { "ggml_backend_dayan_flash_attention", bf16 ? "renew-attn-bf16" : "renew-attn-fp16",
-                       bf16 ? "renew_attention_bf16_1c" : "renew_attention_fp16_1c", "single-core",
-                       kDayanNativeMaxTasks };
+            const bool four_core = node->src[0]->ne[1] > 64;
+            result = { "ggml_backend_dayan_flash_attention", bf16 ? "flash-attn-bf16" : "flash-attn-fp16",
+                       four_core ? (bf16 ? "flash_attention_bf16_4c" : "flash_attention_fp16_4c") :
+                                   (bf16 ? "flash_attention_bf16_1c" : "flash_attention_fp16_1c"),
+                       four_core ? "four-core" : "single-core", kDayanNativeMaxTasks };
         } break;
         case ggml_backend_dayan_slot_kind::gated_delta_net:
             result = { "ggml_backend_dayan_gated_delta_net", "ggml-gdn", "gated_delta_net_f32_1c", "single-core",
@@ -2597,17 +2599,19 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(int64_t), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        ggml_backend_dayan_init_native_launch_attrs(
-            ctx, q->type == GGML_TYPE_BF16 ? "renew-attn-bf16" : "renew-attn-fp16",
-            (uint64_t) config.batch * config.q_heads, &attrs);
-        if (q->type == GGML_TYPE_BF16) {
-            status = renew_attention_bf16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
-                                             ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
-                                             ggml_backend_dayan_tensor_buffer(dst), buffers.result, &attrs);
-        } else if (q->type == GGML_TYPE_F16) {
-            status = renew_attention_fp16_1c(buffers.config, ggml_backend_dayan_tensor_buffer(q),
-                                             ggml_backend_dayan_tensor_buffer(k), ggml_backend_dayan_tensor_buffer(v),
-                                             ggml_backend_dayan_tensor_buffer(dst), buffers.result, &attrs);
+        const bool four_core = config.q_len > 64;
+        const char * name = q->type == GGML_TYPE_BF16 ? "flash-attn-bf16" : "flash-attn-fp16";
+        if (four_core) {
+            ggml_backend_dayan_init_matmul_launch_attrs(ctx, name, &attrs);
+        } else {
+            ggml_backend_dayan_init_native_launch_attrs(ctx, name, (uint64_t) config.batch * config.q_heads, &attrs);
+        }
+        if (q->type == GGML_TYPE_BF16 || q->type == GGML_TYPE_F16) {
+            const auto kernel = q->type == GGML_TYPE_BF16 ?
+                (four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c) :
+                (four_core ? flash_attention_fp16_4c : flash_attention_fp16_1c);
+            status = kernel(buffers.config, ggml_backend_dayan_tensor_buffer(q), ggml_backend_dayan_tensor_buffer(k),
+                            ggml_backend_dayan_tensor_buffer(v), ggml_backend_dayan_tensor_buffer(dst), buffers.result, &attrs);
         } else {
             status = -1;
         }

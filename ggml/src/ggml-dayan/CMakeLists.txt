@@ -78,7 +78,6 @@ add_custom_command(
         ggml-dayan-memory.h
         ggml-dayan-moe.h
         ggml-dayan-normalization.h
-        ggml-dayan-renew-attention.h
         ggml-dayan-rope.h
         ggml-dayan-softmax.h
         device_include/cstdint
@@ -114,7 +113,6 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-memory.h
     ggml-dayan-moe.h
     ggml-dayan-normalization.h
-    ggml-dayan-renew-attention.h
     ggml-dayan-rope.h
     ggml-dayan-softmax.h
     "${DAYAN_KERNEL_OBJECT}")
