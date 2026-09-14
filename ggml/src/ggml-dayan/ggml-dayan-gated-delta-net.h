@@ -63,6 +63,15 @@ static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, lo
     __tx_vec_tcsr_write<Base + 4>(dim3_stride);
     __tx_vec_tcsr_write<Base + 5>(0);
     __tx_vec_tcsr_write<Base + 6>(0);
+    if constexpr (Base == kVecV0Base) {
+        __tx_vec_tcsr_write<VEC_V0_URAM_CHANNEL_STRIDE>(32);
+    } else if constexpr (Base == kVecV1Base) {
+        __tx_vec_tcsr_write<VEC_V1_URAM_CHANNEL_STRIDE>(32);
+    } else if constexpr (Base == kVecV2Base) {
+        __tx_vec_tcsr_write<VEC_V2_URAM_CHANNEL_STRIDE>(32);
+    } else if constexpr (Base == kVecV3Base) {
+        __tx_vec_tcsr_write<VEC_V3_URAM_CHANNEL_STRIDE>(32);
+    }
 }
 
 static inline void configure_vec_recurrence() {

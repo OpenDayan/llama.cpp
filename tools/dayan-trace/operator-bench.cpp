@@ -223,7 +223,12 @@ int main(int argc, char ** argv) {
             output = device.filled(reference.size(), nan);
             const int64_t initial_status = -1;
             kernel_result = device.upload(&initial_status, sizeof(initial_status));
-            launch = [&, cfg, q, key, v]() { return renew_attention_bf16_1c(cfg, q, key, v, output, kernel_result, &attrs); };
+            const bool four_core = m > 64;
+            attrs.config.task_mode = four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
+            launch = [&, cfg, q, key, v, four_core]() {
+                const auto kernel = four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c;
+                return kernel(cfg, q, key, v, output, kernel_result, &attrs);
+            };
         } else if (op == "norm") {
             attrs.config.task_dim.x = std::min<uint32_t>(m, kDayanNativeMaxTasks);
             DayanNormPipelineConfig config{};

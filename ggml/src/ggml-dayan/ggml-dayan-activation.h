@@ -26,6 +26,7 @@ enum VecTcsr {
 enum : long {
     kVecLanes = 64,
     kVecBytes = kVecLanes * sizeof(float),
+    kVecDefaultUramChannelStride = 32,
 };
 
 struct F32Tensor {
@@ -49,7 +50,11 @@ struct ActivationConstants {
 };
 
 template <long Base>
-static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, long dim2_stride, long dim3_stride) {
+static inline void configure_vec_iterator(long dim0_stride,
+                                          long dim1_stride,
+                                          long dim2_stride,
+                                          long dim3_stride,
+                                          long channel_stride = kVecDefaultUramChannelStride) {
     __tx_vec_tcsr_write<Base>(0);
     __tx_vec_tcsr_write<Base + 1>(dim0_stride);
     __tx_vec_tcsr_write<Base + 2>(dim1_stride);
@@ -57,6 +62,15 @@ static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, lo
     __tx_vec_tcsr_write<Base + 4>(dim3_stride);
     __tx_vec_tcsr_write<Base + 5>(0);
     __tx_vec_tcsr_write<Base + 6>(0);
+    if constexpr (Base == kVecV0Base) {
+        __tx_vec_tcsr_write<VEC_V0_URAM_CHANNEL_STRIDE>(channel_stride);
+    } else if constexpr (Base == kVecV1Base) {
+        __tx_vec_tcsr_write<VEC_V1_URAM_CHANNEL_STRIDE>(channel_stride);
+    } else if constexpr (Base == kVecV2Base) {
+        __tx_vec_tcsr_write<VEC_V2_URAM_CHANNEL_STRIDE>(channel_stride);
+    } else if constexpr (Base == kVecV3Base) {
+        __tx_vec_tcsr_write<VEC_V3_URAM_CHANNEL_STRIDE>(channel_stride);
+    }
 }
 
 static inline void configure_vec_grid(long dim2, long dim3 = 1) {

@@ -391,14 +391,10 @@ template <typename Format> static void calculate_qk(const State & s) {
 static inline void initialize_vec() {
     using namespace ggml_dayan_vec_detail;
     configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 8 * kBc * 4, 0);
+    configure_vec_iterator<kVecV0Base>(0, 0, 8 * kBc * 4, 0, kBc * 4);
     configure_vec_iterator<kVecV1Base>(0, 0, kVecBytes, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, kVecBytes, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 16 * 32, 0);
-    __tx_vec_tcsr_write<VEC_V0_URAM_CHANNEL_STRIDE>(kBc * 4);
-    __tx_vec_tcsr_write<VEC_V1_URAM_CHANNEL_STRIDE>(32);
-    __tx_vec_tcsr_write<VEC_V2_URAM_CHANNEL_STRIDE>(32);
-    __tx_vec_tcsr_write<VEC_V3_URAM_CHANNEL_STRIDE>(32);
 }
 
 template <bool Mask, bool First> static inline void online_softmax(long base, long rows, uint32_t scale) {
@@ -584,8 +580,6 @@ static void output(void * argument) {
     configure_vec_grid(1, s.cfg->head_dim / 64);
     configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
     configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
-    __tx_vec_tcsr_write<VEC_V0_URAM_CHANNEL_STRIDE>(32);
-    __tx_vec_tcsr_write<VEC_V2_URAM_CHANNEL_STRIDE>(32);
     configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4, s.cfg->q_heads * s.cfg->head_dim * 4);
     for (uint64_t block = 0; block < s.blocks; ++block) {
         for (long ki = 0; ki < s.shared_keys(block); ++ki) {
