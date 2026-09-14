@@ -364,6 +364,8 @@ int main(int argc, char ** argv) {
         { "pipeline-rescale-bf16-1c", GGML_TYPE_BF16, 1, 1, 1, 129, 385, 128, 0, false, false, 1, false, 2.0f },
         { "pipeline-rescale-fp16-4c", GGML_TYPE_F16, 1, 1, 1, 257, 641, 64, 384, true, false, 1, true, 2.0f },
         { "pipeline-short-fp16-1c", GGML_TYPE_F16, 2, 4, 2, 17, 23, 64, 6, true, false, 4 },
+        { "pipeline-state-reuse-bf16-1c", GGML_TYPE_BF16, 2, 1, 1, 257, 257, 256, 0, true },
+        { "pipeline-state-reuse-fp16-4c", GGML_TYPE_F16, 2, 1, 1, 513, 641, 64, 128, true, false, 1, true },
     };
 
     int      result = 0;

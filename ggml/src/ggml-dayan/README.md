@@ -34,23 +34,25 @@ Contiguous F32 residual adds and RMSNorm execute on Dayan. One parameterized nor
 
 The attention operator package provides dedicated BF16 and FP16 QG, K, and V projection entry points. Q and K fuse low-precision matrix writeback, RMSNorm, RoPE or MRoPE, and output layout conversion. K and V also have indexed KV-cache variants that write directly to cache rows. Flash-Attention has native BF16 and FP16 entries, uses `dayan_uram_base()` directly, and has an explicit causal offset for KV-cache decode. It supports GQA and right-aligned causal masking. The output path fuses `attention * sigmoid(gate)`, low-precision quantization, and the output projection. The graph compiler recognizes the Qwen3.5 gate view, sigmoid, multiply, and output matrix multiplication pattern.
 
-Flash-Attention uses 64-query tiles and 128-key tiles. Each core owns four Q slices; Q remains resident across the KV traversal. K and transposed V each have two buffers. Four-core mode splits Q tiles between cores and elects one active core to load each K or V tile, then copies its URAM tile to the other active cores. Every core retires its Shared Resource credit, including cores with no query rows. Single-core mode uses private KV loaders. The graph executor selects four-core mode for more than 64 query rows and single-core tasks for shorter queries.
+Flash-Attention uses 128-query tiles and 128-key tiles. Each core owns two Q slices; Q remains resident across the KV traversal. K and transposed V each have two buffers. Four-core mode splits Q tiles between cores and elects one active core to load each K or V tile, then copies its URAM tile to the other active cores. Every core retires its Shared Resource credit, including cores with no query rows. Single-core mode uses private KV loaders. The graph executor selects four-core mode for more than 64 query rows and single-core tasks for shorter queries.
 
-The root issues QK MAT; six child Threads load Q, load K, load V, compute online softmax, issue PV MAT, and update/store O. Each Q slice has its own intermediate buffers, allowing the four compute stages to overlap across slices. Score and P share one FP32 buffer; both Resource tokens must be free before QK can overwrite it. P is read directly as TF32 by the mixed TF32/BF16 or TF32/FP16 PV product. Alpha stays reserved until O update completes, protecting the M/L recurrence. There are 24 Local Resources and, in four-core mode, four Shared Resources plus 128 bytes of shared metadata.
+The root issues QK MAT; six child Threads load Q, load K, load V, compute online softmax, issue PV MAT, and update/store O. Each Q slice has two Score/P, PV, and softmax-state buffers, allowing the compute stages to overlap across KV tiles as well as slices. Score and P share FP32 storage in each buffer; both Resource tokens must be free before QK can overwrite it. P is read directly as TF32 by the mixed TF32/BF16 or TF32/FP16 PV product. Each state generation has an O-update reader and, except for the last tile, a reader in the next softmax. Two alternating O version tokens serialize updates to one O allocation. There are 26 Local Resources and, in four-core mode, four Shared Resources plus 128 bytes of shared metadata.
 
-Each core reserves 1088 KiB of URAM:
+Q becomes reusable after its last QK MAT read. K becomes reusable after all active slices finish their QK MAT reads and all peer copies finish. Neither waits for softmax or O update. PV MAT releases P and V when its reads complete; O update releases PV and its state credit when VEC completes. The final O token is released by the LSU store. Resource phases persist across query groups and batches, including slices with different causal tile counts.
+
+Each core reserves 1536 KiB of URAM:
 
 | Buffer | Count | KiB per buffer | Lifetime |
 | --- | ---: | ---: | --- |
-| Q | 4 | 32 | All KV tiles for one query slice |
-| Score/P | 4 | 32 | QK write through PV read |
-| PV | 4 | 64 | PV write through O update |
-| O | 4 | 64 | All KV tiles through output store |
-| M, L, alpha | 4 each | 2 | Per-row online state |
-| Mask | 4 | 4 | One softmax tile |
+| Q | 2 | 64 | Load through last QK read for one query slice |
+| Score/P | 4 | 64 | QK write through PV read |
+| PV | 4 | 128 | PV write through O update |
+| O | 2 | 128 | All KV tiles through output store |
+| M, L, alpha | 4 each | 4 | Softmax write through next softmax and O update |
+| Mask | 4 | 8 | One softmax tile, reserved with its state buffer |
 | K, transposed V | 2 each | 64 | Local MAT and peer-copy consumers |
 
-The buffers occupy 1064 KiB plus a 256-byte zero source. Maximum sizes support head dimensions 64, 128, 192, and 256. Q/K use identity swizzling for dimensions 64/192 and `(5,1,5)`/`(5,2,5)` for 128/256. Transposed V uses `(5,1,5)`; VEC-visible buffers use identity swizzling.
+The buffers occupy 1488 KiB plus a 256-byte zero source. Maximum sizes support head dimensions 64, 128, 192, and 256. Q/K use identity swizzling for dimensions 64/192 and `(5,1,5)`/`(5,2,5)` for 128/256. Transposed V uses `(5,1,5)`; VEC-visible buffers use identity swizzling.
 
 Online softmax follows `FlexVecAttentionSpec.scala`: each 64-lane VEC context processes eight rows, with eight lanes per row, two scans of 128 columns, native FP32 max, and XOR reductions by 4, 2, and 1. The unmasked block has 167 instructions: the test's 131 plus 32 scale multiplies, three constant broadcasts, and one alpha store. Causal/tail masks add 64 instructions. FP32 M/L remain in registers between the scans. The firmware SDK must provide `__tx_vec_v_fp32_eru` and `MAT_DATATYPE_PAIR` with mixed TF32 operand support.
 
@@ -114,6 +116,15 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-backend-ops -b
 ```
 
 Enable the cores required by the selected kernel in `dayan_server`; four-core MatMul paths need core mask `0xf`. The same client commands work with a TestCluster-backed server.
+
+To run cmodel alongside a TestCluster using `/tmp/virtual_npu`, use a separate FUSE mount and Runtime socket. The QEMU build must support `NPU_DEVICE_PREFIX`:
+
+```sh
+NPU_DEVICE_PREFIX=/tmp/dayan-attn-dbuf-npu NPU_XDMA_DEVICE_DIR=/tmp/dayan-attn-dbuf-npu DAYAN_SERVER_SOCKET=/tmp/dayan-attn-dbuf.sock ~/npu-firmware/run_cmodel_server.sh
+DAYAN_SERVER_SOCKET=/tmp/dayan-attn-dbuf.sock ./build-dayan/bin/test-dayan-attention-pipeline
+```
+
+Run the client in another terminal. This separates cmodel from TestCluster; the cmodel launcher still permits only one cmodel instance because its internal IPC and shared-memory names are fixed. Run clients against each simulator sequentially.
 
 Replace `test` with `support` to check whether Dayan supports the selected cases without running their numerical comparison. `perf` runs the performance case set, which has different shapes and may require a different `-p` filter; host timings under simulation are not hardware throughput measurements.
 

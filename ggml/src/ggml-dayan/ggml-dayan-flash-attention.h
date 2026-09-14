@@ -7,33 +7,43 @@
 
 namespace ggml_dayan_flash_attention_detail {
 
-constexpr long kSlices = 4;
+constexpr long kSlices = 2;
+constexpr long kSlots = 2;
 constexpr long kVecLanes = 64;
 constexpr uint32_t kFlagCausal = 1;
-constexpr long kBr = 64;
+constexpr long kBr = 128;
 constexpr long kBc = 128;
 constexpr long kMaxHeadDim = 256;
 constexpr long kVecBytes = 256;
-constexpr long kLocalResources = 24;
+constexpr long kLocalResources = kSlices + 5 * kSlices * kSlots + 4;
 constexpr long kSharedResources = 4;
 constexpr long kMatQK = 1;
 constexpr long kAtomicBytes = 128;
-constexpr long kUramBytes = 1088 * 1024;
-constexpr long kCtxQ = 0x00000;
-constexpr long kCtxScore = 0x08000;
-constexpr long kCtxPV = 0x10000;
-constexpr long kCtxO = 0x20000;
-constexpr long kCtxM = 0x30000;
-constexpr long kCtxL = 0x30800;
-constexpr long kCtxAlpha = 0x31000;
-constexpr long kCtxMask = 0x31800;
-constexpr long kContextBytes = 0x32800;
+constexpr long kUramBytes = 1536 * 1024;
+constexpr long kQBytes = kBr * kMaxHeadDim * sizeof(uint16_t);
+constexpr long kOBytes = kBr * kMaxHeadDim * sizeof(float);
+constexpr long kPVBytes = kOBytes;
+constexpr long kScoreBytes = kBr * kBc * sizeof(float);
+constexpr long kStateVectorBytes = kBr * 32;
+constexpr long kMaskBytes = (kBr / 8) * (kBc / 8) * 32;
+constexpr long kCtxQ = 0;
+constexpr long kCtxO = kQBytes;
+constexpr long kCtxTiles = kCtxO + kOBytes;
+constexpr long kTileScore = 0;
+constexpr long kTilePV = kTileScore + kScoreBytes;
+constexpr long kTileM = kTilePV + kPVBytes;
+constexpr long kTileL = kTileM + kStateVectorBytes;
+constexpr long kTileAlpha = kTileL + kStateVectorBytes;
+constexpr long kTileMask = kTileAlpha + kStateVectorBytes;
+constexpr long kTileBytes = kTileMask + kMaskBytes;
+constexpr long kContextBytes = kCtxTiles + kSlots * kTileBytes;
 constexpr long kKBytes = kBc * kMaxHeadDim * sizeof(uint16_t);
 constexpr long kVtBytes = kKBytes;
 constexpr long kUramK0 = kSlices * kContextBytes;
 constexpr long kUramVt0 = kUramK0 + 2 * kKBytes;
 constexpr long kUramZero = kUramVt0 + 2 * kVtBytes;
 static_assert(kUramZero + kVecBytes <= kUramBytes, "Attention URAM exceeds allocation");
+static_assert(kLocalResources <= 32, "Attention exceeds the Local Resource window");
 
 static inline uint64_t uram_addr(long offset) { return (uint64_t) dayan_uram_base() + offset; }
 static inline long min_long(long a, long b) { return a < b ? a : b; }
@@ -45,11 +55,15 @@ static inline void check(int status) {
 }
 
 static inline dayan_resource_t q_resource(long slice) { return DAYAN_LOCAL_RESOURCE(slice); }
-static inline dayan_resource_t score_resource(long slice) { return DAYAN_LOCAL_RESOURCE(4 + slice); }
-static inline dayan_resource_t p_resource(long slice) { return DAYAN_LOCAL_RESOURCE(8 + slice); }
-static inline dayan_resource_t pv_resource(long slice) { return DAYAN_LOCAL_RESOURCE(12 + slice); }
-static inline dayan_resource_t alpha_resource(long slice) { return DAYAN_LOCAL_RESOURCE(16 + slice); }
-static inline dayan_resource_t kv_resource(bool v, long slot) { return DAYAN_LOCAL_RESOURCE(20 + 2 * v + slot); }
+static inline dayan_resource_t score_resource(long slice, long slot) { return DAYAN_LOCAL_RESOURCE(kSlices + slice * kSlots + slot); }
+static inline dayan_resource_t p_resource(long slice, long slot) { return DAYAN_LOCAL_RESOURCE(kSlices + kSlices * kSlots + slice * kSlots + slot); }
+static inline dayan_resource_t pv_resource(long slice, long slot) { return DAYAN_LOCAL_RESOURCE(kSlices + 2 * kSlices * kSlots + slice * kSlots + slot); }
+static inline dayan_resource_t state_resource(long slice, long slot) { return DAYAN_LOCAL_RESOURCE(kSlices + 3 * kSlices * kSlots + slice * kSlots + slot); }
+static inline dayan_resource_t o_resource(long slice, long slot) { return DAYAN_LOCAL_RESOURCE(kSlices + 4 * kSlices * kSlots + slice * kSlots + slot); }
+static inline dayan_resource_t kv_resource(bool v, long slot) { return DAYAN_LOCAL_RESOURCE(kLocalResources - 4 + 2 * v + slot); }
+static inline long tile_offset(long slice, long slot) {
+    return slice * kContextBytes + kCtxTiles + slot * kTileBytes;
+}
 
 template <long Group> static inline void configure_lsu_rows(long row_bytes, long input_stride, long output_stride) {
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(0);
@@ -359,6 +373,7 @@ template <typename Format> static void calculate_qk(const State & s) {
         const long keys = s.shared_keys(block);
         for (long ki = 0; ki < keys; ++ki, ++generation) {
             const auto k = kv_resource(false, generation & 1);
+            const long slot = ki & 1;
             const long users = s.users(block, ki);
             for (long slice = 0, used = 0; slice < kSlices; ++slice) {
                 const long slice_keys = s.keys(block, slice, s.lane);
@@ -368,14 +383,15 @@ template <typename Format> static void calculate_qk(const State & s) {
                 const auto q = q_resource(slice);
                 const uint64_t inputs = DAYAN_RESOURCE_MASK(q) | DAYAN_RESOURCE_MASK(k);
                 // Both tokens protect the in-place score/P tile through the PV read.
-                const uint64_t outputs = DAYAN_RESOURCE_MASK(score_resource(slice)) | DAYAN_RESOURCE_MASK(p_resource(slice));
+                const uint64_t outputs = DAYAN_RESOURCE_MASK(score_resource(slice, slot)) | DAYAN_RESOURCE_MASK(p_resource(slice, slot));
                 check(dayan_resource_wait(outputs, inputs, phases, 0));
                 __tx_mat_tcsr_write<kMatQK * MAT_GROUPSZ + MAT_M>(s.rows(block, slice) - 1);
                 __tx_mat_tcsr_write<kMatQK * MAT_GROUPSZ + MAT_N>(min_long(kBc, (long) s.cfg->kv_len - ki * kBc) - 1);
                 const long base = s.uram + slice * kContextBytes;
-                __tx_mat_mm<kMatQK>(base + kCtxScore, base + kCtxQ, s.uram + kUramK0 + (generation & 1) * kKBytes);
+                __tx_mat_mm<kMatQK>(s.uram + tile_offset(slice, slot) + kTileScore, base + kCtxQ, s.uram + kUramK0 + (generation & 1) * kKBytes);
                 const bool last = ki + 1 == slice_keys;
-                check(dayan_resource_produce_mat(score_resource(slice), 1, DAYAN_RESOURCE_MASK(k) | (last ? DAYAN_RESOURCE_MASK(q) : 0)));
+                // Q and K are reusable after their last MAT read, before softmax or PV.
+                check(dayan_resource_produce_mat(score_resource(slice, slot), 1, DAYAN_RESOURCE_MASK(k) | (last ? DAYAN_RESOURCE_MASK(q) : 0)));
                 if (last) {
                     phases ^= DAYAN_RESOURCE_MASK(q);
                 }
@@ -397,7 +413,7 @@ static inline void initialize_vec() {
     configure_vec_iterator<kVecV3Base>(0, 0, 16 * 32, 0);
 }
 
-template <bool Mask, bool First> static inline void online_softmax(long base, long rows, uint32_t scale) {
+template <bool Mask, bool First> static inline void online_softmax(long base, long previous, long rows, uint32_t scale) {
     using namespace ggml_dayan_vec_detail;
     // FlexVecAttentionSpec: 131 instructions, plus scale, constants, alpha store, and optional masks.
     constexpr long instructions = Mask ? 231 : 167;
@@ -407,10 +423,10 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0xff7fffffU);
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
     for (long part = 0; part < 16; ++part) {
-        __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kCtxScore + part * 32));
+        __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileScore + part * 32));
         __tx_vec_vv_fp32_mul<0, 0, 18, 0>();
         if constexpr (Mask) {
-            __tx_vec_lsu_u2s<0, 3>(uram_addr(base + kCtxMask + part * 32));
+            __tx_vec_lsu_u2s<0, 3>(uram_addr(base + kTileMask + part * 32));
             __tx_vec_vv_mux2<0, 17, 0, 0>();
         }
         if (part) {
@@ -424,20 +440,20 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
     if constexpr (First) {
         __tx_vec_lsu_g2v_broadcast32<1, 0>(0xff7fffffU);
     } else {
-        __tx_vec_lsu_u2v<1, 1>(uram_addr(base + kCtxM));
+        __tx_vec_lsu_u2v<1, 1>(uram_addr(previous + kTileM));
     }
     __tx_vec_vv_fp32_max<1, 0, 16, 0>();
     // Q1 ages: new M=0, old M=1, zero=5, floor=6, scale=7.
     for (long part = 0; part < 16; ++part) {
-        __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kCtxScore + part * 32));
+        __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileScore + part * 32));
         __tx_vec_vv_fp32_mul<0, 0, 23, 0>();
         __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
         __tx_vec_v_fp32_eru<0, 0, 0>();
         if constexpr (Mask) {
-            __tx_vec_lsu_u2s<0, 3>(uram_addr(base + kCtxMask + part * 32));
+            __tx_vec_lsu_u2s<0, 3>(uram_addr(base + kTileMask + part * 32));
             __tx_vec_vv_mux2<0, 21, 0, 0>();
         }
-        __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kCtxScore + part * 32));
+        __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kTileScore + part * 32));
         if (part) {
             __tx_vec_vv_fp32_add<0, Mask ? 5 : 4, 0, 0>();
         }
@@ -448,16 +464,16 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
     }
     __tx_vec_vv_fp32_sub<0, 20, 19, 0>();
     __tx_vec_v_fp32_eru<0, 0, 0>();
-    __tx_vec_lsu_v2u<0, 2>(uram_addr(base + kCtxAlpha));
+    __tx_vec_lsu_v2u<0, 2>(uram_addr(base + kTileAlpha));
     if constexpr (First) {
         __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
     } else {
-        __tx_vec_lsu_u2v<1, 1>(uram_addr(base + kCtxL));
+        __tx_vec_lsu_u2v<1, 1>(uram_addr(previous + kTileL));
     }
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_vv_fp32_add<0, 3, 0, 0>();
-    __tx_vec_lsu_v2u<0, 1>(uram_addr(base + kCtxL));
-    __tx_vec_lsu_v2u<20, 1>(uram_addr(base + kCtxM));
+    __tx_vec_lsu_v2u<0, 1>(uram_addr(base + kTileL));
+    __tx_vec_lsu_v2u<20, 1>(uram_addr(base + kTileM));
     __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
@@ -469,7 +485,7 @@ static bool prepare_mask(const State & s, uint64_t block, long slice, long ki) {
     if (rows % 8 == 0 && cols == kBc && (!(s.cfg->flags & 1) || first >= kBc - 1)) {
         return false;
     }
-    uint64_t * masks = (uint64_t *) uram_addr(slice * kContextBytes + kCtxMask);
+    uint64_t * masks = (uint64_t *) uram_addr(tile_offset(slice, ki & 1) + kTileMask);
     for (long group = 0; group < (rows + 7) / 8; ++group) {
         for (long part = 0; part < 16; ++part) {
             uint64_t mask = 0;
@@ -488,6 +504,7 @@ static bool prepare_mask(const State & s, uint64_t block, long slice, long ki) {
 static void softmax(void * argument) {
     const State & s = *(State *) argument;
     uint64_t phases = 0;
+    uint64_t state_phases = 0;
     initialize_vec();
     for (uint64_t block = 0; block < s.blocks; ++block) {
         for (long ki = 0; ki < s.shared_keys(block); ++ki) {
@@ -495,22 +512,28 @@ static void softmax(void * argument) {
                 if (ki >= s.keys(block, slice, s.lane)) {
                     continue;
                 }
-                const uint64_t score = DAYAN_RESOURCE_MASK(score_resource(slice));
-                // Alpha remains reserved until O update finishes reading this generation's state.
-                check(dayan_resource_wait(DAYAN_RESOURCE_MASK(alpha_resource(slice)), score, phases, 0));
+                const long slot = ki & 1;
+                const uint64_t score = DAYAN_RESOURCE_MASK(score_resource(slice, slot));
+                const uint64_t state = DAYAN_RESOURCE_MASK(state_resource(slice, slot));
+                const uint64_t previous_state = ki == 0 ? 0 : DAYAN_RESOURCE_MASK(state_resource(slice, slot ^ 1));
+                // Publication phases also advance for the final state, which has no softmax reader.
+                check(dayan_resource_wait(state, score | previous_state, phases | (previous_state & ~state_phases), 0));
                 const bool masked = prepare_mask(s, block, slice, ki);
-                const long base = slice * kContextBytes;
+                const long base = tile_offset(slice, slot);
+                const long previous = tile_offset(slice, slot ^ 1);
                 const long rows = s.rows(block, slice);
                 if (ki == 0) {
-                    if (masked) online_softmax<true, true>(base, rows, s.scale);
-                    else online_softmax<false, true>(base, rows, s.scale);
+                    if (masked) online_softmax<true, true>(base, previous, rows, s.scale);
+                    else online_softmax<false, true>(base, previous, rows, s.scale);
                 } else {
-                    if (masked) online_softmax<true, false>(base, rows, s.scale);
-                    else online_softmax<false, false>(base, rows, s.scale);
+                    if (masked) online_softmax<true, false>(base, previous, rows, s.scale);
+                    else online_softmax<false, false>(base, previous, rows, s.scale);
                 }
-                check(dayan_resource_produce_vec(p_resource(slice), 1, score));
-                check(dayan_resource_produce_vec(alpha_resource(slice), 1, 0));
+                const bool last = ki + 1 == s.keys(block, slice, s.lane);
+                check(dayan_resource_produce_vec(p_resource(slice, slot), 1, score));
+                check(dayan_resource_produce_vec(state_resource(slice, slot), last ? 1 : 2, previous_state));
                 phases ^= score;
+                state_phases ^= state;
             }
         }
     }
@@ -530,18 +553,19 @@ template <typename Format> static void calculate_pv(void * argument) {
         const long keys = s.shared_keys(block);
         for (long ki = 0; ki < keys; ++ki, ++generation) {
             const auto v = kv_resource(true, generation & 1);
+            const long slot = ki & 1;
             const long users = s.users(block, ki);
             for (long slice = 0, used = 0; slice < kSlices; ++slice) {
                 if (ki >= s.keys(block, slice, s.lane)) {
                     continue;
                 }
-                const uint64_t p = DAYAN_RESOURCE_MASK(p_resource(slice));
+                const uint64_t p = DAYAN_RESOURCE_MASK(p_resource(slice, slot));
                 const uint64_t inputs = p | DAYAN_RESOURCE_MASK(v);
-                check(dayan_resource_wait(DAYAN_RESOURCE_MASK(pv_resource(slice)), inputs, phases, 0));
+                check(dayan_resource_wait(DAYAN_RESOURCE_MASK(pv_resource(slice, slot)), inputs, phases, 0));
                 __tx_mat_tcsr_write<MAT_M>(s.rows(block, slice) - 1);
-                const long base = s.uram + slice * kContextBytes;
-                __tx_mat_mm<0>(base + kCtxPV, base + kCtxScore, s.uram + kUramVt0 + (generation & 1) * kVtBytes);
-                check(dayan_resource_produce_mat(pv_resource(slice), 1, inputs));
+                const long base = s.uram + tile_offset(slice, slot);
+                __tx_mat_mm<0>(base + kTilePV, base + kTileScore, s.uram + kUramVt0 + (generation & 1) * kVtBytes);
+                check(dayan_resource_produce_mat(pv_resource(slice, slot), 1, inputs));
                 phases ^= p;
                 if (++used == users) {
                     phases ^= DAYAN_RESOURCE_MASK(v);
@@ -552,23 +576,23 @@ template <typename Format> static void calculate_pv(void * argument) {
     dayan_wait_mat();
 }
 
-template <bool First, bool Last> static inline void update_output(long base) {
+template <bool First, bool Last> static inline void update_output(long base, long out) {
     using namespace ggml_dayan_vec_detail;
     constexpr long instructions = (First ? 2 : 6) + (Last ? 3 : 0);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kCtxPV));
+    __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTilePV));
     if constexpr (!First) {
-        __tx_vec_lsu_u2v<1, 0>(uram_addr(base + kCtxO));
-        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kCtxAlpha));
+        __tx_vec_lsu_u2v<1, 0>(uram_addr(out));
+        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kTileAlpha));
         __tx_vec_vv_fp32_mul<1, 17, 16, 0>();
         __tx_vec_vv_fp32_add<0, 0, 16, 0>();
     }
     if constexpr (Last) {
-        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kCtxL));
+        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kTileL));
         __tx_vec_v_fp32_eru<1, 16, 1>();
         __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     }
-    __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kCtxO));
+    __tx_vec_lsu_v2u<0, 0>(uram_addr(out));
     __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
@@ -577,6 +601,7 @@ static void output(void * argument) {
     using namespace ggml_dayan_vec_detail;
     const State & s = *(State *) argument;
     uint64_t phases = 0;
+    uint64_t o_phases = 0;
     configure_vec_grid(1, s.cfg->head_dim / 64);
     configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
     configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
@@ -588,25 +613,33 @@ static void output(void * argument) {
                 if (ki >= keys) {
                     continue;
                 }
-                const uint64_t inputs = DAYAN_RESOURCE_MASK(pv_resource(slice)) | DAYAN_RESOURCE_MASK(alpha_resource(slice));
-                check(dayan_resource_wait(0, inputs, phases, 0));
+                const long slot = ki & 1;
+                const auto o = o_resource(slice, slot);
+                const uint64_t current_o = DAYAN_RESOURCE_MASK(o);
+                const uint64_t previous_o = ki == 0 ? 0 : DAYAN_RESOURCE_MASK(o_resource(slice, slot ^ 1));
+                const uint64_t inputs = DAYAN_RESOURCE_MASK(pv_resource(slice, slot)) | DAYAN_RESOURCE_MASK(state_resource(slice, slot));
+                // Two version tokens serialize updates to the single O allocation.
+                check(dayan_resource_wait(current_o, inputs | previous_o, phases | (previous_o & ~o_phases), 0));
                 const long rows = s.rows(block, slice);
-                const long base = slice * kContextBytes;
+                const long base = tile_offset(slice, slot);
+                const long out = slice * kContextBytes + kCtxO;
                 const bool last = ki + 1 == keys;
                 __tx_vec_tcsr_write<kVecDim2>(rows - 1);
                 if (ki == 0) {
-                    if (last) update_output<true, true>(base);
-                    else update_output<true, false>(base);
+                    if (last) update_output<true, true>(base, out);
+                    else update_output<true, false>(base, out);
                 } else {
-                    if (last) update_output<false, true>(base);
-                    else update_output<false, false>(base);
+                    if (last) update_output<false, true>(base, out);
+                    else update_output<false, false>(base, out);
                 }
-                check(dayan_resource_consume_vec(inputs));
+                check(dayan_resource_produce_vec(o, 1, inputs | previous_o));
                 phases ^= inputs;
+                o_phases ^= current_o;
                 if (last) {
-                    dayan_wait_vec();
+                    check(dayan_resource_wait_ready(o, (o_phases & current_o) ? 0 : 1));
                     set_lsu_rows<0>(rows);
-                    __tx_lsu_dma_u2d<0>(s.output_address(block, slice), uram_addr(base + kCtxO));
+                    __tx_lsu_dma_u2d<0>(s.output_address(block, slice), uram_addr(out));
+                    check(dayan_resource_consume_lsu(current_o));
                     dayan_wait_lsu();
                 }
             }

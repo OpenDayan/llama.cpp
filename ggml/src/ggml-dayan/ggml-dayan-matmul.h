@@ -274,11 +274,14 @@ static inline MatmulNode matmul_node(const MatmulState & s, uint64_t generation,
     const uint64_t begin = s.split_n ? 0 : s.config->m * (lane >> 1) / grid;
     const uint64_t end = s.split_n ? s.config->m : s.config->m * ((lane >> 1) + 1) / grid;
     const uint64_t row = begin + out / s.nt * s.tile_m;
-    const uint64_t col_begin = s.split_n ? s.config->n * lane / s.cores : (lane & 1) * s.tile_n;
+    const uint64_t col_base = out % s.nt * grid * s.tile_n;
+    // Keep full tiles large and divide the final column group across core columns.
+    const int tile_n = s.split_n ? s.tile_n : (extent((int64_t) s.config->n - (int64_t) col_base, grid * s.tile_n) + grid - 1) / grid;
+    const uint64_t col_begin = s.split_n ? s.config->n * lane / s.cores : (lane & 1) * tile_n;
     const uint64_t col_end = s.split_n ? s.config->n * (lane + 1) / s.cores : s.config->n;
-    const uint64_t col = col_begin + out % s.nt * grid * s.tile_n;
+    const uint64_t col = col_begin + col_base;
     const int rows = extent((int64_t) end - (int64_t) row, s.tile_m);
-    const int cols = extent((int64_t) col_end - (int64_t) col, s.tile_n);
+    const int cols = extent((int64_t) col_end - (int64_t) col, tile_n);
     const int row_offset = s.buffer_a ? 0 : slice * s.slice_m;
     const int col_offset = s.buffer_a ? slice * s.slice_n : 0;
     const int users = s.buffer_a ? (cols + s.slice_n - 1) / s.slice_n : (rows + s.slice_m - 1) / s.slice_m;

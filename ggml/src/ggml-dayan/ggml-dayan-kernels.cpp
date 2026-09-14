@@ -1657,14 +1657,14 @@ DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_fp16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_fp16_4c);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
-                              6, 2, 2, 0, 24, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
-                              6, 2, 2, 0, 24, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
-                              6, 2, 2, 0, 24, 4);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1088U * 1024U),
-                              6, 2, 2, 0, 24, 4);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, 4);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, 4);
 DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 0, 0,
                        DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 1, 1, 0);
 DAYAN_MATMUL_1C_DESC(project_qg_bf16_1c);

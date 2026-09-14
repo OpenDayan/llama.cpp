@@ -238,7 +238,10 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
-        if (run_case(dayan.get(), GGML_TYPE_BF16, 31, 6149, 257, 1, 1, 1, 1, false) != 0 ||
+        if (run_case(dayan.get(), GGML_TYPE_BF16, 1024, 1024, 257, 1, 1, 1, 1, false) != 0 ||
+            run_case(dayan.get(), GGML_TYPE_F16, 1025, 1025, 257, 2, 1, 2, 1, false) != 0 ||
+            run_case(dayan.get(), GGML_TYPE_BF16, 1025, 1537, 257, 1, 1, 1, 1, false) != 0 ||
+            run_case(dayan.get(), GGML_TYPE_BF16, 31, 6149, 257, 1, 1, 1, 1, false) != 0 ||
             run_case(dayan.get(), GGML_TYPE_F16, 257, 33, 65, 1, 1, 2, 2, false) != 0) {
             return 1;
         }
