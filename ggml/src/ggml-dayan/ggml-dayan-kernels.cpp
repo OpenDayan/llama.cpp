@@ -862,6 +862,78 @@ __kernel__ void flash_attention_fp16_4c(const DayanFlashAttentionConfig * config
 #endif
 }
 
+__kernel__ void flash_attention_decode_bf16_4c(const DayanFlashAttentionConfig * config,
+                                        const uint16_t *                  q,
+                                        const uint16_t *                  k,
+                                        const uint16_t *                  v,
+                                        float *                           output,
+                                        int64_t *                         result) {
+#if defined(__DAYAN_DEVICE__)
+    dayan_acquire_config(config);
+    DAYAN_PARAMS_IF(result == nullptr) {
+        return;
+    }
+#if defined(ENABLE_PARAMS_CHECK)
+    *result = -22;
+#endif
+    DAYAN_PARAMS_IF(config == nullptr) {
+        return;
+    }
+
+    const int status = ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Bf16Format, 4, true>(
+        config, q, k, v, output);
+    if (status < 0) {
+        dayan_thread_exit(status);
+    }
+    if (dayan_task_id(DAYAN_TASK_X) == 0U) {
+        *result = status;
+    }
+#else
+    (void) config;
+    (void) q;
+    (void) k;
+    (void) v;
+    (void) output;
+    (void) result;
+#endif
+}
+
+__kernel__ void flash_attention_decode_fp16_4c(const DayanFlashAttentionConfig * config,
+                                        const uint16_t *                  q,
+                                        const uint16_t *                  k,
+                                        const uint16_t *                  v,
+                                        float *                           output,
+                                        int64_t *                         result) {
+#if defined(__DAYAN_DEVICE__)
+    dayan_acquire_config(config);
+    DAYAN_PARAMS_IF(result == nullptr) {
+        return;
+    }
+#if defined(ENABLE_PARAMS_CHECK)
+    *result = -22;
+#endif
+    DAYAN_PARAMS_IF(config == nullptr) {
+        return;
+    }
+
+    const int status = ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 4, true>(
+        config, q, k, v, output);
+    if (status < 0) {
+        dayan_thread_exit(status);
+    }
+    if (dayan_task_id(DAYAN_TASK_X) == 0U) {
+        *result = status;
+    }
+#else
+    (void) config;
+    (void) q;
+    (void) k;
+    (void) v;
+    (void) output;
+    (void) result;
+#endif
+}
+
 __kernel__ void gated_delta_net_f32_1c(const DayanGatedDeltaNetConfig * config,
                                        const float *                    q,
                                        const float *                    k,
@@ -1665,6 +1737,10 @@ DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC
                               6, 2, 2, 0, 26, 4);
 DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
                               6, 2, 2, 0, 26, 4);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, 0);
 DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 0, 0,
                        DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 1, 1, 0);
 DAYAN_MATMUL_1C_DESC(project_qg_bf16_1c);

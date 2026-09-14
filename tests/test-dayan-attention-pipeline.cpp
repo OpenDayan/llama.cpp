@@ -40,6 +40,7 @@ struct attention_case {
     uint32_t       tasks          = 1;
     bool           four_core      = false;
     float          qk_range       = 0.25f;
+    bool           split_kv       = false;
 };
 
 static int fail(const char * message) {
@@ -265,8 +266,8 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
         attrs.config.task_mode = test.four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
         const auto kernel = test.type == GGML_TYPE_BF16 ?
-            (test.four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c) :
-            (test.four_core ? flash_attention_fp16_4c : flash_attention_fp16_1c);
+            (test.split_kv ? flash_attention_decode_bf16_4c : test.four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c) :
+            (test.split_kv ? flash_attention_decode_fp16_4c : test.four_core ? flash_attention_fp16_4c : flash_attention_fp16_1c);
         status = kernel(buffers.config, buffers.q, buffers.k, buffers.v, buffers.output, buffers.result, &attrs);
     }
     if (status == 0) {
@@ -350,6 +351,14 @@ int main(int argc, char ** argv) {
     }
 
     const attention_case cases[] = {
+        { "decode-trace-bf16", GGML_TYPE_BF16, 1, 8, 2, 1, 1025, 256, 1024, true, true, 1, true, 2.0f, true },
+        { "decode-batch-fp16", GGML_TYPE_F16, 2, 6, 2, 1, 769, 128, 0, false, false, 1, true, 2.0f, true },
+        { "decode-mqa-bf16", GGML_TYPE_BF16, 1, 1, 1, 1, 512, 64, 0, false, false, 1, true, 6.0f, true },
+        { "decode-mha-fp16", GGML_TYPE_F16, 1, 3, 3, 1, 515, 192, 0, false, true, 1, true, 2.0f, true },
+        { "decode-gqa-tail-bf16", GGML_TYPE_BF16, 1, 13, 1, 1, 2049, 256, 0, false, false, 1, true, 2.0f, true },
+        { "decode-head-wrap-bf16", GGML_TYPE_BF16, 1, 130, 1, 1, 517, 64, 0, false, false, 1, true, 2.0f, true },
+        { "decode-prefix-fp16", GGML_TYPE_F16, 1, 8, 2, 1, 1025, 128, 772, true, true, 1, true, 2.0f, true },
+        { "decode-short-bf16", GGML_TYPE_BF16, 2, 2, 1, 1, 4, 64, 0, false, false, 1, true, 2.0f, true },
         { "pipeline-full-bf16", GGML_TYPE_BF16, 1, 2, 1, 64, 128, 64, 0, false },
         { "pipeline-two-full-bf16", GGML_TYPE_BF16, 1, 1, 1, 1, 256, 64, 0, false },
         { "pipeline-tail-bf16", GGML_TYPE_BF16, 1, 1, 1, 17, 64, 64, 0, false },
@@ -378,6 +387,10 @@ int main(int argc, char ** argv) {
         }
         ran = true;
         if (run_case(&runtime, test, seed++) != 0) {
+            result = 1;
+            break;
+        }
+        if (test.split_kv && run_case(&runtime, test, seed++) != 0) {
             result = 1;
             break;
         }

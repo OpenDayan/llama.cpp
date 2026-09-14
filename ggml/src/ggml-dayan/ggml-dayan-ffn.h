@@ -113,7 +113,7 @@ static void load_b(void * argument) {
                 if (!n.cols) {
                     continue;
                 }
-                const MatmulBuffer & b = s.b[s.buffer_a ? slice : (out * s.kt + step) & 1];
+                const MatmulBuffer & b = s.b[s.buffer_a && n.users > 1 ? slice : (out * s.kt + step) & 1];
                 const int inner = extent((int64_t) s.config->k - (int64_t) step * kInner, kInner);
                 const uint64_t offset = n.col * s.config->bt_stride + (uint64_t) step * kInputStride;
                 matmul_check(dayan_resource_wait_free(b.resource));
@@ -148,7 +148,7 @@ static void calculate(State & s) {
                 }
                 const int index = (out * s.kt + step) & 1;
                 const MatmulBuffer & a = s.a[s.buffer_a ? index : slice];
-                const MatmulBuffer & b = s.b[s.buffer_a ? slice : index];
+                const MatmulBuffer & b = s.b[s.buffer_a && n.users > 1 ? slice : index];
                 const MatmulBuffer & c = s.c[slice];
                 const auto inputs = DAYAN_RESOURCE_MASK(a.resource) | DAYAN_RESOURCE_MASK(b.resource);
                 matmul_check(dayan_resource_wait(step == 0 ? DAYAN_RESOURCE_MASK(c.resource) : 0, inputs, phases, 0));

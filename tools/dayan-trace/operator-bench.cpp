@@ -223,10 +223,11 @@ int main(int argc, char ** argv) {
             output = device.filled(reference.size(), nan);
             const int64_t initial_status = -1;
             kernel_result = device.upload(&initial_status, sizeof(initial_status));
-            const bool four_core = m > 64;
+            const bool split_kv = dayan_flash_attention_use_split_kv(m, config.kv_len);
+            const bool four_core = m > 64 || split_kv;
             attrs.config.task_mode = four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
-            launch = [&, cfg, q, key, v, four_core]() {
-                const auto kernel = four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c;
+            launch = [&, cfg, q, key, v, four_core, split_kv]() {
+                const auto kernel = split_kv ? flash_attention_decode_bf16_4c : four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c;
                 return kernel(cfg, q, key, v, output, kernel_result, &attrs);
             };
         } else if (op == "norm") {

@@ -285,10 +285,15 @@ static inline MatmulNode matmul_node(const MatmulState & s, uint64_t generation,
     const int row_offset = s.buffer_a ? 0 : slice * s.slice_m;
     const int col_offset = s.buffer_a ? slice * s.slice_n : 0;
     const int users = s.buffer_a ? (cols + s.slice_n - 1) / s.slice_n : (rows + s.slice_m - 1) / s.slice_m;
+    int b_index = s.buffer_a ? slice : (int) ((generation * products + product) & 1);
+    if (s.split_n) {
+        // Use all B buffers to prefetch K steps when only a few N slices are active.
+        b_index = (int) (((generation * products + product) * users + slice) % kMatmulSlices);
+    }
     return {row + row_offset, col + col_offset, extent(rows - row_offset, s.slice_m), extent(cols - col_offset, s.slice_n),
             extent((int64_t) s.config->k - (int64_t) step * Constants::kTileK, Constants::kTileK), step,
             s.buffer_a ? (int) (generation & 1) : slice,
-            s.buffer_a ? slice : (int) ((generation * products + product) & 1), users};
+            b_index, users};
 }
 
 static inline void matmul_check(int status) {

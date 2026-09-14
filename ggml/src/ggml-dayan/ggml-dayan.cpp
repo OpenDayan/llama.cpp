@@ -265,16 +265,25 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
         case ggml_backend_dayan_slot_kind::mul_mat_silu: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
             const bool silu = slot.kind == ggml_backend_dayan_slot_kind::mul_mat_silu;
+            const bool inference = (node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 ?
+                                    ggml_nrows(node->src[1]) : node->src[1]->ne[1]) <= 512;
             result.executor = "ggml_backend_dayan_mul_mat";
             result.launch_name = silu ? "ggml-mm-silu" : "ggml-mul-mat";
             result.kernel = silu ? (bf16 ? "matmul_silu_bf16_4c" : "matmul_silu_fp16_4c") :
                                    (bf16 ? "matmul_bf16_4c" : "matmul_fp16_4c");
+            if (inference) {
+                result.kernel = silu ? (bf16 ? "matmul_silu_inference_bf16_4c" : "matmul_silu_inference_fp16_4c") :
+                                       (bf16 ? "matmul_inference_bf16_4c" : "matmul_inference_fp16_4c");
+            }
         } break;
         case ggml_backend_dayan_slot_kind::mul_mat_quantized: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
             result.executor    = "ggml_backend_dayan_mul_mat_quantized";
             result.launch_name = "ggml-mm-lowp";
             result.kernel      = bf16 ? "matmul_quantized_bf16_4c" : "matmul_quantized_fp16_4c";
+            if (node->src[1]->ne[1] <= 512) {
+                result.kernel = bf16 ? "matmul_quantized_inference_bf16_4c" : "matmul_quantized_inference_fp16_4c";
+            }
         } break;
         case ggml_backend_dayan_slot_kind::mul_mat_pair: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
@@ -290,6 +299,10 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
             result.launch_name = swiglu ? "ggml-swiglu" : "ggml-geglu";
             result.kernel      = swiglu ? (bf16 ? "matmul_swiglu_bf16_4c" : "matmul_swiglu_fp16_4c") :
                                           (bf16 ? "matmul_geglu_bf16_4c" : "matmul_geglu_fp16_4c");
+            if (node->src[1]->ne[1] <= 512) {
+                result.kernel = swiglu ? (bf16 ? "matmul_swiglu_inference_bf16_4c" : "matmul_swiglu_inference_fp16_4c") :
+                                        (bf16 ? "matmul_geglu_inference_bf16_4c" : "matmul_geglu_inference_fp16_4c");
+            }
         } break;
         case ggml_backend_dayan_slot_kind::mul_mat_id: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
@@ -504,8 +517,13 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
             break;
         case ggml_backend_dayan_slot_kind::flash_attention: {
             const bool bf16 = node->src[0]->type == GGML_TYPE_BF16;
-            const bool four_core = node->src[0]->ne[1] > 64;
+            uint32_t causal_offset = 0;
+            uint32_t kv_len = 0;
+            const bool split_kv = ggml_backend_dayan_flash_attention_lengths(node, &causal_offset, &kv_len) &&
+                                  dayan_flash_attention_use_split_kv(node->src[0]->ne[1], kv_len);
+            const bool four_core = node->src[0]->ne[1] > 64 || split_kv;
             result = { "ggml_backend_dayan_flash_attention", bf16 ? "flash-attn-bf16" : "flash-attn-fp16",
+                       split_kv ? (bf16 ? "flash_attention_decode_bf16_4c" : "flash_attention_decode_fp16_4c") :
                        four_core ? (bf16 ? "flash_attention_bf16_4c" : "flash_attention_fp16_4c") :
                                    (bf16 ? "flash_attention_bf16_1c" : "flash_attention_fp16_1c"),
                        four_core ? "four-core" : "single-core", kDayanNativeMaxTasks };
@@ -2599,7 +2617,8 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(int64_t), &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        const bool four_core = config.q_len > 64;
+        const bool split_kv = dayan_flash_attention_use_split_kv(config.q_len, config.kv_len);
+        const bool four_core = config.q_len > 64 || split_kv;
         const char * name = q->type == GGML_TYPE_BF16 ? "flash-attn-bf16" : "flash-attn-fp16";
         if (four_core) {
             ggml_backend_dayan_init_matmul_launch_attrs(ctx, name, &attrs);
@@ -2608,8 +2627,8 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
         }
         if (q->type == GGML_TYPE_BF16 || q->type == GGML_TYPE_F16) {
             const auto kernel = q->type == GGML_TYPE_BF16 ?
-                (four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c) :
-                (four_core ? flash_attention_fp16_4c : flash_attention_fp16_1c);
+                (split_kv ? flash_attention_decode_bf16_4c : four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c) :
+                (split_kv ? flash_attention_decode_fp16_4c : four_core ? flash_attention_fp16_4c : flash_attention_fp16_1c);
             status = kernel(buffers.config, ggml_backend_dayan_tensor_buffer(q), ggml_backend_dayan_tensor_buffer(k),
                             ggml_backend_dayan_tensor_buffer(v), ggml_backend_dayan_tensor_buffer(dst), buffers.result, &attrs);
         } else {

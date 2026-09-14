@@ -217,17 +217,35 @@ struct State {
     uint64_t blocks;
     uint32_t task, tasks, cores, lane, scale;
     long groups;
+    bool split_kv;
 
     uint64_t work(uint64_t block) const { return task + block / groups * tasks; }
-    uint32_t batch(uint64_t block) const { return (uint32_t) (work(block) / cfg->q_heads); }
-    uint32_t head(uint64_t block) const { return (uint32_t) (work(block) % cfg->q_heads); }
+    uint32_t batch(uint64_t block) const { return (uint32_t) (work(block) / (split_kv ? cfg->kv_heads : cfg->q_heads)); }
+    uint32_t head(uint64_t block) const {
+        return split_kv ? (work(block) % cfg->kv_heads) * (cfg->q_heads / cfg->kv_heads) + block % groups * kBr : work(block) % cfg->q_heads;
+    }
     long row(uint64_t block, long slice, long core) const {
+        if (split_kv) {
+            return 0;
+        }
         return ((block % groups * kSlices + slice) * cores + core) * kBr;
     }
     long rows(uint64_t block, long slice) const {
+        if (split_kv) {
+            return slice ? 0 : extent(cfg->q_heads / cfg->kv_heads - block % groups * kBr, kBr);
+        }
         return extent((long) cfg->q_len - row(block, slice, lane), kBr);
     }
+    long key_begin(long core) const {
+        const long visible = (cfg->flags & kFlagCausal) ? cfg->causal_offset + 1L : cfg->kv_len;
+        return split_kv ? visible * core / 4 : 0;
+    }
+    long key_count(long core) const { return split_kv ? key_begin(core + 1) - key_begin(core) : cfg->kv_len; }
+    long cols(long ki) const { return extent(key_count(lane) - ki * kBc, kBc); }
     long keys(uint64_t block, long slice, long core) const {
+        if (split_kv) {
+            return slice ? 0 : (key_count(core) + kBc - 1) / kBc;
+        }
         const long first = row(block, slice, core);
         const long count = extent((long) cfg->q_len - first, kBr);
         if (!count) {
@@ -237,6 +255,9 @@ struct State {
         return (end + kBc - 1) / kBc;
     }
     long shared_keys(uint64_t block) const {
+        if (split_kv) {
+            return keys(block, 0, lane);
+        }
         long count = 0;
         for (long slice = 0; slice < kSlices; ++slice) {
             for (long core = 0; core < cores; ++core) {
@@ -259,8 +280,9 @@ struct State {
     }
     uint64_t kv_address(uint64_t block, long ki, bool value) const {
         const long kh = head(block) / (cfg->q_heads / cfg->kv_heads);
-        return value ? v + batch(block) * cfg->v_batch_stride + kh * cfg->v_head_stride + ki * kBc * cfg->v_row_stride :
-                       k + batch(block) * cfg->k_batch_stride + kh * cfg->k_head_stride + ki * kBc * cfg->k_row_stride;
+        const long first = key_begin(lane) + ki * kBc;
+        return value ? v + batch(block) * cfg->v_batch_stride + kh * cfg->v_head_stride + first * cfg->v_row_stride :
+                       k + batch(block) * cfg->k_batch_stride + kh * cfg->k_head_stride + first * cfg->k_row_stride;
     }
     uint64_t output_address(uint64_t block, long slice) const {
         return out + ((uint64_t) batch(block) * cfg->q_len * cfg->q_heads +
@@ -276,7 +298,7 @@ constexpr long kVSwizzle = MAT_BATCH_SWIZZLE(5, 1, 5);
 
 static void load_q(void * argument) {
     const State & s = *(State *) argument;
-    configure_lsu_rows<0>(s.cfg->head_dim * 2, s.cfg->q_row_stride, s.cfg->head_dim * 2);
+    configure_lsu_rows<0>(s.cfg->head_dim * 2, s.split_kv ? s.cfg->q_head_stride : s.cfg->q_row_stride, s.cfg->head_dim * 2);
     __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(qk_swizzle(s.cfg->head_dim));
     for (uint64_t block = 0; block < s.blocks; ++block) {
         for (long slice = 0; slice < kSlices; ++slice) {
@@ -306,10 +328,12 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
     }
     for (uint64_t block = 0; block < s.blocks; ++block) {
         const long keys = s.shared_keys(block);
+        const uint64_t kv_base = s.kv_address(block, 0, Value);
+        const uint64_t row_stride = Value ? s.cfg->v_row_stride : s.cfg->k_row_stride;
         for (long ki = 0; ki < keys; ++ki, ++generation) {
             const long slot = generation & 1;
             const long users = s.users(block, ki);
-            const long cols = min_long(kBc, (long) s.cfg->kv_len - ki * kBc);
+            const long cols = s.cols(ki);
             const long offset = Value ? kUramVt0 + slot * kVtBytes : kUramK0 + slot * kKBytes;
             const auto local = kv_resource(Value, slot);
             const auto ready = DAYAN_SHARED_RESOURCE(2 * Value + slot);
@@ -337,10 +361,10 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
                         __tx_lsu_tcsr_write<LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(kVSwizzle);
                         __tx_lsu_dma_u2u<1>(uram_addr(offset + end), uram_addr(kUramZero));
                     }
-                    load_v_transposed<0>(s.kv_address(block, ki, true), offset, cols, s.cfg->v_row_stride);
+                    load_v_transposed<0>(kv_base + ki * kBc * row_stride, offset, cols, row_stride);
                 } else {
                     set_lsu_rows<0>(cols);
-                    __tx_lsu_dma_d2u<0>(uram_addr(offset), s.kv_address(block, ki, false));
+                    __tx_lsu_dma_d2u<0>(uram_addr(offset), kv_base + ki * kBc * row_stride);
                 }
                 check(dayan_resource_produce_lsu(local, users, 0));
                 if constexpr (Cores == 4) {
@@ -386,7 +410,7 @@ template <typename Format> static void calculate_qk(const State & s) {
                 const uint64_t outputs = DAYAN_RESOURCE_MASK(score_resource(slice, slot)) | DAYAN_RESOURCE_MASK(p_resource(slice, slot));
                 check(dayan_resource_wait(outputs, inputs, phases, 0));
                 __tx_mat_tcsr_write<kMatQK * MAT_GROUPSZ + MAT_M>(s.rows(block, slice) - 1);
-                __tx_mat_tcsr_write<kMatQK * MAT_GROUPSZ + MAT_N>(min_long(kBc, (long) s.cfg->kv_len - ki * kBc) - 1);
+                __tx_mat_tcsr_write<kMatQK * MAT_GROUPSZ + MAT_N>(s.cols(ki) - 1);
                 const long base = s.uram + slice * kContextBytes;
                 __tx_mat_mm<kMatQK>(s.uram + tile_offset(slice, slot) + kTileScore, base + kCtxQ, s.uram + kUramK0 + (generation & 1) * kKBytes);
                 const bool last = ki + 1 == slice_keys;
@@ -480,9 +504,10 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
 
 static bool prepare_mask(const State & s, uint64_t block, long slice, long ki) {
     const long rows = s.rows(block, slice);
-    const long cols = min_long(kBc, (long) s.cfg->kv_len - ki * kBc);
+    const long cols = s.cols(ki);
+    const bool causal = !s.split_kv && (s.cfg->flags & kFlagCausal);
     const long first = s.row(block, slice, s.lane) + s.cfg->causal_offset - ki * kBc;
-    if (rows % 8 == 0 && cols == kBc && (!(s.cfg->flags & 1) || first >= kBc - 1)) {
+    if (rows % 8 == 0 && cols == kBc && (!causal || first >= kBc - 1)) {
         return false;
     }
     uint64_t * masks = (uint64_t *) uram_addr(tile_offset(slice, ki & 1) + kTileMask);
@@ -491,7 +516,7 @@ static bool prepare_mask(const State & s, uint64_t block, long slice, long ki) {
             uint64_t mask = 0;
             for (long r = 0; r < 8; ++r) {
                 const long row = group * 8 + r;
-                const long valid = row >= rows ? 0 : (s.cfg->flags & 1) ? extent(first + row + 1, cols) : cols;
+                const long valid = row >= rows ? 0 : causal ? extent(first + row + 1, cols) : cols;
                 const long count = extent(valid - part * 8, 8);
                 mask |= ((uint64_t{1} << count) - 1) << (r * 8);
             }
@@ -597,16 +622,88 @@ template <bool First, bool Last> static inline void update_output(long base, lon
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
 
+static void merge_decode(const State & s, long base, long rows) {
+    using namespace ggml_dayan_vec_detail;
+    Cluster & cluster = *(Cluster *) shared;
+    // The unused second Q slice holds peer state and merge weights.
+    const long peer = tile_offset(1, 0);
+    const long alpha = peer + kTileAlpha;
+    const long beta = peer + kTileMask;
+    const long state_bytes = (rows + 7) / 8 * kVecBytes;
+    check(dayan_cluster_barrier(4, &cluster.barrier));
+    if (s.lane == 0) {
+        for (long core = 1; core < 4; ++core) {
+            const long slot = (s.keys(0, 0, core) - 1) & 1;
+            const uint64_t source = cluster.uram[core];
+            configure_lsu_rows<0>(state_bytes, state_bytes, state_bytes);
+            __tx_lsu_dma_d2u<0>(uram_addr(peer + kTileM), source + tile_offset(0, slot) + kTileM);
+            __tx_lsu_dma_d2u<0>(uram_addr(peer + kTileL), source + tile_offset(0, slot) + kTileL);
+            configure_lsu_rows<0>(rows * s.cfg->head_dim * 4, 0, 0);
+            __tx_lsu_dma_d2u<0>(uram_addr(kContextBytes + kCtxO), source + kCtxO);
+            dayan_wait_lsu();
+
+            configure_vec_grid((rows + 7) / 8);
+            configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
+            begin_vec_block(16);
+            __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileM));
+            __tx_vec_lsu_u2v<1, 0>(uram_addr(peer + kTileM));
+            __tx_vec_vv_fp32_max<0, 0, 16, 0>();
+            __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kTileM));
+            __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
+            __tx_vec_v_fp32_eru<0, 0, 0>();
+            __tx_vec_lsu_v2u<0, 0>(uram_addr(alpha));
+            __tx_vec_vv_fp32_sub<1, 16, 2, 0>();
+            __tx_vec_v_fp32_eru<1, 16, 0>();
+            __tx_vec_lsu_v2u<16, 0>(uram_addr(beta));
+            __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileL));
+            __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+            __tx_vec_lsu_u2v<1, 0>(uram_addr(peer + kTileL));
+            __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
+            __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+            __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kTileL));
+            start_vec_block(16);
+            dayan_wait_vec();
+
+            configure_vec_grid(rows, s.cfg->head_dim / 64);
+            configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
+            configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
+            begin_vec_block(8);
+            __tx_vec_lsu_u2v<0, 0>(uram_addr(kCtxO));
+            __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(alpha));
+            __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+            __tx_vec_lsu_u2v<1, 0>(uram_addr(kContextBytes + kCtxO));
+            __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(beta));
+            __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
+            __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+            __tx_vec_lsu_v2u<0, 0>(uram_addr(kCtxO));
+            start_vec_block(8);
+            dayan_wait_vec();
+        }
+        begin_vec_block(5);
+        __tx_vec_lsu_u2v<0, 0>(uram_addr(kCtxO));
+        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kTileL));
+        __tx_vec_v_fp32_eru<1, 16, 1>();
+        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+        __tx_vec_lsu_v2u<0, 0>(uram_addr(kCtxO));
+        start_vec_block(5);
+        dayan_wait_vec();
+    }
+    // Peer O and softmax state stay live until all remote reads finish.
+    check(dayan_cluster_barrier(4, &cluster.barrier));
+}
+
 static void output(void * argument) {
     using namespace ggml_dayan_vec_detail;
     const State & s = *(State *) argument;
     uint64_t phases = 0;
     uint64_t o_phases = 0;
-    configure_vec_grid(1, s.cfg->head_dim / 64);
-    configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
-    configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
-    configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4, s.cfg->q_heads * s.cfg->head_dim * 4);
     for (uint64_t block = 0; block < s.blocks; ++block) {
+        if (block == 0 || s.split_kv) {
+            configure_vec_grid(1, s.cfg->head_dim / 64);
+            configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
+            configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
+            configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4, s.cfg->q_heads * s.cfg->head_dim * 4);
+        }
         for (long ki = 0; ki < s.shared_keys(block); ++ki) {
             for (long slice = 0; slice < kSlices; ++slice) {
                 const long keys = s.keys(block, slice, s.lane);
@@ -624,22 +721,30 @@ static void output(void * argument) {
                 const long base = tile_offset(slice, slot);
                 const long out = slice * kContextBytes + kCtxO;
                 const bool last = ki + 1 == keys;
+                const bool normalize = last && !s.split_kv;
                 __tx_vec_tcsr_write<kVecDim2>(rows - 1);
                 if (ki == 0) {
-                    if (last) update_output<true, true>(base, out);
+                    if (normalize) update_output<true, true>(base, out);
                     else update_output<true, false>(base, out);
                 } else {
-                    if (last) update_output<false, true>(base, out);
+                    if (normalize) update_output<false, true>(base, out);
                     else update_output<false, false>(base, out);
                 }
-                check(dayan_resource_produce_vec(o, 1, inputs | previous_o));
+                const uint64_t merge_state = last && s.split_kv ? DAYAN_RESOURCE_MASK(state_resource(slice, slot)) : 0;
+                check(dayan_resource_produce_vec(o, 1, (inputs & ~merge_state) | previous_o));
                 phases ^= inputs;
                 o_phases ^= current_o;
                 if (last) {
                     check(dayan_resource_wait_ready(o, (o_phases & current_o) ? 0 : 1));
-                    set_lsu_rows<0>(rows);
-                    __tx_lsu_dma_u2d<0>(s.output_address(block, slice), uram_addr(out));
-                    check(dayan_resource_consume_lsu(current_o));
+                    if (s.split_kv) {
+                        merge_decode(s, base, rows);
+                        configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4, s.cfg->head_dim * 4);
+                    }
+                    if (!s.split_kv || s.lane == 0) {
+                        set_lsu_rows<0>(rows);
+                        __tx_lsu_dma_u2d<0>(s.output_address(block, slice), uram_addr(out));
+                    }
+                    check(dayan_resource_consume_lsu(current_o | merge_state));
                     dayan_wait_lsu();
                 }
             }
@@ -658,7 +763,7 @@ enum FlashAttentionError {
     FA_OUTPUT_ALIAS = -6,
 };
 
-template <typename Format, int Cores>
+template <typename Format, int Cores, bool SplitKV = false>
 static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * out) {
     static_assert(Cores == 1 || Cores == 4, "Attention supports one or four cores");
     if (!cfg) {
@@ -706,6 +811,12 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     if ((q_heads % kv_heads) != 0) {
         return FA_UNSUPPORTED_HEAD_MAPPING;
     }
+    if constexpr (SplitKV) {
+        static_assert(Cores == 4, "Split-KV uses four cores");
+        if (q_len != 1 || ((flags & kFlagCausal) ? causal_offset + 1L : kv_len) < 4) {
+            return FA_INVALID_ARGUMENT;
+        }
+    }
 
     const float scale_log2e = u32_as_float(scale_bits) * 1.4426950408889634f;
     if ((float_as_u32(scale_log2e) & 0x7f800000U) == 0x7f800000U) {
@@ -752,6 +863,7 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
 
     State s = {};
     s.cfg = cfg;
+    s.split_kv = SplitKV;
     s.q = q_base_addr;
     s.k = k_base_addr;
     s.v = v_base_addr;
@@ -765,8 +877,8 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     s.task = Cores == 4 ? 0 : task;
     s.tasks = Cores == 4 ? 1 : tasks;
     s.scale = float_as_u32(scale_log2e);
-    s.groups = q_groups;
-    const uint64_t work = (uint64_t) batch * q_heads;
+    s.groups = SplitKV ? (q_heads / kv_heads + kBr - 1) / kBr : q_groups;
+    const uint64_t work = (uint64_t) batch * (SplitKV ? kv_heads : q_heads);
     s.blocks = (work > s.task ? (work - s.task + s.tasks - 1) / s.tasks : 0) * s.groups;
     for (long i = 0; i < kVecBytes / 4; ++i) {
         ((uint32_t *) uram_addr(kUramZero))[i] = 0;
@@ -781,12 +893,12 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     }
     dayan_thread_resources_t resources = {};
     resources.local_resource_count = kLocalResources;
-    resources.shared_resource_count = Cores == 4 ? kSharedResources : 0;
+    resources.shared_resource_count = Cores == 4 && !SplitKV ? kSharedResources : 0;
     resources.lsu_tcsr_count = 1;
     check(dayan_create_thread("attn-load-q", load_q, &s, &resources));
     resources.lsu_tcsr_count = 2;
-    check(dayan_create_thread("attn-load-k", load_kv<Cores, false>, &s, &resources));
-    check(dayan_create_thread("attn-load-v", load_kv<Cores, true>, &s, &resources));
+    check(dayan_create_thread("attn-load-k", load_kv<SplitKV ? 1 : Cores, false>, &s, &resources));
+    check(dayan_create_thread("attn-load-v", load_kv<SplitKV ? 1 : Cores, true>, &s, &resources));
     resources.lsu_tcsr_count = 0;
     resources.vec_tcsr_count = 1;
     check(dayan_create_thread("attn-softmax", softmax, &s, &resources));

@@ -96,6 +96,10 @@ struct DayanFlashAttentionConfig {
     uint64_t v_batch_stride;
 };
 
+static inline bool dayan_flash_attention_use_split_kv(uint32_t q_len, uint32_t kv_len) {
+    return q_len == 1 && kv_len >= 512;
+}
+
 struct DayanGatedDeltaNetConfig {
     uint32_t head_dim;
     uint32_t heads;
@@ -698,6 +702,20 @@ int flash_attention_bf16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    result,
                             const npu_kernel_launch_attrs_t * launch_attrs);
 int flash_attention_fp16_4c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    q,
+                            npu_buffer_t *                    k,
+                            npu_buffer_t *                    v,
+                            npu_buffer_t *                    output,
+                            npu_buffer_t *                    result,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
+int flash_attention_decode_bf16_4c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    q,
+                            npu_buffer_t *                    k,
+                            npu_buffer_t *                    v,
+                            npu_buffer_t *                    output,
+                            npu_buffer_t *                    result,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
+int flash_attention_decode_fp16_4c(npu_buffer_t *                    config,
                             npu_buffer_t *                    q,
                             npu_buffer_t *                    k,
                             npu_buffer_t *                    v,

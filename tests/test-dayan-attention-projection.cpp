@@ -884,6 +884,7 @@ int main(int argc, char ** argv) {
                         result |= run_glu_case(&runtime, type, cores, geglu, m, 1541, 257, true);
                     }
                     result |= run_glu_case(&runtime, type, cores, geglu, 1, 6149, 257, true);
+                    result |= run_glu_case(&runtime, type, cores, geglu, 1, 3584, 1025, true);
                     result |= run_glu_case(&runtime, type, cores, geglu, 1, 1, 513, true);
                     result |= run_glu_case(&runtime, type, cores, geglu, 512, 33, 257, true);
                     result |= run_glu_case(&runtime, type, cores, geglu, 3, 1025, 257, true, true);
