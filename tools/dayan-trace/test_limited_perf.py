@@ -25,6 +25,82 @@ def events(tag, intervals):
 
 
 class PerfReportTests(unittest.TestCase):
+    def test_model_presets_keep_matrix_and_attention_types_separate(self):
+        bf16 = perf.make_cases(128, 512)
+        self.assertEqual(len(bf16), 16)
+        self.assertNotIn("dtype", bf16[0])
+        model = perf.load_model("qwen35-0.8B-mxfp4")
+        cases = {case["id"]: case for case in perf.make_cases(128, 512, model=model)}
+        self.assertEqual(len(cases), 21)
+        self.assertEqual(perf.case_types(cases["prefill-ffn"]), ("mxfp4", "mxfp4"))
+        self.assertEqual(perf.case_types(cases["decode-input"]), ("mxfp4", "f32"))
+        self.assertEqual(perf.case_types(cases["decode-vocab"]), ("bf16", "f32"))
+        self.assertEqual(perf.case_types(cases["decode-attention"]), ("bf16", "f32"))
+        self.assertEqual(perf.case_types(cases["decode-norm"]), ("f32", "f32"))
+        self.assertEqual(cases["decode-attention"]["kv_len"], 513)
+        terms = dict((name, factor) for name, factor, _ in perf.prediction_terms("prefill", model))
+        self.assertEqual(terms["decode-vocab"], 248320 / 6144)
+        self.assertNotIn("decode-input", terms)
+
+    def test_model_selects_additional_case_ids(self):
+        output = io.StringIO()
+        argv = ["limited-perf.py", "plan", "--model", "qwen35-0.8B-mxfp4", "--cases", "decode-vocab", "decode-quantize-input"]
+        with patch("sys.argv", argv), contextlib.redirect_stdout(output):
+            self.assertEqual(perf.main(), 0)
+        self.assertIn("dtype=f32 output=mxfp4", output.getvalue())
+        for arguments in (["--model", "unknown"], ["--cases", "decode-vocab"]):
+            with patch("sys.argv", ["limited-perf.py", "plan", *arguments]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    perf.main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_saved_model_controls_report_without_live_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = perf.load_model("qwen35-0.8B-mxfp4")
+            cases = perf.make_cases(8, 8, model=model)
+            model["prediction_terms"] = [{"case": "decode-vocab", "factor": 7, "reason": "saved factor"}]
+            manifest = dict(model="qwen35-0.8B-mxfp4", model_config=model, cases=cases, simulator="cmodel", run_id="unit", prefill=8, context=8, perf_trace=str(root / "trace.json"))
+            perf.write_json(root / "manifest.json", manifest)
+            perf.write_json(root / "decode-vocab.result.json", dict(status="ok", samples=[
+                dict(tag="vocab", warmup=False, wall_s=2, tasks=4, status=0)]))
+            perf.write_json(root / "trace.json", dict(traceEvents=events("vocab", [(100, 200)] * 4)))
+            argv = ["limited-perf.py", "report", "--output", directory, "--cases", "decode-vocab"]
+            with patch("sys.argv", argv), patch.object(perf, "load_model", side_effect=AssertionError("must use snapshot")), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(perf.main(), 0)
+            report = json.loads((root / "report.json").read_text())
+            self.assertEqual(report["model"], manifest["model"])
+            self.assertEqual(report["predictions"][0]["subtotal_wall_s"], 14)
+            with patch("sys.argv", argv + ["--model", perf.DEFAULT_MODEL]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    perf.main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_old_client_cannot_silently_run_mxfp4_as_bf16(self):
+        argv = ["limited-perf.py", "run", "--model", "qwen35-0.8B-mxfp4", "--perf-trace", "/tmp/unused.json"]
+        with patch("sys.argv", argv), patch.object(perf.subprocess, "run", return_value=perf.subprocess.CompletedProcess([], 1, "", "")), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                perf.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_resume_rejects_changed_model_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = root / "client"
+            client.write_text("test client")
+            model = perf.load_model()
+            cases = perf.make_cases(1024, 1024)
+            model["prediction_terms"][0]["factor"] = 99
+            manifest = dict(model=perf.DEFAULT_MODEL, model_config=model, simulator="testcluster", prefill=1024, context=1024,
+                            cases=cases, client=str(client), client_sha256=perf.hashlib.sha256(client.read_bytes()).hexdigest(),
+                            backend_sha256=None, perf_trace=str(root / "trace.json"), socket="/tmp/unused.sock")
+            perf.write_json(root / "manifest.json", manifest)
+            argv = ["limited-perf.py", "run", "--resume", "--output", directory, "--client", str(client), "--perf-trace", str(root / "trace.json"), "--socket", "/tmp/unused.sock"]
+            with patch("sys.argv", argv), patch.object(perf.subprocess, "run", side_effect=AssertionError("must not launch")), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    perf.main()
+                self.assertEqual(error.exception.code, 2)
+
     def test_case_from_starts_at_selected_case(self):
         output = io.StringIO()
         argv = ["limited-perf.py", "plan", "--cases", "prefill-conv", "decode-conv", "--case-from", "decode-conv"]

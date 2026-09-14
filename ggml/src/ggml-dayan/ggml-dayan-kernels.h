@@ -193,6 +193,14 @@ enum : uint32_t {
     kDayanDataTypeF16  = 2,
     kDayanDataTypeI32  = 3,
     kDayanDataTypeI64  = 4,
+    kDayanDataTypeMXFP4 = 5,
+};
+
+struct DayanMxfp4Config {
+    uint64_t m, n, k;
+    uint64_t a_stride, b_stride, output_stride;
+    uint64_t a_scale_stride, b_scale_stride, output_scale_stride;
+    uint32_t source_type, weight_type, output_type, operation;
 };
 
 struct DayanRowsConfig {
@@ -374,6 +382,11 @@ struct DayanGroupNormConfig {
 };
 
 #if !defined(__DAYAN_DEVICE__)
+int quantize_mxfp4(npu_buffer_t * config, npu_buffer_t * input, npu_buffer_t * output, npu_buffer_t * scales,
+                   const npu_kernel_launch_attrs_t * attrs);
+int matmul_mxfp4_4c(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
+                     npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * output, npu_buffer_t * scales,
+                     const npu_kernel_launch_attrs_t * attrs);
 int matmul_bf16_1c(npu_buffer_t *                    config,
                    npu_buffer_t *                    a,
                    npu_buffer_t *                    bt,

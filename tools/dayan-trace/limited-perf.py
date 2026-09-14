@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import statistics
 import subprocess
 import sys
@@ -17,6 +18,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 COUNTER_PERIOD = 1 << 48
+MODEL_CONFIG = Path(__file__).with_name("limited-perf-models.json")
+DEFAULT_MODEL = "qwen35-0.8B-bf16"
 
 
 def write_json(path, value):
@@ -25,41 +28,62 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def make_cases(prefill, context, repeats=1, warmup=0, timeout_ms=86400000):
+def load_model(name=DEFAULT_MODEL):
+    configuration = json.loads(MODEL_CONFIG.read_text())
+    if configuration.get("schema") != 1:
+        raise ValueError("unsupported model configuration schema")
+    models = configuration["models"]
+    if name not in models:
+        raise ValueError(f"unknown model {name!r}; choose from: " + ", ".join(models))
+    model = models[name]
+    names = set()
+    allowed = {"name", "op", "n", "k", "dtype", "output_dtype", "phases", "channels", "kernel",
+               "heads", "q_heads", "kv_heads", "head_dim", "snapshots"}
+    for case in model["cases"]:
+        if not re.fullmatch(r"[a-z0-9-]+", case["name"]) or case["name"] in names or set(case) - allowed:
+            raise ValueError(f"invalid or duplicate case in model {name}: {case}")
+        if case["op"] not in ("matmul", "ffn", "quantize", "gdn", "ssm_conv", "attention", "norm"):
+            raise ValueError(f"unsupported operator in model {name}: {case['op']}")
+        names.add(case["name"])
+        phases = case.get("phases", ["prefill", "decode"])
+        if not phases or any(phase not in ("prefill", "decode") for phase in phases):
+            raise ValueError(f"invalid phases in model {name}: {case['name']}")
+    if not names or not model["prediction_terms"] or not isinstance(model["description"], str):
+        raise ValueError(f"empty cases, prediction terms, or invalid description in model {name}")
+    ids = {case["id"] for case in make_cases(1024, 1024, model=model)}
+    for phase in ("prefill", "decode"):
+        for case, factor, reason in prediction_terms(phase, model):
+            if case not in ids or not math.isfinite(factor) or factor <= 0 or not isinstance(reason, str):
+                raise ValueError(f"invalid prediction term in model {name}: {case}")
+    return model
+
+
+def make_cases(prefill, context, repeats=1, warmup=0, timeout_ms=86400000, model=None):
+    model = load_model() if model is None else model
     cases = []
     for phase, m in (("prefill", prefill), ("decode", 1)):
-        shapes = [
-            ("ffn", dict(op="ffn", m=m, n=3584, k=1024)),
-            ("down", dict(op="matmul", m=m, n=1024, k=3584)),
-            ("input", dict(op="matmul", m=m, n=6144, k=1024)),
-            ("output", dict(op="matmul", m=m, n=1024, k=2048)),
-            ("gdn", dict(op="gdn", m=m, heads=16, head_dim=128, snapshots=1)),
-            ("conv", dict(op="ssm_conv", m=m, channels=6144, kernel=4)),
-            ("attention", dict(op="attention", m=m, q_heads=8, kv_heads=2, head_dim=256,
-                               kv_len=m if phase == "prefill" else context + 1)),
-            ("norm", dict(op="norm", m=m, n=1024)),
-        ]
-        for name, shape in shapes:
-            cases.append(dict(id=f"{phase}-{name}", phase=phase, repeats=repeats, warmup=warmup,
+        for template in model["cases"]:
+            shape = dict(template)
+            name = shape.pop("name")
+            if phase not in shape.pop("phases", ["prefill", "decode"]):
+                continue
+            if shape["op"] == "attention":
+                shape["kv_len"] = m if phase == "prefill" else context + 1
+            cases.append(dict(id=f"{phase}-{name}", phase=phase, m=m, repeats=repeats, warmup=warmup,
                               timeout_ms=timeout_ms, **shape))
     return cases
 
 
-def prediction_terms(phase):
-    # The 25th GGUF block is the MTP block and is not part of ordinary inference.
-    return [
-        (f"{phase}-ffn", 24, "24 fused gate/up + SwiGLU + BF16 slots"),
-        (f"{phase}-down", 24, "24 FFN down projections"),
-        (f"{phase}-input", (18 * (6144 + 2048 + 32) + 6 * (4096 + 512 + 512)) / 6144,
-         "input projection proxy: sum of N / 6144 at K=1024; excludes fused epilogues"),
-        (f"{phase}-output", 24, "24 output projections; excludes the full-attention gate epilogue"),
-        (f"{phase}-gdn", 18, "18 linear-attention recurrences"),
-        (f"{phase}-conv", 18, "18 depthwise convolutions + SiLU"),
-        (f"{phase}-attention", 6, "6 full-attention layers"),
-        (f"{phase}-norm", 48, "two residual/norm/scale/cast proxies per block"),
-        ("decode-norm", 1, "one final-token norm proxy"),
-        ("decode-input", 248320 / 6144, "one final-token vocabulary projection, N scaled from 6144 to 248320"),
-    ]
+def prediction_terms(phase, model=None):
+    model = load_model() if model is None else model
+    return [(term["case"].replace("{phase}", phase), term["factor"] / term.get("divisor", 1), term["reason"])
+            for term in model["prediction_terms"]]
+
+
+def case_types(case):
+    dtype = case.get("dtype", "bf16" if case["op"] in ("matmul", "ffn", "attention") else "f32")
+    output = case.get("output_dtype", "bf16" if case["op"] in ("ffn", "norm") else "mxfp4" if case["op"] == "quantize" else "f32")
+    return dtype, output
 
 
 def read_trace(path, wanted):
@@ -126,10 +150,16 @@ def cycle_span(roots, tag, tasks):
 
 
 def shape_text(case):
-    return " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len") if key in case)
+    dtype, output = case_types(case)
+    shape = " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len") if key in case)
+    return f"{shape} dtype={dtype} output={output}"
 
 
 def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
+    model_name = manifest.get("model", DEFAULT_MODEL)
+    model = manifest.get("model_config")
+    if model is None:
+        model = load_model(model_name)
     results = {}
     for case in manifest["cases"]:
         path = directory / (case["id"] + ".result.json")
@@ -142,7 +172,8 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
     rows = []
     for case in manifest["cases"]:
         result = results.get(case["id"], {})
-        row = dict(id=case["id"], op=case["op"], shape=shape_text(case),
+        dtype, output_dtype = case_types(case)
+        row = dict(id=case["id"], op=case["op"], shape=shape_text(case), dtype=dtype, output_dtype=output_dtype,
                    status=result.get("status", "not-run"), wall_s=None, cycles=None,
                    process_wall_s=result.get("process_wall_s"), max_abs_error=result.get("max_abs_error"))
         samples = []
@@ -162,7 +193,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
     by_id = {row["id"]: row for row in rows}
     predictions = []
     for phase, tokens in (("prefill", manifest["prefill"]), ("decode", 1)):
-        terms = prediction_terms(phase)
+        terms = prediction_terms(phase, model)
         missing = [name for name, _, _ in terms if by_id.get(name, {}).get("wall_s") is None]
         prediction = dict(phase=phase, tokens=tokens, context=0 if phase == "prefill" else manifest["context"],
                           terms=[dict(case=name, factor=factor, reason=reason) for name, factor, reason in terms],
@@ -185,7 +216,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         "Process wall time includes setup, uploads, launches, output download, validation, and teardown. Both wall measurements include the cost of the active profiler.",
         "Cycles are max(root WAIT_EXIT begin) - min(root first RUNNING begin) across the launched root tasks, using dyperf 48-bit counters. Child threads and overlapping cores are not summed. Host/device submission and the final RPC reply are outside this span.",
         "Cross-core counters must share a time origin. A launch must last less than half the 48-bit counter period. No PCU counters or kernel-side instrumentation are required.",
-        "Model preset: Qwen3.5-0.8B BF16, 24 inference blocks (18 linear, 6 full attention), hidden=1024, FFN=3584, vocab=248320; excludes the MTP block. Batch=1, one final-token logit row, empty-cache prefill and one decode token at the specified prior context.",
+        f"Model preset: {model_name}. {model['description']} Empty-cache prefill and one decode token at the specified prior context.",
         "Predictions are a serial weighted sum of representative kernels, not an executed model. N scaling assumes linear cost, including the large vocabulary projection; pair/projection fusion and final-layer token pruning can change that cost.",
         "Unmeasured work includes RoPE and projection epilogues, extra layouts/casts, small gates/elementwise ops, KV/state copies, host graph scheduling, and sampling. Weights are assumed resident. Model loading, tokenization, and simulator/server startup are excluded.",
         f"The end-to-end scenario adds {overhead_percent:g}% to BOTH sampled subtotals as an explicit uncalibrated allowance, not a measured overhead or a confidence interval. Inspect and adjust the factors before using a different model.",
@@ -194,19 +225,19 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
     ]
     if trace_note:
         notes.append(trace_note)
-    report = dict(schema=1, simulator=manifest["simulator"], run_id=manifest["run_id"],
+    report = dict(schema=2, model=model_name, model_config=model, simulator=manifest["simulator"], run_id=manifest["run_id"],
                   perf_trace=str(trace_path), overhead_percent=overhead_percent, clock_hz=clock_hz,
                   cases=rows, predictions=predictions, notes=notes)
     write_json(directory / "report.json", report)
     with (directory / "operators.csv").open("w", newline="") as stream:
-        fields = ["id", "op", "shape", "status", "wall_s", "cycles", "process_wall_s", "max_abs_error"]
+        fields = ["id", "op", "dtype", "output_dtype", "shape", "status", "wall_s", "cycles", "process_wall_s", "max_abs_error"]
         writer = csv.DictWriter(stream, fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     def number(value, digits=6):
         return "N/A" if value is None else f"{value:.{digits}f}"
 
-    lines = [f"Dayan limited operator measurements ({manifest['simulator']}, run {manifest['run_id']})", "",
+    lines = [f"Dayan limited operator measurements ({model_name}, {manifest['simulator']}, run {manifest['run_id']})", "",
              f"Measured repeats per case: {manifest['cases'][0]['repeats']}; warmups per case: {manifest['cases'][0]['warmup']}. Cycles on cmodel are not RTL cycles.", "",
              "| Case | Shape | Status | Launch wall (s) | Cycles | Process wall (s) |",
              "| --- | --- | --- | ---: | ---: | ---: |"]
@@ -219,7 +250,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         lines.append(f"| {p['phase']} | {p['tokens']} | {p['context']} | {number(p['subtotal_wall_s'])} / {number(p['subtotal_cycles'], 0)} | {number(p['predicted_wall_s'])} / {number(p['predicted_cycles'], 0)} | {number(p['predicted_tokens_per_s'])} |")
     lines += ["", "Projection factors (also saved in report.json):", ""]
     for phase in ("prefill", "decode"):
-        lines.append(f"- {phase}: " + "; ".join(f"{name} * {factor:g}" for name, factor, _ in prediction_terms(phase)))
+        lines.append(f"- {phase}: " + "; ".join(f"{name} * {factor:g}" for name, factor, _ in prediction_terms(phase, model)))
     lines += ["", *[f"- {note}" for note in notes], ""]
     for row in rows:
         if row.get("error"):
@@ -241,6 +272,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("plan", "run", "report"))
+    parser.add_argument("--model", help=f"model preset from {MODEL_CONFIG.name} (default: {DEFAULT_MODEL}, or the saved run for report)")
     parser.add_argument("--output", type=Path, default=ROOT / "build-dayan/limited-perf")
     parser.add_argument("--client", type=Path, default=ROOT / "build-dayan/bin/llama-dayan-operator-bench")
     parser.add_argument("--perf-trace", type=Path, help="JSON output of the already-running dyperf (required for run)")
@@ -248,10 +280,9 @@ def main():
     parser.add_argument("--simulator", choices=("testcluster", "cmodel"), default="testcluster")
     parser.add_argument("--prefill", type=int, default=1024, help="prefill tokens (default: 1024)")
     parser.add_argument("--context", type=int, default=1024, help="decode prefix tokens, excluding the new token (default: 1024)")
-    case_ids = [case["id"] for case in make_cases(1024, 1024)]
-    parser.add_argument("--case", dest="cases", action="append", choices=case_ids, help="select one case; repeat to select several")
-    parser.add_argument("--cases", action="extend", nargs="+", choices=case_ids, help="select a group of cases; defaults to all cases")
-    parser.add_argument("--case-from", choices=case_ids, help="start at this case, inclusive, in plan order after case selection")
+    parser.add_argument("--case", dest="cases", action="append", help="select one case; repeat to select several")
+    parser.add_argument("--cases", action="extend", nargs="+", help="select a group of cases; defaults to all cases in the model preset")
+    parser.add_argument("--case-from", help="start at this case, inclusive, in plan order after case selection")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=86400, help="per-case wall deadline in seconds (default: 24 hours)")
@@ -269,13 +300,20 @@ def main():
     manifest_path = directory / "manifest.json"
     if args.command == "report":
         manifest = json.loads(manifest_path.read_text())
+        if args.model is not None and args.model != manifest.get("model", DEFAULT_MODEL):
+            parser.error("--model does not match the saved run")
         cases = manifest["cases"]
     else:
-        cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000)
+        model_name = args.model or DEFAULT_MODEL
+        try:
+            model = load_model(model_name)
+        except (ValueError, KeyError, TypeError, ZeroDivisionError) as error:
+            parser.error(str(error))
+        cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000, model)
     if args.cases:
         missing = set(args.cases) - {case["id"] for case in cases}
         if missing:
-            parser.error("cases are not in the saved run: " + ", ".join(sorted(missing)))
+            parser.error("cases are not in this model plan or saved run: " + ", ".join(sorted(missing)))
         cases = [case for case in cases if case["id"] in args.cases]
     if args.case_from:
         selected_ids = [case["id"] for case in cases]
@@ -285,7 +323,7 @@ def main():
     if args.command == "plan":
         for case in cases:
             print(f"{case['id']:20} {case['op']:10} {shape_text(case)}")
-        print(f"{len(cases)} cases, {len(cases) * (args.repeats + args.warmup)} kernel launches; no server access.")
+        print(f"{len(cases)} cases, {len(cases) * (args.repeats + args.warmup)} kernel launches; model={model_name}; no server access.")
         return 0
     if args.command == "report":
         manifest["cases"] = cases
@@ -296,8 +334,17 @@ def main():
         parser.error("run requires --perf-trace from the existing dyperf")
     trace = args.perf_trace.resolve()
     client = args.client.resolve()
+    if model_name != DEFAULT_MODEL or any(case.get("dtype") == "mxfp4" or case.get("output_dtype") == "mxfp4" or
+           (case["op"] == "norm" and case.get("output_dtype") == "f32") for case in cases):
+        probe = subprocess.run([str(client), "--capabilities"], capture_output=True, text=True, timeout=10)
+        try:
+            capabilities = json.loads(probe.stdout)
+        except ValueError:
+            capabilities = {}
+        if probe.returncode != 0 or capabilities.get("case_schema", 0) < 2:
+            parser.error("this model needs an updated llama-dayan-operator-bench; rebuild it and pass --client")
     fingerprint = hashlib.sha256(client.read_bytes()).hexdigest()
-    configuration = dict(simulator=args.simulator, prefill=args.prefill, context=args.context,
+    configuration = dict(model=model_name, model_config=model, simulator=args.simulator, prefill=args.prefill, context=args.context,
                          cases=cases, client=str(client), client_sha256=fingerprint,
                          backend_sha256=hashlib.sha256((client.parent / "libggml-dayan.so").read_bytes()).hexdigest()
                          if (client.parent / "libggml-dayan.so").exists() else None,
@@ -306,11 +353,15 @@ def main():
         if not args.resume:
             parser.error("output already contains a run; use --resume or a new directory")
         manifest = json.loads(manifest_path.read_text())
-        if any(manifest[key] != value for key, value in configuration.items()):
+        saved = dict(manifest)
+        saved.setdefault("model", DEFAULT_MODEL)
+        if "model_config" not in saved:
+            saved["model_config"] = load_model(saved["model"])
+        if any(saved.get(key) != value for key, value in configuration.items()):
             parser.error("resume parameters or executable changed; use the original options or a new directory")
     else:
         directory.mkdir(parents=True, exist_ok=True)
-        manifest = dict(schema=1, run_id=uuid.uuid4().hex[:7], created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        manifest = dict(schema=2, run_id=uuid.uuid4().hex[:7], created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                         overhead_percent=20 if args.overhead_percent is None else args.overhead_percent,
                         clock_hz=args.clock_hz, **configuration)
         write_json(manifest_path, manifest)

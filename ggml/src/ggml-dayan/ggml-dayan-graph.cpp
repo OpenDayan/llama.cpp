@@ -51,8 +51,13 @@ bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op) {
     const ggml_tensor * activation      = op->src[1];
     const int64_t       dimension_limit = 0x7ffff000LL;
 
-    if (weight == nullptr || activation == nullptr || !ggml_backend_dayan_is_storage_type(weight->type) ||
-        (activation->type != GGML_TYPE_F32 && activation->type != weight->type) || op->type != GGML_TYPE_F32 ||
+    const bool mx = weight != nullptr && weight->type == GGML_TYPE_MXFP4;
+    if (mx && (weight->ne[0] % 32 != 0 || weight->ne[2] != 1 || weight->ne[3] != 1)) {
+        return false;
+    }
+    if (weight == nullptr || activation == nullptr || (!mx && !ggml_backend_dayan_is_storage_type(weight->type)) ||
+        (activation->type != GGML_TYPE_F32 && activation->type != weight->type &&
+         !(mx && ggml_backend_dayan_is_storage_type(activation->type))) || op->type != GGML_TYPE_F32 ||
         weight->ne[0] != activation->ne[0] || op->ne[0] != weight->ne[1] || op->ne[1] != activation->ne[1] ||
         op->ne[2] != activation->ne[2] || op->ne[3] != activation->ne[3] || weight->ne[0] <= 0 ||
         weight->ne[0] > dimension_limit || weight->ne[1] <= 0 || weight->ne[1] > dimension_limit ||
@@ -159,7 +164,10 @@ bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op) {
     }
 
     const ggml_tensor * mul_mat = op->src[0];
-    return op->type == mul_mat->src[0]->type && ggml_are_same_shape(op, mul_mat);
+    const bool mx = op->type == GGML_TYPE_MXFP4 && op->ne[0] % 32 == 0;
+    const bool mx_input = mul_mat->src[0]->type == GGML_TYPE_MXFP4;
+    return (mx || (mx_input && ggml_backend_dayan_is_storage_type(op->type)) ||
+            (!mx_input && op->type == mul_mat->src[0]->type)) && ggml_are_same_shape(op, mul_mat);
 }
 
 bool ggml_backend_dayan_supports_quantized_glu(const ggml_tensor * op) {
@@ -170,7 +178,9 @@ bool ggml_backend_dayan_supports_quantized_glu(const ggml_tensor * op) {
     }
 
     const ggml_tensor * glu = op->src[0];
-    return op->type == glu->src[0]->src[0]->type && ggml_are_same_shape(op, glu);
+    const bool mx = op->type == GGML_TYPE_MXFP4 && op->ne[0] % 32 == 0 &&
+                    glu->src[0]->op == GGML_OP_MUL_MAT;
+    return (mx || (op->type != GGML_TYPE_MXFP4 && op->type == glu->src[0]->src[0]->type)) && ggml_are_same_shape(op, glu);
 }
 
 bool ggml_backend_dayan_supports_add_id(const ggml_tensor * op) {
@@ -372,6 +382,11 @@ bool ggml_backend_dayan_supports_set_rows(const ggml_tensor * op) {
 }
 
 bool ggml_backend_dayan_supports_copy(const ggml_tensor * op) {
+    if (op != nullptr && op->op == GGML_OP_CPY && op->src[0] != nullptr && op->type == GGML_TYPE_MXFP4) {
+        return ggml_backend_dayan_is_flash_type(op->src[0]->type) && op->ne[0] > 0 && op->ne[0] % 32 == 0 &&
+               ggml_nelements(op) > 0 && (uint64_t) ggml_nelements(op) <= 0x7ffff000ULL &&
+               ggml_are_same_shape(op, op->src[0]) && ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]);
+    }
     return op != nullptr && op->op == GGML_OP_CPY && op->src[0] != nullptr &&
            ggml_backend_dayan_is_copy_type(op->src[0]->type) && ggml_backend_dayan_is_copy_type(op->type) &&
            ggml_nelements(op) == ggml_nelements(op->src[0]) && ggml_nelements(op) >= 0 &&
@@ -788,6 +803,7 @@ bool ggml_backend_dayan_supports_gate_cont(const ggml_tensor * op) {
     const size_t element_size = ggml_type_size(op->type);
     return view->op == GGML_OP_VIEW && packed_qg != nullptr && packed_qg->type == op->type && qg != nullptr &&
            ggml_backend_dayan_supports_mul_mat(qg) &&
+           ggml_backend_dayan_is_storage_type(qg->src[0]->type) &&
            ggml_backend_dayan_mul_mat_has_single_batch(qg) &&
            view->type == op->type && view->ne[0] > 0 && view->ne[1] > 0 && view->ne[2] == qg->ne[1] &&
            view->ne[3] == 1 && op->ne[0] == view->ne[0] * view->ne[1] && op->ne[1] == view->ne[2] &&
@@ -1044,7 +1060,8 @@ static bool ggml_backend_dayan_residual_source_storage_type(
         *type = input->type;
         return true;
     }
-    if (ggml_backend_dayan_supports_mul_mat(input) || ggml_backend_dayan_supports_mul_mat_id(input)) {
+    if ((ggml_backend_dayan_supports_mul_mat(input) || ggml_backend_dayan_supports_mul_mat_id(input)) &&
+        ggml_backend_dayan_is_storage_type(input->src[0]->type)) {
         *type = input->src[0]->type;
         return true;
     }
@@ -1114,6 +1131,9 @@ static bool ggml_backend_dayan_find_cast_hoist(ggml_tensor *                    
                                                enum ggml_type                     type,
                                                const ggml_backend_dayan_use_map & uses,
                                                ggml_backend_dayan_cast_hoist *    hoist) {
+    if (type == GGML_TYPE_MXFP4) {
+        return false;
+    }
     std::vector<ggml_tensor *> layouts;
     ggml_tensor *              root = activation;
     while (ggml_backend_dayan_is_cast_hoist_layout(root)) {
@@ -1309,6 +1329,30 @@ static bool ggml_backend_dayan_preserve_norm_pipeline_inputs(const ggml_cgraph *
     return true;
 }
 
+static bool ggml_backend_dayan_preserve_mxfp4_inputs(const ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * output = graph->nodes[i];
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up = nullptr;
+        if (ggml_backend_dayan_supports_quantized_mul_mat(output) || ggml_backend_dayan_supports_mul_mat_silu(output)) {
+            gate = output->src[0];
+        } else if (ggml_backend_dayan_supports_quantized_glu(output) && output->src[0]->src[0]->op == GGML_OP_MUL_MAT) {
+            gate = output->src[0]->src[0];
+            up = output->src[0]->src[1];
+        }
+        if (gate == nullptr || (output->type != GGML_TYPE_MXFP4 && gate->src[0]->type != GGML_TYPE_MXFP4)) {
+            continue;
+        }
+        // The fused post stage must not reuse an input's payload or scale plane.
+        if (!ggml_backend_dayan_add_dependency(output, gate->src[0]) ||
+            !ggml_backend_dayan_add_dependency(output, gate->src[1]) ||
+            (up != nullptr && !ggml_backend_dayan_add_dependency(output, up->src[0]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph * cgraph) {
     GGML_UNUSED(backend);
 
@@ -1419,7 +1463,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     }
     for (ggml_tensor * node : nodes) {
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
-            node->src[1]->type == GGML_TYPE_F32 && !ggml_backend_dayan_supports_gated_attention(node->src[1])) {
+            (node->src[1]->type == GGML_TYPE_F32 || (node->src[0]->type == GGML_TYPE_MXFP4 && node->src[1]->type != GGML_TYPE_MXFP4)) &&
+            (node->src[0]->type == GGML_TYPE_MXFP4 || !ggml_backend_dayan_supports_gated_attention(node->src[1]))) {
             auto inserted = activation_types.emplace(node->src[1], node->src[0]->type);
             if (!inserted.second && inserted.first->second != node->src[0]->type) {
                 conflicting_activations.insert(node->src[1]);
@@ -1437,8 +1482,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
 
     for (ggml_tensor * node : nodes) {
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
-            node->src[1]->type == GGML_TYPE_F32) {
-            if (ggml_backend_dayan_supports_gated_attention(node->src[1])) {
+            (node->src[1]->type == GGML_TYPE_F32 || (node->src[0]->type == GGML_TYPE_MXFP4 && node->src[1]->type != GGML_TYPE_MXFP4))) {
+            if (node->src[0]->type != GGML_TYPE_MXFP4 && ggml_backend_dayan_supports_gated_attention(node->src[1])) {
                 ggml_backend_dayan_gated_cast rewrite;
                 if (ggml_backend_dayan_find_gated_cast(node, uses, &rewrite)) {
                     gated_casts.push_back(rewrite);
@@ -1479,7 +1524,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     }
 
     if (cast_keys.empty()) {
-        const bool success = ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph);
+        const bool success = ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) &&
+                             ggml_backend_dayan_preserve_mxfp4_inputs(cgraph);
         GGML_LOG_DEBUG("%s: no activation casts, embedding-lowp=%zu, residual-lowp=%zu, gated-f32=%zu, time=%.3f ms\n",
                        __func__, embedding_lowp, residual_lowp, gated_f32,
                        (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
@@ -1532,8 +1578,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
             ggml_build_forward_expand(cgraph, node);
         }
     }
-    if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph)) {
-        GGML_LOG_WARN("%s: graph has no source slots for fused RMSNorm dependencies\n", __func__);
+    if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) || !ggml_backend_dayan_preserve_mxfp4_inputs(cgraph)) {
+        GGML_LOG_WARN("%s: graph has no source slots for fused input dependencies\n", __func__);
         return false;
     }
 
@@ -1578,6 +1624,20 @@ static bool ggml_backend_dayan_can_elide_glu_intermediates(const ggml_cgraph * c
            second_index < cgraph->n_nodes && glu_index < cgraph->n_nodes &&
            ggml_node_has_n_uses(cgraph, first_index, 1) && ggml_node_has_n_uses(cgraph, second_index, 1) &&
            ggml_node_has_n_uses(cgraph, glu_index, 1);
+}
+
+static bool ggml_backend_dayan_mxfp4_inputs_live(const ggml_tensor * output, const ggml_tensor * first,
+                                                const ggml_tensor * second = nullptr) {
+    if (output->type != GGML_TYPE_MXFP4 && first->src[0]->type != GGML_TYPE_MXFP4) {
+        return true;
+    }
+    const ggml_tensor * inputs[] = {first->src[0], first->src[1], second ? second->src[0] : first->src[0]};
+    for (const ggml_tensor * input : inputs) {
+        bool found = false;
+        for (const ggml_tensor * source : output->src) { found |= source == input; }
+        if (!found) { return false; }
+    }
+    return true;
 }
 
 static void ggml_backend_dayan_set_norm_pipeline_outputs(const ggml_cgraph *             cgraph,
@@ -1627,7 +1687,8 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
     }
     for (int index = 0; index < cgraph->n_nodes; ++index) {
         ggml_tensor * output = cgraph->nodes[index];
-        if (!ggml_backend_dayan_supports_quantized_mul_mat(output)) {
+        if (!ggml_backend_dayan_supports_quantized_mul_mat(output) ||
+            !ggml_backend_dayan_mxfp4_inputs_live(output, output->src[0])) {
             continue;
         }
         const auto producer = node_indices.find(output->src[0]);
@@ -2147,6 +2208,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
 
         const int silu_index = ggml_backend_dayan_next_compute(cgraph, i + 1);
         if (silu_index < cgraph->n_nodes && ggml_backend_dayan_supports_mul_mat_silu(cgraph->nodes[silu_index]) &&
+            ggml_backend_dayan_mxfp4_inputs_live(cgraph->nodes[silu_index], node) &&
             cgraph->nodes[silu_index]->src[0] == node && ggml_node_has_n_uses(cgraph, i, 1) &&
             (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
             slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_silu;
@@ -2172,6 +2234,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
                 ggml_backend_dayan_can_elide_glu_intermediates(cgraph, i, pair_index, glu_index) &&
                 ggml_backend_dayan_supports_glu(cgraph->nodes[glu_index]) &&
                 ggml_backend_dayan_supports_quantized_glu(cgraph->nodes[cast_index]) &&
+                ggml_backend_dayan_mxfp4_inputs_live(cgraph->nodes[cast_index], node, pair) &&
                 ((cgraph->nodes[glu_index]->src[0] == node && cgraph->nodes[glu_index]->src[1] == pair) ||
                  (cgraph->nodes[glu_index]->src[0] == pair && cgraph->nodes[glu_index]->src[1] == node)) &&
                 cgraph->nodes[cast_index]->src[0] == cgraph->nodes[glu_index]) {

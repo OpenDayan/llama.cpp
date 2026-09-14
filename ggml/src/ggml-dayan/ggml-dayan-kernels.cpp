@@ -11,6 +11,7 @@
 #include "ggml-dayan-moe.h"
 #include "ggml-dayan-matmul-4c.h"
 #include "ggml-dayan-normalization.h"
+#include "ggml-dayan-mxfp4.h"
 #include "ggml-dayan-rope.h"
 #include "ggml-dayan-softmax.h"
 
@@ -55,6 +56,18 @@ static inline float u32_as_float(uint32_t value) {
 #    include "ggml-dayan-flash-attention.h"
 #    include "ggml-dayan-gated-delta-net.h"
 #endif
+
+__kernel__ void quantize_mxfp4(const DayanMxfp4Config * config, const void * input, void * output, void * scales) {
+    dayan_acquire_config(config);
+    ggml_dayan_mxfp4_detail::convert(config, input, output, scales);
+}
+
+__kernel__ void matmul_mxfp4_4c(const DayanMxfp4Config * config, const void * a, const void * as,
+                                const void * b, const void * bs, const void * up, const void * ups,
+                                void * output, void * scales) {
+    dayan_acquire_config(config);
+    ggml_dayan_matmul_detail::matmul_check(ggml_dayan_mxfp4_detail::run(config, a, as, b, bs, up, ups, output, scales));
+}
 
 __kernel__ void matmul_bf16_1c(const DayanMatmulConfig * config,
                                const uint16_t *          a,
@@ -1682,6 +1695,8 @@ DAYAN_MATMUL_1C_DESC(matmul_inference_bf16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_fp16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_inference_fp16_1c);
 DAYAN_MATMUL_4C_DESC(matmul_bf16_4c);
+DAYAN_MATMUL_4C_DESC(matmul_mxfp4_4c);
+DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 0, 0, DAYAN_DESC_URAM_BYTES(64U * 1024U), 1, 0, 1, 0);
 DAYAN_MATMUL_4C_DESC(matmul_inference_bf16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_fp16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_inference_fp16_4c);

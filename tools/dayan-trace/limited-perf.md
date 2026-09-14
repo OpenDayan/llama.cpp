@@ -1,6 +1,6 @@
 # Limited operator profiling
 
-`limited-perf.py` measures a small set of existing Dayan kernels and estimates Qwen3.5-0.8B BF16 inference cost. It connects to an existing `dayan_server` and reads the JSON output of an existing firmware `dyperf`. It does not start or stop TestCluster, cmodel, the server, or a profiler. No kernel contains custom performance instrumentation.
+`limited-perf.py` measures the key Dayan operators selected by `--model` and estimates their inference cost. Model groups, shapes, storage types, and prediction factors are recorded in [limited-perf-models.json](limited-perf-models.json). It connects to an existing `dayan_server` and reads the JSON output of an existing firmware `dyperf`. It does not start or stop TestCluster, cmodel, the server, or a profiler. No kernel contains custom performance instrumentation.
 
 Build the host client from the repository root:
 
@@ -11,6 +11,39 @@ python3 tools/dayan-trace/limited-perf.py plan
 ```
 
 The default plan has 16 cases: eight operators for prefill with M=1024 and the same eight for decode with M=1. Each runs once, with no hidden warmup or shape sweep. A four-core server with core mask `0xf` is required. Run one operator client at a time; leave TestCluster advancing continuously and waveform recording disabled.
+
+## Select the model
+
+The default `--model qwen35-0.8B-bf16` preserves the existing BF16 group. Select `qwen35-0.8B-mxfp4` for the prepared MXFP4 model:
+
+```sh
+cmake --build build-dayan-mxfp4 --target llama-dayan-operator-bench -j4
+python3 tools/dayan-trace/limited-perf.py plan --model qwen35-0.8B-mxfp4
+python3 tools/dayan-trace/limited-perf.py run \
+    --model qwen35-0.8B-mxfp4 \
+    --client build-dayan-mxfp4/bin/llama-dayan-operator-bench \
+    --socket /tmp/dayan-server.sock --perf-trace /tmp/dayan-perf.json \
+    --output build-dayan-mxfp4/rtl-perf
+```
+
+Use the socket and trace file of your existing server/profiler, after any other operator test has finished. `--model` selects representative operators; it does not load a GGUF or execute the full model. The client must be rebuilt with MXFP4 support and the SDK conversion encoding fix described in the [backend README](../../ggml/src/ggml-dayan/README.md). The script checks client capabilities before launching MXFP4 cases so an old BF16 client cannot silently produce mislabeled results.
+
+The MXFP4 group has 21 cases: ten per phase plus a decode-only BF16 vocabulary proxy. `ffn`, `down`, `input`, and `output` use `matmul_mxfp4_4c`. FFN includes SwiGLU and the VEC conversion of its output to MXFP4. Matrix inputs have packed FP4 payload and separate Z-packed scales; load-a/load-b load both. Upload and host packing are outside the launch measurement.
+
+`quantize-input` (width 1024) and `quantize-output` (width 2048) measure standalone F32-to-MXFP4 VEC conversion, including output scale stores. They represent the shared casts after norms and before attention output projections. They do not duplicate the conversion already fused into FFN. `norm` writes F32 in this group. GDN, convolution, and BF16 FlashAttention keep their floating-point paths. `decode-vocab` uses BF16 because this model's vocabulary projection uses the floating-point embedding weight; its cost is extrapolated separately from the MXFP4 projections.
+
+Use the same selection options with either model, for example:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py plan --model qwen35-0.8B-mxfp4 \
+    --cases decode-ffn decode-down decode-quantize-input
+```
+
+Each model configuration has a `description`, `cases`, and `prediction_terms`. A case defines its `name`, `op`, dimensions, optional `dtype`/`output_dtype`, and optional `phases` (default: both). The script supplies M from `--prefill` or decode M=1, and derives attention KV length from the phase and `--context`. Dtype defaults preserve the BF16 preset: BF16 matrix/attention inputs, F32 other inputs, BF16 FFN/norm outputs, and F32 other outputs; `quantize` writes MXFP4. The client honors the recorded dimensions and rejects unsupported storage combinations. GDN currently requires head dimension 128 and one snapshot; attention samples require head dimension 256.
+
+Prediction terms reference `{phase}-name` or a fixed case ID. Their multiplier is `factor / divisor`, with divisor defaulting to 1; `reason` explains the proxy. New runs save the selected model configuration in `manifest.json`. Reports use that snapshot, and resume rejects a changed configuration. Old BF16 manifests remain readable. `report` infers the model from the saved run; an explicit mismatched `--model` is rejected.
+
+## BF16 samples
 
 | Sample | Shape or parameters | Why it is measured |
 | --- | --- | --- |
@@ -23,7 +56,7 @@ The default plan has 16 cases: eight operators for prefill with M=1024 and the s
 | FlashAttention | 8 query heads, 2 KV heads, head dimension 256 | Causal prefill or decode with a populated KV cache |
 | Residual + RMSNorm + scale + BF16 | M x 1024 | Repeated memory/vector work outside MatMul |
 
-The cases follow the backend dispatch: M<=512 uses the four-core inference entry and M>512 uses the general entry. MatMul uses N sharding for inference and a 2x2 layout for larger M. Both FFN entries use the dedicated pipeline with N sharding, combined gate/up B tiles, and exact M-row A tiles when M<32. Set `--prefill` to 1..1024 to sample another M; a single run has only one prefill size. Decode uses one token with a prefix of `--context` tokens (default 1024), hence KV length 1025. Inputs use deterministic constants with analytical references; every output element is checked, including the DeltaNet state. This is a measurement smoke check; existing numerical operator tests cover varied data and layouts.
+The BF16 cases follow the backend dispatch: M<=512 uses the four-core inference entry and M>512 uses the general entry. MatMul uses N sharding for inference and a 2x2 layout for larger M. Both FFN entries use the dedicated pipeline with N sharding, combined gate/up B tiles, and exact M-row A tiles when M<32. MXFP4 uses its four-core tiled pipeline for both phases. Set `--prefill` to 1..1024 to sample another M; a single run has only one prefill size. Decode uses one token with a prefix of `--context` tokens (default 1024), hence KV length 1025. Inputs use deterministic constants with analytical references; every output element is checked, including the DeltaNet state. MXFP4 references include the hardware scale choice and E2M1 truncation. This is a measurement smoke check; existing numerical operator tests cover varied data and layouts.
 
 ## Use the existing server and profiler
 
@@ -52,7 +85,7 @@ python3 tools/dayan-trace/limited-perf.py run \
 The command writes progress and the final report to stdout. The output directory contains:
 
 - `report.md`, `report.json`, and `operators.csv`: per-shape measurements and predictions, with formulas and limitations.
-- `manifest.json`: selected cases, dimensions, repetition counts, executable/backend hashes, simulator label, and socket.
+- `manifest.json`: model name and configuration snapshot, selected cases, dimensions, repetition counts, executable/backend hashes, simulator label, and socket.
 - `*.case.json`, `*.result.json`, and `*.log`: inputs, raw wall measurements, unique profiler task names, reference errors, commands, and client output. Results are saved after each case.
 
 Firmware dyperf buffers records on Device and in its output stream. It can keep a short run's final records until collection ends. A live profiler therefore does not guarantee that all cycle records are readable. The script leaves it running, reports missing cycles as `N/A`, and exits with code 2. Once the existing collection has ended and dyperf has written its final records, regenerate the report without executing any operators:
@@ -123,7 +156,7 @@ launch_cycles = max(root WAIT_EXIT begin) - min(root first RUNNING begin)
 
 It uses raw 48-bit counters and handles wraparound for launches shorter than half the counter period. All cores must have a shared counter origin. This is the Device execution span including scheduler gaps and child work, after the first root starts and before the final root's exit RPC. It does not add overlapping core times, child times, or idle time until the profiler closes. Incomplete launches and non-positive counters never become zero-cycle measurements.
 
-The prediction assumes 24 inference blocks (18 linear-attention and 6 full-attention blocks), hidden size 1024, FFN width 3584, vocabulary 248320, batch 1, resident weights, and only the last token's logits. The GGUF's extra MTP block is excluded. The report exposes every multiplicity and proxy factor. In particular, the huge vocabulary projection is extrapolated from M=1, N=6144, K=1024 by `248320 / 6144`; it is not simulated at full size. Other input projections share an N-scaled proxy. Pair fusion and attention epilogues can change that estimate.
+Both supplied model configurations assume 24 inference blocks (18 linear-attention and 6 full-attention blocks), hidden size 1024, FFN width 3584, vocabulary 248320, batch 1, resident weights, and only the last token's logits. MTP is excluded. The report exposes every multiplicity and proxy factor. In particular, the huge vocabulary projection is extrapolated from a BF16 M=1, N=6144, K=1024 sample by `248320 / 6144`; it is not simulated at full size. Other input projections share an N-scaled proxy of their own storage type. Pair fusion and attention epilogues can change that estimate.
 
 For wall time and cycles separately, the report sums `sample * factor` and displays both that subtotal and a scenario with `--overhead-percent` added (default 20%). This is an explicit, uncalibrated allowance for omitted casts/layouts, RoPE, small gates, KV/state copies, host scheduling, and sampling; it is not a measured overhead or confidence interval. The timing of those operations can differ substantially from the allowance. Cold module-loading cost is repeated by this formula unless warmup is enabled. The preset is a coarse estimate, not a full-model benchmark or a general model profiler. Model loading, tokenization, and simulator startup are excluded.
 

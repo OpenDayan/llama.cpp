@@ -1,6 +1,68 @@
 # Dayan backend
 
+BF16, FP16, and MXFP4 weights use the same `ggml-dayan` backend and kernel module. Enabling `GGML_DAYAN` compiles all three paths together; runtime dispatch selects operators by tensor type. Switching between these GGUF weight formats requires no format-specific CMake flags or rebuild.
+
+## Build
+
+Build on Linux with the Dayan SDK's `dycc`, host and Device API headers, and `libDayanRuntime.a` available. Set `DAYAN_ROOT` to the SDK checkout or installation prefix. For a source checkout, build the host dependencies once:
+
+```sh
+export DAYAN_ROOT="$HOME/npu-firmware"
+make -C "$DAYAN_ROOT" -j6 host-driver dycc
+```
+
+From the llama.cpp repository root, configure one build directory for all supported weight formats:
+
+```sh
+cmake -S . -B build-dayan \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_DAYAN=ON \
+    -DDAYAN_ROOT="$DAYAN_ROOT" \
+    -DLLAMA_BUILD_TOOLS=ON \
+    -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_SERVER=ON
+cmake --build build-dayan -j6
+```
+
+Executables are written to `build-dayan/bin`, including `llama-cli`, `llama-server`, `llama-bench`, `llama-dayan-trace`, and `llama-dayan-operator-bench`. `LLAMA_BUILD_SERVER=ON` also enables the CLI target in this checkout. To rebuild only the inference tools and Dayan tests after a change:
+
+```sh
+cmake --build build-dayan -j6 --target \
+    llama-cli llama-server llama-bench llama-dayan-trace llama-dayan-operator-bench \
+    test-backend-ops test-dayan-matmul test-dayan-graph test-dayan-mxfp4
+```
+
+The same binaries accept BF16, FP16, and MXFP4 models. Select the model at runtime with `-m /path/to/model.gguf` and the server connection with `DAYAN_SERVER_SOCKET`; the build directory name does not select a weight format.
+
+## Backend behavior
+
 The backend supports contiguous `GGML_OP_MUL_MAT` with BF16 or FP16 weights, including broadcastable `ne2` and `ne3` batches. Activations are stored with the same type as the weights, matrix accumulation uses F32, and an unfused matrix multiplication returns the F32 result required by ggml.
+
+Dense MXFP4 MatMul and FFN use `ggml-dayan-mxfp4.h`. MXFP4 weights must have one matrix batch, contiguous rows, and K divisible by 32. Activation batches are flattened into M. Attention operators and KV storage keep their existing floating-point paths. MXFP4 expert routing is not supported.
+
+The GGUF representation remains the standard 17-byte block: one E8M0 scale followed by 32 FP4 values. Upload splits this into consecutive low-nibble-first FP4 payload and a separate scale view stored in `tensor->extra`. Readback restores the GGUF representation, including partial transfers. The arena allocation includes payload row padding and all scale planes, so the graph allocator owns both lifetimes.
+
+For either operand, let `r` be the A row or B column and `g` the K32 group. The scale offset is `(g / 4) * scale_stride + r * 4 + g % 4`, with `scale_stride = align_up(rows_or_columns, 8) * 4`. Eight lanes occupy 32 bytes in each K128 plane. Scales are unswizzled; only matrix payload follows the selected MAT input swizzle. The load-a and load-b threads load both payload and scales before publishing their Resource. The paired gate/up products share A and release its Resource after both MAT reads.
+
+MXFP4 tiling follows `npu-firmware/demo/matmul_fp4_4c.cpp`: each core keeps two A buffers and splits the macro tile into two N slices, each with its own B and F32 accumulator buffers. A is reused across both N slices and, for FFN, both gate/up products. The four cores own independent output macro tiles. `DayanMxfp4Tile` accounts for payload, scale planes, accumulators, alignment, VEC staging, and a 64-byte guard within 1536 KiB per core:
+
+| Large-M path | Macro M x N x K | MAT slice M x N x K | URAM used | Capacity used |
+| --- | --- | --- | --- | --- |
+| MXFP4 MatMul, F32 output | 512 x 512 x 640 | 512 x 256 x 640 | 1534.06 KiB | 99.87% |
+| MXFP4 MatMul with output conversion | 528 x 512 x 512 | 528 x 256 x 512 | 1535.78 KiB | 99.99% |
+| MXFP4 gate/up + activation + conversion | 256 x 512 x 512 | 256 x 256 x 512, twice | 1530.28 KiB | 99.63% |
+
+M shrinks to the actual row count rounded up to eight. Below 128 rows, N targets one quarter of the output columns, rounded up to 256 and capped at 3072; MXFP4 K grows to 1024, 2048, or 4096 when useful and within budget. Small matrices do not fill URAM with unused rows. BF16/FP16 producers retain K=512 and reduce M to fit their wider inputs. Actual tail instructions use valid M/N/K, including K32 tails.
+
+The post thread processes 56 x 128 elements at a time; this is VEC staging, not the MAT slice size. LSU removes the accumulator swizzle into a 640-byte row stride before activation or conversion. The standalone conversion also handles 56 x 128 blocks. URAM A scale planes use `align_up(M * 4, 64)` as their K128 stride so LSU's 64-byte tail zero-fill cannot overwrite the next plane; the external Z layout is unchanged.
+
+VisualSwizzle was evaluated with 32 banks, 32-byte words, eight rows per cycle, actual buffer offsets, and FP4 64-byte or floating-point 32-byte row accesses. A/B strides 256 and 320 use M/B/S=(7,1,3), 512 uses (7,2,3), 1024 uses (7,3,3), and 2048 uses (7,3,4). C uses the same rule for its power-of-two row-stride factor; the default 1024-byte C stride uses (7,3,3). All selected layouts have peak bank pressure 1 and zero excess requests. Four-block coverage is 26/32 for the 320-byte input stride and 32/32 for the other MAT layouts. The 320-byte mapping stays within 256-byte windows to preserve partial input buffer boundaries.
+
+The rewrite shares activation casts and fuses eligible MatMul or SwiGLU/GeGLU producers with an MXFP4 output cast. Dependencies on the final fused node keep input payload and scale planes live through the post stage. Without these dependencies, the compiler leaves the operations separate. BF16/FP16 producers can also write MXFP4, and MXFP4 MatMul can write BF16/FP16 at an attention boundary. The post thread converts each output tile before its DRAM store. A standalone VEC conversion handles inputs whose producers cannot be fused. BF16 groups use the hardware MXFP4 conversion directly; F32 and FP16 inputs first round to BF16. Hardware conversion uses the smallest E8M0 scale that covers the finite normal group maximum and truncates E2M1 magnitudes. This differs from GGML's generic MXFP4 activation quantizer.
+
+The SDK must include the MXFP4 correction in `dayan_intrinsics.h`: `__tx_vec_cvt_mxfp4_bf16<0, 0, 0>()` must encode `0x8027800b`. The older Clang builtin emits `0x8023800b`, which does not select the conversion instruction class. This uses the same SDK correction mechanism as the BF16/FP16 conversion wrappers.
+
+Build `test-dayan-mxfp4` and run it against an isolated cmodel server. It checks scale Z layout, partial transfers, VEC conversion, matrix tails, repeated resource reuse, shared casts, fused FFN, and floating-point output boundaries. `test-dayan-mxfp4 --host-only` checks packing without a device.
 
 Before scheduling a llama graph, the backend rewrite inserts one matching BF16 or FP16 `CPY` for each unique F32 activation used by an eligible matrix multiplication. Matrix multiplications that share an activation and storage type also share the cast tensor. Direct ggml users that do not run the rewrite can still provide F32 activations; the Dayan graph executor converts each unique activation once.
 
@@ -62,13 +124,6 @@ Gated Delta Net assigns heads and sequences to at most 16 root tasks, with up to
 
 Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The chunk layout uses 345.5 KiB within a 352 KiB task reservation, or 1408 KiB for four resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation.
 
-Configure the firmware SDK explicitly:
-
-```sh
-cmake -S . -B build-dayan -DGGML_DAYAN=ON -DDAYAN_ROOT=/path/to/npu-firmware
-cmake --build build-dayan --target test-backend-ops -j
-```
-
 ## Profiling
 
 Device operators contain no custom cycle counters or performance buffers. Use the firmware profiler for scheduling traces:
@@ -117,14 +172,7 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-backend-ops -b
 
 Enable the cores required by the selected kernel in `dayan_server`; four-core MatMul paths need core mask `0xf`. The same client commands work with a TestCluster-backed server.
 
-To run cmodel alongside a TestCluster using `/tmp/virtual_npu`, use a separate FUSE mount and Runtime socket. The QEMU build must support `NPU_DEVICE_PREFIX`:
-
-```sh
-NPU_DEVICE_PREFIX=/tmp/dayan-attn-dbuf-npu NPU_XDMA_DEVICE_DIR=/tmp/dayan-attn-dbuf-npu DAYAN_SERVER_SOCKET=/tmp/dayan-attn-dbuf.sock ~/npu-firmware/run_cmodel_server.sh
-DAYAN_SERVER_SOCKET=/tmp/dayan-attn-dbuf.sock ./build-dayan/bin/test-dayan-attention-pipeline
-```
-
-Run the client in another terminal. This separates cmodel from TestCluster; the cmodel launcher still permits only one cmodel instance because its internal IPC and shared-memory names are fixed. Run clients against each simulator sequentially.
+To run cmodel alongside TestCluster, isolate its FUSE mount, Runtime socket, emulator IPC sockets, and DRAM/URAM shared-memory names. Separate mount and Runtime socket paths alone are insufficient. The stock `run_cmodel_server.sh` cleans the default IPC and shared-memory files, so do not use it while TestCluster owns those resources. Use an isolated emulator/QEMU pair and a launcher whose cleanup touches only that instance's paths. Clients select the instance through `DAYAN_SERVER_SOCKET`.
 
 Replace `test` with `support` to check whether Dayan supports the selected cases without running their numerical comparison. `perf` runs the performance case set, which has different shapes and may require a different `-p` filter; host timings under simulation are not hardware throughput measurements.
 
