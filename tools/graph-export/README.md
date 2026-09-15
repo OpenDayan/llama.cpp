@@ -2,6 +2,8 @@
 
 `llama-graph-export` builds representative prefill and single-token decode graphs without running inference. It exports tensor names, operations, types, shapes, strides, buffer placement, flags, views, and source edges as JSON. For Dayan, it also compiles the graph into physical execution slots.
 
+Each tensor includes numeric `op_id`, `type_id`, and the raw `op_params` integer array for reconstructing operator tests. These IDs and parameter layouts belong to the exporting build; use a matching build of `test-backend-ops` when converting them to its `--test-file` format.
+
 ```sh
 llama-graph-export -m model.gguf -p "Hello" -o graph.json
 python3 tools/graph-export/graph-export-html.py graph.json graph.html --graph decode

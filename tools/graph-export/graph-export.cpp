@@ -295,8 +295,10 @@ static json export_graph(llama_context * ctx,
             { "name", tensor->name },
             { "kind", tensor_kind(tensor, graph_nodes.count(tensor) != 0) },
             { "op", ggml_op_name(tensor->op) },
+            { "op_id", tensor->op },
             { "op_symbol", ggml_op_symbol(tensor->op) },
             { "type", ggml_type_name(tensor->type) },
+            { "type_id", tensor->type },
             { "shape", tensor_dimensions(tensor->ne) },
             { "strides", tensor_strides(tensor->nb) },
             { "elements", ggml_nelements(tensor) },
@@ -307,6 +309,10 @@ static json export_graph(llama_context * ctx,
             { "execution_backend", tensor_backend(ctx, tensor) },
             { "view_offset", tensor->view_offs },
         };
+        node["op_params"] = json::array();
+        for (int32_t parameter : tensor->op_params) {
+            node["op_params"].push_back(parameter);
+        }
         if (order != graph_order.end()) {
             node["order"] = order->second;
         } else {

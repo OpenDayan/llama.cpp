@@ -45,6 +45,12 @@ The same inference binaries accept BF16, FP16, and MXFP4 models. Select the mode
 
 ### Start the simulator and Runtime server
 
+Rebuild cmodel after changing its source or instruction implementations. The firmware launcher builds firmware and the Runtime server, but does not rebuild cmodel:
+
+```sh
+make -C "$HOME/rvtng-cmodel" -j6
+```
+
 In a separate terminal, start a four-core cmodel server and wait for `Dayan cmodel server is ready`:
 
 ```sh
@@ -59,7 +65,7 @@ For a single-core run, stop this launcher with Ctrl-C and restart it with `NPU_C
 Select a GGUF with actual model weights, then generate a short response:
 
 ```sh
-export DAYAN_MODEL=/path/to/model.gguf
+export DAYAN_MODEL=/share/models/Qwen3.5-0.8B-MXFP4/Qwen3.5-0.8B-MXFP4-Vocab-MXFP4.gguf
 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
     --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
     -n 16 --no-warmup --single-turn -p "Hello"
@@ -104,6 +110,8 @@ With the Runtime server ready, run numerical checks for MatMul, graph fusion, at
 For more selectors and individual GGML operators, see [Dedicated tests](#dedicated-tests) and [Test a specific operator](#test-a-specific-operator).
 
 ### Run limited-perf.py
+
+`--cmp` checks the selected preset cases. It does not cover every operator in a model graph. In particular, row reads/writes, RoPE, layout copies, small gates, and the model's FP16 attention path need separate backend tests. MXFP4 conversion uses a scalar reference for the device's scale selection and truncation; the GGML CPU quantizer uses different rules.
 
 `--model` selects representative operator shapes, not a GGUF file. Preview the BF16 prefill/decode cases without contacting a server:
 
@@ -345,6 +353,7 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-graph ro
 | `get-rows` | Indexed row reads |
 | `embedding-norm` | Embedding lookup and normalization |
 | `memory` | Memory and layout operators |
+| `empty` | Empty Scale, memory operators, and BF16/FP16/MXFP4 output MatMul |
 
 The standalone test executables below have matching CMake build targets, for example `cmake --build build-dayan --target test-dayan-attention-projection -j`.
 

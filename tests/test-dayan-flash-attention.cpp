@@ -296,6 +296,8 @@ int main() {
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 1, 0x35f18U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 2048, 1025, 0x35f20U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 513, 0x35f21U, GGML_TYPE_F16) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 128, 512, 128, 0x35f24U, GGML_TYPE_F16) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 512, 129, 0x35f25U, GGML_TYPE_F16) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 512, 0x35f22U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 511, 0x35f23U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 65, 256, 151, 0x35f19U) != 0) {

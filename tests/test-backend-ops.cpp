@@ -7483,7 +7483,9 @@ struct test_generic_op : public test_case {
         }
 
         ggml_tensor * out;
-        if (inplace && source_count > 0) {
+        if (op == GGML_OP_SET_ROWS && source_count == 3) {
+            out = ggml_view_tensor(ctx, source_tensors[2]);
+        } else if (inplace && source_count > 0) {
             out = ggml_view_tensor(ctx, source_tensors[0]);
         } else {
             out = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
@@ -7527,6 +7529,7 @@ struct test_generic_op : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
         ggml_tensor * out = ggml_get_tensor(ctx, "out");
 
         std::random_device rd;

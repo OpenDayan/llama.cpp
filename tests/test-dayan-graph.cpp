@@ -1479,6 +1479,58 @@ static int run_empty_memory_case(ggml_backend_t dayan) {
     return 0;
 }
 
+static int run_empty_output_case(ggml_backend_t dayan, enum ggml_type type) {
+    constexpr int64_t width      = 64;
+    constexpr int64_t rows       = 4;
+    constexpr int     graph_size = 16;
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) {
+        return fail("cannot create the empty output context");
+    }
+
+    ggml_tensor * input    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, rows);
+    ggml_tensor * weight   = ggml_new_tensor_2d(ctx.get(), type, width, width);
+    ggml_tensor * indices  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 0);
+    ggml_tensor * scaled   = ggml_scale(ctx.get(), input, 2.0f);
+    ggml_tensor * selected = ggml_get_rows(ctx.get(), scaled, indices);
+    ggml_tensor * output   = ggml_mul_mat(ctx.get(), weight, selected);
+    ggml_set_input(input);
+    ggml_set_output(scaled);
+    ggml_set_name(output, "result_output");
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, output);
+    if (!rewrite_graph(dayan, ctx.get(), graph)) {
+        return fail("DAYAN empty output graph rewrite failed");
+    }
+    if (!ggml_is_empty(output) || !ggml_backend_supports_op(dayan, output)) {
+        return fail("DAYAN rejected empty output MatMul");
+    }
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) {
+        return fail("cannot allocate empty output graph tensors");
+    }
+    std::vector<float> data(width * rows, 1.0f);
+    ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) {
+        return fail("DAYAN empty output graph failed");
+    }
+    ggml_backend_tensor_get(scaled, data.data(), 0, ggml_nbytes(scaled));
+    for (float value : data) {
+        if (value != 2.0f) {
+            return fail("DAYAN skipped a nonempty ancestor of the empty output");
+        }
+    }
+    std::printf("empty output type=%s matmul=PASS ancestor=PASS\n", ggml_type_name(type));
+    return 0;
+}
+
 static int run_copy_fast_path_case(ggml_backend_t dayan) {
     constexpr int64_t contiguous_width  = 128;
     constexpr int64_t contiguous_rows   = 128;
@@ -2306,8 +2358,14 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "memory") == 0) {
         return run_memory_case(dayan.get());
     }
+    if (argc == 2 && std::strcmp(argv[1], "empty") == 0) {
+        return run_empty_scale_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
+                       run_empty_output_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
+                       run_empty_output_case(dayan.get(), GGML_TYPE_F16) != 0 ||
+                       run_empty_output_case(dayan.get(), GGML_TYPE_MXFP4) != 0 ? 1 : 0;
+    }
     if (argc != 1) {
-        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output|copy|get-rows|embedding-norm|norm|memory]");
+        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output|copy|get-rows|embedding-norm|norm|memory|empty]");
     }
 
     if (run_norm_cached_cases(dayan.get()) != 0 ||
@@ -2327,6 +2385,9 @@ int main(int argc, char ** argv) {
         run_math_case(dayan.get()) != 0 || run_reduction_norm_case(dayan.get()) != 0 ||
         run_strided_rms_case(dayan.get()) != 0 || run_rope_cases(dayan.get(), cpu.get()) != 0 ||
         run_memory_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
+        run_empty_output_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
+        run_empty_output_case(dayan.get(), GGML_TYPE_F16) != 0 ||
+        run_empty_output_case(dayan.get(), GGML_TYPE_MXFP4) != 0 ||
         run_copy_fast_path_case(dayan.get()) != 0 || run_get_rows_fast_path_case(dayan.get()) != 0 ||
         run_layout_case(dayan.get()) != 0 || run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
         run_softmax_clamp_case(dayan.get()) != 0 ||

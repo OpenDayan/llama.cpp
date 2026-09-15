@@ -1613,6 +1613,7 @@ static bool ggml_backend_dayan_is_metadata(const ggml_tensor * node) {
 
 static int ggml_backend_dayan_next_compute(const ggml_cgraph * cgraph, int index) {
     while (index < cgraph->n_nodes && ((cgraph->nodes[index]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+                                       ggml_is_empty(cgraph->nodes[index]) ||
                                        ggml_backend_dayan_is_metadata(cgraph->nodes[index]))) {
         ++index;
     }

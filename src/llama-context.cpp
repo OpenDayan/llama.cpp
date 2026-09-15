@@ -88,7 +88,7 @@ static bool llama_graph_is_dayan_only(const llama_model & model, ggml_backend_sc
     int compute_nodes = 0;
     for (int index = 0; index < ggml_graph_n_nodes(gf); ++index) {
         ggml_tensor * node = ggml_graph_node(gf, index);
-        if (llama_graph_node_is_metadata(node)) {
+        if (llama_graph_node_is_metadata(node) || ggml_is_empty(node)) {
             continue;
         }
 

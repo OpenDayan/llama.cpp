@@ -3677,6 +3677,10 @@ static ggml_backend_buffer_type_t ggml_backend_dayan_device_get_buffer_type(ggml
 static bool ggml_backend_dayan_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
 
+    if (ggml_is_empty(op)) {
+        return true;
+    }
+
     switch (op->op) {
         case GGML_OP_NONE:
             return true;

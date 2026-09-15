@@ -10,7 +10,7 @@ cmake --build build-dayan --target llama-dayan-operator-bench -j4
 python3 tools/dayan-trace/limited-perf.py plan
 ```
 
-The default plan has 16 cases: eight operators for prefill with M=1024 and the same eight for decode with M=1. Each runs once, with no hidden warmup or shape sweep. A four-core server with core mask `0xf` is required. Run one operator client at a time; leave TestCluster advancing continuously and waveform recording disabled.
+The default plan has 16 cases: eight operators for prefill with M=1024 and the same eight for decode with M=1. Each runs once, with no hidden warmup or shape sweep. The client queries Runtime topology and selects cooperative kernels only when a complete four-core group is available. A single-core server uses non-cooperative kernels with Task Dim `(1,1,1)`. Run one operator client at a time; leave TestCluster advancing continuously and waveform recording disabled.
 
 ## Select the model
 
@@ -44,6 +44,8 @@ Each model configuration has a `description`, `cases`, and `prediction_terms`. A
 Use `--model qwen35-0.8B-mxfp4-vocab` for the GGUF with a quantized shared embedding/LM head. Its `decode-vocab` case uses MXFP4; the original `qwen35-0.8B-mxfp4` preset keeps its BF16 vocabulary proxy for comparison. Both vocabulary cases still sample N=6144 and extrapolate to 248320.
 
 ## CPU comparison
+
+Comparison covers the selected preset cases, not all operators in a model graph. Use backend tests for GET_ROWS, SET_ROWS, RoPE, layout copies, small gates, and FP16 attention. The preset attention case uses BF16. Standalone GLU requires a graph fusion pattern on Dayan; test it through the fused FFN case. GGML CPU does not accept MXFP4 activations for MUL_MAT, so the native benchmark compares against CPU F32 MatMul with the same decoded input values.
 
 Add `--cmp` to check every launch against a CPU gold reference:
 
