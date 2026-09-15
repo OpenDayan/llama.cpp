@@ -30,7 +30,7 @@ static_assert((NormalizationLayout::kScalar & 63U) == 0U, "Normalization scalar 
 static inline uint32_t dayan_native_task_id() {
     const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
     const uint32_t task  = dayan_task_id(DAYAN_TASK_X);
-    if (dayan_task_mode() != 1U || tasks == 0U || tasks > kDayanNativeMaxTasks || task >= tasks ||
+    if (dayan_task_mode() != 1U || tasks == 0U || task >= tasks ||
         dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         DAYAN_PARAMS_ERROR();
     }

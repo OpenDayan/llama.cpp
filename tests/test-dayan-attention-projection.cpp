@@ -215,7 +215,7 @@ static bool compare_fp32(const std::vector<float> & expected, const std::vector<
     return close;
 }
 
-static int run_case(runtime_context * runtime, enum ggml_type type) {
+static int run_case(runtime_context * runtime, enum ggml_type type, int cores = 1, uint32_t groups = 1) {
     constexpr uint32_t tokens     = 3;
     constexpr uint32_t embd       = 64;
     constexpr uint32_t head_dim   = 64;
@@ -359,25 +359,25 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
                                          qg    ? "qg-proj" :
                                          value ? "v-proj" :
                                                  "k-proj");
-            attrs.config.task_dim  = NPUTaskDim3{ 1, 1, 1 };
-            attrs.config.task_mode = NPUTaskMode::kSingleCore;
+            attrs.config.task_dim  = cores == 4 ? NPUTaskDim3{4, groups, 1} : NPUTaskDim3{groups, 1, 1};
+            attrs.config.task_mode = cores == 4 ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
             attrs.timeout_ms       = 3600000U;
             if (qg) {
                 status = type == GGML_TYPE_BF16 ?
-                             project_qg_bf16_1c(buffers.config, buffers.activation, buffers.weight, buffers.norm,
+                             (cores == 4 ? project_qg_bf16_4c : project_qg_bf16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.norm,
                                                 buffers.positions, buffers.raw, buffers.output, &attrs) :
-                             project_qg_fp16_1c(buffers.config, buffers.activation, buffers.weight, buffers.norm,
+                             (cores == 4 ? project_qg_fp16_4c : project_qg_fp16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.norm,
                                                 buffers.positions, buffers.raw, buffers.output, &attrs);
             } else if (value) {
-                status = type == GGML_TYPE_BF16 ? project_v_bf16_1c(buffers.config, buffers.activation, buffers.weight,
+                status = type == GGML_TYPE_BF16 ? (cores == 4 ? project_v_bf16_4c : project_v_bf16_1c)(buffers.config, buffers.activation, buffers.weight,
                                                                     buffers.raw, buffers.output, &attrs) :
-                                                  project_v_fp16_1c(buffers.config, buffers.activation, buffers.weight,
+                                                  (cores == 4 ? project_v_fp16_4c : project_v_fp16_1c)(buffers.config, buffers.activation, buffers.weight,
                                                                     buffers.raw, buffers.output, &attrs);
             } else {
                 status = type == GGML_TYPE_BF16 ?
-                             project_k_bf16_1c(buffers.config, buffers.activation, buffers.weight, buffers.norm,
+                             (cores == 4 ? project_k_bf16_4c : project_k_bf16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.norm,
                                                buffers.positions, buffers.raw, buffers.output, &attrs) :
-                             project_k_fp16_1c(buffers.config, buffers.activation, buffers.weight, buffers.norm,
+                             (cores == 4 ? project_k_fp16_4c : project_k_fp16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.norm,
                                                buffers.positions, buffers.raw, buffers.output, &attrs);
             }
         }
@@ -502,14 +502,14 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     if (flash_status == 0) {
         npu_kernel_launch_attrs_t attrs;
         npu_kernel_launch_attrs_init(&attrs, runtime->context, runtime->stream, "fattn");
-        attrs.config.task_dim  = NPUTaskDim3{ 1, 1, 1 };
-        attrs.config.task_mode = NPUTaskMode::kSingleCore;
+        attrs.config.task_dim  = cores == 4 ? NPUTaskDim3{4, groups, 1} : NPUTaskDim3{groups, 1, 1};
+        attrs.config.task_mode = cores == 4 ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
         flash_status =
             type == GGML_TYPE_BF16 ?
-                flash_attention_bf16_1c(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
+                (cores == 4 ? flash_attention_bf16_4c : flash_attention_bf16_1c)(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
                                         flash_buffers.positions, flash_buffers.output, flash_buffers.result, &attrs) :
-                flash_attention_fp16_1c(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
+                (cores == 4 ? flash_attention_fp16_4c : flash_attention_fp16_1c)(flash_buffers.config, flash_buffers.weight, flash_buffers.norm,
                                         flash_buffers.positions, flash_buffers.output, flash_buffers.result, &attrs);
     }
     std::vector<float> flash_layout(attention.size());
@@ -607,22 +607,22 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
             npu_kernel_launch_attrs_t attrs;
             npu_kernel_launch_attrs_init(&attrs, runtime->context, runtime->stream,
                                          k_projection ? "k-cache" : "v-cache");
-            attrs.config.task_dim  = NPUTaskDim3{ 1, 1, 1 };
-            attrs.config.task_mode = NPUTaskMode::kSingleCore;
+            attrs.config.task_dim  = cores == 4 ? NPUTaskDim3{4, groups, 1} : NPUTaskDim3{groups, 1, 1};
+            attrs.config.task_mode = cores == 4 ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
             attrs.timeout_ms       = 3600000U;
             if (k_projection) {
                 status =
                     type == GGML_TYPE_BF16 ?
-                        project_k_cache_bf16_1c(buffers.config, buffers.activation, buffers.weight, buffers.norm,
+                        (cores == 4 ? project_k_cache_bf16_4c : project_k_cache_bf16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.norm,
                                                 buffers.positions, buffers.raw, buffers.output, &attrs) :
-                        project_k_cache_fp16_1c(buffers.config, buffers.activation, buffers.weight, buffers.norm,
+                        (cores == 4 ? project_k_cache_fp16_4c : project_k_cache_fp16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.norm,
                                                 buffers.positions, buffers.raw, buffers.output, &attrs);
             } else {
                 status =
                     type == GGML_TYPE_BF16 ?
-                        project_v_cache_bf16_1c(buffers.config, buffers.activation, buffers.weight, buffers.positions,
+                        (cores == 4 ? project_v_cache_bf16_4c : project_v_cache_bf16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.positions,
                                                 buffers.raw, buffers.output, &attrs) :
-                        project_v_cache_fp16_1c(buffers.config, buffers.activation, buffers.weight, buffers.positions,
+                        (cores == 4 ? project_v_cache_fp16_4c : project_v_cache_fp16_1c)(buffers.config, buffers.activation, buffers.weight, buffers.positions,
                                                 buffers.raw, buffers.output, &attrs);
             }
         }
@@ -682,6 +682,9 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
 
     int             gated_status = create_buffer(runtime->context, sizeof(gated_config), &gated_buffers.config);
     if (gated_status == 0) {
+        gated_status = create_buffer(runtime->context, attention.size() * sizeof(uint16_t) * groups, &gated_buffers.activation);
+    }
+    if (gated_status == 0) {
         gated_status = create_buffer(runtime->context, attention.size() * sizeof(float), &gated_buffers.raw);
     }
     if (gated_status == 0) {
@@ -710,15 +713,15 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     if (gated_status == 0) {
         npu_kernel_launch_attrs_t attrs;
         npu_kernel_launch_attrs_init(&attrs, runtime->context, runtime->stream, "gate-out");
-        attrs.config.task_dim  = NPUTaskDim3{ 1, 1, 1 };
-        attrs.config.task_mode = NPUTaskMode::kSingleCore;
+        attrs.config.task_dim  = cores == 4 ? NPUTaskDim3{4, groups, 1} : NPUTaskDim3{groups, 1, 1};
+        attrs.config.task_mode = cores == 4 ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
         gated_status =
             type == GGML_TYPE_BF16 ?
-                project_gated_output_bf16_1c(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
-                                             gated_buffers.weight, gated_buffers.output, &attrs) :
-                project_gated_output_fp16_1c(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
-                                             gated_buffers.weight, gated_buffers.output, &attrs);
+                (cores == 4 ? project_gated_output_bf16_4c : project_gated_output_bf16_1c)(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
+                                             gated_buffers.weight, gated_buffers.output, gated_buffers.activation, &attrs) :
+                (cores == 4 ? project_gated_output_fp16_4c : project_gated_output_fp16_1c)(gated_buffers.config, gated_buffers.raw, gated_buffers.norm,
+                                             gated_buffers.weight, gated_buffers.output, gated_buffers.activation, &attrs);
     }
     std::vector<float> gated_observed(gated_expected.size());
     if (gated_status == 0) {
@@ -755,7 +758,7 @@ static int run_case(runtime_context * runtime, enum ggml_type type) {
     return close ? 0 : fail("projection numerical comparison failed");
 }
 
-static int run_glu_case(runtime_context * runtime, ggml_type type, int cores, bool geglu, uint64_t m, uint64_t n, uint64_t k, bool inference = false, bool batched = false) {
+static int run_glu_case(runtime_context * runtime, ggml_type type, int cores, bool geglu, uint64_t m, uint64_t n, uint64_t k, bool inference = false, bool batched = false, uint32_t groups = 1) {
     DayanMatmulConfig config = {m, n, k, (k + (batched ? 5 : 0)) * 2, (k + (batched ? 9 : 0)) * 2, (n + (batched ? 7 : 0)) * 2};
     if (batched) {
         config.batch_ne2 = 4;
@@ -801,7 +804,7 @@ static int run_glu_case(runtime_context * runtime, ggml_type type, int cores, bo
     };
     npu_kernel_launch_attrs_t attrs;
     npu_kernel_launch_attrs_init(&attrs, runtime->context, runtime->stream, "test-glu");
-    attrs.config.task_dim = NPUTaskDim3{(uint32_t) cores, 1, 1};
+    attrs.config.task_dim = cores == 4 ? NPUTaskDim3{4, groups, 1} : NPUTaskDim3{groups, 1, 1};
     attrs.config.task_mode = cores == 4 ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
     attrs.timeout_ms = 3600000U;
     for (int repeat = 0; repeat < 2 && status == 0; ++repeat) {
@@ -847,7 +850,7 @@ static int run_glu_case(runtime_context * runtime, ggml_type type, int cores, bo
             close = close && std::isfinite(actual) && error <= 1e-5f + (type == GGML_TYPE_BF16 ? 0.008f : 0.001f) * std::abs(reference);
         }
     }
-    std::printf("GLU type=%s cores=%d inference=%d batched=%d op=%s M=%llu N=%llu K=%llu max_abs=%g\n", ggml_type_name(type), cores, inference, batched,
+    std::printf("GLU type=%s cores=%d groups=%u inference=%d batched=%d op=%s M=%llu N=%llu K=%llu max_abs=%g\n", ggml_type_name(type), cores, groups, inference, batched,
                 geglu ? "GEGLU" : "SWIGLU", (unsigned long long) m, (unsigned long long) n, (unsigned long long) k, max_abs);
     return close ? 0 : fail("GLU numerical comparison failed");
 }
@@ -874,7 +877,23 @@ int main(int argc, char ** argv) {
     }
 
     int result = 0;
-    if (argc == 2 && std::strcmp(argv[1], "glu") == 0) {
+    if (argc == 2 && std::strcmp(argv[1], "launch") == 0) {
+        npu_runtime_topology_t info = {};
+        DayanTopology topology;
+        if (npu_runtime_get_topology(runtime.runtime, &info) < 0 || !topology.init(info)) {
+            free_runtime(&runtime);
+            return fail("cannot query topology");
+        }
+        for (int cores : {1, 4}) {
+            if (cores == 4 && !topology.clusters) { continue; }
+            for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
+                result |= run_case(&runtime, type, cores, 2);
+                result |= run_glu_case(&runtime, type, cores, false, 3, 481, 513, false, false, 2);
+                result |= run_glu_case(&runtime, type, cores, true, 1, 1541, 257, true, false, 2);
+                result |= run_glu_case(&runtime, type, cores, false, 3, 1025, 257, true, true, 8);
+            }
+        }
+    } else if (argc == 2 && std::strcmp(argv[1], "glu") == 0) {
         for (int cores : {1, 4}) {
             for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
                 for (bool geglu : {false, true}) {
@@ -898,7 +917,7 @@ int main(int argc, char ** argv) {
     } else if (argc == 1) {
         result = run_case(&runtime, GGML_TYPE_BF16) != 0 || run_case(&runtime, GGML_TYPE_F16) != 0;
     } else {
-        result = fail("usage: test-dayan-attention-projection [glu]");
+        result = fail("usage: test-dayan-attention-projection [glu|launch]");
     }
     free_runtime(&runtime);
     if (result != 0) {

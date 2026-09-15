@@ -162,7 +162,7 @@ static void convert(const DayanMxfp4Config * cfg, const void * input, void * out
     if (!base || scale + Rows * Columns / 32 + 64 - base > dayan_uram_size()) { dayan_thread_exit(-12); }
     if ((base | packed | scale) & 31) { dayan_thread_exit(-22); }
     long checksum = 0;
-    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((cfg->m + Rows - 1) / Rows) * nt; tile += 4) {
+    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((cfg->m + Rows - 1) / Rows) * nt; tile += dayan_task_dim(DAYAN_TASK_X)) {
         const uint64_t row = tile / nt * Rows, col = tile % nt * Columns;
         const int rows = extent(cfg->m - row, Rows), cols = extent(cfg->n - col, Columns);
         const int columns = (cols + 127) & ~127;
@@ -198,7 +198,7 @@ struct State {
 struct Tile { uint64_t row, col; int rows, cols, users; };
 
 static Tile tile_at(const State & s, uint64_t out, int slice) {
-    const uint64_t tile = out * 4 + dayan_task_id(DAYAN_TASK_X);
+    const uint64_t tile = out * ((uint64_t) dayan_task_dim(DAYAN_TASK_X) * dayan_task_dim(DAYAN_TASK_Y)) + dayan_task_id(DAYAN_TASK_X) + (uint64_t) dayan_task_dim(DAYAN_TASK_X) * dayan_task_id(DAYAN_TASK_Y);
     const uint64_t row = tile / s.nt * s.shape.m, col = tile % s.nt * s.shape.n;
     const int cols = extent((int64_t) s.cfg->n - col, s.shape.n);
     return {row, col + slice * s.slice_n, extent((int64_t) s.cfg->m - row, s.shape.m),
@@ -372,7 +372,9 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
     s.c_stride = s.slice_n * 4;
     s.kt = (cfg->k + shape.k - 1) / shape.k;
     s.nt = (cfg->n + shape.n - 1) / shape.n;
-    s.tiles = (((cfg->m + shape.m - 1) / shape.m) * s.nt + 3) / 4;
+    const uint64_t tasks = (uint64_t) dayan_task_dim(DAYAN_TASK_X) * dayan_task_dim(DAYAN_TASK_Y);
+    if (!tasks || dayan_task_dim(DAYAN_TASK_Z) != 1) { return -22; }
+    s.tiles = (((cfg->m + shape.m - 1) / shape.m) * s.nt + tasks - 1) / tasks;
     s.physical = (uintptr_t) dayan_uram_base();
     s.local = s.physical & (Constants::kUramWindowStride - 1);
     uint64_t address = s.local;

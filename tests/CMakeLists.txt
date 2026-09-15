@@ -269,6 +269,10 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 
 if (GGML_DAYAN)
+    llama_build_and_test(test-dayan-topology.cpp)
+    target_include_directories(test-dayan-topology PRIVATE
+        "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan"
+        "${DAYAN_ROOT}/host/include")
     llama_build(test-dayan-matmul.cpp)
     llama_build(test-dayan-mxfp4.cpp)
     target_include_directories(test-dayan-mxfp4 PRIVATE "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan")

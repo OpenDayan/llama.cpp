@@ -404,11 +404,11 @@ template <typename Format>
 static inline void run_projection_matmul(const DayanMatmulConfig * config,
                                          const uint16_t *          activation,
                                          const uint16_t *          weight,
-                                         uint16_t *                output) {
+                                         uint16_t *                output, uint64_t alignment) {
     if (config->m <= 512) {
-        matmul_check(run_matmul<Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Format>, nullptr, 0, true>(config, activation, weight, nullptr, output));
+        matmul_check(run_matmul<Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Format>, nullptr, 0, true>(config, activation, weight, nullptr, output, nullptr, nullptr, alignment));
     } else {
-        matmul_check(run_matmul<Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Format>>(config, activation, weight, nullptr, output));
+        matmul_check(run_matmul<Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Format>>(config, activation, weight, nullptr, output, nullptr, nullptr, alignment));
     }
 }
 
@@ -494,7 +494,7 @@ static inline void postprocess_attention_projection(const DayanAttentionProjecti
         const uint32_t position_axes = config->rope_mode == 8U ? 4U : 1U;
         attention_load_i32(attention_uram(kAttentionPositions), positions + token, position_axes,
                            (uint64_t) config->tokens * sizeof(int32_t));
-        for (uint32_t head = 0; head < config->heads; ++head) {
+        for (uint32_t head = dayan_partition_begin(config->heads, matmul_group_id(), matmul_group_count(), 1); head < dayan_partition_begin(config->heads, matmul_group_id() + 1, matmul_group_count(), 1); ++head) {
             const uint16_t * source = raw_output + (uint64_t) token * config->matmul.output_stride / sizeof(uint16_t) +
                                       head * projection_step;
             uint16_t *       destination = output + ((uint64_t) head * config->tokens + token) * head_dim;
@@ -516,7 +516,7 @@ static inline void run_attention_projection(const DayanAttentionProjectionConfig
         DAYAN_PARAMS_ERROR();
     }
 
-    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output);
+    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output, config->head_dim * (HasGate ? 2U : 1U));
     postprocess_attention_projection<Format, HasGate>(config, norm, positions, raw_output, output);
 }
 
@@ -538,19 +538,24 @@ static inline void run_value_projection(const DayanAttentionProjectionConfig * c
         DAYAN_PARAMS_ERROR();
     }
 
-    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output);
+    run_projection_matmul<Format>(&config->matmul, activation, weight, raw_output, config->head_dim);
+    const uint32_t begin = dayan_partition_begin(config->heads, matmul_group_id(), matmul_group_count(), 1);
+    const uint32_t end = dayan_partition_begin(config->heads, matmul_group_id() + 1, matmul_group_count(), 1);
+    if (begin == end) { return; }
+    raw_output += (uint64_t) begin * config->head_dim;
+    output += (uint64_t) begin * config->tokens * config->head_dim;
     const uint32_t full_blocks = row_bytes / 64U;
     const uint32_t tail        = row_bytes % 64U;
     bool           issued = false;
     if (full_blocks != 0U) {
-        configure_attention_lsu_3d<0>(full_blocks, 64, 64, config->heads, row_bytes, output_head_stride,
+        configure_attention_lsu_3d<0>(full_blocks, 64, 64, end - begin, row_bytes, output_head_stride,
                                       config->tokens, config->matmul.output_stride, row_bytes, 64, 64);
         __tx_lsu_dma_d2d<0>(reinterpret_cast<uint64_t>(output), reinterpret_cast<uint64_t>(raw_output));
         issued = true;
     }
     if (tail != 0U) {
         const uint64_t offset = (uint64_t) full_blocks * 64U;
-        configure_attention_lsu_3d<0>(1, 0, 0, config->heads, row_bytes, output_head_stride, config->tokens,
+        configure_attention_lsu_3d<0>(1, 0, 0, end - begin, row_bytes, output_head_stride, config->tokens,
                                       config->matmul.output_stride, row_bytes, tail, tail);
         __tx_lsu_dma_d2d<0>(reinterpret_cast<uint64_t>(output) + offset,
                             reinterpret_cast<uint64_t>(raw_output) + offset);
@@ -581,7 +586,7 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
     const DayanAttentionProjectionConfig * projection    = &config->projection;
     const uint32_t                         position_axes = projection->rope_mode == 8U ? 4U : 1U;
     const int32_t *                        indices = positions_indices + (uint64_t) position_axes * projection->tokens;
-    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace);
+    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace, projection->head_dim);
     attention_reset_scratch();
     attention_initialize_constants(projection);
     attention_load_bytes(attention_uram(kAttentionNorm), norm, projection->head_dim * sizeof(float));
@@ -594,7 +599,7 @@ static inline void run_k_cache_projection(const DayanKVProjectionConfig * config
         }
         attention_load_i32(attention_uram(kAttentionPositions), positions_indices + token, position_axes,
                            (uint64_t) projection->tokens * sizeof(int32_t));
-        for (uint32_t head = 0; head < projection->heads; ++head) {
+        for (uint32_t head = dayan_partition_begin(projection->heads, matmul_group_id(), matmul_group_count(), 1); head < dayan_partition_begin(projection->heads, matmul_group_id() + 1, matmul_group_count(), 1); ++head) {
             const uint16_t * source = workspace +
                                       (uint64_t) token * projection->matmul.output_stride / sizeof(uint16_t) +
                                       head * projection->head_dim;
@@ -617,7 +622,7 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
     }
 
     const DayanAttentionProjectionConfig * projection = &config->projection;
-    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace);
+    run_projection_matmul<Format>(&projection->matmul, activation, weight, workspace, projection->head_dim);
     const uint32_t cache_width = projection->heads * projection->head_dim;
     for (uint32_t token = 0; token < projection->tokens; ++token) {
         attention_load_i32(attention_uram(kAttentionPositions), indices + token, 1, sizeof(int32_t));
@@ -628,7 +633,9 @@ static inline void run_v_cache_projection(const DayanKVProjectionConfig * config
         const uint16_t * source = workspace +
                                   (uint64_t) token * projection->matmul.output_stride / sizeof(uint16_t);
         uint16_t * destination = cache + (uint64_t) cache_row * cache_width;
-        attention_copy_bytes(destination, source, cache_width * sizeof(uint16_t));
+        const uint64_t begin = dayan_partition_begin(projection->heads, matmul_group_id(), matmul_group_count(), 1) * projection->head_dim;
+        const uint64_t end = dayan_partition_begin(projection->heads, matmul_group_id() + 1, matmul_group_count(), 1) * projection->head_dim;
+        if (begin != end) { attention_copy_bytes(destination + begin, source + begin, (end - begin) * sizeof(uint16_t)); }
     }
 }
 

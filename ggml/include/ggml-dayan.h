@@ -60,6 +60,8 @@ struct ggml_backend_dayan_graph_plan_slot {
     size_t                     output_count;
     uint32_t                   output_mask;
     uint32_t                   sort_k;
+    uint32_t                   task_dim_y;
+    uint32_t                   task_dim_z;
 };
 
 typedef void (*ggml_backend_dayan_graph_plan_callback)(const struct ggml_backend_dayan_graph_plan_slot * slot,

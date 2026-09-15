@@ -37,6 +37,7 @@ static inline void initialize_resources() {
 
 static inline int finish_epilogue_4c()
 {
+    if (dayan_task_mode() == 1) { return 0; }
     return dayan_cluster_barrier(Constants::kClusterCores,
                                  &cluster_shared().barrier);
 }
@@ -265,8 +266,8 @@ static inline void store_postprocess_tile(uint16_t *destination, int rows,
 }
 
 template <typename Format, bool Inference = false>
-static int run_matmul_quantized_4c(const DayanMatmulConfig * config, const uint16_t * a, const uint16_t * bt, uint16_t * output) {
-    return ggml_dayan_matmul_detail::run_matmul<Format, 4, 1, sizeof(uint16_t), true, ggml_dayan_matmul_detail::epilogue_lowp<Format>, nullptr, 0, Inference>(config, a, bt, nullptr, output);
+static int run_matmul_quantized_4c(const DayanMatmulConfig * config, const uint16_t * a, const uint16_t * bt, uint16_t * output, uint64_t alignment = 64) {
+    return ggml_dayan_matmul_detail::run_matmul<Format, 4, 1, sizeof(uint16_t), true, ggml_dayan_matmul_detail::epilogue_lowp<Format>, nullptr, 0, Inference>(config, a, bt, nullptr, output, nullptr, nullptr, alignment);
 }
 
 template <typename Format, bool GeGLU, bool Inference = false>
@@ -435,6 +436,7 @@ static int postprocess_attention_projection_4c(
     for (uint64_t job = lane; job < jobs; job += Constants::kClusterCores) {
         const uint32_t token = (uint32_t)(job / config->heads);
         const uint32_t head = (uint32_t)(job % config->heads);
+        if (head < dayan_partition_begin(config->heads, matmul_group_id(), matmul_group_count(), 1) || head >= dayan_partition_begin(config->heads, matmul_group_id() + 1, matmul_group_count(), 1)) { continue; }
         attention_load_i32(attention_uram(kAttentionPositions),
                            positions + token, position_axes,
                            (uint64_t)config->tokens * sizeof(int32_t));
@@ -461,7 +463,7 @@ static int run_attention_projection_4c(
         !output)
         return -22;
 
-    int status = (config->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&config->matmul, activation, weight, raw_output);
+    int status = (config->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&config->matmul, activation, weight, raw_output, config->head_dim * (HasGate ? 2U : 1U));
     if (status == 0)
         status = postprocess_attention_projection_4c<Format, HasGate>(
             config, norm, positions, raw_output, output);
@@ -479,7 +481,7 @@ static int run_value_projection_4c(
         !weight || !raw_output || !output)
         return -22;
 
-    int status = (config->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&config->matmul, activation, weight, raw_output);
+    int status = (config->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&config->matmul, activation, weight, raw_output, config->head_dim);
     if (status == 0) {
         const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
         const uint64_t jobs = (uint64_t)config->tokens * config->heads;
@@ -487,6 +489,7 @@ static int run_value_projection_4c(
              job += Constants::kClusterCores) {
             const uint32_t token = (uint32_t)(job / config->heads);
             const uint32_t head = (uint32_t)(job % config->heads);
+            if (head < dayan_partition_begin(config->heads, matmul_group_id(), matmul_group_count(), 1) || head >= dayan_partition_begin(config->heads, matmul_group_id() + 1, matmul_group_count(), 1)) { continue; }
             const uint16_t *source = raw_output +
                 (uint64_t)token * config->matmul.output_stride /
                     sizeof(uint16_t) +
@@ -514,7 +517,7 @@ static int run_k_cache_projection_4c(
         return -22;
 
     const DayanAttentionProjectionConfig *projection = &config->projection;
-    int status = (projection->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&projection->matmul, activation, weight, raw_output);
+    int status = (projection->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&projection->matmul, activation, weight, raw_output, projection->head_dim);
     if (status == 0) {
         attention_reset_scratch();
         attention_initialize_constants(projection);
@@ -540,6 +543,7 @@ static int run_k_cache_projection_4c(
                                (uint64_t)projection->tokens * sizeof(int32_t));
             for (uint32_t head = lane; head < projection->heads;
                  head += Constants::kClusterCores) {
+                if (head < dayan_partition_begin(projection->heads, matmul_group_id(), matmul_group_count(), 1) || head >= dayan_partition_begin(projection->heads, matmul_group_id() + 1, matmul_group_count(), 1)) { continue; }
                 const uint16_t *source = raw_output +
                     (uint64_t)token * projection->matmul.output_stride /
                         sizeof(uint16_t) +
@@ -569,7 +573,7 @@ static int run_v_cache_projection_4c(
         return -22;
 
     const DayanAttentionProjectionConfig *projection = &config->projection;
-    int status = (projection->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&projection->matmul, activation, weight, raw_output);
+    int status = (projection->matmul.m <= 512 ? run_matmul_quantized_4c<Format, true> : run_matmul_quantized_4c<Format>)(&projection->matmul, activation, weight, raw_output, projection->head_dim);
     if (status == 0) {
         const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
         const uint32_t cache_width = projection->heads * projection->head_dim;
@@ -585,6 +589,7 @@ static int run_v_cache_projection_4c(
             }
             for (uint32_t head = lane; head < projection->heads;
                  head += Constants::kClusterCores) {
+                if (head < dayan_partition_begin(projection->heads, matmul_group_id(), matmul_group_count(), 1) || head >= dayan_partition_begin(projection->heads, matmul_group_id() + 1, matmul_group_count(), 1)) { continue; }
                 const uint16_t *source = raw_output +
                     (uint64_t)token * projection->matmul.output_stride /
                         sizeof(uint16_t) +
@@ -681,14 +686,14 @@ static int gate_attention_input_4c(
     const uint32_t head_tiles =
         (config->heads + heads_per_tile - 1U) / heads_per_tile;
     const uint64_t tile_count = (uint64_t)row_tiles * head_tiles;
-    const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t lane = dayan_task_mode() == 4 ? dayan_task_id(DAYAN_TASK_X) : 0;
 
     initialize_postprocess_constants();
     configure_postprocess_load(0, (uint64_t)width * sizeof(float));
     configure_postprocess_store((uint64_t)width * sizeof(uint16_t));
     ConfigureGate(config);
     for (uint64_t tile = lane; tile < tile_count;
-         tile += Constants::kClusterCores) {
+         tile += dayan_task_mode()) {
         const uint32_t row_tile = (uint32_t)(tile / head_tiles);
         const uint32_t head_tile = (uint32_t)(tile % head_tiles);
         const uint32_t row_base = row_tile * PostprocessLayout::kRows;
@@ -751,11 +756,17 @@ static int run_gated_output_projection_impl_4c(
         config->matmul.m >= config->matmul.n)
         return -22;
 
-    uint16_t *gated = scratch;
+    uint16_t *gated = scratch + ggml_dayan_matmul_detail::matmul_group_id() * (uint64_t) config->tokens * width;
     int status = gate_attention_input_4c<Format, ConfigureGate, LoadGate>(
         config, attention, gate, gated);
-    if (status == 0)
-        status = (config->matmul.m <= 512 ? run_matmul_4c<Format, true> : run_matmul_4c<Format>)(&config->matmul, gated, weight, output);
+    if (status == 0) {
+        if (dayan_task_mode() == 4) {
+            status = (config->matmul.m <= 512 ? run_matmul_4c<Format, true> : run_matmul_4c<Format>)(&config->matmul, gated, weight, output);
+        } else {
+            using namespace ggml_dayan_matmul_detail;
+            status = (config->matmul.m <= 512 ? run_matmul<Format, 1, 1, sizeof(float), false, epilogue_identity, nullptr, 0, true> : run_matmul<Format, 1, 1, sizeof(float), false, epilogue_identity>)(&config->matmul, gated, weight, nullptr, output, nullptr, nullptr, 64);
+        }
+    }
     return status;
 }
 

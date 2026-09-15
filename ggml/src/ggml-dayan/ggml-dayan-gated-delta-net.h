@@ -162,8 +162,10 @@ static inline void emit_dot_half(uint64_t input, uint64_t state) {
 }
 
 template <long Delta>
-static inline void emit_update_half(uint64_t state, uint64_t key, uint64_t query) {
+static inline void emit_update_half(uint64_t state, uint64_t key, uint64_t query, uint64_t gate) {
     __tx_vec_lsu_u2v<0, 1>(state);
+    __tx_vec_lsu_u2v<0, 0>(gate);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_lsu_u2v<0, 0>(key);
     __tx_vec_vv_fp32_mul<0, Delta, 0, 0>();
     __tx_vec_vv_fp32_add<0, 0, 2, 0>();
@@ -217,26 +219,27 @@ static inline void issue_vector_gate(uint64_t input) {
 }
 
 template <long GateHalfStride>
-static inline void issue_scale_state() {
+static inline void issue_gated_key() {
     constexpr long instructions = 4;
-    configure_vec_outer(kHeadDim, kRowGroups);
-    configure_vec_iterator<kVecV0Base>(0, 0, kHeadDim * sizeof(float), kVecBytes);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, GateHalfStride);
+    configure_vec_outer(kRowGroups);
+    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, GateHalfStride, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kHeadDim * sizeof(float), kVecBytes);
+    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramState));
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramK));
     __tx_vec_lsu_u2v<1, 1>(uram_address(kUramGate));
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramState));
+    __tx_vec_lsu_v2u<0, 3>(uram_address(kUramGatedK));
     start_vec_block(instructions, instructions, instructions, instructions, instructions);
     dayan_wait_vec();
 }
 
+template <long GateHalfStride>
 static inline void emit_recurrence_row(uint32_t scale_bits) {
-    emit_dot_half(uram_address(kUramK), uram_address(kUramState));
+    emit_dot_half(uram_address(kUramGatedK), uram_address(kUramState));
     __tx_vec_shuffle_xor<1, 0>(0);
-    emit_dot_half(uram_address(kUramK + kVecBytes), uram_address(kUramState + kVecBytes));
+    emit_dot_half(uram_address(kUramGatedK + kVecBytes), uram_address(kUramState + kVecBytes));
     __tx_vec_vv_fp32_add<0, 0, 16, 0>();
     __tx_vec_s_iter_gets<0, 0, 0, 0>();
     __tx_vec_shuffle_broadcast_dyn<0, 17, 0>();
@@ -245,10 +248,10 @@ static inline void emit_recurrence_row(uint32_t scale_bits) {
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_shuffle_xor<1, 0>(0);
 
-    emit_update_half<16>(uram_address(kUramState), uram_address(kUramK), uram_address(kUramQ));
+    emit_update_half<16>(uram_address(kUramState), uram_address(kUramK), uram_address(kUramQ), uram_address(kUramGate));
     __tx_vec_shuffle_xor<1, 0>(0);
     emit_update_half<17>(uram_address(kUramState + kVecBytes), uram_address(kUramK + kVecBytes),
-                         uram_address(kUramQ + kVecBytes));
+                         uram_address(kUramQ + kVecBytes), uram_address(kUramGate + GateHalfStride));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
@@ -257,10 +260,11 @@ static inline void emit_recurrence_row(uint32_t scale_bits) {
     __tx_vec_shuffle_xor<1, 20>(0);
 }
 
+template <long GateHalfStride>
 static inline void issue_recurrence(uint32_t scale_bits) {
     constexpr long prologue0 = 0;
     constexpr long group_prologue = 2;
-    constexpr long row_instructions = 83;
+    constexpr long row_instructions = 87;
     constexpr long group_epilogue = 2;
     const long prologue1 = prologue0 + group_prologue;
     const long loop = prologue1 + row_instructions;
@@ -269,7 +273,7 @@ static inline void issue_recurrence(uint32_t scale_bits) {
     begin_vec_block(epilogue1);
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
     __tx_vec_lsu_u2v<1, 2>(uram_address(kUramV));
-    emit_recurrence_row(scale_bits);
+    emit_recurrence_row<GateHalfStride>(scale_bits);
     __tx_vec_lsu_g2s<0>((1U << kRowsPerThread) - 1);
     __tx_vec_lsu_v2u_mask<17, 2, 0>(uram_address(kUramOutputPacked));
     start_vec_block(prologue0, prologue1, loop, epilogue1, epilogue1);
@@ -310,25 +314,74 @@ static inline void load_gdn_pair(uint64_t destination0, uint64_t destination1,
 constexpr long kChunkTokens = 64;
 constexpr long kHeadStride = kHeadDim * sizeof(float) + 64;
 constexpr long kChunkStride = kChunkTokens * sizeof(float) + 64;
-constexpr long kChunkState = 0;
-constexpr long kChunkQ = kChunkState + kHeadDim * kHeadStride;
-constexpr long kChunkK = kChunkQ + kChunkTokens * kHeadStride;
-constexpr long kChunkV = kChunkK + kChunkTokens * kHeadStride;
-constexpr long kChunkR = kChunkV + kChunkTokens * kHeadStride;
+
+constexpr long kInputQ = 0;
+constexpr long kInputK = kInputQ + kChunkTokens * kHeadStride;
+constexpr long kInputV = kInputK + kChunkTokens * kHeadStride;
+constexpr long kInputG = kInputV + kChunkTokens * kHeadStride;
+constexpr long kInputBeta = kInputG + kVecBytes;
+constexpr long kInputBytes = kInputBeta + kVecBytes;
+
+// U and the temporary W transpose share one triangular solve.
+constexpr long kPreparedU = 0;
+constexpr long kPreparedKT = kPreparedU + kHeadDim * kChunkStride;
+constexpr long kPreparedW = kPreparedKT + kHeadDim * kChunkStride;
+constexpr long kPreparedQ = kPreparedW + kChunkTokens * kHeadStride;
+constexpr long kPreparedA = kPreparedQ + kChunkTokens * kHeadStride;
+constexpr long kPreparedG = kPreparedA + kChunkTokens * kChunkStride;
+constexpr long kPreparedDecay = kPreparedG + kVecBytes;
+constexpr long kPreparedBytes = kPreparedDecay + kVecBytes;
+
+constexpr long kChunkPrepared = 2 * kInputBytes;
+constexpr long kChunkState = kChunkPrepared + 2 * kPreparedBytes;
+constexpr long kChunkR = kChunkState + kHeadDim * kHeadStride;
 constexpr long kChunkO = kChunkR + kHeadDim * kChunkStride;
 constexpr long kChunkKK = kChunkO + kHeadDim * kChunkStride;
 constexpr long kChunkKQ = kChunkKK + kChunkTokens * kChunkStride;
-constexpr long kChunkTemp = kChunkKQ + kChunkTokens * kChunkStride;
-constexpr long kChunkG = kChunkTemp + kHeadDim * kChunkStride;
-constexpr long kChunkBeta = kChunkG + kVecBytes;
-constexpr long kChunkGCum = kChunkBeta + kVecBytes;
-constexpr long kChunkExpG = kChunkGCum + kVecBytes;
-constexpr long kChunkTailDecay = kChunkExpG + kVecBytes;
-constexpr long kChunkEndDecay = kChunkTailDecay + kVecBytes;
-constexpr long kChunkLower = kChunkEndDecay + kVecBytes;
+constexpr long kChunkGCum = kChunkKQ + kChunkTokens * kChunkStride;
+constexpr long kChunkTailDecay = kChunkGCum + kVecBytes;
+constexpr long kChunkLower = kChunkTailDecay + kVecBytes;
 constexpr long kChunkDiag = kChunkLower + kChunkTokens * kScalarStride;
 constexpr long kChunkEnd = kChunkDiag + kChunkTokens * kScalarStride;
-static_assert(kChunkEnd <= DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES, "GDN chunk exceeds URAM budget");
+static_assert(kChunkEnd <= DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES, "GDN pipeline exceeds URAM budget");
+
+struct GdnPipeline {
+    const DayanGatedDeltaNetConfig * config;
+    const float * q;
+    const float * k;
+    const float * v;
+    const float * g;
+    const float * beta;
+    uint64_t chunks;
+    uint64_t generations;
+    uint32_t task;
+    uint32_t tasks;
+};
+
+struct GdnChunk {
+    uint32_t head;
+    uint32_t sequence;
+    uint32_t token;
+    long rows;
+    long input;
+    long prepared;
+};
+
+static inline GdnChunk gdn_chunk(const GdnPipeline & pipeline, uint64_t generation) {
+    const auto * config = pipeline.config;
+    const uint64_t work = pipeline.task + generation / pipeline.chunks * pipeline.tasks;
+    const uint32_t token = (uint32_t) (generation % pipeline.chunks * kChunkTokens);
+    return { (uint32_t) (work % config->heads), (uint32_t) (work / config->heads), token,
+             config->tokens - token < kChunkTokens ? config->tokens - token : kChunkTokens,
+             (long) (generation & 1) * kInputBytes,
+             kChunkPrepared + (long) (generation & 1) * kPreparedBytes };
+}
+
+static inline void gdn_check(int status) {
+    if (status < 0) {
+        dayan_thread_exit(status);
+    }
+}
 
 static inline void configure_chunk_mat(long m, long n, long k, long a_stride, long b_stride, long c_stride) {
     __tx_mat_tcsr_write<MAT_M>(m - 1);
@@ -339,12 +392,20 @@ static inline void configure_chunk_mat(long m, long n, long k, long a_stride, lo
     __tx_mat_tcsr_write<MAT_CSTRIDE>(c_stride);
 }
 
-static inline void issue_chunk_prefix(long rows) {
+static inline void initialize_chunk_mat() {
+    __tx_mat_tcsr_write<MAT_ASWIZZLEMBS>(0);
+    __tx_mat_tcsr_write<MAT_BSWIZZLEMBS>(0);
+    __tx_mat_tcsr_write<MAT_CSWIZZLEMBS>(0);
+    __tx_mat_tcsr_write<MAT_PERSISTENTMODE>(0);
+    __tx_mat_tcsr_write<MAT_DATATYPE>(MAT_DATATYPE_PAIR(BaseNPUInstBuilder::DT_MATIN_TF32, BaseNPUInstBuilder::DT_MATIN_TF32));
+}
+
+static inline void issue_chunk_prefix(const GdnChunk & chunk) {
     constexpr long instructions = 38;
     configure_vec_outer(1);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkG));
+    __tx_vec_lsu_u2v<0, 0>(uram_address(chunk.input + kInputG));
     for (long shift = 1; shift < kChunkTokens; shift *= 2) {
         __tx_vec_lsu_g2s<0>((long) (~uint64_t{0} << shift));
         __tx_vec_shuffle_ror<0, 0>(kChunkTokens - shift);
@@ -355,11 +416,11 @@ static inline void issue_chunk_prefix(long rows) {
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0x3fb8aa3bU);
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 1>();
-    __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkExpG));
-    __tx_vec_shuffle_broadcast<0, 0>(rows - 1);
-    __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkEndDecay));
+    __tx_vec_lsu_v2u<0, 0>(uram_address(chunk.prepared + kPreparedG));
+    __tx_vec_shuffle_broadcast<0, 0>(chunk.rows - 1);
+    __tx_vec_lsu_v2u<0, 0>(uram_address(chunk.prepared + kPreparedDecay));
     __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkGCum));
-    __tx_vec_shuffle_broadcast<0, 0>(rows - 1);
+    __tx_vec_shuffle_broadcast<0, 0>(chunk.rows - 1);
     __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_v_fp32_sfu<0, 0, 1>();
@@ -367,9 +428,9 @@ static inline void issue_chunk_prefix(long rows) {
     start_vec_block(instructions, instructions, instructions, instructions, instructions);
 }
 
-static inline void issue_chunk_coefficients(long rows, uint32_t scale_bits) {
+static inline void issue_chunk_coefficients(const GdnChunk & chunk, uint32_t scale_bits) {
     constexpr long instructions = 25;
-    configure_vec_outer(rows);
+    configure_vec_outer(chunk.rows);
     configure_vec_iterator<kVecS0Base>(0, 0, 1, 0);
     configure_vec_iterator<kVecV0Base>(0, 0, kChunkStride, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
@@ -389,7 +450,7 @@ static inline void issue_chunk_coefficients(long rows, uint32_t scale_bits) {
     __tx_vec_shuffle_xor<1, 0>(0);
     __tx_vec_lsu_u2s<0, 3>(uram_address(kChunkLower));
     __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkKK));
-    __tx_vec_lsu_u2v<0, 1>(uram_address(kChunkBeta));
+    __tx_vec_lsu_u2v<0, 1>(uram_address(chunk.input + kInputBeta));
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_vv_mux2<0, 17, 0, 0>();
@@ -404,202 +465,236 @@ static inline void issue_chunk_coefficients(long rows, uint32_t scale_bits) {
     start_vec_block(instructions, instructions, instructions, instructions, instructions);
 }
 
-static inline void issue_chunk_residual(uint64_t valid_mask, uint32_t scale_bits) {
-    constexpr long instructions = 17;
+static inline void issue_chunk_uw(const GdnChunk & chunk) {
+    configure_vec_outer(kHeadDim);
+    configure_vec_iterator<kVecV0Base>(0, 0, kChunkStride, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    for (long operand = 0; operand < 2; ++operand) {
+        const long instructions = operand == 0 ? 4 : 6;
+        const uint64_t address = uram_address(chunk.prepared + operand * kHeadDim * kChunkStride);
+        begin_vec_block(instructions);
+        __tx_vec_lsu_u2v<1, 1>(uram_address(chunk.input + kInputBeta));
+        if (operand != 0) {
+            __tx_vec_lsu_u2v<1, 1>(uram_address(chunk.prepared + kPreparedG));
+            __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
+        }
+        __tx_vec_lsu_u2v<0, 0>(address);
+        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+        __tx_vec_lsu_v2u<0, 0>(address);
+        start_vec_block(instructions, instructions, instructions, instructions, instructions);
+        dayan_wait_vec();
+    }
+
+    if (chunk.rows > 1) {
+        configure_vec_outer(2 * kHeadDim);
+        __tx_vec_tcsr_write<kVecDim1>(chunk.rows - 2);
+        configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
+        configure_vec_iterator<kVecV0Base>(0, kChunkStride, 0, 0);
+        configure_vec_iterator<kVecV1Base>(0, 0, kChunkStride, 0);
+        begin_vec_block(7);
+        __tx_vec_lsu_u2v<1, 1>(uram_address(chunk.prepared + kPreparedU));
+        __tx_vec_s_iter_gets<0, 0, 0, 0>();
+        __tx_vec_shuffle_broadcast_dyn<0, 16, 0>();
+        __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkKK));
+        __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+        __tx_vec_vv_fp32_sub<1, 16, 0, 0>();
+        __tx_vec_lsu_v2u<16, 1>(uram_address(chunk.prepared + kPreparedU));
+        start_vec_block(1, 1, 6, 6, 7);
+    }
+}
+
+static inline void issue_chunk_residual(long prepared, uint32_t scale_bits) {
+    constexpr long instructions = 10;
     configure_vec_outer(kHeadDim);
     configure_vec_iterator<kVecV0Base>(0, 0, kChunkStride, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<1, 1>(uram_address(kChunkExpG));
+    __tx_vec_lsu_u2v<1, 1>(uram_address(prepared + kPreparedG));
     __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkR));
-    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkTemp));
+    __tx_vec_lsu_u2v<0, 0>(uram_address(prepared + kPreparedU));
     __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
-    __tx_vec_lsu_u2v<1, 1>(uram_address(kChunkBeta));
-    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
-    __tx_vec_lsu_g2s<0>((long) valid_mask);
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
     __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkR));
     __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkO));
-    __tx_vec_vv_fp32_mul<0, 0, 18, 0>();
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-    __tx_vec_vv_mux2<0, 16, 0, 0>();
     __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkO));
     start_vec_block(instructions, instructions, instructions, instructions, instructions);
 }
 
-static inline void issue_chunk_solve(long rows) {
-    if (rows == 1) {
-        return;
-    }
-    configure_vec_outer(kHeadDim);
-    __tx_vec_tcsr_write<kVecDim1>(rows - 2);
-    configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
-    configure_vec_iterator<kVecV0Base>(0, kChunkStride, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, kChunkStride, 0);
-    begin_vec_block(7);
-    // Eliminate one column at a time; every value row retains all 64 RHS lanes.
-    __tx_vec_lsu_u2v<1, 1>(uram_address(kChunkR));
-    __tx_vec_s_iter_gets<0, 0, 0, 0>();
-    __tx_vec_shuffle_broadcast_dyn<0, 16, 0>();
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkKK));
-    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-    __tx_vec_vv_fp32_sub<1, 16, 0, 0>();
-    __tx_vec_lsu_v2u<16, 1>(uram_address(kChunkR));
-    start_vec_block(1, 1, 6, 6, 7);
-}
-
-static inline void issue_chunk_decay(long rows) {
-    configure_vec_outer(kRowGroups, rows);
-    configure_vec_iterator<kVecS0Base>(0, 0, 0, 1);
-    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, kHeadStride);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    begin_vec_block(6);
-    __tx_vec_lsu_u2v<1, 1>(uram_address(kChunkTailDecay));
-    __tx_vec_s_iter_gets<0, 0, 0, 0>();
-    __tx_vec_shuffle_broadcast_dyn<0, 16, 0>();
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkK));
-    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-    __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkK));
-    start_vec_block(6, 6, 6, 6, 6);
-    dayan_wait_vec();
-
-    configure_vec_outer(kRowGroups, kHeadDim);
-    begin_vec_block(4);
-    __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkState));
-    __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kChunkEndDecay));
-    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-    __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkState));
-    start_vec_block(4, 4, 4, 4, 4);
-}
-
-static inline void run_chunked_head(const DayanGatedDeltaNetConfig * config, const float * q, const float * k,
-                                    const float * v, const float * g, const float * beta, const float * state,
-                                    float * output, uint32_t head, uint32_t sequence) {
-    const uint64_t state_index = ((uint64_t) sequence * config->heads + head) * kHeadDim * kHeadDim;
-    const uint64_t attn_count = (uint64_t) config->sequences * config->tokens * config->heads * kHeadDim;
-    const uint32_t q_sequence = sequence / (config->sequences / config->q_sequences);
-    const uint32_t k_sequence = sequence / (config->sequences / config->k_sequences);
-    long checksum = 0;
-    configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadStride);
-    __tx_lsu_dma_d2u<0>(uram_address(kChunkState), (uint64_t) (state + state_index));
-    // Padded linear rows keep VEC access compatible and give MAT a 1x Bank peak.
-    __tx_mat_tcsr_write<MAT_ASWIZZLEMBS>(0);
-    __tx_mat_tcsr_write<MAT_BSWIZZLEMBS>(0);
-    __tx_mat_tcsr_write<MAT_CSWIZZLEMBS>(0);
-    __tx_mat_tcsr_write<MAT_PERSISTENTMODE>(0);
-    __tx_mat_tcsr_write<MAT_DATATYPE>(MAT_DATATYPE_PAIR(BaseNPUInstBuilder::DT_MATIN_TF32, BaseNPUInstBuilder::DT_MATIN_TF32));
-
-    for (uint64_t token = 0; token < config->tokens; token += kChunkTokens) {
-        const long rows = config->tokens - token < kChunkTokens ? config->tokens - token : kChunkTokens;
-        const float * v_row = gdn_row(v, config->v_nb, head, token, sequence);
-        const bool v_transposed = rows == kChunkTokens && (((uint64_t) v_row | config->v_nb[2]) & 63) == 0;
-        const uint64_t valid_mask = rows == kChunkTokens ? ~uint64_t{0} : (uint64_t{1} << rows) - 1;
-        for (long j = 0; j < rows; ++j) {
-            *uram_pointer<uint64_t>(kChunkLower + j * kScalarStride) = j == 63 ? 0 : valid_mask & (~uint64_t{0} << (j + 1));
-            *uram_pointer<uint64_t>(kChunkDiag + j * kScalarStride) = valid_mask & (~uint64_t{0} << j);
-        }
-        if (rows != kChunkTokens) {
-            configure_vec_outer(3 * kChunkTokens * kHeadStride / kVecBytes);
+static void load_chunks(void * opaque) {
+    const auto & pipeline = *static_cast<const GdnPipeline *>(opaque);
+    const auto * config = pipeline.config;
+    for (uint64_t generation = 0; generation < pipeline.generations; ++generation) {
+        const GdnChunk chunk = gdn_chunk(pipeline, generation);
+        const auto resource = DAYAN_LOCAL_RESOURCE(generation & 1);
+        gdn_check(dayan_resource_wait_free(resource));
+        if (chunk.rows != kChunkTokens) {
+            configure_vec_outer(kInputBytes / kVecBytes);
             configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
             begin_vec_block(2);
             __tx_vec_lsu_g2v_broadcast32<0, 0>(0);
-            __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkQ));
+            __tx_vec_lsu_v2u<0, 0>(uram_address(chunk.input));
             start_vec_block(2, 2, 2, 2, 2);
             dayan_wait_vec();
         }
-        configure_vec_outer(2);
-        configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
-        begin_vec_block(2);
-        __tx_vec_lsu_g2v_broadcast32<0, 0>(0);
-        __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkG));
-        start_vec_block(2, 2, 2, 2, 2);
-        dayan_wait_vec();
 
-        configure_lsu_rows<0>(rows, kHeadDim * sizeof(float), config->q_nb[2], kHeadStride);
-        load_gdn_pair(uram_address(kChunkQ), uram_address(kChunkK),
-                       gdn_row(q, config->q_nb, head % config->q_heads, token, q_sequence),
-                       gdn_row(k, config->k_nb, head % config->k_heads, token, k_sequence), config->q_nb[2], config->k_nb[2]);
-        if (!v_transposed) {
-            configure_lsu_rows<0>(rows, kHeadDim * sizeof(float), config->v_nb[2], kHeadStride);
-            __tx_lsu_dma_d2u<0>(uram_address(kChunkV), (uint64_t) v_row);
-        }
-        const float * g_row = gdn_row(g, config->g_nb, head, token, sequence);
-        const float * beta_row = gdn_row(beta, config->beta_nb, head, token, sequence);
-        if (config->g_nb[2] == sizeof(float) && config->beta_nb[2] == sizeof(float)) {
-            const long full_rows = rows / 16 * 16;
-            configure_lsu_rows<0>(1, kVecBytes, kVecBytes, kVecBytes);
-            if (full_rows != 0) {
-                __tx_lsu_tcsr_write<LSU_DIM0>(full_rows / 16 - 1);
-                load_gdn_pair(uram_address(kChunkG), uram_address(kChunkBeta), g_row, beta_row, kVecBytes, kVecBytes);
-            }
-            if (rows != full_rows) {
-                __tx_lsu_tcsr_write<LSU_DIM0>(0);
-                __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>((rows - full_rows) * sizeof(float) - 1);
-                load_gdn_pair(uram_address(kChunkG + full_rows * sizeof(float)), uram_address(kChunkBeta + full_rows * sizeof(float)),
-                               g_row + full_rows, beta_row + full_rows, kVecBytes, kVecBytes);
-            }
-        } else {
-            configure_lsu_rows<0>(rows, 64, config->g_nb[2], sizeof(float));
-            __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(sizeof(float) - 1);
-            __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(sizeof(float) - 1);
-            load_gdn_pair(uram_address(kChunkG), uram_address(kChunkBeta), g_row, beta_row, config->g_nb[2], config->beta_nb[2]);
-        }
-        dayan_wait_lsu();
-
-        configure_chunk_mat(rows, rows, kHeadDim, kHeadStride, kHeadStride, kChunkStride);
-        __tx_mat_mm<0>(uram_address(kChunkKK), uram_address(kChunkK), uram_address(kChunkK));
-        __tx_mat_mm<0>(uram_address(kChunkKQ), uram_address(kChunkK), uram_address(kChunkQ));
-        configure_chunk_mat(kHeadDim, rows, kHeadDim, kHeadStride, kHeadStride, kChunkStride);
-        __tx_mat_mm<0>(uram_address(kChunkR), uram_address(kChunkState), uram_address(kChunkK));
-        __tx_mat_mm<0>(uram_address(kChunkO), uram_address(kChunkState), uram_address(kChunkQ));
-        if (v_transposed) {
-            // Load V in the transposed layout while MAT consumes Q, K and state.
-            set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), config->v_nb[2], kChunkStride);
-            __tx_lsu_dma_d2u<0>(uram_address(kChunkTemp), (uint64_t) v_row);
-        } else {
-            set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
-            __tx_lsu_dma_u2u<0>(uram_address(kChunkTemp), uram_address(kChunkV));
-        }
-        issue_chunk_prefix(rows);
-        dayan_wait_mat();
-        dayan_wait_lsu();
-        dayan_wait_vec();
-        issue_chunk_coefficients(rows, config->scale_bits);
-        dayan_wait_vec();
-        issue_chunk_residual(valid_mask, config->scale_bits);
-        dayan_wait_vec();
-        issue_chunk_solve(rows);
-        dayan_wait_vec();
-
-        set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kChunkTokens * sizeof(float), kChunkStride, kChunkStride);
-        __tx_lsu_dma_u2u<0>(uram_address(kChunkTemp), uram_address(kChunkKQ));
-        dayan_wait_lsu();
-        configure_chunk_mat(kHeadDim, rows, rows, kChunkStride, kChunkStride, kChunkStride);
-        __tx_mat_mma<0>(uram_address(kChunkO), uram_address(kChunkR), uram_address(kChunkTemp));
-        dayan_wait_mat();
-
-        set_lsu_matrix<0, true, 2>(checksum, kHeadDim, kChunkTokens * sizeof(float), kChunkStride, kHeadStride);
-        __tx_lsu_dma_u2u<0>(uram_address(kChunkQ), uram_address(kChunkO));
-        issue_chunk_decay(rows);
-        dayan_wait_lsu();
-        const uint64_t value_index = (((uint64_t) sequence * config->tokens + token) * config->heads + head) * kHeadDim;
-        configure_lsu_rows<0>(rows, kHeadDim * sizeof(float), kHeadStride, (uint64_t) config->heads * kHeadDim * sizeof(float));
-        __tx_lsu_dma_u2d<0>((uint64_t) (output + value_index), uram_address(kChunkQ));
-        dayan_wait_vec();
-        set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
-        __tx_lsu_dma_u2u<0>(uram_address(kChunkTemp), uram_address(kChunkK));
-        dayan_wait_lsu();
-        configure_chunk_mat(kHeadDim, kHeadDim, rows, kChunkStride, kChunkStride, kHeadStride);
-        __tx_mat_mma<0>(uram_address(kChunkState), uram_address(kChunkR), uram_address(kChunkTemp));
-        dayan_wait_mat();
+        const uint32_t q_sequence = chunk.sequence / (config->sequences / config->q_sequences);
+        const uint32_t k_sequence = chunk.sequence / (config->sequences / config->k_sequences);
+        configure_lsu_rows<0>(chunk.rows, kHeadDim * sizeof(float), config->q_nb[2], kHeadStride);
+        load_gdn_pair(uram_address(chunk.input + kInputQ), uram_address(chunk.input + kInputK),
+                       gdn_row(pipeline.q, config->q_nb, chunk.head % config->q_heads, chunk.token, q_sequence),
+                       gdn_row(pipeline.k, config->k_nb, chunk.head % config->k_heads, chunk.token, k_sequence),
+                       config->q_nb[2], config->k_nb[2]);
+        configure_lsu_rows<0>(chunk.rows, kHeadDim * sizeof(float), config->v_nb[2], kHeadStride);
+        __tx_lsu_dma_d2u<0>(uram_address(chunk.input + kInputV),
+                            (uint64_t) gdn_row(pipeline.v, config->v_nb, chunk.head, chunk.token, chunk.sequence));
+        configure_lsu_rows<0>(chunk.rows, 64, config->g_nb[2], sizeof(float));
+        __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(sizeof(float) - 1);
+        __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(sizeof(float) - 1);
+        load_gdn_pair(uram_address(chunk.input + kInputG), uram_address(chunk.input + kInputBeta),
+                       gdn_row(pipeline.g, config->g_nb, chunk.head, chunk.token, chunk.sequence),
+                       gdn_row(pipeline.beta, config->beta_nb, chunk.head, chunk.token, chunk.sequence),
+                       config->g_nb[2], config->beta_nb[2]);
+        gdn_check(dayan_resource_produce_lsu(resource, 1, 0));
     }
-    configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadStride, kHeadDim * sizeof(float));
-    __tx_lsu_dma_u2d<0>((uint64_t) (output + attn_count + state_index), uram_address(kChunkState));
     dayan_wait_lsu();
 }
+
+static void prepare_chunks(void * opaque) {
+    const auto & pipeline = *static_cast<const GdnPipeline *>(opaque);
+    uint64_t phases = 0;
+    long checksum = 0;
+    initialize_chunk_mat();
+    for (uint64_t generation = 0; generation < pipeline.generations; ++generation) {
+        const GdnChunk chunk = gdn_chunk(pipeline, generation);
+        const auto input = DAYAN_RESOURCE_MASK(DAYAN_LOCAL_RESOURCE(generation & 1));
+        const auto prepared = DAYAN_LOCAL_RESOURCE(2 + (generation & 1));
+        gdn_check(dayan_resource_wait(DAYAN_RESOURCE_MASK(prepared), input, phases, 0));
+
+        configure_chunk_mat(chunk.rows, chunk.rows, kHeadDim, kHeadStride, kHeadStride, kChunkStride);
+        __tx_mat_mm<0>(uram_address(kChunkKK), uram_address(chunk.input + kInputK), uram_address(chunk.input + kInputK));
+        __tx_mat_mm<0>(uram_address(kChunkKQ), uram_address(chunk.input + kInputK), uram_address(chunk.input + kInputQ));
+        set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedU), uram_address(chunk.input + kInputV));
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedKT), uram_address(chunk.input + kInputK));
+        configure_lsu_rows<0>(chunk.rows, kHeadDim * sizeof(float), kHeadStride, kHeadStride);
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedQ), uram_address(chunk.input + kInputQ));
+        issue_chunk_prefix(chunk);
+        dayan_wait_mat();
+        dayan_wait_lsu();
+        dayan_wait_vec();
+
+        issue_chunk_coefficients(chunk, pipeline.config->scale_bits);
+        dayan_wait_vec();
+        set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kChunkTokens * sizeof(float), kChunkStride, kChunkStride);
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedA), uram_address(kChunkKQ));
+        issue_chunk_uw(chunk);
+        dayan_wait_vec();
+
+        set_lsu_matrix<0, true, 2>(checksum, kHeadDim, kChunkTokens * sizeof(float), kChunkStride, kHeadStride);
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedW), uram_address(chunk.prepared + kPreparedKT));
+        dayan_wait_lsu();
+        set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedKT), uram_address(chunk.input + kInputK));
+        dayan_wait_lsu();
+
+        configure_vec_outer(kHeadDim);
+        configure_vec_iterator<kVecV0Base>(0, 0, kChunkStride, 0);
+        configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+        begin_vec_block(4);
+        __tx_vec_lsu_u2v<1, 1>(uram_address(kChunkTailDecay));
+        __tx_vec_lsu_u2v<0, 0>(uram_address(chunk.prepared + kPreparedKT));
+        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+        __tx_vec_lsu_v2u<0, 0>(uram_address(chunk.prepared + kPreparedKT));
+        start_vec_block(4, 4, 4, 4, 4);
+        gdn_check(dayan_resource_produce_vec(prepared, 1, input));
+        phases ^= input;
+        dayan_wait_vec();
+    }
+}
+
+static long run_chunked(const DayanGatedDeltaNetConfig * config, const float * q, const float * k,
+                        const float * v, const float * g, const float * beta, const float * state, float * output) {
+    if (dayan_uram_size() < DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES) {
+        return -22;
+    }
+    const uint32_t task = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
+    const uint64_t work_items = (uint64_t) config->heads * config->sequences;
+    const uint64_t chunks = ((uint64_t) config->tokens + kChunkTokens - 1) / kChunkTokens;
+    GdnPipeline pipeline = { config, q, k, v, g, beta, chunks,
+                             task < work_items ? (work_items - task + tasks - 1) / tasks * chunks : 0, task, tasks };
+    for (long j = 0; j < kChunkTokens; ++j) {
+        *uram_pointer<uint64_t>(kChunkLower + j * kScalarStride) = j == 63 ? 0 : ~uint64_t{0} << (j + 1);
+        *uram_pointer<uint64_t>(kChunkDiag + j * kScalarStride) = ~uint64_t{0} << j;
+    }
+
+    dayan_thread_resources_t resources = {};
+    resources.lsu_tcsr_count = 1;
+    resources.vec_tcsr_count = 1;
+    resources.local_resource_count = 4;
+    gdn_check(dayan_create_thread("gdn-load", load_chunks, &pipeline, &resources));
+    resources.mat_tcsr_count = 1;
+    gdn_check(dayan_create_thread("gdn-prepare", prepare_chunks, &pipeline, &resources));
+    initialize_chunk_mat();
+
+    uint64_t phases = 0;
+    long checksum = 0;
+    const uint64_t attn_count = (uint64_t) config->sequences * config->tokens * config->heads * kHeadDim;
+    for (uint64_t generation = 0; generation < pipeline.generations; ++generation) {
+        const GdnChunk chunk = gdn_chunk(pipeline, generation);
+        const auto input = DAYAN_RESOURCE_MASK(DAYAN_LOCAL_RESOURCE(2 + (generation & 1)));
+        const uint64_t state_index = ((uint64_t) chunk.sequence * config->heads + chunk.head) * kHeadDim * kHeadDim;
+        if (chunk.token == 0) {
+            configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadStride);
+            __tx_lsu_dma_d2u<0>(uram_address(kChunkState), (uint64_t) (state + state_index));
+            dayan_wait_lsu();
+        }
+        gdn_check(dayan_resource_wait(0, input, phases, 0));
+
+        configure_chunk_mat(kHeadDim, chunk.rows, kHeadDim, kHeadStride, kHeadStride, kChunkStride);
+        __tx_mat_mm<0>(uram_address(kChunkR), uram_address(kChunkState), uram_address(chunk.prepared + kPreparedW));
+        __tx_mat_mm<0>(uram_address(kChunkO), uram_address(kChunkState), uram_address(chunk.prepared + kPreparedQ));
+        dayan_wait_mat();
+        issue_chunk_residual(chunk.prepared, config->scale_bits);
+        dayan_wait_vec();
+        configure_chunk_mat(kHeadDim, chunk.rows, chunk.rows, kChunkStride, kChunkStride, kChunkStride);
+        __tx_mat_mma<0>(uram_address(kChunkO), uram_address(kChunkR), uram_address(chunk.prepared + kPreparedA));
+
+        configure_vec_outer(kRowGroups, kHeadDim);
+        configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, kHeadStride);
+        configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+        begin_vec_block(4);
+        __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkState));
+        __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(chunk.prepared + kPreparedDecay));
+        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+        __tx_vec_lsu_v2u<0, 0>(uram_address(kChunkState));
+        start_vec_block(4, 4, 4, 4, 4);
+        dayan_wait_mat();
+        dayan_wait_vec();
+
+        configure_chunk_mat(kHeadDim, kHeadDim, chunk.rows, kChunkStride, kChunkStride, kHeadStride);
+        __tx_mat_mma<0>(uram_address(kChunkState), uram_address(kChunkR), uram_address(chunk.prepared + kPreparedKT));
+        // Q is no longer read; reuse its slot for the transposed output.
+        set_lsu_matrix<0, true, 2>(checksum, kHeadDim, kChunkTokens * sizeof(float), kChunkStride, kHeadStride);
+        __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedQ), uram_address(kChunkO));
+        dayan_wait_lsu();
+        const uint64_t value_index = (((uint64_t) chunk.sequence * config->tokens + chunk.token) * config->heads + chunk.head) * kHeadDim;
+        configure_lsu_rows<0>(chunk.rows, kHeadDim * sizeof(float), kHeadStride, (uint64_t) config->heads * kHeadDim * sizeof(float));
+        __tx_lsu_dma_u2d<0>((uint64_t) (output + value_index), uram_address(chunk.prepared + kPreparedQ));
+        dayan_wait_mat();
+        if (chunk.token + chunk.rows == config->tokens) {
+            configure_lsu_rows<0>(kHeadDim, kHeadDim * sizeof(float), kHeadStride, kHeadDim * sizeof(float));
+            __tx_lsu_dma_u2d<0>((uint64_t) (output + attn_count + state_index), uram_address(kChunkState));
+        }
+        gdn_check(dayan_resource_consume_lsu(input));
+        phases ^= input;
+    }
+    dayan_wait_lsu();
+    return dayan_thread_join_all();
+}
+
 
 template <long LsuGroup>
 static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * config,
@@ -618,12 +713,15 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
                     config->heads % config->k_heads != 0 || config->q_sequences == 0 || config->k_sequences == 0 ||
                     config->sequences % config->q_sequences != 0 || config->sequences % config->k_sequences != 0 ||
                     dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) == 0U ||
-                    dayan_task_dim(DAYAN_TASK_X) > kDayanGatedDeltaNetMaxTasks ||
                     dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U ||
                     dayan_uram_base() == nullptr ||
                     dayan_uram_size() < DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES) {
         return -22;
+    }
+
+    if (config->gate_width == 1 && config->snapshots == 1 && config->tokens >= 16) {
+        return run_chunked(config, q, k, v, g, beta, state, output);
     }
 
     const uint64_t vector_count     = (uint64_t) config->sequences * config->tokens * config->heads;
@@ -648,10 +746,6 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
     for (uint64_t work = task; work < work_items; work += tasks) {
         const uint32_t sequence    = (uint32_t) (work / config->heads);
         const uint32_t head        = (uint32_t) (work % config->heads);
-        if (config->gate_width == 1 && config->snapshots == 1 && config->tokens >= 16) {
-            run_chunked_head(config, q, k, v, g, beta, state, output, head, sequence);
-            continue;
-        }
         const uint64_t state_index = ((uint64_t) sequence * config->heads + head) * kHeadDim * kHeadDim;
         __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramState), reinterpret_cast<uint64_t>(state + state_index));
         dayan_wait_lsu();
@@ -684,13 +778,15 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
             float * attn_output = output + value_index;
             if (config->gate_width == 1) {
                 issue_scalar_gate(uram_address(kUramG));
-                issue_scale_state<0>();
+                issue_gated_key<0>();
+                configure_vec_recurrence();
+                issue_recurrence<0>(config->scale_bits);
             } else {
                 issue_vector_gate(uram_address(kUramG));
-                issue_scale_state<kVecBytes>();
+                issue_gated_key<kVecBytes>();
+                configure_vec_recurrence();
+                issue_recurrence<kVecBytes>(config->scale_bits);
             }
-            configure_vec_recurrence();
-            issue_recurrence(config->scale_bits);
             dayan_wait_vec();
             configure_lsu_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
             __tx_lsu_dma_u2d<LsuGroup>(reinterpret_cast<uint64_t>(attn_output), uram_address(kUramOutputPacked));

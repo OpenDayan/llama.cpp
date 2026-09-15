@@ -2,13 +2,21 @@
 
 BF16, FP16, and MXFP4 weights use the same `ggml-dayan` backend and kernel module. Enabling `GGML_DAYAN` compiles all three paths together; runtime dispatch selects operators by tensor type. Switching between these GGUF weight formats requires no format-specific CMake flags or rebuild.
 
-## Build
+## Common commands
 
-Build on Linux with the Dayan SDK's `dycc`, host and Device API headers, and `libDayanRuntime.a` available. Set `DAYAN_ROOT` to the SDK checkout or installation prefix. For a source checkout, build the host dependencies once:
+Run these commands from the llama.cpp repository root. Set the SDK path and Runtime socket in each terminal:
 
 ```sh
 export DAYAN_ROOT="$HOME/npu-firmware"
-make -C "$DAYAN_ROOT" -j6 host-driver dycc
+export DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock
+```
+
+### Build
+
+Build on Linux with the Dayan SDK's `dycc`, host and Device API headers, and `libDayanRuntime.a` available. For a source checkout, build the host dependencies and profiler once:
+
+```sh
+make -C "$DAYAN_ROOT" -j6 host-driver dycc dyperf
 ```
 
 From the llama.cpp repository root, configure one build directory for all supported weight formats:
@@ -29,10 +37,127 @@ Executables are written to `build-dayan/bin`, including `llama-cli`, `llama-serv
 ```sh
 cmake --build build-dayan -j6 --target \
     llama-cli llama-server llama-bench llama-dayan-trace llama-dayan-operator-bench \
-    test-backend-ops test-dayan-matmul test-dayan-graph test-dayan-mxfp4
+    test-backend-ops test-dayan-topology test-dayan-matmul test-dayan-graph \
+    test-dayan-mxfp4 test-dayan-attention-projection test-dayan-flash-attention
 ```
 
 The same inference binaries accept BF16, FP16, and MXFP4 models. Select the model at runtime with `-m /path/to/model.gguf` and the server connection with `DAYAN_SERVER_SOCKET`; the build directory name does not select a weight format.
+
+### Start the simulator and Runtime server
+
+In a separate terminal, start a four-core cmodel server and wait for `Dayan cmodel server is ready`:
+
+```sh
+NPU_CMODEL_HARTS=4 NPU_CMODEL_MEMORY_MIB=4096 \
+    bash "$DAYAN_ROOT/run_cmodel_server.sh"
+```
+
+For a single-core run, stop this launcher with Ctrl-C and restart it with `NPU_CMODEL_HARTS=1`. The backend reads the enabled topology automatically; client commands stay the same. Increase `NPU_CMODEL_MEMORY_MIB` when the model and graph buffers need more memory. If using an existing TestCluster or hardware server, set its socket instead of starting cmodel. Run one inference or operator client at a time.
+
+### Run model inference
+
+Select a GGUF with actual model weights, then generate a short response:
+
+```sh
+export DAYAN_MODEL=/path/to/model.gguf
+./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    -n 16 --no-warmup --single-turn -p "Hello"
+```
+
+For an HTTP inference server:
+
+```sh
+./build-dayan/bin/llama-server -m "$DAYAN_MODEL" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    --parallel 1 --no-warmup --host 127.0.0.1 --port 8080
+```
+
+Measure prefill and decode throughput with the profiler stopped:
+
+```sh
+./build-dayan/bin/llama-bench -m "$DAYAN_MODEL" \
+    --device DAYAN -ngl 99 -fa on -p 128 -n 16 -b 128 -ub 128 \
+    -r 1 --no-warmup
+```
+
+`--no-warmup` keeps these smoke runs short. Omit it and increase repetitions for warm measurements. On cmodel, the reported wall time and tokens/s measure simulator execution, not hardware throughput.
+
+### Run operator tests
+
+Check topology selection and MXFP4 packing without a device:
+
+```sh
+ctest --test-dir build-dayan -R '^test-dayan-topology$' --output-on-failure
+./build-dayan/bin/test-dayan-mxfp4 --host-only
+```
+
+With the Runtime server ready, run numerical checks for MatMul, graph fusion, attention projections, and FlashAttention:
+
+```sh
+./build-dayan/bin/test-dayan-matmul 3 481 513
+./build-dayan/bin/test-dayan-graph
+./build-dayan/bin/test-dayan-attention-projection launch
+./build-dayan/bin/test-dayan-flash-attention
+```
+
+For more selectors and individual GGML operators, see [Dedicated tests](#dedicated-tests) and [Test a specific operator](#test-a-specific-operator).
+
+### Run limited-perf.py
+
+`--model` selects representative operator shapes, not a GGUF file. Preview the BF16 prefill/decode cases without contacting a server:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py plan \
+    --model qwen35-0.8B-bf16 --prefill 128 --context 512 --cmp
+```
+
+With the Runtime server ready, start dyperf in another terminal and leave it collecting:
+
+```sh
+"$DAYAN_ROOT/build/host/dyperf/dyperf" \
+    --socket "$DAYAN_SERVER_SOCKET" --follow -o /tmp/dayan-perf.json
+```
+
+Run all cases in the preview, including CPU reference comparisons:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py run \
+    --model qwen35-0.8B-bf16 \
+    --client build-dayan/bin/llama-dayan-operator-bench \
+    --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+    --perf-trace /tmp/dayan-perf.json --output build-dayan/limited-perf-cmodel \
+    --prefill 128 --context 512 --cmp
+```
+
+For a short run, add `--cases decode-ffn decode-down` to both `plan` and `run`, and use a separate output directory. Other common options are `--case-from prefill-conv`, `--warmup 1 --repeats 3`, and `--timeout 3600` (seconds per case). Use `--model qwen35-0.8B-mxfp4` or `--model qwen35-0.8B-mxfp4-vocab` to select the MXFP4 presets with the same build. For an existing RTL server/profiler, use `--simulator testcluster` and their socket/trace paths; this option only labels results and does not start a simulator.
+
+After the run finishes, stop dyperf with Ctrl-C to flush its remaining records, then regenerate the report without rerunning operators:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py report \
+    --output build-dayan/limited-perf-cmodel
+```
+
+The output directory contains `report.md`, `report.json`, `operators.csv`, and per-case inputs, results, and logs. Exit code 0 means the selected cases passed with complete cycle records; 1 means a run or comparison failure; 2 means operators passed but cycle records are incomplete. To resume an interrupted run, repeat its original `run` command with `--resume`, keeping the same trace, output directory, binaries, and parameters. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for measurement scope and prediction formulas.
+
+## Runtime topology and task dimensions
+
+The backend queries `npu_runtime_get_topology` once when it opens the device. The SDK headers, Runtime library, and `dayan_server` must support this API. The query returns physical topology and the Server's enabled Cluster/Core masks. Initialization fails if the query is unavailable or invalid.
+
+A cooperative kernel requires all four cores of an enabled Cluster. `TaskDim.x` stays 4, and `TaskDim.y` specifies the number of logical four-core groups. The Server places each group within one Cluster; logical group IDs are not physical Cluster IDs. `TaskDim.z` stays 1.
+
+| Enabled topology | Cooperative kernel | Non-cooperative kernel |
+| --- | --- | --- |
+| 1 core | 1c, `(1,1,1)` | `(1,1,1)` |
+| 1 complete Cluster, 4 cores | 4c, `(4,1,1)` | `(4,1,1)` |
+| 2 complete Clusters, 8 cores | 4c, `(4,2,1)` | `(8,1,1)` |
+| 4 complete Clusters, 16 cores | 4c, `(4,4,1)` | `(16,1,1)` |
+| 2 Clusters with 3 enabled cores each | 1c, `(6,1,1)` | `(6,1,1)` |
+
+MatMul, fused SiLU, paired projections, SWIGLU/GEGLU FFN, MoE, MXFP4, and gated output projections have non-cooperative fallbacks. FlashAttention uses its general 1c entry when four-core prefill or split-KV decode is unavailable. Standalone GLU support still requires the existing graph fusion pattern; topology selection does not add a generic standalone SWIGLU kernel.
+
+Independent workers and cooperative groups partition output columns; attention projections keep whole heads within each partition. MXFP4 partitions output tiles, and FlashAttention partitions heads and batches. Gated output projections reserve separate staging storage for each worker or group. Native operators use the enabled core count, with Gated Delta Net and SSM convolution also limiting tasks to available work.
 
 ## Backend behavior
 
@@ -104,7 +229,7 @@ Contiguous F32 residual adds and RMSNorm execute on Dayan. One parameterized nor
 
 The attention operator package provides dedicated BF16 and FP16 QG, K, and V projection entry points. Q and K fuse low-precision matrix writeback, RMSNorm, RoPE or MRoPE, and output layout conversion. K and V also have indexed KV-cache variants that write directly to cache rows. Flash-Attention has native BF16 and FP16 entries, uses `dayan_uram_base()` directly, and has an explicit causal offset for KV-cache decode. It supports GQA and right-aligned causal masking. The output path fuses `attention * sigmoid(gate)`, low-precision quantization, and the output projection. The graph compiler recognizes the Qwen3.5 gate view, sigmoid, multiply, and output matrix multiplication pattern.
 
-Flash-Attention uses 128-query tiles and 128-key tiles. Each core owns two Q slices; Q remains resident across the KV traversal. K and transposed V each have two buffers. Four-core mode splits Q tiles between cores and elects one active core to load each K or V tile, then copies its URAM tile to the other active cores. Every core retires its Shared Resource credit, including cores with no query rows. Single-core mode uses private KV loaders. The graph executor selects four-core mode for more than 64 query rows and single-core tasks for shorter queries.
+Flash-Attention uses 128-query tiles and 128-key tiles. Each core owns two Q slices; Q remains resident across the KV traversal. K and transposed V each have two buffers. Four-core mode splits Q tiles between cores and elects one active core to load each K or V tile, then copies its URAM tile to the other active cores. Every core retires its Shared Resource credit, including cores with no query rows. Single-core mode uses private KV loaders. The graph executor selects four-core mode for more than 64 query rows when a complete Cluster is enabled, and single-core tasks otherwise.
 
 The root issues QK MAT; six child Threads load Q, load K, load V, compute online softmax, issue PV MAT, and update/store O. Each Q slice has two Score/P, PV, and softmax-state buffers, allowing the compute stages to overlap across KV tiles as well as slices. Score and P share FP32 storage in each buffer; both Resource tokens must be free before QK can overwrite it. P is read directly as TF32 by the mixed TF32/BF16 or TF32/FP16 PV product. Each state generation has an O-update reader and, except for the last tile, a reader in the next softmax. Two alternating O version tokens serialize updates to one O allocation. There are 26 Local Resources and, in four-core mode, four Shared Resources plus 128 bytes of shared metadata.
 
@@ -128,9 +253,11 @@ Online softmax follows `FlexVecAttentionSpec.scala`: each 64-lane VEC context pr
 
 For Qwen3.5 linear-attention layers, `SSM_CONV` followed by SiLU uses one dedicated device function. LSU gathers the F32 channel-major input and depthwise weights into tap-major URAM tiles. VEC performs one elementwise multiply per tap, accumulates the taps in F32, and optionally applies the common SiLU implementation before one output writeback. The kernel does not construct diagonal matrices or use MAT convolution. It supports kernel widths up to 63 and uses 64-token tiles. The convolution remains a separate operator from the delta-net core.
 
-Gated Delta Net assigns heads and sequences to at most 16 root tasks, with up to four resident tasks per core. Decode and short prefill update state with VEC hardware loops: DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Scalar-gate prefill with at least 16 tokens and one final state snapshot uses 64-token chunks. MAT computes block correlations, output contributions, and state updates; VEC computes gate prefixes and triangular corrections with 128 independent value rows. Only the complete FP32 state crosses chunk boundaries. Vector gates (KDA) and multiple state snapshots use the recurrent VEC path.
+Gated Delta Net assigns heads and sequences to independent single-core tasks, limited by the enabled core count. Scalar-gate prefill with at least 16 tokens and one final state snapshot uses 64-token chunks. Each task has a loader Thread, a precompute Thread, and the root state-update loop. Two input slots and two prepared slots use four Local Resources for backpressure. Precompute builds the gate coefficients and jointly solves U and W with 256 independent RHS rows. The root computes the corrected values as U - W S, then produces outputs and updates the FP32 state. MAT, VEC, and LSU work from different chunks can overlap. Resource phases continue across heads and sequences; there is no separate limit on how far a producer can advance.
 
-Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The chunk layout uses 345.5 KiB within a 352 KiB task reservation, or 1408 KiB for four resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation.
+Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The pipeline uses 758.5 KiB within a 768 KiB task reservation, with up to two resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation. Prepared Q becomes output storage after its last MAT read, and the prepared Resource stays held until the output DMA completes.
+
+Decode, short prefill, vector gates (KDA), and multiple state snapshots use the FP32 recurrent VEC path with a 96 KiB reservation and up to four resident tasks per core. It forms the gated key once per token and folds state decay into the state update, avoiding a separate full-state read/write pass. DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Both entries can distribute independent tasks across the available cores; they do not split one head across a cooperating four-core group.
 
 ## Profiling
 
@@ -178,13 +305,15 @@ For a matrix multiplication smoke case:
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-backend-ops -b DAYAN -o MUL_MAT -p 'type_a=bf16,type_b=f32,m=16,n=1,k=256,bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\]'
 ```
 
-Enable the cores required by the selected kernel in `dayan_server`; four-core MatMul paths need core mask `0xf`. The same client commands work with a TestCluster-backed server.
+The backend selects kernels from the cores enabled in `dayan_server`; core mask `0xf` permits four-core cooperation, and a partial mask selects non-cooperative kernels. The same client commands work with a TestCluster-backed server.
 
 To run cmodel alongside TestCluster, isolate its FUSE mount, Runtime socket, emulator IPC sockets, and DRAM/URAM shared-memory names. Separate mount and Runtime socket paths alone are insufficient. The stock `run_cmodel_server.sh` cleans the default IPC and shared-memory files, so do not use it while TestCluster owns those resources. Use an isolated emulator/QEMU pair and a launcher whose cleanup touches only that instance's paths. Clients select the instance through `DAYAN_SERVER_SOCKET`.
 
 Replace `test` with `support` to check whether Dayan supports the selected cases without running their numerical comparison. `perf` runs the performance case set, which has different shapes and may require a different `-p` filter; host timings under simulation are not hardware throughput measurements.
 
 ## Dedicated tests
+
+`test-dayan-topology` checks launch selection for 1, 4, 8, and 16 cores, partial masks, and output partition boundaries without a device. `test-dayan-attention-projection launch` checks independent workers and multiple four-core groups when available. The attention pipeline cases `groups-prefill-bf16`, `groups-decode-fp16`, and `tasks-prefill-fp16` cover group and worker sharding. Multiple logical groups can run in sequence on one physical Cluster; this does not validate physical multi-Cluster concurrency.
 
 The standalone BF16 matrix multiplication smoke test defaults to `M=1`, `N=8064`, and `K=1024`. Pass three dimensions to override the default shape:
 
@@ -231,7 +360,7 @@ The attention projection test runs QG, K, and V projection, indexed KV-cache wri
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-projection
 ```
 
-The Gated Delta Net test compares outputs and state snapshots with the CPU reference. It covers decode, 16/17/64/65/128/1024-token prefill, weak and strong gates, shared Q/K heads and sequences, repeated task work, KDA, and multiple state snapshots. Chunk tests check TF32 error separately for outputs and final state; recurrent tests retain FP32 tolerances.
+The Gated Delta Net test compares outputs and state snapshots with the CPU reference. It covers decode, 16/17/64/65/128/129/257/1024-token prefill, weak and strong gates, shared Q/K heads and sequences, odd chunk counts across repeated task work, KDA, and multiple state snapshots. Chunk tests check TF32 error separately for outputs and final state; recurrent tests retain FP32 tolerances.
 
 ```sh
 cmake --build build-dayan --target test-dayan-gated-delta-net -j4

@@ -12,6 +12,8 @@ using ggml_dayan_matmul_detail::MatmulPhases;
 using ggml_dayan_matmul_detail::extent;
 using ggml_dayan_matmul_detail::load_matrix;
 using ggml_dayan_matmul_detail::matmul_check;
+using ggml_dayan_matmul_detail::matmul_group_id;
+using ggml_dayan_matmul_detail::matmul_group_count;
 using ggml_dayan_matmul_detail::store_matrix;
 
 enum : int {
@@ -218,13 +220,25 @@ template <typename Format, int Cores, bool GeGLU, bool Inference = false>
 static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint16_t * gate, const uint16_t * up,
                uint16_t * output, MatmulPhases * phases = nullptr) {
     static_assert(Cores == 1 || Cores == 4);
-    const int lane = dayan_task_id(DAYAN_TASK_X);
+    const int lane = Cores == 4 ? dayan_task_id(DAYAN_TASK_X) : 0;
+    const uint32_t groups = matmul_group_count();
+    const uint32_t group = matmul_group_id();
     if (!ggml_dayan_matmul_detail::matmul_config_valid<sizeof(uint16_t)>(config) || !a || !gate || !up || !output ||
-        dayan_task_mode() != Cores || dayan_task_dim(DAYAN_TASK_X) != Cores || lane >= Cores ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1 || dayan_task_dim(DAYAN_TASK_Z) != 1 || (Cores == 4 && !shared) ||
+        dayan_task_mode() != Cores || (Cores == 4 && dayan_task_dim(DAYAN_TASK_X) != 4) || lane >= Cores ||
+        !groups || group >= groups || (Cores == 1 && dayan_task_dim(DAYAN_TASK_Y) != 1) ||
+        dayan_task_dim(DAYAN_TASK_Z) != 1 || (Cores == 4 && !shared) ||
         (Inference && config->m > 512)) {
         return -22;
     }
+    const uint64_t begin = dayan_partition_begin(config->n, group, groups);
+    const uint64_t end = dayan_partition_begin(config->n, group + 1, groups);
+    if (begin == end) { return 0; }
+    DayanMatmulConfig shard = *config;
+    shard.n = end - begin;
+    gate = (const uint16_t *) ((const char *) gate + begin * config->bt_stride);
+    up = (const uint16_t *) ((const char *) up + begin * config->bt_stride);
+    output += begin;
+    config = &shard;
     MatmulPhases local_phases;
     MatmulCluster * cluster = (MatmulCluster *) shared;
     State s = {};

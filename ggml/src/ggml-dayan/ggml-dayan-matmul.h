@@ -55,6 +55,14 @@ static inline int min_int(int left, int right) {
     return left < right ? left : right;
 }
 
+static inline uint32_t matmul_group_id() {
+    return dayan_task_id(dayan_task_mode() == 4 ? DAYAN_TASK_Y : DAYAN_TASK_X);
+}
+
+static inline uint32_t matmul_group_count() {
+    return dayan_task_dim(dayan_task_mode() == 4 ? DAYAN_TASK_Y : DAYAN_TASK_X);
+}
+
 struct MatmulInputArgs {
     const void * context;
     uint64_t     output;
@@ -497,19 +505,31 @@ static inline bool matmul_config_valid(const DayanMatmulConfig * c) {
 template <typename Format, int Cores, int Products, int OutputBytes, bool HasEpilogue, MatmulEpilogue Epilogue,
           MatmulInputLoader InputLoader = nullptr, uint64_t InputScratchBytes = 0, bool Inference = false>
 static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, const uint16_t * bt0, const uint16_t * bt1,
-                      void * output, const void * input_context = nullptr, MatmulPhases * phases = nullptr) {
+                      void * output, const void * input_context = nullptr, MatmulPhases * phases = nullptr, uint64_t alignment = 64) {
     static_assert(Cores == 1 || Cores == 4);
     static_assert(Products == 1 || Products == 2);
-    const int lane = dayan_task_id(DAYAN_TASK_X);
+    const int lane = Cores == 4 ? dayan_task_id(DAYAN_TASK_X) : 0;
+    const uint32_t groups = matmul_group_count();
+    const uint32_t group = matmul_group_id();
     if (!matmul_config_valid<OutputBytes>(config) || !a || !bt0 || !output || (Products == 2 && !bt1) ||
-        dayan_task_mode() != Cores || dayan_task_dim(DAYAN_TASK_X) != Cores || lane >= Cores ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1 || dayan_task_dim(DAYAN_TASK_Z) != 1 || (Cores == 4 && !shared) ||
+        dayan_task_mode() != Cores || (Cores == 4 && dayan_task_dim(DAYAN_TASK_X) != 4) || lane >= Cores ||
+        !groups || group >= groups || (Cores == 1 && dayan_task_dim(DAYAN_TASK_Y) != 1) ||
+        dayan_task_dim(DAYAN_TASK_Z) != 1 || (Cores == 4 && !shared) ||
         (InputLoader != nullptr && (Cores != 1 || config->m >= config->n || config->batch_ne2))) {
         return -22;
     }
     if (Inference && config->m > 512) {
         return -22;
     }
+    const uint64_t begin = dayan_partition_begin(config->n, group, groups, alignment);
+    const uint64_t end = dayan_partition_begin(config->n, group + 1, groups, alignment);
+    if (begin == end) { return 0; }
+    DayanMatmulConfig shard = *config;
+    shard.n = end - begin;
+    bt0 = (const uint16_t *) ((const char *) bt0 + begin * config->bt_stride);
+    if (bt1) { bt1 = (const uint16_t *) ((const char *) bt1 + begin * config->bt_stride); }
+    output = (char *) output + begin * OutputBytes;
+    config = &shard;
     const uint64_t ne2 = config->batch_ne2 ? config->batch_ne2 : 1;
     const uint64_t ne3 = config->batch_ne3 ? config->batch_ne3 : 1;
     const uint64_t ratio2 = config->batch_ne2 ? ne2 / config->weight_ne2 : 1;
@@ -544,7 +564,7 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     s.tile_m = Products == 2 ? 96 : Cores == 4 && !HasEpilogue ? 512 : Constants::kTileM;
     s.tile_n = Constants::kTileN;
     s.split_n = Inference && Cores == 4;
-    s.buffer_a = Inference || matrix.m < matrix.n;
+    s.buffer_a = Inference || InputLoader != nullptr || matrix.m < matrix.n;
     if (Inference && matrix.m < 32) {
         s.tile_m = (int) matrix.m;
         s.tile_n = Cores == 4 ? 1536 : 768;

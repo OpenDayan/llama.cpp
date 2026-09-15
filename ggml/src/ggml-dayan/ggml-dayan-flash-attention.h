@@ -794,8 +794,8 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
         (flags & ~kFlagCausal) != 0 || ((flags & kFlagCausal) == 0 && causal_offset != 0) ||
         ((flags & kFlagCausal) != 0 && static_cast<uint64_t>(causal_offset) + q_len > kv_len) ||
         (scale_bits & 0x7f800000U) == 0x7f800000U || ((scale_bits & 0x80000000U) != 0 && scale_magnitude != 0) ||
-        dayan_task_mode() != Cores || (Cores == 4 && tasks != 4) || tasks == 0U || tasks > kDayanNativeMaxTasks || task >= tasks ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
+        dayan_task_mode() != Cores || (Cores == 4 && tasks != 4) || tasks == 0U || task >= tasks ||
+        (Cores == 1 && dayan_task_dim(DAYAN_TASK_Y) != 1U) || !dayan_task_dim(DAYAN_TASK_Y) || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         return FA_INVALID_ARGUMENT;
     }
     if (head_dim == 0 || head_dim > kMaxHeadDim || (head_dim % kVecLanes) != 0) {
@@ -874,8 +874,8 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     }
     s.cores = Cores;
     s.lane = Cores == 4 ? task : 0;
-    s.task = Cores == 4 ? 0 : task;
-    s.tasks = Cores == 4 ? 1 : tasks;
+    s.task = Cores == 4 ? dayan_task_id(DAYAN_TASK_Y) : task;
+    s.tasks = Cores == 4 ? dayan_task_dim(DAYAN_TASK_Y) : tasks;
     s.scale = float_as_u32(scale_log2e);
     s.groups = SplitKV ? (q_heads / kv_heads + kBr - 1) / kBr : q_groups;
     const uint64_t work = (uint64_t) batch * (SplitKV ? kv_heads : q_heads);

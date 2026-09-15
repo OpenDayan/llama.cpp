@@ -4124,6 +4124,15 @@ struct test_gated_delta_net : public test_case {
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
           v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        const auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        if (strcmp(ggml_backend_reg_name(reg), "DAYAN") == 0 && head_size == 128 && n_seq_tokens >= 16 && !kda && K == 1) {
+            // TF32 inputs: match the chunk test's 3e-3 relative L2 limit.
+            return 9e-6;
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
         ggml_tensor * k;
@@ -9718,6 +9727,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  65, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 129, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 65, 2, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));

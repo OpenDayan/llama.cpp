@@ -351,7 +351,7 @@ function slotLabel(node, showMembers) {
   lines.push('kernel: ' + implementation.kernel);
   lines.push('launch: ' + implementation.launch_name);
   if (node.sort_k) lines.push('selected indices per row: ' + node.sort_k);
-  lines.push('mode: ' + implementation.task_mode + ' x' + implementation.task_dim_x);
+  lines.push('mode: ' + implementation.task_mode + ' dim=(' + [implementation.task_dim_x, implementation.task_dim_y || 1, implementation.task_dim_z || 1].join(',') + ')');
   lines.push('I/O: ' + node.inputs.length + ' inputs / ' + node.outputs.length + ' outputs');
   if (showMembers) {
     lines.push('--- fused logical ops ---');

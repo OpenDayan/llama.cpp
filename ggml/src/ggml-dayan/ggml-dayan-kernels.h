@@ -40,15 +40,57 @@ enum : uint32_t {
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES
-#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (352U * 1024U)
+#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (96U * 1024U)
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_URAM_BYTES
 #    define DAYAN_GATED_DELTA_NET_URAM_BYTES DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES
 #endif
 
+#ifndef DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES
+#    define DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES (768U * 1024U)
+#endif
+
 #ifndef DAYAN_ROPE_MAX_PAIRS
 #    define DAYAN_ROPE_MAX_PAIRS 256U
+#endif
+
+static inline uint64_t dayan_partition_begin(uint64_t elements, uint32_t index, uint32_t count, uint64_t alignment = 64) {
+    const uint64_t blocks = (elements + alignment - 1) / alignment;
+    const uint64_t offset = blocks * index / count * alignment;
+    return offset < elements ? offset : elements;
+}
+
+#if !defined(__DAYAN_DEVICE__)
+struct DayanTopology {
+    uint32_t cores = 0;
+    uint32_t clusters = 0;
+
+    bool init(const npu_runtime_topology_t & info) {
+        cores = clusters = 0;
+        if (info.cluster_count == 0 || info.cluster_count > 32 || info.cores_per_cluster == 0 || info.cores_per_cluster > 32 ||
+            !info.enabled_cluster_mask || !info.enabled_core_mask ||
+            (info.cluster_count < 32 && (info.enabled_cluster_mask >> info.cluster_count)) ||
+            (info.cores_per_cluster < 32 && (info.enabled_core_mask >> info.cores_per_cluster))) {
+            return false;
+        }
+        uint32_t enabled_clusters = 0, enabled_cores = 0;
+        for (uint32_t mask = info.enabled_cluster_mask; mask; mask &= mask - 1) { ++enabled_clusters; }
+        for (uint32_t mask = info.enabled_core_mask; mask; mask &= mask - 1) { ++enabled_cores; }
+        cores = enabled_clusters * enabled_cores;
+        clusters = info.cores_per_cluster == 4 && info.enabled_core_mask == 0xf ? enabled_clusters : 0;
+        return true;
+    }
+
+    NPULaunchConfig launch(bool cooperative, uint64_t work = UINT64_MAX) const {
+        const bool four_core = cooperative && clusters != 0;
+        uint32_t count = four_core ? clusters : cores;
+        if (work < count) { count = (uint32_t) work; }
+        if (count == 0) { count = 1; }
+        return {four_core ? NPUTaskDim3{4, count, 1} : NPUTaskDim3{count, 1, 1},
+                four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore};
+    }
+};
 #endif
 
 struct DayanMatmulConfig {
@@ -157,8 +199,7 @@ struct DayanSSMConvConfig {
     uint32_t one_bits;
 };
 
-static inline uint32_t dayan_ssm_conv_task_count(uint32_t channels, uint32_t tokens, uint32_t sequences) {
-    const uint64_t max_tasks      = kDayanSSMConvMaxTasks;
+static inline uint32_t dayan_ssm_conv_task_count(uint32_t channels, uint32_t tokens, uint32_t sequences, uint32_t max_tasks = kDayanSSMConvMaxTasks) {
     const uint64_t channel_groups = ((uint64_t) channels + 63U) / 64U;
     const uint64_t row_groups     = ((uint64_t) tokens + kDayanSSMConvTokenTile - 1U) / kDayanSSMConvTokenTile * sequences;
     const uint64_t tasks = (channel_groups < max_tasks ? channel_groups : max_tasks) *
@@ -387,6 +428,9 @@ struct DayanGroupNormConfig {
 #if !defined(__DAYAN_DEVICE__)
 int quantize_mxfp4(npu_buffer_t * config, npu_buffer_t * input, npu_buffer_t * output, npu_buffer_t * scales,
                    const npu_kernel_launch_attrs_t * attrs);
+int matmul_mxfp4_1c(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
+                     npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * output, npu_buffer_t * scales,
+                     const npu_kernel_launch_attrs_t * attrs);
 int matmul_mxfp4_4c(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
                      npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * output, npu_buffer_t * scales,
                      const npu_kernel_launch_attrs_t * attrs);
@@ -430,7 +474,17 @@ int matmul_inference_fp16_4c(npu_buffer_t *                    config,
                    npu_buffer_t *                    bt,
                    npu_buffer_t *                    output,
                    const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_bf16_1c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_silu_bf16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_inference_bf16_1c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
                         npu_buffer_t *                    bt,
                         npu_buffer_t *                    output,
@@ -440,7 +494,17 @@ int matmul_silu_inference_bf16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    bt,
                         npu_buffer_t *                    output,
                         const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_fp16_1c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_silu_fp16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    bt,
+                        npu_buffer_t *                    output,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_silu_inference_fp16_1c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
                         npu_buffer_t *                    bt,
                         npu_buffer_t *                    output,
@@ -450,7 +514,21 @@ int matmul_silu_inference_fp16_4c(npu_buffer_t *                    config,
                         npu_buffer_t *                    bt,
                         npu_buffer_t *                    output,
                         const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_pair_bf16_1c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    first_bt,
+                        npu_buffer_t *                    second_bt,
+                        npu_buffer_t *                    first,
+                        npu_buffer_t *                    second,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
 int matmul_pair_bf16_4c(npu_buffer_t *                    config,
+                        npu_buffer_t *                    a,
+                        npu_buffer_t *                    first_bt,
+                        npu_buffer_t *                    second_bt,
+                        npu_buffer_t *                    first,
+                        npu_buffer_t *                    second,
+                        const npu_kernel_launch_attrs_t * launch_attrs);
+int matmul_pair_fp16_1c(npu_buffer_t *                    config,
                         npu_buffer_t *                    a,
                         npu_buffer_t *                    first_bt,
                         npu_buffer_t *                    second_bt,
@@ -624,7 +702,23 @@ int mul_mat_id_fp16_4c(npu_buffer_t *                    config,
                        npu_buffer_t *                    ids,
                        npu_buffer_t *                    output,
                        const npu_kernel_launch_attrs_t * launch_attrs);
+int mul_mat_id_pair_bf16_1c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    activation,
+                            npu_buffer_t *                    first_weight,
+                            npu_buffer_t *                    second_weight,
+                            npu_buffer_t *                    ids,
+                            npu_buffer_t *                    first_output,
+                            npu_buffer_t *                    second_output,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
 int mul_mat_id_pair_bf16_4c(npu_buffer_t *                    config,
+                            npu_buffer_t *                    activation,
+                            npu_buffer_t *                    first_weight,
+                            npu_buffer_t *                    second_weight,
+                            npu_buffer_t *                    ids,
+                            npu_buffer_t *                    first_output,
+                            npu_buffer_t *                    second_output,
+                            const npu_kernel_launch_attrs_t * launch_attrs);
+int mul_mat_id_pair_fp16_1c(npu_buffer_t *                    config,
                             npu_buffer_t *                    activation,
                             npu_buffer_t *                    first_weight,
                             npu_buffer_t *                    second_weight,
@@ -747,6 +841,15 @@ int gated_delta_net_f32_1c(npu_buffer_t *                    config,
                            npu_buffer_t *                    state,
                            npu_buffer_t *                    output,
                            const npu_kernel_launch_attrs_t * launch_attrs);
+int gated_delta_net_chunk_f32_1c(npu_buffer_t *                    config,
+                                 npu_buffer_t *                    q,
+                                 npu_buffer_t *                    k,
+                                 npu_buffer_t *                    v,
+                                 npu_buffer_t *                    g,
+                                 npu_buffer_t *                    beta,
+                                 npu_buffer_t *                    state,
+                                 npu_buffer_t *                    output,
+                                 const npu_kernel_launch_attrs_t * launch_attrs);
 int project_qg_bf16_1c(npu_buffer_t *                    config,
                        npu_buffer_t *                    activation,
                        npu_buffer_t *                    weight,
@@ -900,12 +1003,14 @@ int project_gated_output_bf16_1c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    gate,
                                  npu_buffer_t *                    weight,
                                  npu_buffer_t *                    output,
+                                 npu_buffer_t *                    scratch,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_fp16_1c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    attention,
                                  npu_buffer_t *                    gate,
                                  npu_buffer_t *                    weight,
                                  npu_buffer_t *                    output,
+                                 npu_buffer_t *                    scratch,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_bf16_4c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    attention,
@@ -921,7 +1026,21 @@ int project_gated_output_fp16_4c(npu_buffer_t *                    config,
                                  npu_buffer_t *                    output,
                                  npu_buffer_t *                    scratch,
                                  const npu_kernel_launch_attrs_t * launch_attrs);
+int project_gated_output_f32_gate_bf16_1c(npu_buffer_t *                    config,
+                                          npu_buffer_t *                    attention,
+                                          npu_buffer_t *                    gate,
+                                          npu_buffer_t *                    weight,
+                                          npu_buffer_t *                    output,
+                                          npu_buffer_t *                    scratch,
+                                          const npu_kernel_launch_attrs_t * launch_attrs);
 int project_gated_output_f32_gate_bf16_4c(npu_buffer_t *                    config,
+                                          npu_buffer_t *                    attention,
+                                          npu_buffer_t *                    gate,
+                                          npu_buffer_t *                    weight,
+                                          npu_buffer_t *                    output,
+                                          npu_buffer_t *                    scratch,
+                                          const npu_kernel_launch_attrs_t * launch_attrs);
+int project_gated_output_f32_gate_fp16_1c(npu_buffer_t *                    config,
                                           npu_buffer_t *                    attention,
                                           npu_buffer_t *                    gate,
                                           npu_buffer_t *                    weight,

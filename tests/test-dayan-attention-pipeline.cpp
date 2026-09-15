@@ -262,7 +262,7 @@ static int run_case(runtime_context * runtime, const attention_case & test, uint
         npu_kernel_launch_attrs_t attrs;
         const char *              launch_name = test.type == GGML_TYPE_BF16 ? "flash-attn-bf16" : "flash-attn-fp16";
         npu_kernel_launch_attrs_init(&attrs, runtime->context, runtime->stream, launch_name);
-        attrs.config.task_dim  = NPUTaskDim3{ test.four_core ? 4U : test.tasks, 1, 1 };
+        attrs.config.task_dim  = test.four_core ? NPUTaskDim3{4, test.tasks, 1} : NPUTaskDim3{test.tasks, 1, 1};
         attrs.config.task_mode = test.four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
         attrs.timeout_ms       = 3600000U;
         const auto kernel = test.type == GGML_TYPE_BF16 ?
@@ -351,6 +351,9 @@ int main(int argc, char ** argv) {
     }
 
     const attention_case cases[] = {
+        { "groups-prefill-bf16", GGML_TYPE_BF16, 2, 6, 2, 65, 151, 64, 86, true, true, 2, true },
+        { "groups-decode-fp16", GGML_TYPE_F16, 2, 6, 2, 1, 769, 128, 0, false, false, 8, true, 2.0f, true },
+        { "tasks-prefill-fp16", GGML_TYPE_F16, 2, 6, 2, 65, 151, 64, 86, true, true, 8 },
         { "decode-trace-bf16", GGML_TYPE_BF16, 1, 8, 2, 1, 1025, 256, 1024, true, true, 1, true, 2.0f, true },
         { "decode-batch-fp16", GGML_TYPE_F16, 2, 6, 2, 1, 769, 128, 0, false, false, 1, true, 2.0f, true },
         { "decode-mqa-bf16", GGML_TYPE_BF16, 1, 1, 1, 1, 512, 64, 0, false, false, 1, true, 6.0f, true },

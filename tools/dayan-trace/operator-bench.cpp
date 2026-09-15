@@ -348,12 +348,15 @@ int main(int argc, char ** argv) {
         const char * socket = std::getenv("DAYAN_SERVER_SOCKET");
         if (socket && socket[0]) { options.server_socket = socket; }
         check(npu_runtime_open(&device.runtime, &options), "npu_runtime_open");
+        npu_runtime_topology_t info{};
+        DayanTopology topology;
+        check(npu_runtime_get_topology(device.runtime, &info), "npu_runtime_get_topology");
+        if (!topology.init(info)) { throw std::runtime_error("invalid Dayan topology"); }
         check(npu_context_create(device.runtime, nullptr, &device.context), "npu_context_create");
         check(npu_stream_create(device.context, nullptr, &device.stream), "npu_stream_create");
         npu_kernel_launch_attrs_t attrs;
         npu_kernel_launch_attrs_init(&attrs, device.context, device.stream, tag.c_str());
-        attrs.config.task_dim = NPUTaskDim3{4, 1, 1};
-        attrs.config.task_mode = NPUTaskMode::kSingleCore;
+        attrs.config = topology.launch(false);
         attrs.timeout_ms = device.timeout_ms;
 
         npu_buffer_t * output = nullptr;
@@ -396,7 +399,7 @@ int main(int argc, char ** argv) {
                 result["kernel"] = "quantize_mxfp4";
                 launch = [&, cfg, a, scales]() { return quantize_mxfp4(cfg, a, output, scales, &attrs); };
             } else {
-                attrs.config.task_mode = NPUTaskMode::kFourCore;
+                attrs.config = topology.launch(true);
                 const auto a_layout = DayanMxfp4Layout::make(m, k), b_layout = DayanMxfp4Layout::make(n, k);
                 config.source_type = config.weight_type = kDayanDataTypeMXFP4;
                 config.a_stride = a_layout.row_stride; config.b_stride = b_layout.row_stride;
@@ -408,9 +411,9 @@ int main(int argc, char ** argv) {
                 auto bs = device.view(b, b_layout.scale_offset, b_layout.bytes - b_layout.scale_offset);
                 auto up = op == "ffn" ? mxfp4_input(device, b_layout, value) : b;
                 auto ups = op == "ffn" ? device.view(up, b_layout.scale_offset, b_layout.bytes - b_layout.scale_offset) : bs;
-                result["kernel"] = "matmul_mxfp4_4c";
+                result["kernel"] = topology.clusters ? "matmul_mxfp4_4c" : "matmul_mxfp4_1c";
                 launch = [&, cfg, a, as, b, bs, up, ups, scales]() {
-                    return matmul_mxfp4_4c(cfg, a, as, b, bs, up, ups, output, scales, &attrs);
+                    return (topology.clusters ? matmul_mxfp4_4c : matmul_mxfp4_1c)(cfg, a, as, b, bs, up, ups, output, scales, &attrs);
                 };
                 value = k / 4096.0f;
                 if (op == "ffn") { value = value * value / (1.0f + std::exp(-value)); }
@@ -421,7 +424,7 @@ int main(int argc, char ** argv) {
             }
             reference.assign((size_t) m * n, value);
         } else if (matrix) {
-            attrs.config.task_mode = NPUTaskMode::kFourCore;
+            attrs.config = topology.launch(true);
             DayanMatmulConfig config{m, n, k, k * 2ULL, k * 2ULL, n * (lowp_output ? 2ULL : 4ULL)};
             auto cfg = device.upload(&config, sizeof(config));
             auto a = device.input((size_t) m * k, 1.0f / 64, true);
@@ -431,12 +434,12 @@ int main(int argc, char ** argv) {
             if (lowp_output) {
                 auto up = device.input((size_t) n * k, 1.0f / 64, true);
                 launch = [&, cfg, a, b, up]() {
-                    return (m <= 512 ? matmul_swiglu_inference_bf16_4c : matmul_swiglu_bf16_4c)(cfg, a, b, up, output, &attrs);
+                    return (topology.clusters ? (m <= 512 ? matmul_swiglu_inference_bf16_4c : matmul_swiglu_bf16_4c) : (m <= 512 ? matmul_swiglu_inference_bf16_1c : matmul_swiglu_bf16_1c))(cfg, a, b, up, output, &attrs);
                 };
                 value = value * value / (1.0f + std::exp(-value));
             } else {
                 launch = [&, cfg, a, b]() {
-                    return (m <= 512 ? matmul_inference_bf16_4c : matmul_bf16_4c)(cfg, a, b, output, &attrs);
+                    return (topology.clusters ? (m <= 512 ? matmul_inference_bf16_4c : matmul_bf16_4c) : (m <= 512 ? matmul_inference_bf16_1c : matmul_bf16_1c))(cfg, a, b, output, &attrs);
                 };
             }
             reference.assign((size_t) m * n, value);
@@ -444,7 +447,7 @@ int main(int argc, char ** argv) {
             const uint32_t channels = spec.value("channels", 6144U), kernel = spec.value("kernel", 4U);
             if (channels == 0 || channels > 65536 || kernel == 0 || kernel > 63) { throw std::runtime_error("invalid convolution shape"); }
             DayanSSMConvConfig config{m + kernel - 1, channels, m, 1, kernel, 1, float_bits(-1.4426950408889634f), float_bits(1.0f)};
-            attrs.config.task_dim = NPUTaskDim3{dayan_ssm_conv_task_count(config.channels, config.tokens, config.sequences), 1, 1};
+            attrs.config = topology.launch(false, dayan_ssm_conv_task_count(config.channels, config.tokens, config.sequences, topology.cores));
             auto cfg = device.upload(&config, sizeof(config));
             auto a = device.input((size_t) config.input_length * config.channels, 1.0f / 64);
             auto b = device.input(kernel * config.channels, 1.0f / 32);
@@ -463,7 +466,7 @@ int main(int argc, char ** argv) {
             config.tokens = m;
             config.sequences = config.snapshots = config.gate_width = config.q_sequences = config.k_sequences = 1;
             config.scale_bits = float_bits(1.0f / std::sqrt(128.0f));
-            attrs.config.task_dim = NPUTaskDim3{std::min(config.heads * config.sequences, (uint32_t) kDayanGatedDeltaNetMaxTasks), 1, 1};
+            attrs.config = topology.launch(false, (uint64_t) config.heads * config.sequences);
             for (auto nb : {config.q_nb, config.k_nb, config.v_nb}) { strides(nb, 128, config.heads, m); }
             for (auto nb : {config.g_nb, config.beta_nb}) { strides(nb, 1, config.heads, m); }
             auto cfg = device.upload(&config, sizeof(config));
@@ -483,7 +486,7 @@ int main(int argc, char ** argv) {
             std::fill(reference.begin() + m * width, reference.end(), s);
             output = device.filled(reference.size(), nan);
             launch = [&, cfg, q, key, v, g, beta, state]() {
-                return gated_delta_net_f32_1c(cfg, q, key, v, g, beta, state, output, &attrs);
+                return (m >= 16 ? gated_delta_net_chunk_f32_1c : gated_delta_net_f32_1c)(cfg, q, key, v, g, beta, state, output, &attrs);
             };
         } else if (op == "attention") {
             DayanFlashAttentionConfig config{};
@@ -513,15 +516,14 @@ int main(int argc, char ** argv) {
             output = device.filled(reference.size(), nan);
             const int64_t initial_status = -1;
             kernel_result = device.upload(&initial_status, sizeof(initial_status));
-            const bool split_kv = dayan_flash_attention_use_split_kv(m, config.kv_len);
-            const bool four_core = m > 64 || split_kv;
-            attrs.config.task_mode = four_core ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
+            const bool split_kv = topology.clusters && dayan_flash_attention_use_split_kv(m, config.kv_len);
+            const bool four_core = topology.clusters && (m > 64 || split_kv);
+            attrs.config = topology.launch(four_core);
             launch = [&, cfg, q, key, v, four_core, split_kv]() {
                 const auto kernel = split_kv ? flash_attention_decode_bf16_4c : four_core ? flash_attention_bf16_4c : flash_attention_bf16_1c;
                 return kernel(cfg, q, key, v, output, kernel_result, &attrs);
             };
         } else if (op == "norm") {
-            attrs.config.task_dim.x = std::min<uint32_t>(m, kDayanNativeMaxTasks);
             DayanNormPipelineConfig config{};
             config.norm.width = n;
             config.norm.rows = m;

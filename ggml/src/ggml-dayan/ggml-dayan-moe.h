@@ -42,7 +42,7 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
                            const uint16_t *            activation,
                            const uint16_t *            weight,
                            const int32_t *             ids,
-                           float *                     output) {
+                           float *                     output, MatmulPhases * phases = nullptr) {
     if (config == nullptr || activation == nullptr || weight == nullptr || ids == nullptr || output == nullptr ||
         config->k == 0 || config->n == 0 || config->experts == 0 || config->experts > INT32_MAX ||
         config->experts_used == 0 || config->tokens == 0 || config->activation_slots == 0 ||
@@ -65,7 +65,8 @@ static void run_mul_mat_id(const DayanMulMatIdConfig * config,
         (uint64_t) config->n * sizeof(float),
     };
     const uint64_t weight_elements = (uint64_t) config->n * config->k;
-    MatmulPhases resource_phases;
+    MatmulPhases local_phases;
+    MatmulPhases & resource_phases = phases ? *phases : local_phases;
     for (uint32_t token = 0; token < config->tokens; ++token) {
         for (uint32_t used = 0; used < config->experts_used; ++used) {
             const int32_t * row_ids = (const int32_t *) ((const char *) ids + token * config->ids_row_stride);

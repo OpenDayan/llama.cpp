@@ -214,6 +214,8 @@ int main() {
         run_case(dayan.get(), cpu.get(), 5, 65, 1, false, 0x35d1fU, -0.02f, -0.001f) != 0 ||
         run_case(dayan.get(), cpu.get(), 4, 128, 1, false, 0x35d20U) != 0 ||
         run_case(dayan.get(), cpu.get(), 16, 1024, 1, false, 0x35d21U, -0.02f, -0.001f) != 0 ||
+        run_case(dayan.get(), cpu.get(), 1, 257, 1, false, 0x35d26U, -0.02f, -0.001f) != 0 ||
+        run_case(dayan.get(), cpu.get(), 4, 129, 5, false, 0x35d27U, -0.02f, -0.001f, 2, 1) != 0 ||
         run_case(dayan.get(), cpu.get(), 8, 65, 3, false, 0x35d22U, -2.0f, -0.05f, 2, 1) != 0 ||
         run_case(dayan.get(), cpu.get(), 4, 17, 1, false, 0x35d23U, -2.0f, -0.05f, 0, 0, 2) != 0 ||
         run_case(dayan.get(), cpu.get(), 4, 16, 1, true, 0x35d24U) != 0 ||
