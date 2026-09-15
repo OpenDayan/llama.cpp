@@ -356,9 +356,11 @@ static bool ggml_backend_dayan_is_copy_type(enum ggml_type type) {
 }
 
 bool ggml_backend_dayan_supports_get_rows(const ggml_tensor * op) {
+    const bool mx = op != nullptr && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_MXFP4;
     if (op == nullptr || op->op != GGML_OP_GET_ROWS || op->src[0] == nullptr || op->src[1] == nullptr ||
-        !ggml_backend_dayan_is_copy_type(op->src[0]->type) ||
-        (op->type != GGML_TYPE_F32 && op->type != op->src[0]->type) ||
+        (!mx && !ggml_backend_dayan_is_copy_type(op->src[0]->type)) ||
+        (mx ? (op->ne[0] % 32 != 0 || !ggml_backend_dayan_is_copy_type(op->type)) :
+              (op->type != GGML_TYPE_F32 && op->type != op->src[0]->type)) ||
         (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64) || op->ne[0] != op->src[0]->ne[0] ||
         op->ne[1] != op->src[1]->ne[0] || op->ne[2] != op->src[1]->ne[1] || op->ne[3] != op->src[1]->ne[2] ||
         !ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op)) {
@@ -1073,8 +1075,8 @@ static size_t ggml_backend_dayan_rewrite_get_rows_activation(
     const ggml_backend_dayan_use_map &               uses,
     const ggml_backend_dayan_residual_type_map &     residual_types) {
     if (!ggml_backend_dayan_supports_get_rows(node) || node->type != GGML_TYPE_F32 ||
-        !ggml_backend_dayan_is_storage_type(node->src[0]->type) || node->view_src != nullptr || node->view_offs != 0 ||
-        !ggml_backend_dayan_layout_can_change_type(node, node->src[0]->type)) {
+        (!ggml_backend_dayan_is_storage_type(node->src[0]->type) && node->src[0]->type != GGML_TYPE_MXFP4) ||
+        node->view_src != nullptr || node->view_offs != 0) {
         return 0;
     }
 
@@ -1082,7 +1084,8 @@ static size_t ggml_backend_dayan_rewrite_get_rows_activation(
     if (!ggml_backend_dayan_activation_storage_type(node, uses, &type)) {
         return 0;
     }
-    if (type != node->src[0]->type ||
+    if ((node->src[0]->type != GGML_TYPE_MXFP4 && type != node->src[0]->type) ||
+        !ggml_backend_dayan_layout_can_change_type(node, type) ||
         !ggml_backend_dayan_residual_uses_are_compatible(node, type, uses, residual_types)) {
         return 0;
     }

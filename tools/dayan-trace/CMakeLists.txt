@@ -8,7 +8,7 @@ target_include_directories(llama-dayan-operator-bench PRIVATE
     "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan"
     "${DAYAN_INCLUDE_DIR}"
     "${CMAKE_SOURCE_DIR}/vendor")
-target_link_libraries(llama-dayan-operator-bench PRIVATE ggml-dayan ggml-base)
+target_link_libraries(llama-dayan-operator-bench PRIVATE ggml-dayan ggml)
 target_compile_features(llama-dayan-operator-bench PRIVATE cxx_std_17)
 
 if(LLAMA_TOOLS_INSTALL)

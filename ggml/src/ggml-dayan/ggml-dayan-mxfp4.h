@@ -8,96 +8,179 @@ namespace ggml_dayan_mxfp4_detail {
 
 using namespace ggml_dayan_matmul_detail;
 
-enum : int { PostRows = DayanMxfp4Tile::post_rows, PostStride = DayanMxfp4Tile::post_stride };
-
-// VisualSwizzle: peak 1; keep the 320B mapping inside each 256B window.
+// VisualSwizzle: peak 1; the 320B mapping needs 1024B-aligned buffer boundaries.
 static uint64_t row_swizzle(int stride) {
-    if (stride == 320) { return MAT_BATCH_SWIZZLE(7, 1, 3); }
+    if (stride == 320) { return MAT_BATCH_SWIZZLE(9, 1, 1); }
     int bit = 0;
     while ((stride & 1) == 0) { ++bit; stride >>= 1; }
     return bit <= 7 ? 0 : MAT_BATCH_SWIZZLE(7, bit < 10 ? bit - 7 : 3, bit < 10 ? 3 : bit - 7);
 }
 
-static void fp16_to_f32() { __tx_vec_cvt_fp32_fp16<0, 0, 0>(); }
-
-static void quantize_tile(uint64_t input, int input_stride, uint32_t type, uint64_t raw,
-                          uint64_t packed, uint64_t scales, int rows, int cols) {
+template <int Operation>
+static inline void emit_post_activation(uint64_t gate, uint64_t up) {
     using namespace ggml_dayan_vec_detail;
-    const bool bf16 = type == kDayanDataTypeBF16;
-    const long instructions = bf16 ? 3 : 10;
-    configure_vec_grid(1, rows);
-    configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, input_stride);
-    configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 256);
+    if constexpr (Operation == 2) { emit_swiglu(gate, up); }
+    else if constexpr (Operation == 3) { emit_geglu(gate, up); }
+    else {
+        __tx_vec_lsu_u2v<0, 0>(gate);
+        if constexpr (Operation == 1) {
+            __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(-1.4426950408889634f));
+            __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+            __tx_vec_v_fp32_sfu<0, 0, 1>();
+            __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
+            __tx_vec_vv_fp32_add<0, 16, 0, 0>();
+            __tx_vec_v_fp32_sfu<0, 0, 5>();
+            __tx_vec_vv_fp32_mul<0, 0, 4, 0>();
+        }
+    }
+}
+
+template <int Operation>
+static void post_values(uint64_t gate, uint64_t up, int rows, int columns, int stride, uint32_t output_type) {
+    using namespace ggml_dayan_vec_detail;
+    constexpr int activation_instructions = Operation == 3 ? 26 : Operation == 2 ? 10 : Operation == 1 ? 8 : 1;
+    constexpr int saved_bf16 = 16 + (Operation == 3 ? 10 : Operation == 2 ? 3 : Operation == 1 ? 2 : 0);
+    const bool mx = output_type == kDayanDataTypeMXFP4;
+    const bool f32 = output_type == kDayanDataTypeF32;
+    const int block_bytes = mx ? 512 : 256;
+    const long instructions = mx ? 2 * activation_instructions + 8 : activation_instructions + (f32 ? 1 : 6);
+    configure_vec_grid(columns * 4 / block_bytes, rows);
+    configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, block_bytes, stride);
+    configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, block_bytes, stride);
+    configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, block_bytes, stride, mx ? 64 : 32);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(input);
-    if (!bf16) {
+    emit_post_activation<Operation>(gate, up);
+    if (mx) {
         __tx_vec_cvt_bf16_fp32<0, 0, 0>();
-        __tx_vec_shuffle_compress<0, 0>(0);
-        __tx_vec_lsu_u2v<0, 0>(input + 256);
+        // Queue 1 keeps the first half across the second activation (at most ten queue writes).
+        __tx_vec_shuffle_compress<1, 0>(0);
+        emit_post_activation<Operation>(gate + 256, up + 256);
         __tx_vec_cvt_bf16_fp32<0, 0, 0>();
         __tx_vec_shuffle_compress<0, 0>(0);
         __tx_vec_lsu_g2s<0>((long) 0xffffffff00000000ULL);
-        __tx_vec_vv_mux2<0, 3, 0, 0>();
+        __tx_vec_vv_mux2<0, saved_bf16, 0, 0>();
+        __tx_vec_cvt_mxfp4_bf16<0, 0, 0>();
+    } else if (!f32) {
+        if (output_type == kDayanDataTypeBF16) { __tx_vec_cvt_bf16_fp32<0, 0, 0>(); }
+        else { __tx_vec_cvt_fp16_fp32<0, 0, 0>(); }
+        __tx_vec_shuffle_compress<0, 0>(0);
+        __tx_vec_shuffle_xor<1, 0>(16);
+        __tx_vec_lsu_g2s<0>((long) 0xffffffff00000000ULL);
+        __tx_vec_vv_mux2<0, 0, 16, 0>();
+    }
+    // Read the entire physical block before overwriting it; 128B group positions stay unchanged.
+    __tx_vec_lsu_v2u<0, 3>(gate);
+    start_vec_block(instructions);
+}
+
+static void quantize_lowp(uint64_t input, int rows, int columns, int stride, bool fp16) {
+    using namespace ggml_dayan_vec_detail;
+    const long instructions = fp16 ? 34 : 3;
+    configure_vec_grid(columns / 128, rows);
+    configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 256, stride);
+    configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 256, stride);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2v<0, 0>(input);
+    if (fp16) {
+        swap_vec_lane_bits<0x0000ffffffff0000ULL, 48>();
+        swap_vec_lane_bits<0x00ffff0000ffff00ULL, 24>();
+        swap_vec_lane_bits<0x0ff00ff00ff00ff0ULL, 12>();
+        swap_vec_lane_bits<0x3c3c3c3c3c3c3c3cULL, 6>();
+        swap_vec_lane_bits<0x6666666666666666ULL, 3>();
+        __tx_vec_shuffle_xor<1, 0>(1);
+        __tx_vec_lsu_g2s<0>((long) 0xaaaaaaaaaaaaaaaaULL);
+        __tx_vec_vv_mux2<0, 0, 16, 0>();
+        __tx_vec_v_int32_srl<1, 0, 16>();
+        __tx_vec_vv_mux2<0, 0, 16, 0>();
+        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+        __tx_vec_shuffle_compress<1, 0>(0);
+        // Keep the first packed half in queue 1 while expanding the second half.
+        __tx_vec_vv_mux2<0, 18, 4, 0>();
+        __tx_vec_v_int32_srl<1, 0, 16>();
+        __tx_vec_vv_mux2<0, 0, 16, 0>();
+        __tx_vec_cvt_fp32_fp16<0, 0, 0>();
+        __tx_vec_cvt_bf16_fp32<0, 0, 0>();
+        __tx_vec_shuffle_compress<0, 0>(0);
+        __tx_vec_lsu_g2s<0>((long) 0xffffffff00000000ULL);
+        __tx_vec_vv_mux2<0, 17, 0, 0>();
     }
     __tx_vec_cvt_mxfp4_bf16<0, 0, 0>();
-    __tx_vec_lsu_v2u<0, 3>(raw);
+    __tx_vec_lsu_v2u<0, 3>(input);
     start_vec_block(instructions);
-    dayan_wait_vec();
+}
 
-    // Each subcore returns 16 payload bytes and one scale at byte 32.
+static void pack_quantized(uint64_t input, uint64_t packed, uint64_t scales, int rows, int columns,
+                           int input_stride, int group_stride, int packed_stride, int scale_stride, uint64_t swizzle) {
     long checksum = 0;
-    set_lsu_matrix<0>(checksum, rows, 64, 256, 64);
-    __tx_lsu_tcsr_write<LSU_DIM0>(cols / 32 - 1);
-    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(64);
+    set_lsu_matrix<0>(checksum, rows, 64, input_stride, packed_stride);
+    __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(swizzle);
+    __tx_lsu_tcsr_write<LSU_DIM0>(columns / 32 - 1);
+    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(group_stride);
     __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(16);
     __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(15);
     __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(15);
-    __tx_lsu_dma_u2u<0>(packed, raw);
-    set_lsu_matrix<0>(checksum, rows, 64, 256, 4);
-    __tx_lsu_tcsr_write<LSU_DIM0>(cols / 32 - 1);
-    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(64);
+    __tx_lsu_dma_u2u<0>(packed, input);
+    set_lsu_matrix<0>(checksum, (rows + 7) & ~7, 64, input_stride, 4);
+    __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(swizzle);
+    __tx_lsu_tcsr_write<LSU_DIM0>(3);
+    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(group_stride);
     __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(1);
+    __tx_lsu_tcsr_write<LSU_DIM2>(columns / 128 - 1);
+    __tx_lsu_tcsr_write<LSU_INDIM2STRIDE>(group_stride * 4);
+    __tx_lsu_tcsr_write<LSU_OUTDIM2STRIDE>(scale_stride);
     __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(0);
     __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(0);
-    __tx_lsu_dma_u2u<0>(scales, raw + 32);
-    dayan_wait_lsu();
+    __tx_lsu_dma_u2u<0>(scales, input + group_stride / 2);
 }
 
 static void store_quantized(uint64_t packed, uint64_t scales, uint64_t output, uint64_t output_scales,
-                            int rows, int cols, uint64_t row_stride) {
+                            int rows, int columns, int packed_stride, int scale_stride,
+                            uint64_t output_stride, uint64_t output_scale_stride) {
     long checksum = 0;
-    set_lsu_matrix<0>(checksum, rows, 64, 64, row_stride);
-    store_matrix<0>(cols / 2, rows, 64, rows, packed, output);
-    set_lsu_matrix<0>(checksum, 1, ((rows * 4 + 63) & ~63), rows * 4, rows * 4);
-    store_matrix<0>(rows * 4, 1, ((rows * 4 + 63) & ~63), 1, scales, output_scales);
+    set_lsu_matrix<0>(checksum, rows, columns / 2, packed_stride, output_stride);
+    __tx_lsu_dma_u2d<0>(output, packed);
+    const int scale_bytes = ((rows + 7) & ~7) * 4;
+    const int request_bytes = scale_bytes % 64 ? 32 : 64;
+    set_lsu_matrix<0>(checksum, columns / 128, 64, scale_stride, output_scale_stride);
+    __tx_lsu_tcsr_write<LSU_DIM0>(scale_bytes / request_bytes - 1);
+    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(request_bytes);
+    __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(request_bytes);
+    __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(request_bytes - 1);
+    __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(request_bytes - 1);
+    __tx_lsu_dma_u2d<0>(output_scales, scales);
 }
 
 static void convert(const DayanMxfp4Config * cfg, const void * input, void * output, void * scales) {
     using namespace ggml_dayan_vec_detail;
     const uint64_t base = (uintptr_t) dayan_uram_base();
-    const uint64_t nt = (cfg->n + 127) / 128;
+    enum : int { Rows = 128, Columns = 512 };
+    const uint64_t nt = (cfg->n + Columns - 1) / Columns;
     const int bytes = cfg->source_type == kDayanDataTypeF32 ? 4 : 2;
-    const uint64_t values = cfg->source_type == kDayanDataTypeF16 ? base + PostRows * 256 : base;
-    const uint64_t raw = values + PostRows * (cfg->source_type == kDayanDataTypeBF16 ? 256 : 512);
-    const uint64_t packed = raw + PostRows * 256, scale = packed + PostRows * 64;
-    if (!base || scale + PostRows * 4 + 64 - base > dayan_uram_size()) { dayan_thread_exit(-12); }
+    const int value_stride = Columns * bytes;
+    const uint64_t packed = base + Rows * value_stride, scale = packed + Rows * Columns / 2;
+    if (!base || scale + Rows * Columns / 32 + 64 - base > dayan_uram_size()) { dayan_thread_exit(-12); }
+    if ((base | packed | scale) & 31) { dayan_thread_exit(-22); }
     long checksum = 0;
-    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((cfg->m + PostRows - 1) / PostRows) * nt; tile += 4) {
-        const uint64_t row = tile / nt * PostRows, col = tile % nt * 128;
-        const int rows = extent(cfg->m - row, PostRows), cols = extent(cfg->n - col, 128);
-        set_lsu_matrix<0>(checksum, rows, 128 * bytes, cfg->a_stride, 128 * bytes);
-        load_matrix<0>(cols * bytes, rows, 128 * bytes, rows, base,
+    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((cfg->m + Rows - 1) / Rows) * nt; tile += 4) {
+        const uint64_t row = tile / nt * Rows, col = tile % nt * Columns;
+        const int rows = extent(cfg->m - row, Rows), cols = extent(cfg->n - col, Columns);
+        const int columns = (cols + 127) & ~127;
+        set_lsu_matrix<0>(checksum, rows, Columns * bytes, cfg->a_stride, Columns * bytes);
+        load_matrix<0>(cols * bytes, rows, Columns * bytes, rows, base,
                        (uintptr_t) input + row * cfg->a_stride + col * bytes);
         dayan_wait_lsu();
-        uint32_t type = cfg->source_type;
-        if (type == kDayanDataTypeF16) {
-            issue_lowp_to_f32<fp16_to_f32>(values, base, cols, rows, 256, 512);
-            type = kDayanDataTypeF32;
+        if (bytes == 2) {
+            quantize_lowp(base, rows, columns, value_stride, cfg->source_type == kDayanDataTypeF16);
+        } else {
+            post_values<0>(base, 0, rows, columns, value_stride, kDayanDataTypeMXFP4);
         }
-        quantize_tile(values, type == kDayanDataTypeF32 ? 512 : 256, type, raw, packed, scale, rows, cols);
+        dayan_wait_vec();
+        pack_quantized(base, packed, scale, rows, columns, value_stride, bytes * 32, Columns / 2, Rows * 4, 0);
+        dayan_wait_lsu();
         store_quantized(packed, scale, (uintptr_t) output + row * cfg->output_stride + col / 2,
                         (uintptr_t) scales + col / 128 * cfg->output_scale_stride + row * 4,
-                        rows, cols, cfg->output_stride);
+                        rows, columns, Columns / 2, Rows * 4, cfg->output_stride, cfg->output_scale_stride);
         dayan_wait_lsu();
     }
 }
@@ -106,7 +189,7 @@ struct State {
     const DayanMxfp4Config * cfg;
     DayanMxfp4Tile shape;
     uint64_t input[3], scales[3], output, output_scales;
-    uint64_t physical, local, staging, raw, packed, packed_scales;
+    uint64_t physical, local, packed, packed_scales;
     uint64_t a[2], as[2], b[2], bs[2], c[2];
     int slice_n, c_stride, kt, nt;
     uint64_t tiles;
@@ -227,48 +310,45 @@ static void post(void * arg) {
             matmul_check(dayan_resource_wait(0, mask, phases, 0));
             const uint64_t c = s.physical + s.c[slice] - s.local;
             const uint64_t destination = s.output + tile.row * s.cfg->output_stride;
-            if (!s.shape.post) {
+            if (s.shape.post) {
+                const uint64_t up = c + s.shape.m * s.c_stride;
+                // C swizzles permute 128B groups within each row, preserving K32 quantization groups.
+                switch (s.cfg->operation) {
+                    case 1: post_values<1>(c, up, tile.rows, s.slice_n, s.c_stride, s.cfg->output_type); break;
+                    case 2: post_values<2>(c, up, tile.rows, s.slice_n, s.c_stride, s.cfg->output_type); break;
+                    case 3: post_values<3>(c, up, tile.rows, s.slice_n, s.c_stride, s.cfg->output_type); break;
+                    default: post_values<0>(c, up, tile.rows, s.slice_n, s.c_stride, s.cfg->output_type); break;
+                }
+                dayan_wait_vec();
+            }
+            if (s.cfg->output_type == kDayanDataTypeMXFP4) {
+                // The previous store owns the shared packed buffers until LSU completes.
+                dayan_wait_lsu();
+                const int columns = (tile.cols + 127) & ~127;
+                pack_quantized(c, s.packed, s.packed_scales, tile.rows, columns, s.c_stride, 128,
+                               s.slice_n / 2, s.shape.m * 4, row_swizzle(s.c_stride));
+                dayan_wait_lsu();
+                store_quantized(s.packed, s.packed_scales, destination + tile.col / 2,
+                                s.output_scales + tile.col / 128 * s.cfg->output_scale_stride + tile.row * 4,
+                                tile.rows, columns, s.slice_n / 2, s.shape.m * 4,
+                                s.cfg->output_stride, s.cfg->output_scale_stride);
+            } else if (s.cfg->output_type == kDayanDataTypeF32) {
                 set_lsu_matrix<0>(checksum, tile.rows, s.c_stride, s.c_stride, s.cfg->output_stride);
                 __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(row_swizzle(s.c_stride));
                 store_matrix<0>(tile.cols * 4, tile.rows, s.c_stride, tile.rows, c, destination + tile.col * 4);
-            } else for (int row = 0; row < tile.rows; row += PostRows) {
-                for (int col = 0; col < tile.cols; col += 128) {
-                    const int rows = extent(tile.rows - row, PostRows), cols = extent(tile.cols - col, 128);
-                    // LSU removes the MAT swizzle before VEC reads the small post tile.
-                    dayan_wait_lsu();
-                    set_lsu_matrix<0>(checksum, rows, 512, s.c_stride, PostStride);
-                    __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(row_swizzle(s.c_stride));
-                    for (int product = 0; product < s.shape.products; ++product) {
-                        __tx_lsu_dma_u2u<0>(s.staging + product * PostRows * PostStride,
-                                           c + (product * s.shape.m + row) * s.c_stride + col * 4);
-                    }
-                    dayan_wait_lsu();
-                    const F32Tensor gate = {s.staging, PostStride}, up = {s.staging + PostRows * PostStride, PostStride};
-                    if (s.cfg->operation == 2) { issue_swiglu(gate, up, gate, rows, cols); }
-                    if (s.cfg->operation == 3) { issue_geglu(gate, up, gate, rows, cols); }
-                    if (s.cfg->operation == 1) {
-                        MatmulEpilogueArgs args = {{s.staging, 0}, s.staging, rows, cols, PostStride / 4};
-                        epilogue_silu(&args);
-                    }
-                    dayan_wait_vec();
-                    const uint64_t dst = destination + row * s.cfg->output_stride;
-                    if (s.cfg->output_type == kDayanDataTypeMXFP4) {
-                        quantize_tile(s.staging, PostStride, kDayanDataTypeF32, s.raw, s.packed, s.packed_scales, rows, cols);
-                        store_quantized(s.packed, s.packed_scales, dst + (tile.col + col) / 2,
-                                        s.output_scales + (tile.col + col) / 128 * s.cfg->output_scale_stride + (tile.row + row) * 4,
-                                        rows, cols, s.cfg->output_stride);
-                    } else if (s.cfg->output_type == kDayanDataTypeF32) {
-                        set_lsu_matrix<0>(checksum, rows, 512, PostStride, s.cfg->output_stride);
-                        store_matrix<0>(cols * 4, rows, 512, rows, s.staging, dst + (tile.col + col) * 4);
-                    } else {
-                        if (s.cfg->output_type == kDayanDataTypeBF16) {
-                            convert_f32_to_lowp<BaseNPUInstBuilder::DT_BF16, 0>(gate, gate, {s.packed, 256}, rows, cols);
-                        } else {
-                            convert_f32_to_lowp<BaseNPUInstBuilder::DT_FP16, 0>(gate, gate, {s.packed, 256}, rows, cols);
-                        }
-                        set_lsu_matrix<0>(checksum, rows, 256, 256, s.cfg->output_stride);
-                        store_matrix<0>(cols * 2, rows, 256, rows, s.packed, dst + (tile.col + col) * 2);
-                    }
+            } else {
+                set_lsu_matrix<0>(checksum, tile.rows, 64, s.c_stride, s.cfg->output_stride);
+                __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(row_swizzle(s.c_stride));
+                __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(128);
+                if (tile.cols >= 32) {
+                    __tx_lsu_tcsr_write<LSU_DIM0>(tile.cols / 32 - 1);
+                    __tx_lsu_dma_u2d<0>(destination + tile.col * 2, c);
+                }
+                if (tile.cols % 32) {
+                    __tx_lsu_tcsr_write<LSU_DIM0>(0);
+                    __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>((tile.cols % 32) * 2 - 1);
+                    __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>((tile.cols % 32) * 2 - 1);
+                    __tx_lsu_dma_u2d<0>(destination + (tile.col + tile.cols / 32 * 32) * 2, c + tile.cols / 32 * 128);
                 }
             }
             matmul_check(dayan_resource_consume_lsu(mask));
@@ -308,11 +388,13 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
         s.as[i] = address; address += shape.scales ? shape.a_scale_stride() * (shape.k / 128) : 0;
         s.bs[i] = address; address += shape.scales ? shape.products * s.slice_n * (shape.k / 32) : 0;
     }
-    s.staging = s.physical + shape.scratch_offset();
-    s.raw = s.staging + shape.products * PostRows * PostStride;
-    s.packed = s.raw + PostRows * 256;
-    s.packed_scales = s.packed + PostRows * 256;
+    s.packed = s.physical + shape.scratch_offset();
+    s.packed_scales = s.packed + (shape.post ? shape.m * s.slice_n / 2 : 0);
     if (!s.physical || shape.bytes() > dayan_uram_size() || shape.bytes() > Constants::kUramWindowStride - s.local) { return -12; }
+    if ((s.packed | s.packed_scales) & 31) { return -22; }
+    for (int i = 0; i < 2; ++i) {
+        if (((s.a[i] | s.b[i] | s.c[i]) & 1023) || ((s.as[i] | s.bs[i]) & 31)) { return -22; }
+    }
     dayan_thread_resources_t resources = {};
     resources.lsu_tcsr_count = 1;
     resources.local_resource_count = 6;

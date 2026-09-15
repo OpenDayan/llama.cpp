@@ -68,17 +68,20 @@ static std::vector<float> values(size_t count, int seed) {
 
 static void layout_test() {
     const auto mm = DayanMxfp4Tile::make(1024, 3584, 1024, true, 1, false);
+    const auto converted = DayanMxfp4Tile::make(1024, 3584, 1024, true, 1, true);
     const auto ffn = DayanMxfp4Tile::make(1024, 3584, 1024, true, 2, true);
     require(mm.m == 512 && mm.n == 512 && mm.k == 640, "FP4 demo MatMul tile");
+    require(converted.m == 512 && converted.n == 512 && converted.k == 512, "aligned converted MatMul tile");
     require(ffn.m == 256 && ffn.n == 512 && ffn.k == 512, "large FFN tile");
-    require(mm.bytes() > DayanMxfp4Tile::uram_bytes * .99 && ffn.bytes() > DayanMxfp4Tile::uram_bytes * .99, "URAM utilization");
+    require(mm.bytes() > DayanMxfp4Tile::uram_bytes * .99 && converted.bytes() > DayanMxfp4Tile::uram_bytes * .97 && ffn.bytes() > DayanMxfp4Tile::uram_bytes * .95, "URAM utilization");
     for (int rows : {1, 9, 127, 128, 257, 513, 1024}) {
         for (int columns : {16, 256, 544, 1024, 3584, 6144, 65536}) {
             for (bool mx : {false, true}) {
                 for (int products : {1, 2}) {
                     const auto tile = DayanMxfp4Tile::make(rows, columns, 3584, mx, products, true);
-                    require(tile.m > 0 && tile.m % 8 == 0 && tile.n % 256 == 0 && tile.k >= 512 && tile.k % 128 == 0, "tile alignment");
+                    require(tile.m > 0 && tile.m % 32 == 0 && tile.m <= (products == 2 ? 256 : 512) && tile.n % 256 == 0 && tile.k >= 512 && tile.k % 128 == 0, "tile alignment");
                     require(tile.bytes() <= DayanMxfp4Tile::uram_bytes, "tile fits URAM");
+                    require(tile.accumulator_offset() % 1024 == 0 && tile.scratch_offset() % 32 == 0 && tile.a_scale_stride() % 64 == 0 && tile.bytes() % 32 == 0, "buffer alignment");
                 }
             }
         }
@@ -86,6 +89,7 @@ static void layout_test() {
     for (int rows : {1, 7, 8, 9, 65}) {
         for (int cols : {32, 128, 160, 672}) {
             const auto layout = DayanMxfp4Layout::make(rows, cols);
+            require(layout.row_stride % 64 == 0 && layout.scale_stride % 32 == 0 && layout.scale_offset % 32 == 0 && layout.bytes % 32 == 0, "device payload and scale alignment");
             std::vector<uint8_t> original(rows * cols / 32 * 17), device(layout.bytes, 0), actual(original.size());
             for (size_t i = 0; i < original.size(); ++i) { original[i] = i * 113 + 7; }
             dayan_mxfp4_pack(layout, original.data(), device.data());
@@ -175,16 +179,16 @@ static std::vector<float> matmul(const std::vector<float> & a, const std::vector
 }
 
 static void matmul_test(ggml_backend_t backend, int m, int n, int k, bool ffn,
-                       ggml_type weight_type = GGML_TYPE_MXFP4, ggml_type output_type = GGML_TYPE_F32, bool rewrite_input = true) {
+                       ggml_type weight_type = GGML_TYPE_MXFP4, ggml_type output_type = GGML_TYPE_F32, bool rewrite_input = true, int activation = 0) {
     auto ctx = context();
     auto * a = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, k, m);
     auto * b = ggml_new_tensor_2d(ctx.get(), weight_type, k, n);
     auto * gate = ggml_mul_mat(ctx.get(), b, a);
     auto * up_weight = ffn ? ggml_new_tensor_2d(ctx.get(), weight_type, k, n) : nullptr;
     auto * up = ffn ? ggml_mul_mat(ctx.get(), up_weight, a) : nullptr;
-    auto * intermediate = ffn ? ggml_swiglu_split(ctx.get(), gate, up) : gate;
+    auto * intermediate = ffn ? (activation == 3 ? ggml_geglu_split(ctx.get(), gate, up) : ggml_swiglu_split(ctx.get(), gate, up)) : activation == 1 ? ggml_silu(ctx.get(), gate) : gate;
     if (ffn) { output_type = GGML_TYPE_MXFP4; }
-    auto * output = output_type != GGML_TYPE_F32 ? ggml_cast(ctx.get(), intermediate, output_type) : gate;
+    auto * output = output_type != GGML_TYPE_F32 ? ggml_cast(ctx.get(), intermediate, output_type) : intermediate;
     ggml_set_input(a);
     ggml_set_input(b);
     if (up_weight) { ggml_set_input(up_weight); }
@@ -221,16 +225,22 @@ static void matmul_test(ggml_backend_t backend, int m, int n, int k, bool ffn,
         return result;
     };
     const auto weights = encode(values(n * k, 23)), ups = encode(values(n * k, 71));
-    ggml_backend_tensor_set(b, weights.data(), 0, weights.size());
-    require(get_bytes(b) == weights, "weight round trip");
-    if (ffn) { ggml_backend_tensor_set(up_weight, ups.data(), 0, ups.size()); }
     for (int repeat = 0; repeat < 2; ++repeat) {
+        // Graph allocation can reuse an input's storage after its last consumer.
+        ggml_backend_tensor_set(b, weights.data(), 0, weights.size());
+        require(get_bytes(b) == weights, "weight round trip");
+        if (ffn) { ggml_backend_tensor_set(up_weight, ups.data(), 0, ups.size()); }
         const auto data = values(m * k, 31 + repeat);
         ggml_backend_tensor_set(a, data.data(), 0, data.size() * 4);
         auto reference = matmul(unpack(encode(data)), unpack(weights), m, n, k);
         if (ffn) {
             const auto u = matmul(unpack(encode(data)), unpack(ups), m, n, k);
-            for (size_t i = 0; i < reference.size(); ++i) { reference[i] = reference[i] / (1 + std::exp(-reference[i])) * u[i]; }
+            for (size_t i = 0; i < reference.size(); ++i) {
+                const float x = reference[i];
+                reference[i] = activation == 3 ? .5f * x * (1 + std::tanh(.7978845608028654f * x * (1 + .044715f * x * x))) * u[i] : x / (1 + std::exp(-x)) * u[i];
+            }
+        } else if (activation == 1) {
+            for (float & x : reference) { x /= 1 + std::exp(-x); }
         }
         if (output_type == GGML_TYPE_MXFP4) { reference = decode(quantize(reference)); }
         if (output_type == GGML_TYPE_BF16 || output_type == GGML_TYPE_F16) {
@@ -254,8 +264,8 @@ static void matmul_test(ggml_backend_t backend, int m, int n, int k, bool ffn,
             require(std::isfinite(actual[i]), "finite output");
             error += std::pow(actual[i] - reference[i], 2); norm += std::pow(reference[i], 2);
         }
-        std::printf("MXFP4 %s %s -> %s %dx%dx%d repeat=%d relative L2=%g\n", ffn ? "FFN" : "MatMul", ggml_type_name(weight_type), ggml_type_name(output_type), m, n, k, repeat, std::sqrt(error / norm));
-        if (error > norm * (ffn ? 0.0001 : 1e-10)) {
+        std::printf("MXFP4 %s %s -> %s %dx%dx%d repeat=%d relative L2=%g\n", ffn ? (activation == 3 ? "GeGLU" : "SwiGLU") : activation == 1 ? "SiLU" : "MatMul", ggml_type_name(weight_type), ggml_type_name(output_type), m, n, k, repeat, std::sqrt(error / norm));
+        if (error > norm * (ffn || activation ? 0.0001 : 1e-10)) {
             int printed = 0;
             for (size_t i = 0; i < actual.size() && printed < 16; ++i) {
                 if (std::fabs(actual[i] - reference[i]) > .001f * (1 + std::fabs(reference[i]))) {
@@ -264,8 +274,75 @@ static void matmul_test(ggml_backend_t backend, int m, int n, int k, bool ffn,
                 }
             }
         }
-        require(error <= norm * (ffn ? 0.0001 : 1e-10), "matmul numerical reference");
+        require(error <= norm * (ffn || activation ? 0.0001 : 1e-10), "matmul numerical reference");
     }
+}
+
+static void get_rows_rewrite_test(ggml_backend_t backend, ggml_type type) {
+    auto ctx = context();
+    auto embedding = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_MXFP4, 160, 19);
+    auto indices = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 9);
+    auto selected = ggml_get_rows(ctx.get(), embedding, indices);
+    auto scale = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 160);
+    auto norm = ggml_mul(ctx.get(), ggml_rms_norm(ctx.get(), selected, 1e-6f), scale);
+    auto weight = ggml_new_tensor_2d(ctx.get(), type, 160, 32);
+    auto output = ggml_mul_mat(ctx.get(), weight, norm);
+    auto graph = ggml_new_graph_custom(ctx.get(), 128, false);
+    ggml_build_forward_expand(graph, output);
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    using rewrite_fn = bool (*)(ggml_backend_t, ggml_context *, ggml_cgraph *);
+    auto rewrite = (rewrite_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_graph_rewrite");
+    require(rewrite && rewrite(backend, ctx.get(), graph), "embedding graph rewrite");
+    require(selected->type == type && ggml_is_contiguous(selected), "MXFP4 embedding keeps norm storage type");
+    require(embedding->type == GGML_TYPE_MXFP4 && ggml_backend_supports_op(backend, selected), "MXFP4 embedding weight stays quantized");
+}
+
+static void get_rows_test(ggml_backend_t backend, int width, ggml_type output_type, bool wide_indices) {
+    auto ctx = context();
+    auto source = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_MXFP4, width, 19, 2);
+    auto indices = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 9, 2);
+    auto output = ggml_get_rows(ctx.get(), source, indices);
+    output->type = output_type;
+    output->nb[0] = ggml_type_size(output_type);
+    for (int i = 1; i < 4; ++i) { output->nb[i] = output->nb[i - 1] * output->ne[i - 1]; }
+    if (wide_indices) {
+        indices->type = GGML_TYPE_I64;
+        indices->nb[0] = sizeof(int64_t);
+        for (int i = 1; i < 4; ++i) { indices->nb[i] = indices->nb[i - 1] * indices->ne[i - 1]; }
+    }
+    ggml_set_output(output);
+    require(ggml_backend_supports_op(backend, output), "MXFP4 GET_ROWS support");
+    auto graph = ggml_new_graph_custom(ctx.get(), 128, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    require(buffer != nullptr, "GET_ROWS buffer");
+    auto data = quantize(values((size_t) width * 38, 41));
+    const auto decoded = decode(data);
+    ggml_backend_tensor_set(source, data.data(), 0, data.size());
+    for (int round = 0; round < 2; ++round) {
+        std::vector<int32_t> ids(18);
+        std::vector<int64_t> ids64(18);
+        for (size_t i = 0; i < ids.size(); ++i) { ids64[i] = ids[i] = (i * 7 + round * 11) % 19; }
+        ggml_backend_tensor_set(indices, wide_indices ? (void *) ids64.data() : (void *) ids.data(), 0, ggml_nbytes(indices));
+        ggml_backend_tensor_memset(output, 255, 0, ggml_nbytes(output));
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "GET_ROWS graph");
+        const auto bytes = get_bytes(output);
+        for (size_t i = 0; i < (size_t) width * ids.size(); ++i) {
+            const size_t row = i / width;
+            float expected = decoded[((row / 9) * 19 + ids[row]) * width + i % width];
+            float actual;
+            if (output_type == GGML_TYPE_F32) { std::memcpy(&actual, bytes.data() + i * 4, 4); }
+            else {
+                uint16_t value;
+                std::memcpy(&value, bytes.data() + i * 2, 2);
+                actual = output_type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32({value}) : ggml_fp16_to_fp32(value);
+                expected = output_type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(expected)) : ggml_fp16_to_fp32(ggml_fp32_to_fp16(expected));
+            }
+            if (actual != expected) { std::fprintf(stderr, "GET_ROWS width=%d type=%s index=%zu actual=%g expected=%g\n", width, ggml_type_name(output_type), i, actual, expected); }
+            require(actual == expected, "GET_ROWS exact dequantization");
+        }
+    }
+    std::printf("MXFP4 GET_ROWS width=%d type=%s indices=%s elements=%d PASS\n", width, ggml_type_name(output_type), wide_indices ? "i64" : "i32", width * 18);
 }
 
 int main(int argc, char ** argv) {
@@ -275,10 +352,17 @@ int main(int argc, char ** argv) {
     ggml_backend_ptr backend(ggml_backend_init_by_name("DAYAN", nullptr));
     require(backend != nullptr, "initialize backend");
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
+        for (int width : {32, 160, 1024, 1056}) { get_rows_test(backend.get(), width, type, width == 1056); }
+    }
+    get_rows_rewrite_test(backend.get(), GGML_TYPE_BF16);
+    get_rows_rewrite_test(backend.get(), GGML_TYPE_F16);
+    if (argc > 1 && std::strcmp(argv[1], "--get-rows") == 0) { return 0; }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
         conversion_test(backend.get(), type, 1, 160);
         conversion_test(backend.get(), type, 9, 672);
         conversion_test(backend.get(), type, 65, 160);
         conversion_test(backend.get(), type, 129, 160);
+        conversion_test(backend.get(), type, 257, 1056);
     }
     matmul_test(backend.get(), 3, 144, 672, false);
     matmul_test(backend.get(), 129, 384, 160, false);
@@ -287,11 +371,16 @@ int main(int argc, char ** argv) {
     matmul_test(backend.get(), 257, 1056, 544, true);
     matmul_test(backend.get(), 3, 16, 32, false, GGML_TYPE_MXFP4, GGML_TYPE_F32, false);
     matmul_test(backend.get(), 9, 160, 128, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
-    matmul_test(backend.get(), 529, 544, 544, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
+    matmul_test(backend.get(), 513, 544, 544, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
     matmul_test(backend.get(), 9, 160, 128, false, GGML_TYPE_MXFP4, GGML_TYPE_BF16);
     matmul_test(backend.get(), 9, 160, 128, false, GGML_TYPE_MXFP4, GGML_TYPE_F16);
     matmul_test(backend.get(), 65, 544, 672, false, GGML_TYPE_MXFP4, GGML_TYPE_BF16);
     matmul_test(backend.get(), 65, 544, 672, false, GGML_TYPE_MXFP4, GGML_TYPE_F16);
+    matmul_test(backend.get(), 1, 6144, 160, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
+    matmul_test(backend.get(), 257, 1056, 160, true, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, true, 3);
+    matmul_test(backend.get(), 65, 544, 160, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, true, 1);
+    matmul_test(backend.get(), 9, 144, 128, false, GGML_TYPE_MXFP4, GGML_TYPE_BF16);
+    matmul_test(backend.get(), 9, 144, 128, false, GGML_TYPE_MXFP4, GGML_TYPE_F16);
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16}) {
         matmul_test(backend.get(), 9, 160, 128, false, type, GGML_TYPE_MXFP4);
         matmul_test(backend.get(), 3, 160, 128, true, type);

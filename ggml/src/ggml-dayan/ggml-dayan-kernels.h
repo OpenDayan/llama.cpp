@@ -216,6 +216,9 @@ struct DayanRowsConfig {
     uint64_t index_nb[3];
     uint32_t source_ne[3];
     uint32_t destination_ne[3];
+    uint64_t source_row_stride;
+    uint64_t source_scale_stride;
+    uint64_t source_scale_offset;
 };
 
 enum : uint32_t {

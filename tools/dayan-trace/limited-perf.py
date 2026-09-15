@@ -176,6 +176,14 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         row = dict(id=case["id"], op=case["op"], shape=shape_text(case), dtype=dtype, output_dtype=output_dtype,
                    status=result.get("status", "not-run"), wall_s=None, cycles=None,
                    process_wall_s=result.get("process_wall_s"), max_abs_error=result.get("max_abs_error"))
+        comparison = result.get("comparison", {})
+        row.update(comparison=comparison, validation=result.get("validation"),
+                   cmp_status=comparison.get("status", "not-run") if case.get("cmp") else "smoke",
+                   max_rel_error=comparison.get("max_rel_error"), relative_l2_error=comparison.get("relative_l2_error"),
+                   checked_elements=result.get("checked_elements"), reference_wall_s=result.get("reference_wall_s"))
+        if case.get("cmp") and row["status"] == "ok" and row["cmp_status"] != "pass":
+            row["status"] = "failed"
+            row["error"] = "requested CPU comparison did not pass"
         samples = []
         for sample in result.get("samples", []):
             if sample["warmup"] or sample["status"] != 0 or not math.isfinite(sample["wall_s"]) or sample["wall_s"] <= 0:
@@ -222,6 +230,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         f"The end-to-end scenario adds {overhead_percent:g}% to BOTH sampled subtotals as an explicit uncalibrated allowance, not a measured overhead or a confidence interval. Inspect and adjust the factors before using a different model.",
         "With no warmup, the wall prediction repeats each sample's cold module-loading cost; this can overestimate a resident model. Use --warmup 1 for steady-state measurements at the cost of an extra launch per case.",
         "TestCluster wall predictions apply only to the same simulator/host/profiler setup and are not hardware latency. cmodel wall times and counters do not establish RTL performance.",
+        "With --cmp, deterministic varied inputs are shared with a GGML CPU F32 reference. Stored BF16/MXFP4 inputs and output conversion are included in the reference. Every launch is checked outside its timing interval. These are synthetic operator inputs, not tensors captured from model inference.",
     ]
     if trace_note:
         notes.append(trace_note)
@@ -230,7 +239,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
                   cases=rows, predictions=predictions, notes=notes)
     write_json(directory / "report.json", report)
     with (directory / "operators.csv").open("w", newline="") as stream:
-        fields = ["id", "op", "dtype", "output_dtype", "shape", "status", "wall_s", "cycles", "process_wall_s", "max_abs_error"]
+        fields = ["id", "op", "dtype", "output_dtype", "shape", "status", "wall_s", "cycles", "process_wall_s", "cmp_status", "checked_elements", "max_abs_error", "max_rel_error", "relative_l2_error", "reference_wall_s"]
         writer = csv.DictWriter(stream, fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
@@ -239,10 +248,10 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
 
     lines = [f"Dayan limited operator measurements ({model_name}, {manifest['simulator']}, run {manifest['run_id']})", "",
              f"Measured repeats per case: {manifest['cases'][0]['repeats']}; warmups per case: {manifest['cases'][0]['warmup']}. Cycles on cmodel are not RTL cycles.", "",
-             "| Case | Shape | Status | Launch wall (s) | Cycles | Process wall (s) |",
-             "| --- | --- | --- | ---: | ---: | ---: |"]
+             "| Case | Shape | Status | Launch wall (s) | Cycles | Process wall (s) | CPU cmp | Max abs error | Relative L2 |",
+             "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |"]
     for row in rows:
-        lines.append(f"| {row['id']} | {row['shape']} | {row['status']} | {number(row['wall_s'])} | {number(row['cycles'], 0)} | {number(row['process_wall_s'])} |")
+        lines.append(f"| {row['id']} | {row['shape']} | {row['status']} | {number(row['wall_s'])} | {number(row['cycles'], 0)} | {number(row['process_wall_s'])} | {row['cmp_status']} | {number(row['max_abs_error'], 9)} | {number(row['relative_l2_error'], 9)} |")
     lines += ["", "End-to-end projection (not measured model execution)", "",
               "| Phase | Tokens | Prior context | Sampled subtotal (s / cycles) | With allowance (s / cycles) | Tokens/s |",
               "| --- | ---: | ---: | --- | --- | ---: |"]
@@ -285,11 +294,17 @@ def main():
     parser.add_argument("--case-from", help="start at this case, inclusive, in plan order after case selection")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--cmp", action="store_true", help="compare every launch against a CPU gold reference using deterministic varied inputs")
+    parser.add_argument("--cmp-seed", type=int, default=1, help="32-bit input seed for --cmp (default: 1)")
     parser.add_argument("--timeout", type=int, default=86400, help="per-case wall deadline in seconds (default: 24 hours)")
     parser.add_argument("--overhead-percent", type=float, help="uncalibrated allowance for unmeasured work (default: 20%%, or saved report setting)")
     parser.add_argument("--clock-hz", type=float, help="optional hardware clock for an additional ideal-device estimate; never used to infer cycles")
     parser.add_argument("--resume", action="store_true", help="skip completed cases; require the same executable and run parameters")
     args = parser.parse_args()
+    if not 0 <= args.cmp_seed <= 0xffffffff:
+        parser.error("--cmp-seed must be an unsigned 32-bit integer")
+    if args.cmp_seed != 1 and not args.cmp:
+        parser.error("--cmp-seed requires --cmp")
     if not (1 <= args.prefill <= 1024 and 0 <= args.context < 65536 and 1 <= args.repeats <= 100 and
             0 <= args.warmup <= 99 and args.repeats + args.warmup <= 100 and 1 <= args.timeout <= 4294967):
         parser.error("invalid shape, repetitions, or timeout")
@@ -303,6 +318,8 @@ def main():
         if args.model is not None and args.model != manifest.get("model", DEFAULT_MODEL):
             parser.error("--model does not match the saved run")
         cases = manifest["cases"]
+        if args.cmp and not all(case.get("cmp") for case in cases):
+            parser.error("the saved run has no CPU comparison; run with --cmp in a new output directory")
     else:
         model_name = args.model or DEFAULT_MODEL
         try:
@@ -310,6 +327,9 @@ def main():
         except (ValueError, KeyError, TypeError, ZeroDivisionError) as error:
             parser.error(str(error))
         cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000, model)
+        if args.cmp:
+            for case in cases:
+                case.update(cmp=True, seed=args.cmp_seed)
     if args.cases:
         missing = set(args.cases) - {case["id"] for case in cases}
         if missing:
@@ -322,7 +342,7 @@ def main():
         cases = cases[selected_ids.index(args.case_from):]
     if args.command == "plan":
         for case in cases:
-            print(f"{case['id']:20} {case['op']:10} {shape_text(case)}")
+            print(f"{case['id']:20} {case['op']:10} {shape_text(case)}" + (f" cmp=cpu seed={case['seed']}" if case.get("cmp") else ""))
         print(f"{len(cases)} cases, {len(cases) * (args.repeats + args.warmup)} kernel launches; model={model_name}; no server access.")
         return 0
     if args.command == "report":
@@ -334,7 +354,7 @@ def main():
         parser.error("run requires --perf-trace from the existing dyperf")
     trace = args.perf_trace.resolve()
     client = args.client.resolve()
-    if model_name != DEFAULT_MODEL or any(case.get("dtype") == "mxfp4" or case.get("output_dtype") == "mxfp4" or
+    if args.cmp or model_name != DEFAULT_MODEL or any(case.get("dtype") == "mxfp4" or case.get("output_dtype") == "mxfp4" or
            (case["op"] == "norm" and case.get("output_dtype") == "f32") for case in cases):
         probe = subprocess.run([str(client), "--capabilities"], capture_output=True, text=True, timeout=10)
         try:
@@ -343,6 +363,8 @@ def main():
             capabilities = {}
         if probe.returncode != 0 or capabilities.get("case_schema", 0) < 2:
             parser.error("this model needs an updated llama-dayan-operator-bench; rebuild it and pass --client")
+        if args.cmp and capabilities.get("cmp") is not True:
+            parser.error("--cmp needs an updated llama-dayan-operator-bench; rebuild it and pass --client")
     fingerprint = hashlib.sha256(client.read_bytes()).hexdigest()
     configuration = dict(model=model_name, model_config=model, simulator=args.simulator, prefill=args.prefill, context=args.context,
                          cases=cases, client=str(client), client_sha256=fingerprint,

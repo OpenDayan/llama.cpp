@@ -8116,6 +8116,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_MXFP4, 32, 19, 9, 2, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_MXFP4, 1056, 19, 9, 2, 1, true));
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {

@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 struct DayanMxfp4Tile {
-    enum : int { post_rows = 56, post_stride = 640, uram_bytes = 1536 * 1024 };
+    enum : int { m_alignment = 32, uram_bytes = 1536 * 1024 };
     int m, n, k, input_stride, products;
     bool scales, post;
 
@@ -19,16 +19,14 @@ struct DayanMxfp4Tile {
     }
 
     uint64_t bytes() const {
-        return scratch_offset() + (post ? post_rows * (products * post_stride + 256 + 256 + 4) : 0) + 64;
+        return scratch_offset() + (post ? (uint64_t) m * n * 17 / 64 : 0) + 64;
     }
 
     static DayanMxfp4Tile make(uint64_t rows, uint64_t columns, uint64_t inner, bool scales, int products, bool post) {
         DayanMxfp4Tile tile = {products == 2 ? 256 : 512, 512, scales && !post ? 640 : 512, 0, products, scales, post};
         tile.input_stride = scales ? tile.k / 2 : tile.k * 2;
-        while (tile.bytes() > uram_bytes) { tile.m -= 8; }
-        do { tile.m += 8; } while (tile.bytes() <= uram_bytes);
-        tile.m -= 8;
-        if (rows < (uint64_t) tile.m) { tile.m = (rows + 7) & ~7ULL; }
+        while (tile.bytes() > uram_bytes) { tile.m -= m_alignment; }
+        if (rows < (uint64_t) tile.m) { tile.m = (rows + m_alignment - 1) & ~(uint64_t) (m_alignment - 1); }
         if (rows < 128) {
             tile.n = (columns + 3) / 4 > 3072 ? 3072 : (((columns + 3) / 4 + 255) & ~255ULL);
             while (tile.n > 256 && tile.bytes() > uram_bytes) { tile.n -= 256; }

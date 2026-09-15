@@ -609,11 +609,102 @@ static inline void memory_copy_lowp_to_f32(const DayanCopyConfig * config,
     }
 }
 
+static inline void run_get_rows_mxfp4(const DayanRowsConfig * config, const void * source, const void * indices, void * output) {
+    using namespace ggml_dayan_vec_detail;
+    constexpr uint32_t tile_elements = 1024;
+    constexpr uint64_t payload_offset = 4096, scales_offset = 4864, raw_scales_offset = 6912;
+    constexpr uint64_t shifts_offset = 7168, index_offset = 7424;
+    static_assert(index_offset + 64 <= DAYAN_NATIVE_TASK_URAM_BYTES, "MXFP4 rows scratch exceeds URAM");
+    if (source == nullptr || indices == nullptr || output == nullptr || config->rows == 0 ||
+        config->row_elements == 0 || config->row_elements % 32 != 0 ||
+        (config->destination_type != kDayanDataTypeF32 && config->destination_type != kDayanDataTypeBF16 &&
+         config->destination_type != kDayanDataTypeF16) || config->source_row_stride < config->row_elements / 2 ||
+        config->source_scale_stride < config->source_rows * 4 || !memory_stride_fits(config->source_scale_stride)) {
+        DAYAN_PARAMS_ERROR();
+    }
+    const uint64_t uram = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint32_t task = dayan_native_task_id(), tasks = dayan_native_task_count();
+    const uint64_t tiles = ((uint64_t) config->row_elements + tile_elements - 1) / tile_elements;
+    for (uint32_t i = 0; i < 64; ++i) { ((uint32_t *) (uintptr_t) (uram + shifts_offset))[i] = (i % 8) * 4; }
+    for (uint64_t work = task; work < config->rows * tiles; work += tasks) {
+        const uint32_t row = work / tiles, offset = work % tiles * tile_elements;
+        const uint32_t elements = min_int(config->row_elements - offset, tile_elements);
+        const uint32_t index1 = row / config->index_ne[0] % config->index_ne[1];
+        const uint32_t index2 = row / config->index_ne[0] / config->index_ne[1];
+        const char * index = (const char *) indices + (row % config->index_ne[0]) * config->index_nb[0] +
+                            index1 * config->index_nb[1] + index2 * config->index_nb[2];
+        const uint64_t selected = memory_read_index(index, 0, config->index_type, uram + index_offset);
+        const uint64_t source_row = selected + config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
+        if (selected >= config->source_ne[0] || source_row >= config->source_rows) { DAYAN_PARAMS_ERROR(); }
+        memory_load_bytes(uram + payload_offset, (const char *) source + source_row * config->source_row_stride + offset / 2,
+                          (elements / 2 + 31U) & ~31U);
+        const uint32_t planes = (elements + 127) / 128;
+        configure_memory_lsu<1>(planes, config->source_scale_stride, 32, 32, 32);
+        __tx_lsu_dma_d2u<1>(uram + raw_scales_offset, (long) source + config->source_scale_offset +
+                            (offset / 128) * config->source_scale_stride + (source_row / 8) * 32);
+        dayan_wait_lsu();
+        configure_memory_lsu_3d<1>(4, 1, 64, planes, 32, 256, 1, 0, 0, 1, 64);
+        __tx_lsu_dma_u2u<1>(uram + scales_offset, uram + raw_scales_offset + source_row % 8 * 4);
+        dayan_wait_lsu();
+
+        configure_vec_grid((elements + 63) / 64);
+        configure_vec_iterator<kVecV0Base>(0, 0, 32, 0);
+        configure_vec_iterator<kVecV1Base>(0, 0, 128, 0);
+        configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+        const bool lowp = config->destination_type != kDayanDataTypeF32;
+        const int instructions = lowp ? 28 : 25;
+        configure_vec_iterator<kVecV3Base>(0, 0, lowp ? 128 : 256, 0);
+        // Expand eight packed words to 64 lanes; queue 0 keeps the decoded value during scale conversion.
+        begin_vec_block(instructions);
+        __tx_vec_lsu_u2v<0, 0>(uram + payload_offset);
+        __tx_vec_shuffle_compress<0, 0>(0x22);
+        __tx_vec_lsu_u2v<1, 2>(uram + shifts_offset);
+        __tx_vec_vv_int32_srl<0, 0, 16>();
+        __tx_vec_lsu_g2v_broadcast32<1, 2>(7);
+        __tx_vec_vv_int32_bitwise<0, 0, 16, 8>();
+        __tx_vec_v_int32_sll<0, 0, 2>();
+        __tx_vec_lsu_g2v_broadcast32<1, 2>(0xc8643210U);
+        __tx_vec_vv_int32_srl<0, 16, 0>();
+        __tx_vec_lsu_g2v_broadcast32<1, 2>(15);
+        __tx_vec_vv_int32_bitwise<0, 0, 16, 8>();
+        __tx_vec_cvt_fp32_int32<0, 0, 0>();
+        __tx_vec_v_int32_srl<1, 5, 3>();
+        __tx_vec_v_int32_sll<1, 16, 31>();
+        __tx_vec_vv_int32_bitwise<0, 0, 16, 14>();
+        __tx_vec_lsu_u2v_broadcast32<1, 1>(uram + scales_offset);
+        __tx_vec_lsu_u2v_broadcast32<0, 1>(uram + scales_offset + 64);
+        __tx_vec_lsu_g2s<0>((long) 0xffffffff00000000ULL);
+        __tx_vec_vv_mux2<1, 16, 0, 0>();
+        __tx_vec_cvt_fp32_int32<1, 16, 0>();
+        __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(-128.0f));
+        __tx_vec_vv_fp32_add<1, 17, 16, 0>();
+        __tx_vec_v_fp32_sfu<1, 16, 1>();
+        __tx_vec_vv_fp32_mul<0, 1, 16, 0>();
+        if (lowp) {
+            if (config->destination_type == kDayanDataTypeBF16) { __tx_vec_cvt_bf16_fp32<0, 0, 0>(); }
+            else { __tx_vec_cvt_fp16_fp32<0, 0, 0>(); }
+            __tx_vec_shuffle_compress<0, 0>(0);
+            __tx_vec_lsu_g2s<0>(0xffffffffULL);
+            __tx_vec_lsu_v2u_mask<0, 3, 0>(uram);
+        } else {
+            __tx_vec_lsu_v2u<0, 3>(uram);
+        }
+        start_vec_block(instructions);
+        dayan_wait_vec();
+        memory_store((char *) output + ((uint64_t) row * config->row_elements + offset) * memory_type_bytes(config->destination_type),
+                     uram, elements, config->destination_type);
+    }
+}
+
 static inline void run_get_rows(const DayanRowsConfig * config,
                                 const void *            source,
                                 const void *            indices,
                                 void *                  output) {
     memory_validate(config);
+    if (config->source_type == kDayanDataTypeMXFP4) {
+        run_get_rows_mxfp4(config, source, indices, output);
+        return;
+    }
     if (source == nullptr || indices == nullptr || output == nullptr || config->row_elements == 0 ||
         config->rows == 0 ||
         (config->source_type != kDayanDataTypeF32 && config->source_type != kDayanDataTypeBF16 &&

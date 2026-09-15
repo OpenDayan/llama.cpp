@@ -55,6 +55,36 @@
         {"case": "decode-norm", "factor": 1, "reason": "one final-token norm proxy"},
         {"case": "decode-vocab", "factor": 248320, "divisor": 6144, "reason": "one final-token BF16 vocabulary projection, N scaled from 6144 to 248320; excludes its BF16 activation cast"}
       ]
+    },
+    "qwen35-0.8B-mxfp4-vocab": {
+      "description": "Qwen3.5-0.8B MXFP4: 24 inference blocks (18 linear, 6 full attention), hidden=1024, FFN=3584, vocab=248320; excludes MTP. Dense projections use MXFP4; attention keeps floating-point storage and the shared embedding and vocabulary weight are MXFP4. Batch=1, one final-token logit row.",
+      "cases": [
+        {"name": "ffn", "op": "ffn", "dtype": "mxfp4", "output_dtype": "mxfp4", "n": 3584, "k": 1024},
+        {"name": "down", "op": "matmul", "dtype": "mxfp4", "n": 1024, "k": 3584},
+        {"name": "input", "op": "matmul", "dtype": "mxfp4", "n": 6144, "k": 1024},
+        {"name": "output", "op": "matmul", "dtype": "mxfp4", "n": 1024, "k": 2048},
+        {"name": "vocab", "op": "matmul", "dtype": "mxfp4", "n": 6144, "k": 1024, "phases": ["decode"]},
+        {"name": "quantize-input", "op": "quantize", "dtype": "f32", "output_dtype": "mxfp4", "n": 1024},
+        {"name": "quantize-output", "op": "quantize", "dtype": "f32", "output_dtype": "mxfp4", "n": 2048},
+        {"name": "gdn", "op": "gdn", "heads": 16, "head_dim": 128, "snapshots": 1},
+        {"name": "conv", "op": "ssm_conv", "channels": 6144, "kernel": 4},
+        {"name": "attention", "op": "attention", "q_heads": 8, "kv_heads": 2, "head_dim": 256},
+        {"name": "norm", "op": "norm", "output_dtype": "f32", "n": 1024}
+      ],
+      "prediction_terms": [
+        {"case": "{phase}-ffn", "factor": 24, "reason": "24 fused gate/up + SwiGLU + VEC MXFP4 output slots; includes output scales"},
+        {"case": "{phase}-down", "factor": 24, "reason": "24 MXFP4 FFN down projections"},
+        {"case": "{phase}-input", "factor": 178752, "divisor": 6144, "reason": "MXFP4 input projection proxy: sum of N / 6144 at K=1024; excludes fused epilogues"},
+        {"case": "{phase}-output", "factor": 24, "reason": "24 MXFP4 output projections; excludes the full-attention gate epilogue"},
+        {"case": "{phase}-quantize-input", "factor": 48, "reason": "shared F32-to-MXFP4 activation casts after the two norms per block, width=1024"},
+        {"case": "{phase}-quantize-output", "factor": 24, "reason": "F32-to-MXFP4 activation cast before each attention output projection, width=2048"},
+        {"case": "{phase}-gdn", "factor": 18, "reason": "18 floating-point linear-attention recurrences"},
+        {"case": "{phase}-conv", "factor": 18, "reason": "18 floating-point depthwise convolutions + SiLU"},
+        {"case": "{phase}-attention", "factor": 6, "reason": "6 BF16 full-attention layers"},
+        {"case": "{phase}-norm", "factor": 48, "reason": "two residual/norm/scale proxies per block, with F32 output"},
+        {"case": "decode-norm", "factor": 1, "reason": "one final-token norm proxy"},
+        {"case": "decode-vocab", "factor": 248320, "divisor": 6144, "reason": "one final-token MXFP4 vocabulary projection, N scaled from 6144 to 248320; excludes its MXFP4 activation cast"}
+      ]
     }
   }
 }

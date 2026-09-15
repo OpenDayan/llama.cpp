@@ -350,6 +350,19 @@ static inline void issue_silu(const F32Tensor &           input,
     issue_silu_configured(input, output, constants);
 }
 
+static inline void emit_swiglu(uint64_t gate, uint64_t up) {
+    __tx_vec_lsu_u2v<0, 0>(gate);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(-1.4426950408889634f));
+    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
+    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 5>();
+    __tx_vec_vv_fp32_mul<0, 0, 4, 0>();
+    __tx_vec_lsu_u2v<1, 1>(up);
+    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+}
+
 template <long MatDataType = -1, bool PackedOutput = false>
 static inline void issue_swiglu_configured(const F32Tensor &           gate,
                                            const F32Tensor &           up,
@@ -359,16 +372,7 @@ static inline void issue_swiglu_configured(const F32Tensor &           gate,
     };
 
     begin_vec_block(kInstructions);
-    __tx_vec_lsu_u2v<0, 0>(gate.address);
-    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(-1.4426950408889634f));
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 0, 1>();
-    __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(1.0f));
-    __tx_vec_vv_fp32_add<0, 16, 0, 0>();
-    __tx_vec_v_fp32_sfu<0, 0, 5>();
-    __tx_vec_vv_fp32_mul<0, 0, 4, 0>();
-    __tx_vec_lsu_u2v<1, 1>(up.address);
-    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    emit_swiglu(gate.address, up.address);
     if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
         __tx_vec_cvt_bf16_fp32<0, 0, 0>();
     } else if constexpr (MatDataType == BaseNPUInstBuilder::DT_FP16) {
@@ -397,16 +401,8 @@ static inline void issue_swiglu(const F32Tensor &           gate,
     issue_swiglu_configured<MatDataType>(gate, up, output);
 }
 
-template <long MatDataType = -1, bool PackedOutput = false>
-static inline void issue_geglu_configured(const F32Tensor &           gate,
-                                          const F32Tensor &           up,
-                                          const F32Tensor &           output) {
-    enum : long {
-        kInstructions = 27 + (MatDataType == -1 ? 0 : 2) + (PackedOutput ? 1 : 0),
-    };
-
-    begin_vec_block(kInstructions);
-    __tx_vec_lsu_u2v<0, 0>(gate.address);
+static inline void emit_geglu(uint64_t gate, uint64_t up) {
+    __tx_vec_lsu_u2v<0, 0>(gate);
     __tx_vec_vv_fp32_mul<0, 0, 0, 0>();
     __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(0.044715f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
@@ -430,8 +426,20 @@ static inline void issue_geglu_configured(const F32Tensor &           gate,
     __tx_vec_lsu_g2v_broadcast32<1, 2>((long) f32_bits(0.5f));
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
     __tx_vec_vv_fp32_mul<0, 0, 13, 0>();
-    __tx_vec_lsu_u2v<1, 1>(up.address);
+    __tx_vec_lsu_u2v<1, 1>(up);
     __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+}
+
+template <long MatDataType = -1, bool PackedOutput = false>
+static inline void issue_geglu_configured(const F32Tensor &           gate,
+                                          const F32Tensor &           up,
+                                          const F32Tensor &           output) {
+    enum : long {
+        kInstructions = 27 + (MatDataType == -1 ? 0 : 2) + (PackedOutput ? 1 : 0),
+    };
+
+    begin_vec_block(kInstructions);
+    emit_geglu(gate.address, up.address);
     if constexpr (MatDataType == BaseNPUInstBuilder::DT_BF16) {
         __tx_vec_cvt_bf16_fp32<0, 0, 0>();
     } else if constexpr (MatDataType == BaseNPUInstBuilder::DT_FP16) {

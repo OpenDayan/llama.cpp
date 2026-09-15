@@ -41,6 +41,29 @@ python3 tools/dayan-trace/limited-perf.py plan --model qwen35-0.8B-mxfp4 \
 
 Each model configuration has a `description`, `cases`, and `prediction_terms`. A case defines its `name`, `op`, dimensions, optional `dtype`/`output_dtype`, and optional `phases` (default: both). The script supplies M from `--prefill` or decode M=1, and derives attention KV length from the phase and `--context`. Dtype defaults preserve the BF16 preset: BF16 matrix/attention inputs, F32 other inputs, BF16 FFN/norm outputs, and F32 other outputs; `quantize` writes MXFP4. The client honors the recorded dimensions and rejects unsupported storage combinations. GDN currently requires head dimension 128 and one snapshot; attention samples require head dimension 256.
 
+Use `--model qwen35-0.8B-mxfp4-vocab` for the GGUF with a quantized shared embedding/LM head. Its `decode-vocab` case uses MXFP4; the original `qwen35-0.8B-mxfp4` preset keeps its BF16 vocabulary proxy for comparison. Both vocabulary cases still sample N=6144 and extrapolate to 248320.
+
+## CPU comparison
+
+Add `--cmp` to check every launch against a CPU gold reference:
+
+```sh
+python3 tools/dayan-trace/limited-perf.py run \
+    --model qwen35-0.8B-mxfp4-vocab --cmp \
+    --client build-dayan/bin/llama-dayan-operator-bench \
+    --simulator cmodel --socket /tmp/dayan-cmodel.sock \
+    --perf-trace /tmp/dayan-cmodel-perf.json \
+    --output build-dayan/cmodel-cmp
+```
+
+The client generates deterministic varied inputs with `--cmp-seed` (default 1), including signed values, different MXFP4 block scales, independent gate/up weights, and nonzero GDN state. CPU tensors contain exactly the floating-point values represented by the uploaded BF16/MXFP4 inputs. GGML CPU F32 operators provide the reference for MatMul, fused FFN, convolution plus SiLU, GDN, causal attention, and residual/RMSNorm/scale. Standalone quantization uses the scalar reference for the device's BF16 rounding, scale selection, and E2M1 truncation. These are synthetic operator tests; `--model` does not capture tensors from a running GGUF.
+
+Every output element is compared after each warmup and measured launch, including GDN state and the norm residual. Repeated launches refill outputs with a NaN sentinel. BF16 references include output rounding. Standalone MXFP4 conversion requires identical payload and scale bytes. Fused MXFP4 output also compares decoded values: each error must be no greater than the largest E2M1 step for its reference block, and relative L2 must be at most 0.01. This permits an activation approximation to cross a quantization threshold. Floating-point operators use absolute/relative tolerances and an additional relative L2 limit; the actual limits are recorded with each comparison. Nonfinite values fail.
+
+CPU reference calculation, downloads, and comparison are outside launch wall time and device cycle measurements. They are included in process wall time. `*.result.json` records all launch comparisons, thresholds, checked element counts, maximum absolute/relative errors, relative L2, nonfinite and mismatched element counts, and the first mismatch. Reports and CSV include comparison status and errors. A mismatch exits with code 1 and excludes that case from projections. Incomplete trace data still exits with code 2 after successful comparisons.
+
+Without `--cmp`, the existing constant-input analytical smoke check remains enabled. Comparison settings and seed are part of the saved run parameters; changing them requires a new output directory. `report` reads saved comparisons and cannot add a comparison to an earlier smoke run. The CPU backend must be available for `--cmp`.
+
 Prediction terms reference `{phase}-name` or a fixed case ID. Their multiplier is `factor / divisor`, with divisor defaulting to 1; `reason` explains the proxy. New runs save the selected model configuration in `manifest.json`. Reports use that snapshot, and resume rejects a changed configuration. Old BF16 manifests remain readable. `report` infers the model from the saved run; an explicit mismatched `--model` is rejected.
 
 ## BF16 samples

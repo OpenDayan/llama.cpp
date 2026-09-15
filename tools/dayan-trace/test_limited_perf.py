@@ -25,6 +25,53 @@ def events(tag, intervals):
 
 
 class PerfReportTests(unittest.TestCase):
+    def test_cmp_plan_and_old_client_rejection(self):
+        with patch("sys.argv", ["limited-perf.py", "plan", "--cmp", "--cmp-seed", "42"]), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(perf.main(), 0)
+        self.assertIn("cmp=cpu seed=42", output.getvalue())
+        argv = ["limited-perf.py", "run", "--cmp", "--perf-trace", "/tmp/unused.json"]
+        old_client = perf.subprocess.CompletedProcess([], 0, '{"case_schema":2}', "")
+        with patch("sys.argv", argv), patch.object(perf.subprocess, "run", return_value=old_client), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                perf.main()
+            self.assertEqual(error.exception.code, 2)
+
+    def test_cmp_report_requires_a_pass_and_preserves_failure_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case = perf.make_cases(8, 8)[0]
+            case.update(cmp=True, seed=1)
+            manifest = dict(cases=[case], simulator="cmodel", run_id="cmp", prefill=8, context=8)
+            result = dict(status="ok", samples=[dict(tag="cmp", warmup=False, wall_s=1, tasks=4, status=0)])
+            trace = root / "trace.json"
+            perf.write_json(trace, dict(traceEvents=events("cmp", [(100, 200)] * 4)))
+            for comparison, expected in ((None, 1), (dict(status="fail", nonfinite_elements=1), 1),
+                                         (dict(status="pass", max_abs_error=0.001, relative_l2_error=0.0001), 0)):
+                if comparison is not None:
+                    result["comparison"] = comparison
+                perf.write_json(root / (case["id"] + ".result.json"), result)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(perf.make_report(root, manifest, trace, 0, None), expected)
+                report = json.loads((root / "report.json").read_text())
+                self.assertEqual(report["cases"][0]["comparison"], comparison or {})
+                if expected:
+                    self.assertIsNone(report["cases"][0]["wall_s"])
+
+    def test_cmp_cannot_be_added_to_an_existing_smoke_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            perf.write_json(root / "manifest.json", dict(cases=perf.make_cases(8, 8)))
+            with patch("sys.argv", ["limited-perf.py", "report", "--cmp", "--output", directory]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    perf.main()
+                self.assertEqual(error.exception.code, 2)
+
+    def test_quantized_vocabulary_has_its_own_preset(self):
+        model = perf.load_model("qwen35-0.8B-mxfp4-vocab")
+        cases = {case["id"]: case for case in perf.make_cases(64, 1024, model=model)}
+        self.assertEqual(perf.case_types(cases["decode-vocab"]), ("mxfp4", "f32"))
+        self.assertEqual(perf.case_types(cases["decode-attention"]), ("bf16", "f32"))
+
     def test_model_presets_keep_matrix_and_attention_types_separate(self):
         bf16 = perf.make_cases(128, 512)
         self.assertEqual(len(bf16), 16)

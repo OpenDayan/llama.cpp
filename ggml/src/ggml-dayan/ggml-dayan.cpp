@@ -2094,8 +2094,8 @@ static int ggml_backend_dayan_get_rows(ggml_backend_dayan_context * ctx, const g
         return 0;
     }
 
-    uint32_t source_type;
-    if (!ggml_backend_dayan_type_code(source->type, &source_type)) {
+    uint32_t source_type = kDayanDataTypeMXFP4;
+    if (source->type != GGML_TYPE_MXFP4 && !ggml_backend_dayan_type_code(source->type, &source_type)) {
         return -1;
     }
 
@@ -2105,6 +2105,13 @@ static int ggml_backend_dayan_get_rows(ggml_backend_dayan_context * ctx, const g
     config.source_rows      = (uint64_t) ggml_nrows(source);
     config.destination_rows = (uint64_t) ggml_nrows(output);
     config.source_type      = source_type;
+    if (source->type == GGML_TYPE_MXFP4) {
+        const auto * extra = (const ggml_backend_dayan_mxfp4_extra *) source->extra;
+        if (extra == nullptr) { return -1; }
+        config.source_row_stride = extra->layout.row_stride;
+        config.source_scale_stride = extra->layout.scale_stride;
+        config.source_scale_offset = extra->layout.scale_offset;
+    }
     if (!ggml_backend_dayan_type_code(output->type, &config.destination_type)) {
         return -1;
     }

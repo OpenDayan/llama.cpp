@@ -1696,7 +1696,7 @@ DAYAN_MATMUL_1C_DESC(matmul_fp16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_inference_fp16_1c);
 DAYAN_MATMUL_4C_DESC(matmul_bf16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_mxfp4_4c);
-DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 0, 0, DAYAN_DESC_URAM_BYTES(64U * 1024U), 1, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 0, 0, DAYAN_DESC_URAM_BYTES(296U * 1024U), 1, 0, 1, 0);
 DAYAN_MATMUL_4C_DESC(matmul_inference_bf16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_fp16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_inference_fp16_4c);
