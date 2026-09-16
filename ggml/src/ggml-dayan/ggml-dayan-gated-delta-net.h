@@ -312,6 +312,7 @@ static inline void load_gdn_pair(uint64_t destination0, uint64_t destination1,
 }
 
 constexpr long kChunkTokens = 64;
+constexpr long kSolveBlockTokens = 16;
 constexpr long kHeadStride = kHeadDim * sizeof(float) + 64;
 constexpr long kChunkStride = kChunkTokens * sizeof(float) + 64;
 
@@ -342,7 +343,8 @@ constexpr long kChunkGCum = kChunkKQ + kChunkTokens * kChunkStride;
 constexpr long kChunkTailDecay = kChunkGCum + kVecBytes;
 constexpr long kChunkLower = kChunkTailDecay + kVecBytes;
 constexpr long kChunkDiag = kChunkLower + kChunkTokens * kScalarStride;
-constexpr long kChunkEnd = kChunkDiag + kChunkTokens * kScalarStride;
+constexpr long kChunkOneHot = kChunkDiag + kChunkTokens * kScalarStride;
+constexpr long kChunkEnd = kChunkOneHot + kChunkTokens * kScalarStride;
 static_assert(kChunkEnd <= DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES, "GDN pipeline exceeds URAM budget");
 
 struct GdnPipeline {
@@ -465,7 +467,7 @@ static inline void issue_chunk_coefficients(const GdnChunk & chunk, uint32_t sca
     start_vec_block(instructions, instructions, instructions, instructions, instructions);
 }
 
-static inline void issue_chunk_uw(const GdnChunk & chunk) {
+static inline void issue_chunk_rhs(const GdnChunk & chunk) {
     configure_vec_outer(kHeadDim);
     configure_vec_iterator<kVecV0Base>(0, 0, kChunkStride, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
@@ -484,22 +486,67 @@ static inline void issue_chunk_uw(const GdnChunk & chunk) {
         start_vec_block(instructions, instructions, instructions, instructions, instructions);
         dayan_wait_vec();
     }
+}
 
-    if (chunk.rows > 1) {
-        configure_vec_outer(2 * kHeadDim);
-        __tx_vec_tcsr_write<kVecDim1>(chunk.rows - 2);
-        configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
-        configure_vec_iterator<kVecV0Base>(0, kChunkStride, 0, 0);
-        configure_vec_iterator<kVecV1Base>(0, 0, kChunkStride, 0);
-        begin_vec_block(7);
-        __tx_vec_lsu_u2v<1, 1>(uram_address(chunk.prepared + kPreparedU));
-        __tx_vec_s_iter_gets<0, 0, 0, 0>();
-        __tx_vec_shuffle_broadcast_dyn<0, 16, 0>();
-        __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkKK));
-        __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-        __tx_vec_vv_fp32_sub<1, 16, 0, 0>();
-        __tx_vec_lsu_v2u<16, 1>(uram_address(chunk.prepared + kPreparedU));
-        start_vec_block(1, 1, 6, 6, 7);
+static inline void issue_chunk_identity(long output) {
+    constexpr long instructions = 5;
+    configure_vec_outer(kChunkTokens);
+    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, kScalarStride, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, kChunkStride, 0);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_u2s<0, 2>(uram_address(kChunkOneHot));
+    __tx_vec_lsu_g2v_broadcast32<0, 0>(0x3f800000U);
+    __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
+    __tx_vec_vv_mux2<0, 16, 0, 0>();
+    __tx_vec_lsu_v2u<0, 3>(uram_address(output));
+    start_vec_block(instructions, instructions, instructions, instructions, instructions);
+}
+
+static inline void issue_chunk_inverse(const GdnChunk & chunk, long output) {
+    if (chunk.rows <= 1) {
+        return;
+    }
+    configure_vec_outer(kChunkTokens);
+    __tx_vec_tcsr_write<kVecDim1>(chunk.rows - 2);
+    configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
+    configure_vec_iterator<kVecV0Base>(0, kChunkStride, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, kChunkStride, 0);
+    begin_vec_block(7);
+    __tx_vec_lsu_u2v<1, 1>(uram_address(output));
+    __tx_vec_s_iter_gets<0, 0, 0, 0>();
+    __tx_vec_shuffle_broadcast_dyn<0, 16, 0>();
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kChunkKK));
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_vv_fp32_sub<1, 16, 0, 0>();
+    __tx_vec_lsu_v2u<16, 1>(uram_address(output));
+    start_vec_block(1, 1, 6, 6, 7);
+}
+
+static inline void solve_chunk_mat(const GdnChunk & chunk, long & checksum) {
+    const long inverse = chunk.prepared + kPreparedW;
+
+    // Invert with 64 VEC RHS rows, then apply it to 256 RHS rows with MAT.
+    issue_chunk_identity(inverse);
+    dayan_wait_vec();
+    issue_chunk_inverse(chunk, inverse);
+    dayan_wait_vec();
+    set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kChunkTokens * sizeof(float), kChunkStride, kChunkStride);
+    __tx_lsu_dma_u2u<0>(uram_address(kChunkKQ), uram_address(inverse));
+    dayan_wait_lsu();
+
+    const long blocks = (chunk.rows + kSolveBlockTokens - 1) / kSolveBlockTokens;
+    // Write high columns first so later blocks do not read replaced RHS columns.
+    for (long block = blocks; block-- > 0;) {
+        const long column = block * kSolveBlockTokens;
+        const long columns = chunk.rows - column < kSolveBlockTokens ? chunk.rows - column : kSolveBlockTokens;
+        const long rhs = chunk.prepared + kPreparedU + column * sizeof(float);
+
+        configure_chunk_mat(2 * kHeadDim, columns, column + columns,
+                            kChunkStride, kChunkStride, kChunkStride);
+        __tx_mat_mm<0>(uram_address(rhs), uram_address(chunk.prepared + kPreparedU),
+                       uram_address(kChunkKQ + column * kChunkStride));
     }
 }
 
@@ -589,14 +636,17 @@ static void prepare_chunks(void * opaque) {
         dayan_wait_vec();
         set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kChunkTokens * sizeof(float), kChunkStride, kChunkStride);
         __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedA), uram_address(kChunkKQ));
-        issue_chunk_uw(chunk);
-        dayan_wait_vec();
+        issue_chunk_rhs(chunk);
+        dayan_wait_lsu();
+        solve_chunk_mat(chunk, checksum);
+        dayan_wait_mat();
 
         set_lsu_matrix<0, true, 2>(checksum, kHeadDim, kChunkTokens * sizeof(float), kChunkStride, kHeadStride);
         __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedW), uram_address(chunk.prepared + kPreparedKT));
-        dayan_wait_lsu();
         set_lsu_matrix<0, true, 2>(checksum, kChunkTokens, kHeadDim * sizeof(float), kHeadStride, kChunkStride);
         __tx_lsu_dma_u2u<0>(uram_address(chunk.prepared + kPreparedKT), uram_address(chunk.input + kInputK));
+        gdn_check(dayan_resource_consume_lsu(input));
+        phases ^= input;
         dayan_wait_lsu();
 
         configure_vec_outer(kHeadDim);
@@ -608,10 +658,9 @@ static void prepare_chunks(void * opaque) {
         __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
         __tx_vec_lsu_v2u<0, 0>(uram_address(chunk.prepared + kPreparedKT));
         start_vec_block(4, 4, 4, 4, 4);
-        gdn_check(dayan_resource_produce_vec(prepared, 1, input));
-        phases ^= input;
-        dayan_wait_vec();
+        gdn_check(dayan_resource_produce_vec(prepared, 1, 0));
     }
+    dayan_wait_vec();
 }
 
 static long run_chunked(const DayanGatedDeltaNetConfig * config, const float * q, const float * k,
@@ -628,6 +677,7 @@ static long run_chunked(const DayanGatedDeltaNetConfig * config, const float * q
     for (long j = 0; j < kChunkTokens; ++j) {
         *uram_pointer<uint64_t>(kChunkLower + j * kScalarStride) = j == 63 ? 0 : ~uint64_t{0} << (j + 1);
         *uram_pointer<uint64_t>(kChunkDiag + j * kScalarStride) = ~uint64_t{0} << j;
+        *uram_pointer<uint64_t>(kChunkOneHot + j * kScalarStride) = uint64_t{1} << j;
     }
 
     dayan_thread_resources_t resources = {};

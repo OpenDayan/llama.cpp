@@ -68,7 +68,7 @@ Select a GGUF with actual model weights, then generate a short response:
 export DAYAN_MODEL=/share/models/Qwen3.5-0.8B-MXFP4/Qwen3.5-0.8B-MXFP4-Vocab-MXFP4.gguf
 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
     --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
-    -n 16 --no-warmup --single-turn -p "Hello"
+    -n 16 --no-warmup --single-turn -p "Hello, Who are you? Introduce yourself."
 ```
 
 For an HTTP inference server:
