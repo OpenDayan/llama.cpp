@@ -7,6 +7,8 @@
 enum : uint16_t {
     kDayanMegaQwen35DenseMxfp4Linear = 1,
     kDayanMegaQwen35DenseMxfp4Full   = 2,
+    kDayanMegaQwen35DenseBf16Linear  = 3,
+    kDayanMegaQwen35DenseBf16Full    = 4,
 };
 
 enum : uint32_t {
@@ -14,6 +16,8 @@ enum : uint32_t {
     kDayanMegaRootCount                        = 16,
     kDayanMegaQwen35DenseMxfp4LinearParameters = 172,
     kDayanMegaQwen35DenseMxfp4FullParameters   = 140,
+    kDayanMegaQwen35DenseBf16LinearParameters  = 135,
+    kDayanMegaQwen35DenseBf16FullParameters    = 92,
 };
 
 struct DayanMegaConfig {
@@ -39,6 +43,11 @@ struct Operation {
     const uint16_t * arguments;
 };
 
+template <uint16_t Base, uint16_t Count>
+struct NextParameter {
+    static constexpr uint16_t value = Base + Count;
+};
+
 template <uint16_t... Indices>
 struct Arguments {
     static const uint16_t values[sizeof...(Indices)];
@@ -49,6 +58,7 @@ const uint16_t Arguments<Indices...>::values[sizeof...(Indices)] = { Indices... 
 
 int norm_pipeline(const uintptr_t *, const uint16_t *);
 int residual_add(const uintptr_t *, const uint16_t *);
+int residual_add_bf16(const uintptr_t *, const uint16_t *);
 int rms_norm(const uintptr_t *, const uint16_t *);
 int scale(const uintptr_t *, const uint16_t *);
 int get_rows(const uintptr_t *, const uint16_t *);
@@ -68,12 +78,17 @@ int gated_delta_net(const uintptr_t *, const uint16_t *);
 int rope(const uintptr_t *, const uint16_t *);
 int set_rows(const uintptr_t *, const uint16_t *);
 int flash_attention_fp16(const uintptr_t *, const uint16_t *);
+int matmul_bf16(const uintptr_t *, const uint16_t *);
+int matmul_pair_bf16(const uintptr_t *, const uint16_t *);
+int matmul_swiglu_bf16(const uintptr_t *, const uint16_t *);
+int matmul_quantized_bf16(const uintptr_t *, const uint16_t *);
+int gated_output_projection_bf16(const uintptr_t *, const uint16_t *);
 
 } // namespace ggml_dayan_mega_detail
 
 #else
 
-int qwen35_dense_mxfp4_mega(
+int qwen35_dense_mega(
     npu_buffer_t * config,
     npu_buffer_t * root0,
     npu_buffer_t * root1,

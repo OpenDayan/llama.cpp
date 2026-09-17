@@ -108,9 +108,11 @@ add_custom_command(
     DEPENDS
         ggml-dayan-mega-executor.cpp
         ggml-dayan-mega-executor.h
+        mega-graph/qwen35-dense-bf16.hpp
         mega-graph/qwen35-dense-mxfp4.hpp
         ggml-dayan-kernels.h
         ggml-dayan-activation.h
+        ggml-dayan-attention.h
         ggml-dayan-common.h
         ggml-dayan-conv.h
         ggml-dayan-elementwise.h
@@ -118,6 +120,8 @@ add_custom_command(
         ggml-dayan-gated-delta-net.h
         ggml-dayan-layout.h
         ggml-dayan-matmul.h
+        ggml-dayan-matmul-4c.h
+        ggml-dayan-ffn.h
         ggml-dayan-mxfp4.h
         ggml-dayan-mxfp4-layout.h
         ggml-dayan-memory.h
@@ -144,6 +148,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-mega.cpp
     ggml-dayan-mega.h
     ggml-dayan-mega-executor.h
+    mega-graph/qwen35-dense-bf16.hpp
     mega-graph/qwen35-dense-mxfp4.hpp
     ggml-dayan-kernels.h
     ggml-dayan-activation.h

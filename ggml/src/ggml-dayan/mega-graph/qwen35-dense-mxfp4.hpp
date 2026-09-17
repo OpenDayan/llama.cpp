@@ -6,11 +6,6 @@
 
 namespace ggml_dayan_mega_detail {
 
-template <uint16_t Base, uint16_t Count>
-struct NextParameter {
-    static constexpr uint16_t value = Base + Count;
-};
-
 struct Qwen35DenseMxfp4LinearGraph {
     enum : uint16_t {
         p_norm0     = 0,

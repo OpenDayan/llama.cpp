@@ -89,6 +89,27 @@ Measure prefill and decode throughput with the profiler stopped:
 
 `--no-warmup` keeps these smoke runs short. Omit it and increase repetitions for warm measurements. On cmodel, the reported wall time and tokens/s measure simulator execution, not hardware throughput.
 
+#### Qwen3.5 mega executor
+
+The mega executor is enabled automatically when a supported Qwen3.5 Dense Transformer block runs on one four-core Cluster. It currently recognizes the Linear Attention and Full Attention blocks in the BF16 and MXFP4 Qwen3.5 Dense models. No additional CMake option is required. Leave `GGML_DAYAN_MEGA` unset or set it to `1`:
+
+```sh
+export GGML_DAYAN_MEGA=1
+./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    -n 16 --no-warmup --single-turn -p "Hello"
+```
+
+The backend uses the regular per-operator path when the topology or graph does not match, or when a slot trace or slot filter callback is active. To force this fallback for comparison or debugging, set `GGML_DAYAN_MEGA=0` before starting the inference process:
+
+```sh
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    -n 16 --no-warmup --single-turn -p "Hello"
+```
+
+Restart a long-running inference process after changing `GGML_DAYAN_MEGA`.
+
 ### Run operator tests
 
 Check topology selection and MXFP4 packing without a device:

@@ -3310,10 +3310,12 @@ static int ggml_backend_dayan_mega_launch(void * context,
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
+        const bool linear = graph == kDayanMegaQwen35DenseMxfp4Linear ||
+                            graph == kDayanMegaQwen35DenseBf16Linear;
         ggml_backend_dayan_init_launch_attrs(
-            ctx, graph == kDayanMegaQwen35DenseMxfp4Linear ? "q35-linear" : "q35-full-mega", &attrs);
+            ctx, linear ? "q35-linear" : "q35-full-mega", &attrs);
         attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
-        status = qwen35_dense_mxfp4_mega(
+        status = qwen35_dense_mega(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
             arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],
             arguments[13], arguments[14], arguments[15], &attrs);
@@ -3323,6 +3325,11 @@ static int ggml_backend_dayan_mega_launch(void * context,
 }
 
 static bool ggml_backend_dayan_mega_enabled(const ggml_backend_dayan_context * ctx) {
+    const char * enabled = std::getenv("GGML_DAYAN_MEGA");
+    if (enabled != nullptr && strcmp(enabled, "0") == 0) {
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
     return ctx->device->topology.clusters == 1 && ctx->device->topology.cores == 4 &&
            ggml_backend_dayan_trace_callback == nullptr && ggml_backend_dayan_filter_callback == nullptr;

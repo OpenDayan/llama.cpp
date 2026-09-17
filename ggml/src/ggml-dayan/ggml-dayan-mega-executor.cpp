@@ -1,9 +1,11 @@
 #include "ggml-dayan-mega-executor.h"
 
 #include "ggml-dayan-common.h"
+#include "ggml-dayan-attention.h"
 #include "ggml-dayan-conv.h"
 #include "ggml-dayan-elementwise.h"
 #include "ggml-dayan-layout.h"
+#include "ggml-dayan-matmul-4c.h"
 #include "ggml-dayan-memory.h"
 #include "ggml-dayan-mxfp4.h"
 #include "ggml-dayan-normalization.h"
@@ -36,6 +38,7 @@ static inline float u32_as_float(uint32_t value) {
 
 #    include "ggml-dayan-flash-attention.h"
 #    include "ggml-dayan-gated-delta-net.h"
+#    include "mega-graph/qwen35-dense-bf16.hpp"
 #    include "mega-graph/qwen35-dense-mxfp4.hpp"
 
 namespace ggml_dayan_mega_detail {
@@ -55,6 +58,28 @@ static inline void reset_local_resources() {
     __builtin_riscv_tx_base_tcsr_write(UINT32_MAX, 0, 0x035U);
 }
 
+static int clear_atomic_cache(uint32_t bytes) {
+    if (dayan_task_id(DAYAN_TASK_X) == 0) {
+        volatile uint64_t * words = (volatile uint64_t *) shared;
+        for (uint32_t index = 0; index < (bytes + sizeof(*words) - 1) / sizeof(*words); ++index) {
+            words[index] = 0;
+        }
+    }
+    dayan_cluster_barrier_t * barrier =
+        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
+    return dayan_cluster_barrier(4, barrier);
+}
+
+static int prepare_matmul_4c() {
+    reset_local_resources();
+    const int status = clear_atomic_cache(MATMUL_DAYAN_4C_ATOMIC_BYTES);
+    if (status < 0) {
+        return status;
+    }
+    ggml_dayan_matmul_4c_detail::initialize_resources();
+    return 0;
+}
+
 int norm_pipeline(const uintptr_t * parameters, const uint16_t * indices) {
     using namespace ggml_dayan_matmul_detail;
     run_rms_norm_pipeline(parameter<const DayanNormPipelineConfig *>(parameters, indices, 0),
@@ -71,6 +96,17 @@ int norm_pipeline(const uintptr_t * parameters, const uint16_t * indices) {
 int residual_add(const uintptr_t * parameters, const uint16_t * indices) {
     using namespace ggml_dayan_matmul_detail;
     run_residual_add<Bf16Format, kDayanDataTypeF32, normalization_load_f32>(
+        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
+        parameter<const void *>(parameters, indices, 1),
+        parameter<const void *>(parameters, indices, 2),
+        parameter<void *>(parameters, indices, 3));
+    return 0;
+}
+
+int residual_add_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+    using namespace ggml_dayan_matmul_detail;
+    run_residual_add<Bf16Format, kDayanDataTypeBF16,
+                     normalization_load_lowp<__tx_vec_cvt_fp32_bf16<0, 0, 0>>>(
         parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
         parameter<const void *>(parameters, indices, 1),
         parameter<const void *>(parameters, indices, 2),
@@ -242,18 +278,6 @@ int set_rows(const uintptr_t * parameters, const uint16_t * indices) {
     return 0;
 }
 
-static int clear_atomic_cache(uint32_t bytes) {
-    if (dayan_task_id(DAYAN_TASK_X) == 0) {
-        volatile uint64_t * words = (volatile uint64_t *) shared;
-        for (uint32_t index = 0; index < (bytes + sizeof(*words) - 1) / sizeof(*words); ++index) {
-            words[index] = 0;
-        }
-    }
-    dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
-    return dayan_cluster_barrier(4, barrier);
-}
-
 int flash_attention_fp16(const uintptr_t * parameters, const uint16_t * indices) {
     reset_local_resources();
     const int clear_status = clear_atomic_cache(ggml_dayan_flash_attention_detail::kAtomicBytes);
@@ -271,6 +295,84 @@ int flash_attention_fp16(const uintptr_t * parameters, const uint16_t * indices)
                    config, q, k, v, output) :
                ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 4>(
                    config, q, k, v, output);
+}
+
+int matmul_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+    const int status = prepare_matmul_4c();
+    if (status < 0) {
+        return status;
+    }
+    const DayanMatmulConfig * config = parameter<const DayanMatmulConfig *>(parameters, indices, 0);
+    const uint16_t * input = parameter<const uint16_t *>(parameters, indices, 1);
+    const uint16_t * weight = parameter<const uint16_t *>(parameters, indices, 2);
+    float * output = parameter<float *>(parameters, indices, 3);
+    return config->m <= 512 ?
+               ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Bf16Format, true>(
+                   config, input, weight, output) :
+               ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Bf16Format>(
+                   config, input, weight, output);
+}
+
+int matmul_pair_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+    const int status = prepare_matmul_4c();
+    if (status < 0) {
+        return status;
+    }
+    return ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(
+        parameter<const DayanMatmulPairConfig *>(parameters, indices, 0),
+        parameter<const uint16_t *>(parameters, indices, 1),
+        parameter<const uint16_t *>(parameters, indices, 2),
+        parameter<const uint16_t *>(parameters, indices, 3),
+        parameter<float *>(parameters, indices, 4),
+        parameter<float *>(parameters, indices, 5));
+}
+
+int matmul_swiglu_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+    const int status = prepare_matmul_4c();
+    if (status < 0) {
+        return status;
+    }
+    const DayanMatmulConfig * config = parameter<const DayanMatmulConfig *>(parameters, indices, 0);
+    const uint16_t * input = parameter<const uint16_t *>(parameters, indices, 1);
+    const uint16_t * gate = parameter<const uint16_t *>(parameters, indices, 2);
+    const uint16_t * up = parameter<const uint16_t *>(parameters, indices, 3);
+    uint16_t * output = parameter<uint16_t *>(parameters, indices, 4);
+    return config->m <= 512 ?
+               ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, false, true>(
+                   config, input, gate, up, output) :
+               ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, false>(
+                   config, input, gate, up, output);
+}
+
+int matmul_quantized_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+    const int status = prepare_matmul_4c();
+    if (status < 0) {
+        return status;
+    }
+    const DayanMatmulConfig * config = parameter<const DayanMatmulConfig *>(parameters, indices, 0);
+    const uint16_t * input = parameter<const uint16_t *>(parameters, indices, 1);
+    const uint16_t * weight = parameter<const uint16_t *>(parameters, indices, 2);
+    uint16_t * output = parameter<uint16_t *>(parameters, indices, 3);
+    return config->m <= 512 ?
+               ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Bf16Format, true>(
+                   config, input, weight, output) :
+               ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Bf16Format>(
+                   config, input, weight, output);
+}
+
+int gated_output_projection_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+    const int status = prepare_matmul_4c();
+    if (status < 0) {
+        return status;
+    }
+    return ggml_dayan_matmul_4c_detail::run_gated_output_projection_f32_gate_4c<
+        ggml_dayan_matmul_detail::Bf16Format>(
+            parameter<const DayanGatedProjectionConfig *>(parameters, indices, 0),
+            parameter<const float *>(parameters, indices, 1),
+            parameter<const float *>(parameters, indices, 2),
+            parameter<const uint16_t *>(parameters, indices, 3),
+            parameter<float *>(parameters, indices, 4),
+            parameter<uint16_t *>(parameters, indices, 5));
 }
 
 template <typename Graph>
@@ -295,7 +397,7 @@ static int execute(const uintptr_t * parameters, dayan_cluster_barrier_t * barri
 } // namespace ggml_dayan_mega_detail
 #endif
 
-__kernel__ void qwen35_dense_mxfp4_mega(
+__kernel__ void qwen35_dense_mega(
     const DayanMegaConfig * config,
     const void * root0,
     const void * root1,
@@ -360,6 +462,20 @@ __kernel__ void qwen35_dense_mxfp4_mega(
             status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph>(
                 parameters, barrier);
             break;
+        case kDayanMegaQwen35DenseBf16Linear:
+            if (config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph::parameter_count) {
+                dayan_thread_exit(-22);
+            }
+            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph>(
+                parameters, barrier);
+            break;
+        case kDayanMegaQwen35DenseBf16Full:
+            if (config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph::parameter_count) {
+                dayan_thread_exit(-22);
+            }
+            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph>(
+                parameters, barrier);
+            break;
         default:
             status = -22;
             break;
@@ -389,7 +505,7 @@ __kernel__ void qwen35_dense_mxfp4_mega(
 }
 
 DAYAN_KERNEL_RESOURCE_DESC_EX(
-    qwen35_dense_mxfp4_mega, 1, DAYAN_KERNEL_MAX_CHILD_THREADS, 0,
+    qwen35_dense_mega, 1, DAYAN_KERNEL_MAX_CHILD_THREADS, 0,
     MATMUL_DAYAN_4C_ATOMIC_BYTES + sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_TCSR_LOGICAL_GROUPS, 4,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_RESOURCE_LOGICAL_COUNT, DAYAN_RESOURCE_LOGICAL_COUNT);
