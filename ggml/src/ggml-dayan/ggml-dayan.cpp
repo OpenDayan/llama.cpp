@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-dayan-graph.h"
 #include "ggml-dayan-kernels.h"
+#include "ggml-dayan-mega.h"
 #include "ggml-dayan-mxfp4-layout.h"
 #include "ggml-impl.h"
 
@@ -3281,6 +3282,52 @@ static ggml_backend_buffer_type_t ggml_backend_dayan_buffer_type(ggml_backend_de
     return &buffer_type;
 }
 
+static bool ggml_backend_dayan_mega_resolve(void *,
+                                             const void * pointer,
+                                             size_t size,
+                                             npu_buffer_t ** buffer,
+                                             uint64_t * offset) {
+    ggml_backend_dayan_device_pointer result;
+    if (!ggml_backend_dayan_find_device_pointer(pointer, size, &result)) {
+        return false;
+    }
+    *buffer = result.buffer;
+    *offset = result.offset;
+    return true;
+}
+
+static int ggml_backend_dayan_mega_launch(void * context,
+                                          uint16_t graph,
+                                          const void * config,
+                                          size_t config_size,
+                                          npu_buffer_t * const * roots) {
+    ggml_backend_dayan_context * ctx = (ggml_backend_dayan_context *) context;
+    ggml_backend_dayan_buffers  buffers;
+    int status = ggml_backend_dayan_prepare_launch_buffers(ctx, config, config_size, 0, &buffers);
+    npu_buffer_t * arguments[kDayanMegaRootCount];
+    for (size_t index = 0; index < kDayanMegaRootCount; ++index) {
+        arguments[index] = roots[index] != nullptr ? roots[index] : buffers.config;
+    }
+    if (status == 0) {
+        npu_kernel_launch_attrs_t attrs;
+        ggml_backend_dayan_init_launch_attrs(
+            ctx, graph == kDayanMegaQwen35DenseMxfp4Linear ? "q35-linear" : "q35-full-mega", &attrs);
+        attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
+        status = qwen35_dense_mxfp4_mega(
+            buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
+            arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],
+            arguments[13], arguments[14], arguments[15], &attrs);
+    }
+    ggml_backend_dayan_buffers_free(&buffers, &status);
+    return status;
+}
+
+static bool ggml_backend_dayan_mega_enabled(const ggml_backend_dayan_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
+    return ctx->device->topology.clusters == 1 && ctx->device->topology.cores == 4 &&
+           ggml_backend_dayan_trace_callback == nullptr && ggml_backend_dayan_filter_callback == nullptr;
+}
+
 static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_dayan_context *  ctx = (ggml_backend_dayan_context *) backend->context;
     ggml_backend_dayan_graph_plan plan;
@@ -3301,9 +3348,40 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
         ctx->slot_resources.resize(plan.slots.size());
     }
 
+    const ggml_backend_dayan_mega_runtime mega_runtime = {
+        ctx,
+        ggml_backend_dayan_mega_enabled(ctx),
+        ggml_backend_dayan_mega_resolve,
+        ggml_backend_dayan_mega_launch,
+    };
+    bool split_boundary = false;
+
     for (size_t slot_index = 0; slot_index < plan.slots.size(); ++slot_index) {
-        ctx->active_slot                                    = slot_index;
-        const ggml_backend_dayan_graph_slot & slot          = plan.slots[slot_index];
+        ctx->active_slot = slot_index;
+        const ggml_backend_dayan_mega_result mega =
+            ggml_backend_dayan_try_qwen35_mega(mega_runtime, plan.slots, slot_index);
+        if (mega.launched) {
+            status = mega.status;
+            if (status < 0) {
+                GGML_LOG_ERROR("%s: slots %zu..%zu failed in Qwen3.5 mega executor with status %d\n", __func__,
+                               slot_index, mega.end, status);
+                break;
+            }
+            split_boundary = true;
+            slot_index     = mega.end - 1;
+            continue;
+        }
+
+        ggml_backend_dayan_graph_slot boundary_slot;
+        const ggml_backend_dayan_graph_slot * slot_ptr = &plan.slots[slot_index];
+        if (split_boundary) {
+            boundary_slot              = *slot_ptr;
+            boundary_slot.nodes[0]     = nullptr;
+            boundary_slot.output_mask &= ~kDayanNormSlotOutputResidual;
+            slot_ptr                    = &boundary_slot;
+            split_boundary              = false;
+        }
+        const ggml_backend_dayan_graph_slot & slot = *slot_ptr;
         if (!ggml_backend_dayan_filter_slot(slot, slot_index)) {
             ggml_backend_dayan_trace_slot(slot, slot_index, false, 0, 0);
             continue;

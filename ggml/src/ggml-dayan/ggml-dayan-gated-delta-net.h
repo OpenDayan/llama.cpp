@@ -762,7 +762,7 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
                     config->k_heads == 0 || config->heads % config->q_heads != 0 ||
                     config->heads % config->k_heads != 0 || config->q_sequences == 0 || config->k_sequences == 0 ||
                     config->sequences % config->q_sequences != 0 || config->sequences % config->k_sequences != 0 ||
-                    dayan_task_mode() != 1U || dayan_task_dim(DAYAN_TASK_X) == 0U ||
+                    !ggml_dayan_matmul_detail::dayan_native_task_mode_valid() || dayan_task_dim(DAYAN_TASK_X) == 0U ||
                     dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U ||
                     dayan_uram_base() == nullptr ||

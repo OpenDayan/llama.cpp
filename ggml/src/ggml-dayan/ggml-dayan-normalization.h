@@ -27,14 +27,19 @@ struct NormalizationLayout {
 static_assert(NormalizationLayout::kTotalBytes <= DAYAN_NATIVE_TASK_URAM_BYTES, "Native Task URAM layout is too large");
 static_assert((NormalizationLayout::kScalar & 63U) == 0U, "Normalization scalar storage must be 64-byte aligned");
 
-static inline uint32_t dayan_native_task_id() {
+static inline bool dayan_native_task_mode_valid() {
     const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
     const uint32_t task  = dayan_task_id(DAYAN_TASK_X);
-    if (dayan_task_mode() != 1U || tasks == 0U || task >= tasks ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
+    const uint32_t mode  = dayan_task_mode();
+    return (mode == 1U || (mode == 4U && tasks == 4U)) && tasks != 0U && task < tasks &&
+           dayan_task_dim(DAYAN_TASK_Y) == 1U && dayan_task_dim(DAYAN_TASK_Z) == 1U;
+}
+
+static inline uint32_t dayan_native_task_id() {
+    if (!dayan_native_task_mode_valid()) {
         DAYAN_PARAMS_ERROR();
     }
-    return task;
+    return dayan_task_id(DAYAN_TASK_X);
 }
 
 static inline uint32_t dayan_native_task_count() {

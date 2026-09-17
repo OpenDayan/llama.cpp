@@ -122,7 +122,7 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
                     config->sequences == 0 || config->kernel_size == 0 ||
                     config->kernel_size > kDayanSSMConvMaxKernelSize ||
                     (uint64_t) config->input_length != (uint64_t) config->kernel_size - 1U + config->tokens ||
-                    (config->flags & ~1U) != 0 || dayan_task_mode() != 1U ||
+                    (config->flags & ~1U) != 0 || !dayan_native_task_mode_valid() ||
                     dayan_task_dim(DAYAN_TASK_X) == 0U ||
                     dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
