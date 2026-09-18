@@ -144,7 +144,7 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
     }
 
     std::mt19937                          generator(seed);
-    std::uniform_real_distribution<float> distribution(-0.25f, 0.25f);
+    std::uniform_real_distribution<float> distribution(-4.0f, 4.0f);
     std::vector<float>                    q_f32((size_t) ggml_nelements(reference.q_input));
     std::vector<uint16_t>                 q_lowp(q_f32.size());
     std::vector<uint16_t>                 k((size_t) ggml_nelements(reference.k_input));
@@ -293,6 +293,7 @@ int main() {
         return fail("numerical comparison failed");
     }
     if (test_permuted_cache_layout(dayan.get(), cpu.get(), 3, 64, 9, 0x35f17U) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 4, 4, 4, 0x35f26U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 1, 0x35f18U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 2048, 1025, 0x35f20U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 513, 0x35f21U, GGML_TYPE_F16) != 0 ||

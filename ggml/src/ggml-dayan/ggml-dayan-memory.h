@@ -861,7 +861,6 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
     if (source_elements != config->elements) {
         DAYAN_PARAMS_ERROR();
     }
-
     const uint32_t source_bytes        = memory_type_bytes(config->source_type);
     const uint32_t destination_bytes   = memory_type_bytes(config->destination_type);
     const uint32_t task                = dayan_native_task_id();

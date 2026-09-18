@@ -56,6 +56,17 @@
         {"case": "decode-vocab", "factor": 248320, "divisor": 6144, "reason": "one final-token BF16 vocabulary projection, N scaled from 6144 to 248320; excludes its BF16 activation cast"}
       ]
     },
+    "qwen35-mega-bf16": {
+      "description": "Single Qwen3.5 Dense BF16 transformer blocks for Dayan mega validation: one linear-attention block and one full-attention block. Each case uses a deterministic CPU graph and requires one cmodel mega launch.",
+      "cases": [
+        {"name": "mega-linear", "op": "mega", "dtype": "bf16", "mode": "linear", "layers": 1},
+        {"name": "mega-full", "op": "mega", "dtype": "bf16", "mode": "full", "layers": 1}
+      ],
+      "prediction_terms": [
+        {"case": "{phase}-mega-linear", "factor": 1, "reason": "one linear-attention transformer block"},
+        {"case": "{phase}-mega-full", "factor": 1, "reason": "one full-attention transformer block"}
+      ]
+    },
     "qwen35-0.8B-mxfp4-vocab": {
       "description": "Qwen3.5-0.8B MXFP4: 24 inference blocks (18 linear, 6 full attention), hidden=1024, FFN=3584, vocab=248320; excludes MTP. Dense projections use MXFP4; attention keeps floating-point storage and the shared embedding and vocabulary weight are MXFP4. Batch=1, one final-token logit row.",
       "cases": [

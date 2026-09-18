@@ -78,6 +78,12 @@ static std::vector<ggml_backend_dayan_buffer_context *> ggml_backend_dayan_buffe
 static std::mutex                                       ggml_backend_dayan_trace_mutex;
 static ggml_backend_dayan_slot_trace_callback           ggml_backend_dayan_trace_callback;
 static void *                                           ggml_backend_dayan_trace_user_data;
+static uint64_t                                         ggml_backend_dayan_mega_launch_count;
+
+static uint64_t ggml_backend_dayan_get_mega_launch_count() {
+    return ggml_backend_dayan_mega_launch_count;
+}
+
 static ggml_backend_dayan_slot_filter_callback          ggml_backend_dayan_filter_callback;
 static void *                                           ggml_backend_dayan_filter_user_data;
 
@@ -2801,6 +2807,12 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
     if (dst->src[3] != nullptr) {
         config.flags = 1U;
     }
+    if (q->ne[1] == 4 && q->ne[0] == 256) {
+        GGML_LOG_INFO("flash cfg batch=%u qh=%u kvh=%u qlen=%u kvlen=%u off=%u flags=%u qnb=[%zu,%zu,%zu,%zu] knb=[%zu,%zu,%zu,%zu] vnb=[%zu,%zu,%zu,%zu]\\n",
+                      config.batch, config.q_heads, config.kv_heads, config.q_len, config.kv_len,
+                      config.causal_offset, config.flags, q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+                      k->nb[0], k->nb[1], k->nb[2], k->nb[3], v->nb[0], v->nb[1], v->nb[2], v->nb[3]);
+    }
 
     ggml_backend_dayan_buffers buffers;
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(int64_t), &buffers);
@@ -3111,6 +3123,10 @@ static void ggml_backend_dayan_buffer_set_tensor(ggml_backend_buffer_t buffer,
     if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         std::memcpy((char *) tensor->data + offset, data, size);
     }
+    if (std::getenv("DAYAN_TRACE_SET") != nullptr) {
+        std::fprintf(stderr, "DAYAN_SET t=%llu name=%s offset=%zu size=%zu dev=%p\n",
+                     (unsigned long long) ggml_time_us(), tensor->name, offset, size, (void *) view);
+    }
 }
 
 static void ggml_backend_dayan_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -3315,10 +3331,16 @@ static int ggml_backend_dayan_mega_launch(void * context,
         ggml_backend_dayan_init_launch_attrs(
             ctx, linear ? "q35-linear" : "q35-full-mega", &attrs);
         attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
+        if (std::getenv("DAYAN_TRACE_SET") != nullptr) {
+            std::fprintf(stderr, "MEGA_BEGIN t=%llu\n", (unsigned long long) ggml_time_us());
+        }
         status = qwen35_dense_mega(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
             arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],
             arguments[13], arguments[14], arguments[15], &attrs);
+        if (std::getenv("DAYAN_TRACE_SET") != nullptr) {
+            std::fprintf(stderr, "MEGA_END t=%llu status=%d\n", (unsigned long long) ggml_time_us(), status);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     return status;
@@ -3368,6 +3390,7 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
         const ggml_backend_dayan_mega_result mega =
             ggml_backend_dayan_try_qwen35_mega(mega_runtime, plan.slots, slot_index);
         if (mega.launched) {
+            ++ggml_backend_dayan_mega_launch_count;
             status = mega.status;
             if (status < 0) {
                 GGML_LOG_ERROR("%s: slots %zu..%zu failed in Qwen3.5 mega executor with status %d\n", __func__,
@@ -3922,6 +3945,9 @@ static void * ggml_backend_dayan_reg_get_proc_address(ggml_backend_reg_t reg, co
     }
     if (strcmp(name, "ggml_backend_dayan_get_graph_plan") == 0) {
         return (void *) ggml_backend_dayan_get_graph_plan;
+    }
+    if (strcmp(name, "ggml_backend_dayan_get_mega_launch_count") == 0) {
+        return (void *) ggml_backend_dayan_get_mega_launch_count;
     }
     return nullptr;
 }

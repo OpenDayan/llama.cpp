@@ -8549,6 +8549,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     int ith = params->ith;
 
+    // The query may arrive in a low-precision type (for example when the graph feeds the
+    // attention a cast F16/BF16 query row). Materialize such rows in F32 so the
+    // vec_dot conversion below sees real values instead of reinterpreted bytes.
+    ggml_to_float_t   q_to_float = ggml_get_type_traits(q->type)->to_float;
+    std::vector<float> q_f32(q->type == GGML_TYPE_F32 ? 0 : DK);
+
     for (int ir = ir0; ir < ir1; ++ir) {
         // q indices
         const int iq3 = ir/(neq2*neq1);
@@ -8582,7 +8588,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const int iv3 = iq3 / rv3;
         const int iv2 = iq2 / rv2;
 
-        const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+        const char * pq_bytes = (const char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3);
+        const float * pq;
+        if (q->type == GGML_TYPE_F32) {
+            pq = (const float *) pq_bytes;
+        } else {
+            q_to_float(pq_bytes, q_f32.data(), DK);
+            pq = q_f32.data();
+        }
         q_to_vec_dot(pq, Q_q, DK);
 
         // online softmax / attention

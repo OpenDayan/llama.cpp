@@ -43,6 +43,8 @@ struct Qwen35DenseBf16LinearGraph {
     };
 
     static const Operation operations[];
+    static constexpr bool kProbeFlashQ = false;
+    static constexpr bool kProbeGdn = true;
     static constexpr uint16_t operation_count = 64;
 };
 
@@ -137,6 +139,8 @@ struct Qwen35DenseBf16FullGraph {
     };
 
     static const Operation operations[];
+    static constexpr bool kProbeFlashQ = false;
+    static constexpr bool kProbeGdn = false;
     static constexpr uint16_t operation_count = 36;
 };
 

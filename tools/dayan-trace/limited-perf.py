@@ -37,13 +37,17 @@ def load_model(name=DEFAULT_MODEL):
         raise ValueError(f"unknown model {name!r}; choose from: " + ", ".join(models))
     model = models[name]
     names = set()
-    allowed = {"name", "op", "n", "k", "dtype", "output_dtype", "phases", "channels", "kernel",
-               "heads", "q_heads", "kv_heads", "head_dim", "snapshots"}
+    allowed = {"name", "op", "m", "n", "k", "dtype", "output_dtype", "phases", "channels", "kernel",
+               "heads", "q_heads", "kv_heads", "head_dim", "snapshots", "mode", "layers"}
     for case in model["cases"]:
         if not re.fullmatch(r"[a-z0-9-]+", case["name"]) or case["name"] in names or set(case) - allowed:
             raise ValueError(f"invalid or duplicate case in model {name}: {case}")
-        if case["op"] not in ("matmul", "ffn", "quantize", "gdn", "ssm_conv", "attention", "norm"):
+        if case["op"] not in ("matmul", "ffn", "quantize", "gdn", "ssm_conv", "attention", "norm", "mega"):
             raise ValueError(f"unsupported operator in model {name}: {case['op']}")
+        if case["op"] == "mega" and (case.get("mode") not in ("linear", "full") or case.get("layers") != 1 or
+                                             not 1 <= case.get("m", 1) <= 512 or
+                                             case.get("dtype", "bf16") != "bf16" or case.get("output_dtype", "f32") != "f32"):
+            raise ValueError(f"mega case must be one BF16 linear/full layer in model {name}: {case['name']}")
         names.add(case["name"])
         phases = case.get("phases", ["prefill", "decode"])
         if not phases or any(phase not in ("prefill", "decode") for phase in phases):
@@ -81,7 +85,7 @@ def prediction_terms(phase, model=None):
 
 
 def case_types(case):
-    dtype = case.get("dtype", "bf16" if case["op"] in ("matmul", "ffn", "attention") else "f32")
+    dtype = case.get("dtype", "bf16" if case["op"] in ("matmul", "ffn", "attention", "mega") else "f32")
     output = case.get("output_dtype", "bf16" if case["op"] in ("ffn", "norm") else "mxfp4" if case["op"] == "quantize" else "f32")
     return dtype, output
 
@@ -151,7 +155,7 @@ def cycle_span(roots, tag, tasks):
 
 def shape_text(case):
     dtype, output = case_types(case)
-    shape = " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len") if key in case)
+    shape = " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len", "mode", "layers") if key in case)
     return f"{shape} dtype={dtype} output={output}"
 
 
@@ -330,6 +334,10 @@ def main():
         if args.cmp:
             for case in cases:
                 case.update(cmp=True, seed=args.cmp_seed)
+    if any(case["op"] == "mega" for case in cases) and args.command == "run" and args.simulator != "cmodel":
+        parser.error("mega cases are restricted to --simulator cmodel")
+    if any(case["op"] == "mega" for case in cases) and args.command == "run" and (args.repeats != 1 or args.warmup != 0):
+        parser.error("mega cases currently require --repeats 1 --warmup 0")
     if args.cases:
         missing = set(args.cases) - {case["id"] for case in cases}
         if missing:
@@ -365,6 +373,8 @@ def main():
             parser.error("this model needs an updated llama-dayan-operator-bench; rebuild it and pass --client")
         if args.cmp and capabilities.get("cmp") is not True:
             parser.error("--cmp needs an updated llama-dayan-operator-bench; rebuild it and pass --client")
+        if any(case["op"] == "mega" for case in cases) and "mega" not in capabilities.get("ops", []):
+            parser.error("mega cases need --client build-dayan/bin/test-dayan-qwen35-dense")
     fingerprint = hashlib.sha256(client.read_bytes()).hexdigest()
     configuration = dict(model=model_name, model_config=model, simulator=args.simulator, prefill=args.prefill, context=args.context,
                          cases=cases, client=str(client), client_sha256=fingerprint,
@@ -388,11 +398,13 @@ def main():
                         clock_hz=args.clock_hz, **configuration)
         write_json(manifest_path, manifest)
     env = dict(os.environ, DAYAN_SERVER_SOCKET=args.socket)
+    if any(case["op"] == "mega" for case in cases):
+        env["GGML_DAYAN_MEGA"] = "1"
     for index, case in enumerate(cases):
         result_path = directory / (case["id"] + ".result.json")
         if result_path.exists():
             prior = json.loads(result_path.read_text())
-            if prior.get("status") == "ok":
+            if prior.get("status") == "ok" and (case["op"] != "mega" or prior.get("mega_launched") is True):
                 print(f"Skip completed {case['id']}", flush=True)
                 continue
         spec_path = directory / (case["id"] + ".case.json")
@@ -410,6 +422,9 @@ def main():
                 result["exit_code"] = completed.returncode
                 if completed.returncode:
                     result["status"] = "failed"
+                if case["op"] == "mega" and result.get("mega_launched") is not True:
+                    result["status"] = "failed"
+                    result["error"] = "client graph did not launch a Dayan mega executor"
             except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
                 result = dict(status="failed", error=type(error).__name__ + ": verify device/server state before resuming")
                 interrupted = True

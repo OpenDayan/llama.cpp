@@ -1130,8 +1130,8 @@ static int run_reduction_norm_case(ggml_backend_t dayan, int64_t width = 130) {
 }
 
 static int run_strided_rms_case(ggml_backend_t dayan, int64_t width = 130) {
-    constexpr int64_t heads      = 2;
-    constexpr int64_t tokens     = 3;
+    constexpr int64_t heads      = 8;
+    constexpr int64_t tokens     = 1;
     const int64_t full_width = 2 * width * heads;
     constexpr float   epsilon    = 1.0e-6f;
     constexpr int     graph_size = 8;
@@ -2383,7 +2383,8 @@ int main(int argc, char ** argv) {
         run_layout_cast_hoist_case(dayan.get(), GGML_TYPE_F16) != 0 || run_elementwise_case(dayan.get()) != 0 ||
         run_empty_scale_case(dayan.get()) != 0 || run_offset_scale_case(dayan.get()) != 0 ||
         run_math_case(dayan.get()) != 0 || run_reduction_norm_case(dayan.get()) != 0 ||
-        run_strided_rms_case(dayan.get()) != 0 || run_rope_cases(dayan.get(), cpu.get()) != 0 ||
+        run_strided_rms_case(dayan.get()) != 0 || run_strided_rms_case(dayan.get(), 256) != 0 ||
+        run_rope_cases(dayan.get(), cpu.get()) != 0 ||
         run_memory_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
         run_empty_output_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
         run_empty_output_case(dayan.get(), GGML_TYPE_F16) != 0 ||

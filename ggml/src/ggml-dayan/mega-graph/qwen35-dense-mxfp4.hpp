@@ -45,6 +45,8 @@ struct Qwen35DenseMxfp4LinearGraph {
     using B = Arguments<>;
 
     static const Operation operations[];
+    static constexpr bool kProbeFlashQ = false;
+    static constexpr bool kProbeGdn = false;
     static constexpr uint16_t operation_count = 64;
 };
 
@@ -145,6 +147,8 @@ struct Qwen35DenseMxfp4FullGraph {
     };
 
     static const Operation operations[];
+    static constexpr bool kProbeFlashQ = false;
+    static constexpr bool kProbeGdn = false;
     static constexpr uint16_t operation_count = 47;
 };
 
