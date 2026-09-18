@@ -404,19 +404,18 @@ __kernel__ void qwen35_dense_mega(
     const void * root13,
     const void * root14,
     const void * root15) {
-#if defined(__DAYAN_DEVICE__)
-    if (config == nullptr) {
-        dayan_thread_exit(-22);
+    DAYAN_PARAMS_IF(config == nullptr) {
+        DAYAN_PARAMS_ERROR();
     }
     dayan_cache_invalidate(config, sizeof(*config));
     const DayanMegaParameter * encoded = (const DayanMegaParameter *) (config + 1);
-    if (shared == nullptr || dayan_task_mode() != 4U || dayan_task_dim(DAYAN_TASK_X) != 4U ||
-        dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
-        dayan_thread_exit(-22);
+    DAYAN_PARAMS_IF(shared == nullptr || dayan_task_mode() != 4U || dayan_task_dim(DAYAN_TASK_X) != 4U ||
+                    dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
+        DAYAN_PARAMS_ERROR();
     }
-    if (config->parameter_count > kDayanMegaMaxParameters ||
-        config->total_bytes < sizeof(*config) + (uint32_t) config->parameter_count * sizeof(DayanMegaParameter)) {
-        dayan_thread_exit(-22);
+    DAYAN_PARAMS_IF(config->parameter_count > kDayanMegaMaxParameters ||
+                    config->total_bytes < sizeof(*config) + (uint32_t) config->parameter_count * sizeof(DayanMegaParameter)) {
+        DAYAN_PARAMS_ERROR();
     }
     dayan_cache_invalidate(config, config->total_bytes);
 
@@ -426,42 +425,41 @@ __kernel__ void qwen35_dense_mega(
     };
     uintptr_t parameters[kDayanMegaMaxParameters];
     for (uint16_t index = 0; index < config->parameter_count; ++index) {
-        if (encoded[index].source > kDayanMegaRootCount || sources[encoded[index].source] == nullptr ||
-            (encoded[index].source == 0 && encoded[index].offset >= config->total_bytes)) {
-            dayan_thread_exit(-22);
+        DAYAN_PARAMS_IF(encoded[index].source > kDayanMegaRootCount || sources[encoded[index].source] == nullptr ||
+                        (encoded[index].source == 0 && encoded[index].offset >= config->total_bytes)) {
+            DAYAN_PARAMS_ERROR();
         }
         parameters[index] = (uintptr_t) sources[encoded[index].source] + encoded[index].offset;
     }
-
 
     dayan_cluster_barrier_t * barrier =
         (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
     int status;
     switch (config->graph) {
         case kDayanMegaQwen35DenseMxfp4Linear:
-            if (config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph::parameter_count) {
-                dayan_thread_exit(-22);
+            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph::parameter_count) {
+                DAYAN_PARAMS_ERROR();
             }
             status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph>(
                 parameters, barrier);
             break;
         case kDayanMegaQwen35DenseMxfp4Full:
-            if (config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph::parameter_count) {
-                dayan_thread_exit(-22);
+            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph::parameter_count) {
+                DAYAN_PARAMS_ERROR();
             }
             status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph>(
                 parameters, barrier);
             break;
         case kDayanMegaQwen35DenseBf16Linear:
-            if (config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph::parameter_count) {
-                dayan_thread_exit(-22);
+            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph::parameter_count) {
+                DAYAN_PARAMS_ERROR();
             }
             status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph>(
                 parameters, barrier);
             break;
         case kDayanMegaQwen35DenseBf16Full:
-            if (config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph::parameter_count) {
-                dayan_thread_exit(-22);
+            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph::parameter_count) {
+                DAYAN_PARAMS_ERROR();
             }
             status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph>(
                 parameters, barrier);
@@ -473,25 +471,6 @@ __kernel__ void qwen35_dense_mega(
     if (status < 0) {
         dayan_thread_exit(status);
     }
-#else
-    (void) config;
-    (void) root0;
-    (void) root1;
-    (void) root2;
-    (void) root3;
-    (void) root4;
-    (void) root5;
-    (void) root6;
-    (void) root7;
-    (void) root8;
-    (void) root9;
-    (void) root10;
-    (void) root11;
-    (void) root12;
-    (void) root13;
-    (void) root14;
-    (void) root15;
-#endif
 }
 
 DAYAN_KERNEL_RESOURCE_DESC_EX(
