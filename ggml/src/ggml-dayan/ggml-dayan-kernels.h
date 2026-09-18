@@ -215,6 +215,15 @@ struct DayanElementwiseConfig {
     uint64_t elements;
 };
 
+// Binary elementwise config. The right operand may broadcast: each right_ne[d]
+// must divide ne[d]. The kernel loads both operands contiguously and expands
+// the right operand inside the vector registers.
+struct DayanBinaryConfig {
+    uint64_t elements;
+    uint32_t ne[4];
+    uint32_t right_ne[4];
+};
+
 struct DayanReduceConfig {
     uint32_t width;
     uint32_t rows;

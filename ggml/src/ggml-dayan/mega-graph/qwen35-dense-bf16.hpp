@@ -22,9 +22,9 @@ struct Qwen35DenseBf16LinearGraph {
         p_l2k       = NextParameter<p_l2q, 3>::value,
         p_alpha     = NextParameter<p_l2k, 3>::value,
         p_alpha_add = NextParameter<p_alpha, 4>::value,
-        p_softplus  = NextParameter<p_alpha_add, 7>::value,
+        p_softplus  = NextParameter<p_alpha_add, 4>::value,
         p_alpha_mul = NextParameter<p_softplus, 3>::value,
-        p_beta      = NextParameter<p_alpha_mul, 7>::value,
+        p_beta      = NextParameter<p_alpha_mul, 4>::value,
         p_sigmoid   = NextParameter<p_beta, 4>::value,
         p_gdn       = NextParameter<p_sigmoid, 3>::value,
         p_copy2     = NextParameter<p_gdn, 8>::value,
@@ -43,9 +43,7 @@ struct Qwen35DenseBf16LinearGraph {
     };
 
     static const Operation operations[];
-    static constexpr bool kProbeFlashQ = false;
-    static constexpr bool kProbeGdn = true;
-    static constexpr uint16_t operation_count = 64;
+    static constexpr uint16_t operation_count = 60;
 };
 
 const Operation Qwen35DenseBf16LinearGraph::operations[] = {
@@ -74,15 +72,11 @@ const Operation Qwen35DenseBf16LinearGraph::operations[] = {
     { nullptr, nullptr },
     { matmul_bf16, Arguments<p_alpha + 0, p_alpha + 1, p_alpha + 2, p_alpha + 3>::values },
     { nullptr, nullptr },
-    { repeat, Arguments<p_alpha_add + 0, p_alpha_add + 1, p_alpha_add + 2>::values },
-    { nullptr, nullptr },
-    { add, Arguments<p_alpha_add + 3, p_alpha_add + 4, p_alpha_add + 5, p_alpha_add + 6>::values },
+    { add, Arguments<p_alpha_add + 0, p_alpha_add + 1, p_alpha_add + 2, p_alpha_add + 3>::values },
     { nullptr, nullptr },
     { softplus, Arguments<p_softplus + 0, p_softplus + 1, p_softplus + 2>::values },
     { nullptr, nullptr },
-    { repeat, Arguments<p_alpha_mul + 0, p_alpha_mul + 1, p_alpha_mul + 2>::values },
-    { nullptr, nullptr },
-    { multiply, Arguments<p_alpha_mul + 3, p_alpha_mul + 4, p_alpha_mul + 5, p_alpha_mul + 6>::values },
+    { multiply, Arguments<p_alpha_mul + 0, p_alpha_mul + 1, p_alpha_mul + 2, p_alpha_mul + 3>::values },
     { nullptr, nullptr },
     { matmul_bf16, Arguments<p_beta + 0, p_beta + 1, p_beta + 2, p_beta + 3>::values },
     { nullptr, nullptr },
@@ -121,7 +115,7 @@ struct Qwen35DenseBf16FullGraph {
         p_qg        = NextParameter<p_norm0, 8>::value,
         p_q_norm    = NextParameter<p_qg, 4>::value,
         p_q_scale   = NextParameter<p_q_norm, 3>::value,
-        p_q_rope    = NextParameter<p_q_scale, 7>::value,
+        p_q_rope    = NextParameter<p_q_scale, 4>::value,
         p_kv        = NextParameter<p_q_rope, 5>::value,
         p_k_norm    = NextParameter<p_kv, 6>::value,
         p_k_rope    = NextParameter<p_k_norm, 8>::value,
@@ -139,9 +133,7 @@ struct Qwen35DenseBf16FullGraph {
     };
 
     static const Operation operations[];
-    static constexpr bool kProbeFlashQ = false;
-    static constexpr bool kProbeGdn = false;
-    static constexpr uint16_t operation_count = 36;
+    static constexpr uint16_t operation_count = 34;
 };
 
 const Operation Qwen35DenseBf16FullGraph::operations[] = {
@@ -151,9 +143,7 @@ const Operation Qwen35DenseBf16FullGraph::operations[] = {
     { nullptr, nullptr },
     { rms_norm, Arguments<p_q_norm + 0, p_q_norm + 1, p_q_norm + 2>::values },
     { nullptr, nullptr },
-    { repeat, Arguments<p_q_scale + 0, p_q_scale + 1, p_q_scale + 2>::values },
-    { nullptr, nullptr },
-    { multiply, Arguments<p_q_scale + 3, p_q_scale + 4, p_q_scale + 5, p_q_scale + 6>::values },
+    { multiply, Arguments<p_q_scale + 0, p_q_scale + 1, p_q_scale + 2, p_q_scale + 3>::values },
     { nullptr, nullptr },
     { rope, Arguments<p_q_rope + 0, p_q_rope + 1, p_q_rope + 2, p_q_rope + 3, p_q_rope + 4>::values },
     { nullptr, nullptr },

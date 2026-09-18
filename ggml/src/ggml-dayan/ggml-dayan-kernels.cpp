@@ -1542,37 +1542,37 @@ __kernel__ void residual_add_fp16_1c(const DayanElementwiseConfig * config,
                      normalization_load_lowp<__tx_vec_cvt_fp32_fp16<0, 0, 0>>>(config, left, right, output);
 }
 
-__kernel__ void elementwise_add_f32_1c(const DayanElementwiseConfig * config,
-                                       const float *                  left,
-                                       const float *                  right,
-                                       float *                        output) {
+__kernel__ void elementwise_add_f32_1c(const DayanBinaryConfig * config,
+                                       const float *             left,
+                                       const float *             right,
+                                       float *                   output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
     run_binary_f32<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(config, left, right, output);
 }
 
-__kernel__ void elementwise_mul_f32_1c(const DayanElementwiseConfig * config,
-                                       const float *                  left,
-                                       const float *                  right,
-                                       float *                        output) {
+__kernel__ void elementwise_mul_f32_1c(const DayanBinaryConfig * config,
+                                       const float *             left,
+                                       const float *             right,
+                                       float *                   output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
     run_binary_f32<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(config, left, right, output);
 }
 
-__kernel__ void elementwise_sub_f32_1c(const DayanElementwiseConfig * config,
-                                       const float *                  left,
-                                       const float *                  right,
-                                       float *                        output) {
+__kernel__ void elementwise_sub_f32_1c(const DayanBinaryConfig * config,
+                                       const float *             left,
+                                       const float *             right,
+                                       float *                   output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
     run_binary_f32<__tx_vec_vv_fp32_sub<0, 0, 16, 0>>(config, left, right, output);
 }
 
-__kernel__ void elementwise_div_f32_1c(const DayanElementwiseConfig * config,
-                                       const float *                  left,
-                                       const float *                  right,
-                                       float *                        output) {
+__kernel__ void elementwise_div_f32_1c(const DayanBinaryConfig * config,
+                                       const float *             left,
+                                       const float *             right,
+                                       float *                   output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
     run_div_f32(config, left, right, output);

@@ -1856,19 +1856,45 @@ static const ggml_tensor * ggml_backend_dayan_norm_scale(const ggml_tensor * mul
 
 static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *          ctx,
                                                  const ggml_backend_dayan_graph_slot & slot) {
-    ggml_tensor *                output = slot.nodes[0];
-    const ggml_tensor *          left   = output->src[0];
-    const ggml_tensor *          right  = output->src[1];
-    const DayanElementwiseConfig config = { (uint64_t) ggml_nelements(output) };
-    const size_t                 bytes  = (size_t) config.elements * sizeof(float);
-    ggml_backend_dayan_buffers   buffers;
-    const size_t config_capacity = std::max({ sizeof(config), sizeof(DayanRepeatConfig), sizeof(DayanCopyConfig) });
-    int                          status = ggml_backend_dayan_prepare_launch_buffers_with_capacity(
+    ggml_tensor *       output = slot.nodes[0];
+    const ggml_tensor * left   = output->src[0];
+    const ggml_tensor * right  = output->src[1];
+    // The full (output-shaped) operand must be the left input; the right one
+    // may broadcast. Only commutative kinds can swap their operands.
+    const bool commutative = slot.kind == ggml_backend_dayan_slot_kind::elementwise_add ||
+                             slot.kind == ggml_backend_dayan_slot_kind::elementwise_mul;
+    if (!ggml_are_same_shape(output, left) && commutative && ggml_are_same_shape(output, right)) {
+        const ggml_tensor * swap = left;
+        left                     = right;
+        right                    = swap;
+    }
+    if (!ggml_are_same_shape(output, left)) {
+        GGML_LOG_ERROR("%s: Dayan elementwise broadcast is only supported on the right operand\n", __func__);
+        return -1;
+    }
+    DayanBinaryConfig config  = {};
+    config.elements           = (uint64_t) ggml_nelements(output);
+    bool divisible            = true;
+    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+        if (right->ne[dimension] <= 0 || output->ne[dimension] % right->ne[dimension] != 0) {
+            divisible = false;
+            break;
+        }
+        config.ne[dimension]       = (uint32_t) output->ne[dimension];
+        config.right_ne[dimension] = (uint32_t) right->ne[dimension];
+    }
+    if (!divisible || (config.right_ne[0] != config.ne[0] && (64U % config.right_ne[0]) != 0U)) {
+        GGML_LOG_ERROR("%s: Dayan elementwise broadcast shape is not supported\n", __func__);
+        return -1;
+    }
+    const size_t               config_capacity = std::max(sizeof(config), sizeof(DayanCopyConfig));
+    ggml_backend_dayan_buffers buffers;
+    int                        status = ggml_backend_dayan_prepare_launch_buffers_with_capacity(
         ctx, &config, sizeof(config), config_capacity, 0, &buffers);
     npu_buffer_t * inputs[] = { ggml_backend_dayan_tensor_buffer(left), ggml_backend_dayan_tensor_buffer(right) };
     npu_buffer_t ** packed[] = { &buffers.weight0, &buffers.input3 };
     for (int source = 0; source < 2 && status == 0; ++source) {
-        const ggml_tensor * input = output->src[source];
+        const ggml_tensor * input = source == 0 ? left : right;
         if (ggml_is_contiguous(input)) {
             continue;
         }
@@ -1890,29 +1916,6 @@ static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *   
             inputs[source] = *packed[source];
         }
     }
-    npu_buffer_t * right_buffer = inputs[1];
-    if (status == 0 && !ggml_are_same_shape(right, output)) {
-        status                   = ggml_backend_dayan_buffer_create(ctx->context, bytes, &buffers.weight1);
-        right_buffer             = buffers.weight1;
-        DayanRepeatConfig repeat = {};
-        repeat.type              = kDayanDataTypeF32;
-        for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
-            repeat.source_ne[dimension] = (uint32_t) right->ne[dimension];
-            repeat.output_ne[dimension] = (uint32_t) output->ne[dimension];
-        }
-        if (status == 0) {
-            status =
-                ggml_backend_dayan_upload_slot_config(ctx, &repeat, sizeof(repeat), config_capacity, &buffers.config);
-        }
-        if (status == 0) {
-            npu_kernel_launch_attrs_t attrs;
-            ggml_backend_dayan_init_native_launch_attrs(ctx, "repeat", 1, &attrs);
-            status = repeat_1c(buffers.config, inputs[1], right_buffer, &attrs);
-            if (status < 0) {
-                GGML_LOG_ERROR("%s: Dayan elementwise repeat failed with status %d\n", __func__, status);
-            }
-        }
-    }
     if (status == 0) {
         status = ggml_backend_dayan_upload_slot_config(ctx, &config, sizeof(config), config_capacity,
                                                        &buffers.config);
@@ -1923,25 +1926,25 @@ static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *   
             case ggml_backend_dayan_slot_kind::elementwise_add:
                 ggml_backend_dayan_init_native_launch_attrs(
                     ctx, "elementwise-add", ggml_backend_dayan_native_tiles(config.elements), &attrs);
-                status = elementwise_add_f32_1c(buffers.config, inputs[0], right_buffer,
+                status = elementwise_add_f32_1c(buffers.config, inputs[0], inputs[1],
                                                 ggml_backend_dayan_tensor_buffer(output), &attrs);
                 break;
             case ggml_backend_dayan_slot_kind::elementwise_mul:
                 ggml_backend_dayan_init_native_launch_attrs(
                     ctx, "elementwise-mul", ggml_backend_dayan_native_tiles(config.elements), &attrs);
-                status = elementwise_mul_f32_1c(buffers.config, inputs[0], right_buffer,
+                status = elementwise_mul_f32_1c(buffers.config, inputs[0], inputs[1],
                                                 ggml_backend_dayan_tensor_buffer(output), &attrs);
                 break;
             case ggml_backend_dayan_slot_kind::elementwise_sub:
                 ggml_backend_dayan_init_native_launch_attrs(
                     ctx, "elementwise-sub", ggml_backend_dayan_native_tiles(config.elements), &attrs);
-                status = elementwise_sub_f32_1c(buffers.config, inputs[0], right_buffer,
+                status = elementwise_sub_f32_1c(buffers.config, inputs[0], inputs[1],
                                                 ggml_backend_dayan_tensor_buffer(output), &attrs);
                 break;
             case ggml_backend_dayan_slot_kind::elementwise_div:
                 ggml_backend_dayan_init_native_launch_attrs(
                     ctx, "elementwise-div", ggml_backend_dayan_native_tiles(config.elements), &attrs);
-                status = elementwise_div_f32_1c(buffers.config, inputs[0], right_buffer,
+                status = elementwise_div_f32_1c(buffers.config, inputs[0], inputs[1],
                                                 ggml_backend_dayan_tensor_buffer(output), &attrs);
                 break;
             default:
@@ -2807,12 +2810,6 @@ static int ggml_backend_dayan_flash_attention(ggml_backend_dayan_context * ctx, 
     if (dst->src[3] != nullptr) {
         config.flags = 1U;
     }
-    if (q->ne[1] == 4 && q->ne[0] == 256) {
-        GGML_LOG_INFO("flash cfg batch=%u qh=%u kvh=%u qlen=%u kvlen=%u off=%u flags=%u qnb=[%zu,%zu,%zu,%zu] knb=[%zu,%zu,%zu,%zu] vnb=[%zu,%zu,%zu,%zu]\\n",
-                      config.batch, config.q_heads, config.kv_heads, config.q_len, config.kv_len,
-                      config.causal_offset, config.flags, q->nb[0], q->nb[1], q->nb[2], q->nb[3],
-                      k->nb[0], k->nb[1], k->nb[2], k->nb[3], v->nb[0], v->nb[1], v->nb[2], v->nb[3]);
-    }
 
     ggml_backend_dayan_buffers buffers;
     int status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), sizeof(int64_t), &buffers);
@@ -3123,10 +3120,6 @@ static void ggml_backend_dayan_buffer_set_tensor(ggml_backend_buffer_t buffer,
     if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         std::memcpy((char *) tensor->data + offset, data, size);
     }
-    if (std::getenv("DAYAN_TRACE_SET") != nullptr) {
-        std::fprintf(stderr, "DAYAN_SET t=%llu name=%s offset=%zu size=%zu dev=%p\n",
-                     (unsigned long long) ggml_time_us(), tensor->name, offset, size, (void *) view);
-    }
 }
 
 static void ggml_backend_dayan_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -3331,16 +3324,10 @@ static int ggml_backend_dayan_mega_launch(void * context,
         ggml_backend_dayan_init_launch_attrs(
             ctx, linear ? "q35-linear" : "q35-full-mega", &attrs);
         attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
-        if (std::getenv("DAYAN_TRACE_SET") != nullptr) {
-            std::fprintf(stderr, "MEGA_BEGIN t=%llu\n", (unsigned long long) ggml_time_us());
-        }
         status = qwen35_dense_mega(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
             arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],
             arguments[13], arguments[14], arguments[15], &attrs);
-        if (std::getenv("DAYAN_TRACE_SET") != nullptr) {
-            std::fprintf(stderr, "MEGA_END t=%llu status=%d\n", (unsigned long long) ggml_time_us(), status);
-        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     return status;

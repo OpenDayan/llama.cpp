@@ -24,12 +24,44 @@ static inline void elementwise_validate(uint64_t elements, const void * input, v
 
 using BinaryOperation = void (*)();
 
+static inline bool binary_config_valid(const DayanBinaryConfig * config) {
+    if (config->elements == 0 || config->ne[0] == 0) {
+        return false;
+    }
+    uint64_t elements = 1;
+    for (int dimension = 0; dimension < 4; ++dimension) {
+        if (config->ne[dimension] == 0 || config->right_ne[dimension] == 0 ||
+            config->ne[dimension] % config->right_ne[dimension] != 0) {
+            return false;
+        }
+        elements *= config->ne[dimension];
+    }
+    if (elements != config->elements) {
+        return false;
+    }
+    // A partial right row must fill whole vector lanes so one contiguous load
+    // can feed every 64-lane grid step of the broadcast iterator.
+    if (config->right_ne[0] != config->ne[0] && (Constants::kVecLanes % config->right_ne[0]) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static inline bool binary_same_shape(const DayanBinaryConfig * config) {
+    for (int dimension = 0; dimension < 4; ++dimension) {
+        if (config->right_ne[dimension] != config->ne[dimension]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <BinaryOperation Operation>
-static void run_binary_f32(const DayanElementwiseConfig * config,
-                           const float *                  left,
-                           const float *                  right,
-                           float *                        output) {
-    if (config == nullptr || right == nullptr) {
+static void run_binary_f32(const DayanBinaryConfig * config,
+                           const float *             left,
+                           const float *             right,
+                           float *                   output) {
+    if (config == nullptr || right == nullptr || !binary_config_valid(config)) {
         DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, left, output);
@@ -43,36 +75,103 @@ static void run_binary_f32(const DayanElementwiseConfig * config,
     const uint32_t task       = dayan_native_task_id();
     const uint32_t tasks      = dayan_native_task_count();
     ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements);
-    for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
-         offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
-        const uint64_t remaining = config->elements - offset;
-        const uint32_t elements  = remaining < NormalizationLayout::kTileElements ?
-                                       (uint32_t) remaining :
-                                       (uint32_t) NormalizationLayout::kTileElements;
-        load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
-                       (uint64_t) (uintptr_t) (left + offset));
-        load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
-                       (uint64_t) (uintptr_t) (right + offset));
+
+    if (binary_same_shape(config)) {
+        for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
+             offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
+            const uint64_t remaining = config->elements - offset;
+            const uint32_t elements  = remaining < NormalizationLayout::kTileElements ?
+                                           (uint32_t) remaining :
+                                           (uint32_t) NormalizationLayout::kTileElements;
+            load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
+                           (uint64_t) (uintptr_t) (left + offset));
+            load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                           (uint64_t) (uintptr_t) (right + offset));
+            dayan_wait_lsu();
+            constexpr long instructions = 4;
+            ggml_dayan_vec_detail::begin_vec_block(instructions);
+            __tx_vec_lsu_u2v<0, 0>((long) left_uram);
+            __tx_vec_lsu_u2v<1, 1>((long) right_uram);
+            Operation();
+            __tx_vec_lsu_v2u<0, 3>((long) out_uram);
+            ggml_dayan_vec_detail::start_vec_block(instructions);
+            dayan_wait_vec();
+            store_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
+                            (uint64_t) (uintptr_t) (output + offset));
+            dayan_wait_lsu();
+        }
+        return;
+    }
+
+    // Broadcast layout. Units never cross a row. The right operand is loaded
+    // contiguously; the V1 iterator repeats it across the 64-lane grid steps:
+    // a full right row advances by kVecBytes, a tiled right row (right row
+    // width divides one vector register) re-reads the same lanes, and a scalar
+    // right row uses the broadcast load.
+    const uint64_t row_elements = config->ne[0];
+    const uint64_t rows         = config->elements / row_elements;
+    const uint64_t right_row    = config->right_ne[0];
+    const bool     right_full   = right_row == row_elements;
+    const bool     right_scalar = right_row == 1;
+    const uint64_t unit         = row_elements < NormalizationLayout::kTileElements ? row_elements :
+                                                                         NormalizationLayout::kTileElements;
+    const uint64_t units_per_row = (row_elements + unit - 1) / unit;
+    const uint64_t right_copies  = right_full || right_scalar ? 1 : Constants::kVecLanes / right_row;
+    ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements,
+                                              right_full ? (long) Constants::kVecBytes : 0);
+
+    for (uint64_t unit_index = (uint64_t) task; unit_index < rows * units_per_row;
+         unit_index += (uint64_t) tasks) {
+        const uint64_t row     = unit_index / units_per_row;
+        const uint64_t within  = unit_index % units_per_row;
+        const uint64_t column  = within * unit;
+        const uint64_t length  = row_elements - column < unit ? row_elements - column : unit;
+        const uint64_t d1      = row % config->ne[1];
+        const uint64_t d2      = (row / config->ne[1]) % config->ne[2];
+        const uint64_t d3      = (row / ((uint64_t) config->ne[1] * config->ne[2])) % config->ne[3];
+        const uint64_t r1      = d1 % config->right_ne[1];
+        const uint64_t r2      = d2 % config->right_ne[2];
+        const uint64_t r3      = d3 % config->right_ne[3];
+        const uint64_t right_base = r1 * right_row + r2 * right_row * config->right_ne[1] +
+                                    r3 * right_row * config->right_ne[1] * config->right_ne[2];
+
+        load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
+                       (uint64_t) (uintptr_t) (left + row * row_elements + column));
+        if (right_full) {
+            load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                           (uint64_t) (uintptr_t) (right + right_base + column));
+        } else {
+            const uint64_t right_bytes =
+                right_scalar ? sizeof(float) : right_row * sizeof(float);
+            for (uint64_t copy = 0; copy < right_copies; ++copy) {
+                load_matrix<0>(right_bytes, 1, NormalizationLayout::kFloatBytes, 1,
+                               right_uram + copy * right_bytes, (uint64_t) (uintptr_t) (right + right_base));
+            }
+        }
         dayan_wait_lsu();
         constexpr long instructions = 4;
         ggml_dayan_vec_detail::begin_vec_block(instructions);
         __tx_vec_lsu_u2v<0, 0>((long) left_uram);
-        __tx_vec_lsu_u2v<1, 1>((long) right_uram);
+        if (right_scalar) {
+            __tx_vec_lsu_u2v_broadcast32<1, 1>((long) right_uram);
+        } else {
+            __tx_vec_lsu_u2v<1, 1>((long) right_uram);
+        }
         Operation();
         __tx_vec_lsu_v2u<0, 3>((long) out_uram);
         ggml_dayan_vec_detail::start_vec_block(instructions);
         dayan_wait_vec();
-        store_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
-                        (uint64_t) (uintptr_t) (output + offset));
+        store_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
+                        (uint64_t) (uintptr_t) (output + row * row_elements + column));
         dayan_wait_lsu();
     }
 }
 
-static void run_div_f32(const DayanElementwiseConfig * config,
-                        const float *                  left,
-                        const float *                  right,
-                        float *                        output) {
-    if (config == nullptr || right == nullptr) {
+static void run_div_f32(const DayanBinaryConfig * config,
+                        const float *             left,
+                        const float *             right,
+                        float *                   output) {
+    if (config == nullptr || right == nullptr || !binary_config_valid(config)) {
         DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, left, output);
@@ -86,28 +185,93 @@ static void run_div_f32(const DayanElementwiseConfig * config,
     const uint32_t task       = dayan_native_task_id();
     const uint32_t tasks      = dayan_native_task_count();
     ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements);
-    for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
-         offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
-        const uint64_t remaining = config->elements - offset;
-        const uint32_t elements  = remaining < NormalizationLayout::kTileElements ?
-                                       (uint32_t) remaining :
-                                       (uint32_t) NormalizationLayout::kTileElements;
-        load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
-                       (uint64_t) (uintptr_t) (left + offset));
-        load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
-                       (uint64_t) (uintptr_t) (right + offset));
+
+    if (binary_same_shape(config)) {
+        for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
+             offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
+            const uint64_t remaining = config->elements - offset;
+            const uint32_t elements  = remaining < NormalizationLayout::kTileElements ?
+                                           (uint32_t) remaining :
+                                           (uint32_t) NormalizationLayout::kTileElements;
+            load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
+                           (uint64_t) (uintptr_t) (left + offset));
+            load_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                           (uint64_t) (uintptr_t) (right + offset));
+            dayan_wait_lsu();
+            constexpr long instructions = 5;
+            ggml_dayan_vec_detail::begin_vec_block(instructions);
+            __tx_vec_lsu_u2v<0, 0>((long) left_uram);
+            __tx_vec_lsu_u2v<1, 1>((long) right_uram);
+            __tx_vec_v_fp32_sfu<1, 16, 5>();
+            __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+            __tx_vec_lsu_v2u<0, 3>((long) out_uram);
+            ggml_dayan_vec_detail::start_vec_block(instructions);
+            dayan_wait_vec();
+            store_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
+                            (uint64_t) (uintptr_t) (output + offset));
+            dayan_wait_lsu();
+        }
+        return;
+    }
+
+    // Broadcast layout, mirroring run_binary_f32: the reciprocal is taken on
+    // the right operand land after a scalar, tiled, or full-row load.
+    const uint64_t row_elements = config->ne[0];
+    const uint64_t rows         = config->elements / row_elements;
+    const uint64_t right_row    = config->right_ne[0];
+    const bool     right_full   = right_row == row_elements;
+    const bool     right_scalar = right_row == 1;
+    const uint64_t unit         = row_elements < NormalizationLayout::kTileElements ? row_elements :
+                                                                         NormalizationLayout::kTileElements;
+    const uint64_t units_per_row = (row_elements + unit - 1) / unit;
+    const uint64_t right_copies  = right_full || right_scalar ? 1 : Constants::kVecLanes / right_row;
+    ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements,
+                                              right_full ? (long) Constants::kVecBytes : 0);
+
+    for (uint64_t unit_index = (uint64_t) task; unit_index < rows * units_per_row;
+         unit_index += (uint64_t) tasks) {
+        const uint64_t row     = unit_index / units_per_row;
+        const uint64_t within  = unit_index % units_per_row;
+        const uint64_t column  = within * unit;
+        const uint64_t length  = row_elements - column < unit ? row_elements - column : unit;
+        const uint64_t d1      = row % config->ne[1];
+        const uint64_t d2      = (row / config->ne[1]) % config->ne[2];
+        const uint64_t d3      = (row / ((uint64_t) config->ne[1] * config->ne[2])) % config->ne[3];
+        const uint64_t r1      = d1 % config->right_ne[1];
+        const uint64_t r2      = d2 % config->right_ne[2];
+        const uint64_t r3      = d3 % config->right_ne[3];
+        const uint64_t right_base = r1 * right_row + r2 * right_row * config->right_ne[1] +
+                                    r3 * right_row * config->right_ne[1] * config->right_ne[2];
+
+        load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
+                       (uint64_t) (uintptr_t) (left + row * row_elements + column));
+        if (right_full) {
+            load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                           (uint64_t) (uintptr_t) (right + right_base + column));
+        } else {
+            const uint64_t right_bytes =
+                right_scalar ? sizeof(float) : right_row * sizeof(float);
+            for (uint64_t copy = 0; copy < right_copies; ++copy) {
+                load_matrix<0>(right_bytes, 1, NormalizationLayout::kFloatBytes, 1,
+                               right_uram + copy * right_bytes, (uint64_t) (uintptr_t) (right + right_base));
+            }
+        }
         dayan_wait_lsu();
         constexpr long instructions = 5;
         ggml_dayan_vec_detail::begin_vec_block(instructions);
         __tx_vec_lsu_u2v<0, 0>((long) left_uram);
-        __tx_vec_lsu_u2v<1, 1>((long) right_uram);
+        if (right_scalar) {
+            __tx_vec_lsu_u2v_broadcast32<1, 1>((long) right_uram);
+        } else {
+            __tx_vec_lsu_u2v<1, 1>((long) right_uram);
+        }
         __tx_vec_v_fp32_sfu<1, 16, 5>();
         __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
         __tx_vec_lsu_v2u<0, 3>((long) out_uram);
         ggml_dayan_vec_detail::start_vec_block(instructions);
         dayan_wait_vec();
-        store_matrix<0>((uint64_t) elements * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
-                        (uint64_t) (uintptr_t) (output + offset));
+        store_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, out_uram,
+                        (uint64_t) (uintptr_t) (output + row * row_elements + column));
         dayan_wait_lsu();
     }
 }

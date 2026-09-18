@@ -246,6 +246,12 @@ static bool ggml_backend_dayan_supports_elementwise_binary(const ggml_tensor * o
         return false;
     }
 
+    // A partial right row must fill whole vector lanes; the kernel rejects it
+    // at launch time, so keep such shapes off the backend entirely.
+    if (op->src[1]->ne[0] != op->ne[0] && (64U % op->src[1]->ne[0]) != 0U) {
+        return false;
+    }
+
     return ggml_nelements(op) > 0 && (uint64_t) ggml_nelements(op) <= 0x7ffff000ULL;
 }
 

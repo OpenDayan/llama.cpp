@@ -77,13 +77,6 @@ public:
             root_offset > UINT32_MAX || extra_offset > UINT32_MAX - root_offset) {
             return false;
         }
-        if (tensor->name[0] != '\0' && (std::strstr(tensor->name, "flash_") != nullptr ||
-                                        std::strstr(tensor->name, "attention_output") != nullptr ||
-                                        std::strstr(tensor->name, "ffn_") != nullptr ||
-                                        std::strstr(tensor->name, "permuted") != nullptr)) {
-            GGML_LOG_INFO("mega tensor %s data=%p root=%p offset=%llu nb0=%zu\\n", tensor->name, tensor->data,
-                          (void *) root_buffer, (unsigned long long) root_offset, tensor->nb[0]);
-        }
         size_t root = 0;
         for (; root < root_count_ && roots_[root] != root_buffer; ++root) {}
         if (root == root_count_) {
@@ -442,12 +435,6 @@ static bool ggml_backend_dayan_mega_add_copy(ggml_backend_dayan_mega_parameters 
         config.source_ne[dimension] = (uint32_t) source->ne[dimension];
         config.source_nb[dimension] = source->nb[dimension];
     }
-    if (std::strcmp(output->name, "blk.0.flash_q") == 0) {
-        GGML_LOG_INFO("mega q copy source data=%p name=%s output data=%p name=%s ne=[%lld,%lld,%lld,%lld] index=%u\n",
-                      source->data, source->name, output->data, output->name,
-                      (long long) source->ne[0], (long long) source->ne[1], (long long) source->ne[2],
-                      (long long) source->ne[3], (unsigned) parameters->next());
-    }
     return parameters->add_data(config) && parameters->add_tensor(source) && parameters->add_tensor(output);
 }
 
@@ -489,55 +476,34 @@ static bool ggml_backend_dayan_mega_add_binary(ggml_backend_dayan_mega_parameter
     if (output == nullptr || (slot.kind != ggml_backend_dayan_slot_kind::elementwise_add &&
                               slot.kind != ggml_backend_dayan_slot_kind::residual_add &&
                               slot.kind != ggml_backend_dayan_slot_kind::elementwise_mul) ||
-        output->type != GGML_TYPE_F32 || !ggml_are_same_shape(output, output->src[0]) ||
-        !ggml_are_same_shape(output, output->src[1])) {
-        return false;
-    }
-    const DayanElementwiseConfig config = { (uint64_t) ggml_nelements(output) };
-    return parameters->add_data(config) && parameters->add_tensor(output->src[0]) &&
-           parameters->add_tensor(output->src[1]) && parameters->add_tensor(output);
-}
-
-static bool ggml_backend_dayan_mega_add_broadcast_binary(ggml_backend_dayan_mega_parameters * parameters,
-                                                          const ggml_backend_dayan_graph_slot & slot) {
-    ggml_tensor * output = slot.nodes[0];
-    if (output == nullptr || (slot.kind != ggml_backend_dayan_slot_kind::elementwise_add &&
-                              slot.kind != ggml_backend_dayan_slot_kind::residual_add &&
-                              slot.kind != ggml_backend_dayan_slot_kind::elementwise_mul) ||
         output->type != GGML_TYPE_F32) {
         return false;
     }
-    const ggml_tensor * full = nullptr;
-    const ggml_tensor * repeated = nullptr;
-    if (ggml_are_same_shape(output, output->src[0]) && !ggml_are_same_shape(output, output->src[1])) {
-        full = output->src[0];
-        repeated = output->src[1];
-    } else if (!ggml_are_same_shape(output, output->src[0]) && ggml_are_same_shape(output, output->src[1])) {
-        full = output->src[1];
-        repeated = output->src[0];
-    } else if (ggml_are_same_shape(output, output->src[0]) && ggml_are_same_shape(output, output->src[1])) {
-        full = output->src[0];
-        repeated = output->src[1];
-    } else {
+    // The full (output-shaped) operand is the left input; the other one may
+    // broadcast. All supported kinds are commutative, so swap when needed.
+    const ggml_tensor * left = output->src[0];
+    const ggml_tensor * right = output->src[1];
+    if (!ggml_are_same_shape(output, left)) {
+        const ggml_tensor * swap = left;
+        left = right;
+        right = swap;
+    }
+    if (!ggml_are_same_shape(output, left)) {
         return false;
     }
-    DayanRepeatConfig repeat = {};
-    repeat.type = kDayanDataTypeF32;
+    DayanBinaryConfig config = {};
+    config.elements = (uint64_t) ggml_nelements(output);
     for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
-        if (repeated->ne[dimension] <= 0 || output->ne[dimension] % repeated->ne[dimension] != 0) {
+        if (right->ne[dimension] <= 0 || output->ne[dimension] % right->ne[dimension] != 0) {
             return false;
         }
-        repeat.source_ne[dimension] = (uint32_t) repeated->ne[dimension];
-        repeat.output_ne[dimension] = (uint32_t) output->ne[dimension];
+        config.ne[dimension] = (uint32_t) output->ne[dimension];
+        config.right_ne[dimension] = (uint32_t) right->ne[dimension];
     }
-    const DayanElementwiseConfig binary = { (uint64_t) ggml_nelements(output) };
-    fprintf(stderr, "MEGA-BB kind=%d full=%p rep=%p out=%p full_ne=[%lld,%lld,%lld,%lld] rep_ne=[%lld,%lld,%lld,%lld] out_ne=[%lld,%lld,%lld,%lld]\n",
-            (int) slot.kind, full->data, repeated->data, output->data,
-            (long long) full->ne[0], (long long) full->ne[1], (long long) full->ne[2], (long long) full->ne[3],
-            (long long) repeated->ne[0], (long long) repeated->ne[1], (long long) repeated->ne[2], (long long) repeated->ne[3],
-            (long long) output->ne[0], (long long) output->ne[1], (long long) output->ne[2], (long long) output->ne[3]);
-    return parameters->add_data(repeat) && parameters->add_tensor(repeated) && parameters->add_tensor(output) &&
-           parameters->add_data(binary) && parameters->add_tensor(full) && parameters->add_tensor(output) &&
+    if (config.right_ne[0] != config.ne[0] && (64U % config.right_ne[0]) != 0U) {
+        return false;
+    }
+    return parameters->add_data(config) && parameters->add_tensor(left) && parameters->add_tensor(right) &&
            parameters->add_tensor(output);
 }
 
@@ -731,12 +697,6 @@ static bool ggml_backend_dayan_mega_add_flash_attention(ggml_backend_dayan_mega_
     };
     std::memcpy(&config.scale_bits, output->op_params, sizeof(config.scale_bits));
     if (output->src[3] != nullptr) { config.flags = 1U; }
-    if (config.q_len == 4 && config.head_dim == 256) {
-        GGML_LOG_INFO("mega flash cfg batch=%u qh=%u kvh=%u qlen=%u kvlen=%u off=%u flags=%u qnb=[%zu,%zu,%zu,%zu] knb=[%zu,%zu,%zu,%zu] vnb=[%zu,%zu,%zu,%zu]\\n",
-                      config.batch, config.q_heads, config.kv_heads, config.q_len, config.kv_len,
-                      config.causal_offset, config.flags, q->nb[0], q->nb[1], q->nb[2], q->nb[3],
-                      k->nb[0], k->nb[1], k->nb[2], k->nb[3], v->nb[0], v->nb[1], v->nb[2], v->nb[3]);
-    }
     return parameters->add_data(config) && parameters->add_tensor(q) && parameters->add_tensor(k) &&
            parameters->add_tensor(v) && parameters->add_tensor(output);
 }
@@ -934,9 +894,9 @@ static bool ggml_backend_dayan_pack_qwen35_mxfp4_linear(ggml_backend_dayan_mega_
            ggml_backend_dayan_mega_add_l2_norm(parameters, s[begin + 11]) &&
            ggml_backend_dayan_mega_add_matmul(parameters, s[begin + 12].nodes[0], nullptr,
                                                s[begin + 12].nodes[0], 0) &&
-           ggml_backend_dayan_mega_add_broadcast_binary(parameters, s[begin + 13]) &&
+           ggml_backend_dayan_mega_add_binary(parameters, s[begin + 13]) &&
            ggml_backend_dayan_mega_add_unary(parameters, s[begin + 14]) &&
-           ggml_backend_dayan_mega_add_broadcast_binary(parameters, s[begin + 15]) &&
+           ggml_backend_dayan_mega_add_binary(parameters, s[begin + 15]) &&
            ggml_backend_dayan_mega_add_matmul(parameters, s[begin + 16].nodes[0], nullptr,
                                                s[begin + 16].nodes[0], 0) &&
            ggml_backend_dayan_mega_add_unary(parameters, s[begin + 17]) &&
@@ -968,7 +928,7 @@ static bool ggml_backend_dayan_pack_qwen35_mxfp4_full(ggml_backend_dayan_mega_pa
            ggml_backend_dayan_mega_add_matmul(parameters, s[begin + 2].nodes[0], nullptr,
                                                s[begin + 2].nodes[0], 0) &&
            ggml_backend_dayan_mega_add_rms_norm(parameters, s[begin + 3]) &&
-           ggml_backend_dayan_mega_add_broadcast_binary(parameters, s[begin + 4]) &&
+           ggml_backend_dayan_mega_add_binary(parameters, s[begin + 4]) &&
            ggml_backend_dayan_mega_add_rope(parameters, s[begin + 5]) &&
            ggml_backend_dayan_mega_add_matmul(parameters, s[begin + 6].nodes[0], nullptr,
                                                s[begin + 6].nodes[0], 0) &&
@@ -1012,9 +972,9 @@ static bool ggml_backend_dayan_pack_qwen35_bf16_linear(ggml_backend_dayan_mega_p
            ggml_backend_dayan_mega_add_l2_norm(parameters, s[begin + 10]) &&
            ggml_backend_dayan_mega_add_l2_norm(parameters, s[begin + 11]) &&
            ggml_backend_dayan_mega_add_bf16_matmul(parameters, s[begin + 12].nodes[0], s[begin + 12].nodes[0]) &&
-           ggml_backend_dayan_mega_add_broadcast_binary(parameters, s[begin + 13]) &&
+           ggml_backend_dayan_mega_add_binary(parameters, s[begin + 13]) &&
            ggml_backend_dayan_mega_add_unary(parameters, s[begin + 14]) &&
-           ggml_backend_dayan_mega_add_broadcast_binary(parameters, s[begin + 15]) &&
+           ggml_backend_dayan_mega_add_binary(parameters, s[begin + 15]) &&
            ggml_backend_dayan_mega_add_bf16_matmul(parameters, s[begin + 16].nodes[0], s[begin + 16].nodes[0]) &&
            ggml_backend_dayan_mega_add_unary(parameters, s[begin + 17]) &&
            ggml_backend_dayan_mega_add_gdn(parameters, s[begin + 18]) &&
@@ -1044,7 +1004,7 @@ static bool ggml_backend_dayan_pack_qwen35_bf16_full(ggml_backend_dayan_mega_par
     PACK_STEP(0, ggml_backend_dayan_mega_add_norm(parameters, s[begin + 0], false));
     PACK_STEP(1, ggml_backend_dayan_mega_add_bf16_matmul(parameters, s[begin + 1].nodes[0], s[begin + 1].nodes[0]));
     PACK_STEP(2, ggml_backend_dayan_mega_add_rms_norm(parameters, s[begin + 2]));
-    PACK_STEP(3, ggml_backend_dayan_mega_add_broadcast_binary(parameters, s[begin + 3]));
+    PACK_STEP(3, ggml_backend_dayan_mega_add_binary(parameters, s[begin + 3]));
     PACK_STEP(4, ggml_backend_dayan_mega_add_rope(parameters, s[begin + 4]));
     PACK_STEP(5, ggml_backend_dayan_mega_add_bf16_matmul_pair(parameters, s[begin + 5]));
     PACK_STEP(6, ggml_backend_dayan_mega_add_norm(parameters, s[begin + 6], false));

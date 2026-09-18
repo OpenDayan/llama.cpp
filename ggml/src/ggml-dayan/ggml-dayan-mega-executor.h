@@ -14,10 +14,10 @@ enum : uint16_t {
 enum : uint32_t {
     kDayanMegaMaxParameters                    = 256,
     kDayanMegaRootCount                        = 16,
-    kDayanMegaQwen35DenseMxfp4LinearParameters = 172,
-    kDayanMegaQwen35DenseMxfp4FullParameters   = 140,
-    kDayanMegaQwen35DenseBf16LinearParameters  = 135,
-    kDayanMegaQwen35DenseBf16FullParameters    = 92,
+    kDayanMegaQwen35DenseMxfp4LinearParameters = 166,
+    kDayanMegaQwen35DenseMxfp4FullParameters   = 137,
+    kDayanMegaQwen35DenseBf16LinearParameters  = 129,
+    kDayanMegaQwen35DenseBf16FullParameters    = 89,
 };
 
 struct DayanMegaConfig {

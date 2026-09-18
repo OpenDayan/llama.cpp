@@ -9,7 +9,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -104,6 +103,13 @@ static uint16_t encode_lowp(enum ggml_type type, float value) {
     return type == GGML_TYPE_BF16 ? ggml_fp32_to_bf16(value).bits : ggml_fp32_to_fp16(value);
 }
 
+// Matches ggml-common.h; the encoder is exported by ggml-base.
+typedef struct {
+    uint8_t e;
+    uint8_t qs[16];
+} test_block_mxfp4;
+extern "C" void quantize_row_mxfp4_ref(const float * x, test_block_mxfp4 * y, int64_t k);
+
 static bool rewrite_graph(ggml_backend_t dayan, ggml_context * ctx, ggml_cgraph * graph) {
     ggml_backend_dev_t device = ggml_backend_get_device(dayan);
     ggml_backend_reg_t reg    = ggml_backend_dev_backend_reg(device);
@@ -117,32 +123,6 @@ static uint64_t mega_launch_count(ggml_backend_t dayan) {
     using count_fn            = uint64_t (*)();
     auto fn = (count_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dayan_get_mega_launch_count");
     return fn == nullptr ? 0 : fn();
-}
-
-static void debug_plan_slot(const ggml_backend_dayan_graph_plan_slot * slot, void *) {
-    std::fprintf(stderr, "PLAN %zu %s nodes=%zu", slot->slot_index, slot->kind, slot->node_count);
-    for (size_t i = 0; i < slot->node_count; ++i) {
-        if (slot->nodes[i] == nullptr) {
-            std::fprintf(stderr, " [null]");
-        } else {
-            std::fprintf(stderr, " [%s:%s]", slot->nodes[i]->name, ggml_type_name(slot->nodes[i]->type));
-            if (slot->nodes[i]->op == GGML_OP_CPY && slot->nodes[i]->src[0] != nullptr) {
-                std::fprintf(stderr, "<- %s:%s", slot->nodes[i]->src[0]->name,
-                             ggml_type_name(slot->nodes[i]->src[0]->type));
-            }
-        }
-    }
-    std::fprintf(stderr, "\n");
-}
-
-static void debug_plan(ggml_backend_t dayan, ggml_cgraph * graph) {
-    ggml_backend_dev_t device = ggml_backend_get_device(dayan);
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    using get_plan_fn = bool (*)(const ggml_cgraph *, ggml_backend_dayan_graph_plan_callback, void *);
-    auto get_plan = (get_plan_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dayan_get_graph_plan");
-    if (get_plan != nullptr) {
-        std::fprintf(stderr, "PLAN_RESULT=%d\n", get_plan(graph, debug_plan_slot, nullptr));
-    }
 }
 
 static ggml_tensor * new_input_1d(ggml_context * ctx, enum ggml_type type, int64_t ne0, const char * name) {
@@ -208,6 +188,7 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
                                                    const model_case & config,
                                                    ggml_tensor *      input,
                                                    int                layer,
+                                                   bool               cpu_reference,
                                                    layer_graph *      result) {
     char name[64];
     std::snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", layer);
@@ -237,7 +218,11 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     std::snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", layer);
     ggml_tensor * output_weight = new_input_2d(ctx, config.type, kLinearWidth, kEmbedding, name);
 
-    ggml_tensor * qkv_input = ggml_cast(ctx, ggml_get_rows(ctx, ggml_scale(ctx, input, 1.0f), indices), GGML_TYPE_BF16);
+    // CPU mul_mat needs F32 activations for non-BF16 weight types; the Dayan
+    // graph casts activations straight to the weight type.
+    const bool lowp_activations = !(cpu_reference && config.type != GGML_TYPE_BF16);
+    ggml_tensor * qkv_rows = ggml_get_rows(ctx, ggml_scale(ctx, input, 1.0f), indices);
+    ggml_tensor * qkv_input = lowp_activations ? ggml_cast(ctx, qkv_rows, config.type) : qkv_rows;
     ggml_tensor * qkv   = ggml_mul_mat(ctx, qkv_weight, qkv_input);
     ggml_tensor * z     = ggml_mul_mat(ctx, z_weight, qkv_input);
     ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_mul_mat(ctx, beta_weight, qkv_input));
@@ -270,7 +255,9 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     core = build_rms_norm(ctx, core, norm_weight, 1.0e-6f);
     core = ggml_mul(ctx, core, ggml_silu(ctx, ggml_reshape_4d(ctx, z, kLinearHeadDim, kLinearHeads, config.n_tokens, 1)));
     core = ggml_reshape_2d(ctx, core, kLinearWidth, config.n_tokens);
-    core = ggml_cast(ctx, core, GGML_TYPE_BF16);
+    if (lowp_activations) {
+        core = ggml_cast(ctx, core, config.type);
+    }
     result->attention_output = ggml_mul_mat(ctx, output_weight, core);
     ggml_set_output(result->attention_output);
     return result->attention_output;
@@ -439,7 +426,8 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
     const enum ggml_type input_type = GGML_TYPE_F32;
     result.input       = new_input_2d(ctx, input_type, kEmbedding, config.n_tokens, "model_input");
     result.residual_input = config.mode == model_mode::hybrid ? result.input :
-                            new_input_2d(ctx, cpu_reference ? GGML_TYPE_F32 : GGML_TYPE_BF16,
+                            new_input_2d(ctx, cpu_reference || config.type != GGML_TYPE_BF16 ? GGML_TYPE_F32 :
+                                               GGML_TYPE_BF16,
                                          kEmbedding, config.n_tokens, "model_residual");
     result.positions   = new_input_1d(ctx, GGML_TYPE_I32, GGML_MROPE_SECTIONS * config.n_tokens, "positions");
     result.mask        = new_input_2d(ctx, GGML_TYPE_F16, config.n_tokens, config.n_tokens, "causal_mask");
@@ -468,10 +456,13 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
         ggml_set_output(layer_graph.attention_norm);
         ggml_tensor * attention =
             layer_graph.recurrent ?
-                    build_linear_attention_legacy(ctx, config, normalized, layer, &layer_graph) :
+                    build_linear_attention_legacy(ctx, config, normalized, layer, cpu_reference, &layer_graph) :
                 build_full_attention(ctx, config, normalized, result.positions, result.mask, layer, cpu_reference,
                                      &layer_graph);
-        ggml_tensor * attention_for_residual = config.mode == model_mode::hybrid || cpu_reference ? attention :
+        // The BF16 signature models an explicit residual-stream cast; other
+        // weight types rely on the planner's local widening.
+        const bool widen_residual = !cpu_reference && config.type == GGML_TYPE_BF16;
+        ggml_tensor * attention_for_residual = config.mode == model_mode::hybrid || !widen_residual ? attention :
                                                 ggml_cast(ctx, attention, GGML_TYPE_BF16);
         layer_graph.attention_residual = ggml_add(ctx, attention_for_residual, residual);
         if (!cpu_reference && config.mode != model_mode::hybrid) {
@@ -489,7 +480,7 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
         ggml_set_output(layer_graph.ffn_rms);
         ggml_set_output(layer_graph.ffn_norm);
         ggml_tensor * ffn  = build_ffn(ctx, config, layer_graph.ffn_norm, layer, &layer_graph);
-        ggml_tensor * ffn_for_output = config.mode == model_mode::hybrid || cpu_reference ? ffn :
+        ggml_tensor * ffn_for_output = config.mode == model_mode::hybrid || !widen_residual ? ffn :
                                         ggml_cast(ctx, ffn, GGML_TYPE_BF16);
         layer_graph.output = ggml_add(ctx, ffn_for_output, layer_graph.attention_residual);
         ggml_format_name(layer_graph.output, "blk.%d.output", layer);
@@ -601,12 +592,20 @@ static tensor_blobs make_tensor_blobs(const model_graph & graph, const model_cas
                 }
             }
         } else {
-            uint16_t * values = (uint16_t *) blob.data();
-            for (size_t index = 0; index < elements; ++index) {
-                const float value = name == "model_residual" && index < input_values.size() ? input_values[index] :
-                                    name == "model_input" ? input_dist(generator) :
-                                    (name.find("cache") != std::string::npos ? 0.0f : weight_dist(generator));
-                values[index] = encode_lowp(tensor->type, value);
+            if (tensor->type == GGML_TYPE_MXFP4) {
+                std::vector<float> source(elements);
+                for (size_t index = 0; index < elements; ++index) {
+                    source[index] = name.find("cache") != std::string::npos ? 0.0f : weight_dist(generator);
+                }
+                quantize_row_mxfp4_ref(source.data(), (test_block_mxfp4 *) blob.data(), (int64_t) elements);
+            } else {
+                uint16_t * values = (uint16_t *) blob.data();
+                for (size_t index = 0; index < elements; ++index) {
+                    const float value = name == "model_residual" && index < input_values.size() ? input_values[index] :
+                                        name == "model_input" ? input_dist(generator) :
+                                        (name.find("cache") != std::string::npos ? 0.0f : weight_dist(generator));
+                    values[index] = encode_lowp(tensor->type, value);
+                }
             }
         }
         result.emplace(name, std::move(blob));
@@ -738,7 +737,6 @@ static float compare_tensor(const char *        stage,
     std::vector<uint8_t> observed(ggml_nbytes(observed_tensor));
     float stage_max_abs = 0.0f;
     float stage_max_reference = 0.0f;
-    size_t stage_worst_index = 0;
     ggml_backend_tensor_get(expected_tensor, expected.data(), 0, expected.size());
     ggml_backend_tensor_get(observed_tensor, observed.data(), 0, observed.size());
 
@@ -753,9 +751,6 @@ static float compare_tensor(const char *        stage,
         }
         stage_max_abs         = std::max(stage_max_abs, abs_error);
         stage_max_reference   = std::max(stage_max_reference, std::abs(expected_value));
-        if (abs_error >= stage_max_abs) {
-            stage_worst_index = index;
-        }
         stats->sum_sq += (double) abs_error * abs_error;
         stats->sum_ref_sq += (double) expected_value * expected_value;
         ++stats->count;
@@ -778,57 +773,6 @@ static float compare_tensor(const char *        stage,
     }
     std::fprintf(stderr, "COMPARE %s max_abs=%g expected=%s observed=%s\n", stage, stage_max_abs,
                  ggml_type_name(expected_tensor->type), ggml_type_name(observed_tensor->type));
-    if (const char * dump_dir = std::getenv("DAYAN_VERIFY_DUMP")) {
-        std::string name(dump_dir);
-        name += '/';
-        for (const char * p = stage; *p != '\0'; ++p) {
-            name += (*p == '.' || *p == '_') ? '_' : *p;
-        }
-        std::fprintf(stderr, "DUMP32 %s\n", name.c_str());
-        std::FILE * file = std::fopen((name + ".expected.bin").c_str(), "wb");
-        if (file == nullptr) { std::fprintf(stderr, "DUMP32 open failed errno=%d\n", errno); }
-        if (file) { std::fwrite(expected.data(), 1, expected.size(), file); std::fclose(file); }
-        file = std::fopen((name + ".observed.bin").c_str(), "wb");
-        if (file) { std::fwrite(observed.data(), 1, observed.size(), file); std::fclose(file); }
-    }
-    if (std::strncmp(stage, "layer.0.full_q_norm", 19) == 0) {
-        std::fprintf(stderr, "  q_norm nb expected=[%zu,%zu,%zu,%zu] observed=[%zu,%zu,%zu,%zu]\n",
-                     expected_tensor->nb[0], expected_tensor->nb[1], expected_tensor->nb[2], expected_tensor->nb[3],
-                     observed_tensor->nb[0], observed_tensor->nb[1], observed_tensor->nb[2], observed_tensor->nb[3]);
-        for (size_t index : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(255), size_t(256), size_t(257), size_t(511)}) {
-            if (index >= elements) { continue; }
-            std::fprintf(stderr, "  norm[%zu]=%g/%g\n", index, tensor_value(expected_tensor, expected, index),
-                         tensor_value(observed_tensor, observed, index));
-        }
-    }
-    if (std::strncmp(stage, "layer.0.full_q_input", 20) == 0) {
-        for (size_t index : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(255), size_t(256), size_t(257), size_t(511)}) {
-            if (index >= elements) { continue; }
-            std::fprintf(stderr, "  input[%zu]=%g/%g\n", index, tensor_value(expected_tensor, expected, index),
-                         tensor_value(observed_tensor, observed, index));
-        }
-    }
-    if (std::strncmp(stage, "layer.0.full_q_permuted", 23) == 0) {
-        for (size_t index : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(128), size_t(256), size_t(384), size_t(512), size_t(640), size_t(768), size_t(896), size_t(1024)}) {
-            if (index >= elements) { continue; }
-            std::fprintf(stderr, "  perm[%zu]=%g/%g\n", index, tensor_value(expected_tensor, expected, index),
-                         tensor_value(observed_tensor, observed, index));
-        }
-    }
-    if (std::strncmp(stage, "layer.0.flash_attention", 24) == 0) {
-        std::fprintf(stderr, "  fa worst index=%zu coords=[%zu,%zu,%zu,%zu]\n", stage_worst_index,
-                     stage_worst_index % (size_t) expected_tensor->ne[0],
-                     (stage_worst_index / (size_t) expected_tensor->ne[0]) % (size_t) expected_tensor->ne[1],
-                     (stage_worst_index / ((size_t) expected_tensor->ne[0] * expected_tensor->ne[1])) % (size_t) expected_tensor->ne[2],
-                     stage_worst_index / ((size_t) expected_tensor->ne[0] * expected_tensor->ne[1] * expected_tensor->ne[2]));
-        for (size_t index = 0; index < std::min<size_t>(8, elements); ++index) {
-            std::fprintf(stderr, "  fa[%zu]=%g/%g\n", index, tensor_value(expected_tensor, expected, index),
-                         tensor_value(observed_tensor, observed, index));
-        }
-        const size_t worst = stage_worst_index;
-        std::fprintf(stderr, "  fa worst values=%g/%g\n", tensor_value(expected_tensor, expected, worst),
-                     tensor_value(observed_tensor, observed, worst));
-    }
     return stage_max_abs;
 }
 
@@ -861,28 +805,23 @@ static float compare_lowp_tensor(const char *        stage,
     }
     std::fprintf(stderr, "COMPARE %s max_abs=%g expected=%s observed=%s\n", stage, stage_max_abs,
                  ggml_type_name(expected_tensor->type), ggml_type_name(observed_tensor->type));
-    if (std::strncmp(stage, "layer.0.flash_", 14) == 0) {
-        std::fprintf(stderr, "  dims expected=[%lld,%lld,%lld,%lld] observed=[%lld,%lld,%lld,%lld]\n",
-                     (long long) expected_tensor->ne[0], (long long) expected_tensor->ne[1],
-                     (long long) expected_tensor->ne[2], (long long) expected_tensor->ne[3],
-                     (long long) observed_tensor->ne[0], (long long) observed_tensor->ne[1],
-                     (long long) observed_tensor->ne[2], (long long) observed_tensor->ne[3]);
-        for (size_t index = 0; index < std::min<size_t>(16, elements); ++index) {
-            std::fprintf(stderr, "  value[%zu]=%g/%g\n", index, tensor_value(expected_tensor, expected, index),
-                         tensor_value(observed_tensor, observed, index));
+    return stage_max_abs;
+}
+
+static void bypass_reference_activation_casts(ggml_cgraph * graph) {
+    // The rewrite quantizes matmul activations for Dayan; the CPU reference
+    // needs the plain F32 sources instead.
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        if (node->op != GGML_OP_MUL_MAT || node->src[1] == nullptr) {
+            continue;
         }
-        if (const char * dump_dir = std::getenv("DAYAN_VERIFY_DUMP")) {
-            std::string base(dump_dir);
-            base += "/flashq";
-            const char * suffix = std::strchr(stage, 0) - 1;
-            std::string name = base + (std::strstr(stage, "flash_q") ? "q" : suffix);
-            std::FILE * file = std::fopen((name + ".expected.bin").c_str(), "wb");
-            if (file) { std::fwrite(expected.data(), 1, expected.size(), file); std::fclose(file); }
-            file = std::fopen((name + ".observed.bin").c_str(), "wb");
-            if (file) { std::fwrite(observed.data(), 1, observed.size(), file); std::fclose(file); }
+        ggml_tensor * activation = node->src[1];
+        if (activation->type == GGML_TYPE_MXFP4 && activation->src[0] != nullptr &&
+            activation->src[0]->type == GGML_TYPE_F32) {
+            node->src[1] = activation->src[0];
         }
     }
-    return stage_max_abs;
 }
 
 static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_case & config, json * result = nullptr) {
@@ -902,26 +841,7 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         !rewrite_graph(dayan, actual.ctx.get(), actual.graph)) {
         return fail("model graph rewrite failed");
     }
-    if (config.layers == 1) {
-        debug_plan(dayan, actual.graph);
-        for (int i = 0; i < ggml_graph_n_nodes(actual.graph); ++i) {
-            ggml_tensor * node = ggml_graph_node(actual.graph, i);
-            if (!ggml_backend_supports_op(dayan, node)) {
-                std::fprintf(stderr, "UNSUPPORTED node=%d op=%s name=%s type=%s\n", i,
-                             ggml_op_name(node->op), node->name, ggml_type_name(node->type));
-                for (int source = 0; source < 2; ++source) {
-                    if (node->src[source] != nullptr) {
-                        std::fprintf(stderr, "  src%d=%s type=%s flags=0x%x\n", source, node->src[source]->name,
-                                     ggml_type_name(node->src[source]->type), node->src[source]->flags);
-                    }
-                }
-            }
-            if (node->op == GGML_OP_CPY && node->src[0] != nullptr && !ggml_backend_supports_op(dayan, node->src[0])) {
-                std::fprintf(stderr, "  copy source unsupported op=%s name=%s\n", ggml_op_name(node->src[0]->op),
-                             node->src[0]->name);
-            }
-        }
-    }
+    bypass_reference_activation_casts(reference.graph);
     size_t flash_index = 0;
     for (layer_graph & layer : reference.layers) {
         if (!layer.recurrent) {
@@ -938,22 +858,6 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
     }
     if (ggml_backend_graph_compute(cpu, reference.graph) != GGML_STATUS_SUCCESS) {
         return fail("CPU reference graph failed");
-    }
-    if (std::getenv("DAYAN_REF_DUMP") != nullptr) {
-        const ggml_tensor * ref_tensors[] = { reference.layers[0].flash_q, reference.layers[0].flash_k,
-                                              reference.layers[0].flash_v, reference.layers[0].flash_attention };
-        const char *        ref_names[]   = { "refq", "refk", "refv", "refout" };
-        for (int index = 0; index < 4; ++index) {
-            const ggml_tensor * tensor = ref_tensors[index];
-            std::fprintf(stderr, "REFDUMP %s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%s op=%s\n", ref_names[index],
-                         (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2],
-                         (long long) tensor->ne[3], tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3],
-                         ggml_type_name(tensor->type), ggml_op_name(tensor->op));
-            std::vector<uint8_t> raw(ggml_nbytes(tensor));
-            ggml_backend_tensor_get(tensor, raw.data(), 0, raw.size());
-            std::FILE * file = std::fopen(("/tmp/dayan-verify/" + std::string(ref_names[index]) + ".bin").c_str(), "wb");
-            if (file) { std::fwrite(raw.data(), 1, raw.size(), file); std::fclose(file); }
-        }
     }
 
     ggml_backend_t         backends[] = { dayan, cpu };
@@ -983,36 +887,12 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
     if (!upload_tensor_blobs(actual, actual_blobs, true)) {
         return fail("cannot initialize mixed backend tensors");
     }
-    if (config.mode == model_mode::full && config.layers == 1 && config.n_tokens == 4 &&
-        std::getenv("DAYAN_VERIFY_DUMP") != nullptr) {
-        struct pre_dump { const char * name; const ggml_tensor * tensor; };
-        const pre_dump dumps[] = {
-            { "flashqq", actual.layers[0].flash_q },
-            { "flashattn", actual.layers[0].flash_attention },
-            { "attnout", actual.layers[0].attention_output },
-        };
-        for (const pre_dump & item : dumps) {
-            std::vector<uint8_t> pre(ggml_nbytes(item.tensor));
-            ggml_backend_tensor_get(item.tensor, pre.data(), 0, pre.size());
-            std::string path = std::string("/tmp/dayan-verify/") + item.name + ".pre.bin";
-            std::FILE * file = std::fopen(path.c_str(), "wb");
-            if (file) { std::fwrite(pre.data(), 1, pre.size(), file); std::fclose(file); }
-        }
-    }
     const auto launch_start = std::chrono::steady_clock::now();
     if (ggml_backend_sched_graph_compute(scheduler.get(), actual.graph) != GGML_STATUS_SUCCESS) {
         return fail("mixed Dayan model graph failed");
     }
     const double launch_wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - launch_start).count();
     const bool mega_launched = mega_launch_count(dayan) != mega_before;
-    if (config.mode == model_mode::full && config.layers == 1 && config.n_tokens == 4) {
-        std::fprintf(stderr, "PTR flash=%p attn=%p q=%p k=%p v=%p qnb=[%zu,%zu,%zu,%zu] knb=[%zu,%zu,%zu,%zu] vnb=[%zu,%zu,%zu,%zu]\\n", actual.layers[0].flash_attention->data,
-                     actual.layers[0].attention_output->data, actual.layers[0].flash_q->data,
-                     actual.layers[0].flash_k->data, actual.layers[0].flash_v->data,
-                     actual.layers[0].flash_q->nb[0], actual.layers[0].flash_q->nb[1], actual.layers[0].flash_q->nb[2], actual.layers[0].flash_q->nb[3],
-                     actual.layers[0].flash_k->nb[0], actual.layers[0].flash_k->nb[1], actual.layers[0].flash_k->nb[2], actual.layers[0].flash_k->nb[3],
-                     actual.layers[0].flash_v->nb[0], actual.layers[0].flash_v->nb[1], actual.layers[0].flash_v->nb[2], actual.layers[0].flash_v->nb[3]);
-    }
 
     comparison_stats stats;
     float            flash_max_abs        = 0.0f;
@@ -1173,13 +1053,15 @@ int main(int argc, char ** argv) {
             return fail(error.what());
         }
         model_mode mode;
-        if (spec.value("op", "") != "mega" || spec.value("dtype", "bf16") != "bf16" ||
+        const std::string dtype = spec.value("dtype", "bf16");
+        if (spec.value("op", "") != "mega" || (dtype != "bf16" && dtype != "mxfp4") ||
             !parse_mode(spec.value("mode", ""), &mode) || spec.value("layers", 1) != 1 ||
             spec.value("m", 0) < 1 || spec.value("m", 0) > 1024 || spec.value("repeats", 1) != 1 ||
             spec.value("warmup", 0) != 0) {
-            return fail("mega case needs BF16, one linear/full layer, one launch, and no warmup");
+            return fail("mega case needs BF16 or MXFP4, one linear/full layer, one launch, and no warmup");
         }
-        const model_case config = { GGML_TYPE_BF16, spec.at("m").get<int64_t>(), spec.value("seed", 1U), 1, mode };
+        const model_case config = { dtype == "mxfp4" ? GGML_TYPE_MXFP4 : GGML_TYPE_BF16,
+                                    spec.at("m").get<int64_t>(), spec.value("seed", 1U), 1, mode };
         json result = {{"case", spec}, {"samples", json::array()}};
         int status = run_model_case(dayan.get(), cpu.get(), config, &result);
         if (status == 0 && result.value("mega_launched", false) != true) {

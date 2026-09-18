@@ -179,14 +179,6 @@ int copy(const uintptr_t * parameters, const uint16_t * indices) {
     return 0;
 }
 
-int repeat(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_repeat(
-        parameter<const DayanRepeatConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<void *>(parameters, indices, 2));
-    return 0;
-}
-
 int ssm_conv(const uintptr_t * parameters, const uint16_t * indices) {
     ggml_dayan_matmul_detail::run_ssm_conv(
         parameter<const DayanSSMConvConfig *>(parameters, indices, 0),
@@ -206,7 +198,7 @@ int l2_norm(const uintptr_t * parameters, const uint16_t * indices) {
 
 int add(const uintptr_t * parameters, const uint16_t * indices) {
     ggml_dayan_matmul_detail::run_binary_f32<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
+        parameter<const DayanBinaryConfig *>(parameters, indices, 0),
         parameter<const float *>(parameters, indices, 1),
         parameter<const float *>(parameters, indices, 2),
         parameter<float *>(parameters, indices, 3));
@@ -215,7 +207,7 @@ int add(const uintptr_t * parameters, const uint16_t * indices) {
 
 int multiply(const uintptr_t * parameters, const uint16_t * indices) {
     ggml_dayan_matmul_detail::run_binary_f32<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
+        parameter<const DayanBinaryConfig *>(parameters, indices, 0),
         parameter<const float *>(parameters, indices, 1),
         parameter<const float *>(parameters, indices, 2),
         parameter<float *>(parameters, indices, 3));
@@ -372,125 +364,14 @@ int gated_output_projection_bf16(const uintptr_t * parameters, const uint16_t * 
             parameter<uint16_t *>(parameters, indices, 5));
 }
 
-static void probe_words(uint32_t slot, uint64_t tag, const void * source) {
-    const uint64_t staging = (uint64_t) (uintptr_t) ((char *) dayan_uram_base() +
-        ggml_dayan_matmul_detail::NormalizationLayout::kInput);
-    ggml_dayan_matmul_detail::memory_load_bytes(staging, source, 16U);
-    *(volatile uint64_t *) (staging + 2048U) = *(volatile uint64_t *) staging;
-    *(volatile uint64_t *) (staging + 2056U) = *(volatile uint64_t *) (staging + 8U);
-    *(volatile uint64_t *) (staging + 2064U) = tag;
-    *(volatile uint64_t *) (staging + 2072U) = (uint64_t) (uintptr_t) source;
-    ggml_dayan_matmul_detail::memory_store_bytes(
-        (void *) (0xC0000000ULL + (uint64_t) slot * 32U), staging + 2048U, 32U);
-}
-
 template <typename Graph>
 static int execute(const uintptr_t * parameters, dayan_cluster_barrier_t * barrier) {
-    uint16_t probe_step = 0;
     for (uint16_t index = 0; index < Graph::operation_count; ++index) {
         const Operation & operation = Graph::operations[index];
         if (operation.function == nullptr) {
             const int status = dayan_cluster_barrier(4, barrier);
             if (status < 0) {
                 return status;
-            }
-            if constexpr (Graph::kProbeFlashQ) {
-                if (dayan_task_id(DAYAN_TASK_X) == 0U && probe_step < 20U) {
-                    const uint64_t staging = (uint64_t) (uintptr_t) ((char *) dayan_uram_base() +
-                        ggml_dayan_matmul_detail::NormalizationLayout::kInput);
-                    if (probe_step == 0U) {
-                        *(volatile uint64_t *) (staging + 0U)  = 0x7A7A7A7A51B17A7AULL;
-                        *(volatile uint64_t *) (staging + 8U)  = parameters[56];
-                        *(volatile uint64_t *) (staging + 16U) = parameters[58];
-                        *(volatile uint64_t *) (staging + 24U) = parameters[61];
-                    } else {
-                        ggml_dayan_matmul_detail::memory_load_bytes(staging, (const void *) parameters[56], 16U);
-                        ggml_dayan_matmul_detail::memory_load_bytes(staging + 64U, (const void *) parameters[56], 16U);
-                        *(volatile uint64_t *) (staging + 2048U) = *(volatile uint64_t *) staging;
-                        *(volatile uint64_t *) (staging + 2056U) = *(volatile uint64_t *) (staging + 64U);
-                        *(volatile uint64_t *) (staging + 2064U) = 0xC0DE000000000000ULL + probe_step;
-                        *(volatile uint64_t *) (staging + 2072U) = parameters[56];
-                    }
-                    ggml_dayan_matmul_detail::memory_store_bytes(
-                        (void *) (0xC0000000ULL + (uint64_t) probe_step * 32U),
-                        staging + (probe_step == 0U ? 0U : 2048U), 32U);
-                    ++probe_step;
-                }
-            }
-            if constexpr (Graph::kProbeGdn) {
-                if (dayan_task_id(DAYAN_TASK_X) == 0U) {
-                    uint16_t gdn_index = Graph::operation_count;
-                    for (uint16_t scan = 0; scan < Graph::operation_count; ++scan) {
-                        if (Graph::operations[scan].function == &gated_delta_net) {
-                            gdn_index = scan;
-                            break;
-                        }
-                    }
-                    if (gdn_index < Graph::operation_count) {
-                        const uint16_t * a = Graph::operations[gdn_index].arguments;
-                        if (index == gdn_index - 17U) {
-                            const uint16_t * lq = Graph::operations[gdn_index - 19U].arguments;
-                            const uint16_t * lk = Graph::operations[gdn_index - 18U].arguments;
-                            probe_words(130U, 0xC0DE00000000AA00ULL, (const void *) parameters[lq[2]]);
-                            probe_words(131U, 0xC0DE00000000AA00ULL, (const void *) (parameters[lq[2]] + 8192U));
-                            probe_words(132U, 0xC0DE00000000AA01ULL, (const void *) parameters[lk[2]]);
-                            probe_words(133U, 0xC0DE00000000AA01ULL, (const void *) (parameters[lk[2]] + 8192U));
-                        }
-                        if (index == gdn_index - 15U) {
-                            const uint16_t * mm = Graph::operations[gdn_index - 16U].arguments;
-                            probe_words(134U, 0xC0DE00000000AB00ULL, (const void *) parameters[mm[3]]);
-                            probe_words(135U, 0xC0DE00000000AB00ULL, (const void *) (parameters[mm[3]] + 64U));
-                            probe_words(136U, 0xC0DE00000000AB01ULL, (const void *) parameters[mm[1]]);
-                        }
-                        if (index == gdn_index - 13U) {
-                            const uint16_t * rp = Graph::operations[gdn_index - 14U].arguments;
-                            probe_words(137U, 0xC0DE00000000AC00ULL, (const void *) parameters[rp[2]]);
-                            probe_words(138U, 0xC0DE00000000AC00ULL, (const void *) (parameters[rp[2]] + 64U));
-                        }
-                        if (index == gdn_index - 11U) {
-                            const uint16_t * ad = Graph::operations[gdn_index - 12U].arguments;
-                            probe_words(139U, 0xC0DE00000000AD00ULL, (const void *) parameters[ad[3]]);
-                            probe_words(140U, 0xC0DE00000000AD00ULL, (const void *) (parameters[ad[3]] + 64U));
-                        }
-                        if (index == gdn_index - 9U) {
-                            const uint16_t * sp = Graph::operations[gdn_index - 10U].arguments;
-                            probe_words(141U, 0xC0DE00000000AE00ULL, (const void *) parameters[sp[2]]);
-                            probe_words(142U, 0xC0DE00000000AE00ULL, (const void *) (parameters[sp[2]] + 64U));
-                        }
-                        if (index == gdn_index - 7U) {
-                            const uint16_t * ra = Graph::operations[gdn_index - 8U].arguments;
-                            probe_words(143U, 0xC0DE00000000AF00ULL, (const void *) parameters[ra[2]]);
-                            probe_words(144U, 0xC0DE00000000AF00ULL, (const void *) (parameters[ra[2]] + 64U));
-                        }
-                        if (index + 1U == gdn_index) {
-                            const uint64_t cfg = parameters[a[0]];
-                            probe_words(100U, 0xC0DE000000000A04ULL, (const void *) parameters[a[4]]);
-                            probe_words(101U, 0xC0DE000000000A04ULL, (const void *) (parameters[a[4]] + 64U));
-                            probe_words(102U, 0xC0DE000000000A04ULL, (const void *) (parameters[a[4]] + 128U));
-                            probe_words(103U, 0xC0DE000000000A04ULL, (const void *) (parameters[a[4]] + 192U));
-                            probe_words(104U, 0xC0DE000000000A05ULL, (const void *) parameters[a[5]]);
-                            probe_words(105U, 0xC0DE000000000A05ULL, (const void *) (parameters[a[5]] + 64U));
-                            probe_words(106U, 0xC0DE000000000A05ULL, (const void *) (parameters[a[5]] + 128U));
-                            probe_words(107U, 0xC0DE000000000A05ULL, (const void *) (parameters[a[5]] + 192U));
-                            probe_words(108U, 0xC0DE000000000A00ULL, (const void *) (cfg + 144U));
-                            probe_words(109U, 0xC0DE000000000A00ULL, (const void *) (cfg + 160U));
-                            probe_words(110U, 0xC0DE000000000A00ULL, (const void *) (cfg + 176U));
-                            probe_words(111U, 0xC0DE000000000A00ULL, (const void *) (cfg + 192U));
-                        }
-                        if (index == gdn_index + 1U) {
-                            probe_words(112U, 0xC0DE000000000B07ULL, (const void *) (parameters[a[7]] + 8192U));
-                            probe_words(113U, 0xC0DE000000000B07ULL, (const void *) (parameters[a[7]] + 32768U));
-                            probe_words(114U, 0xC0DE000000000B07ULL, (const void *) parameters[a[7]]);
-                            probe_words(115U, 0xC0DE000000000B07ULL, (const void *) (parameters[a[7]] + 16384U));
-                        }
-                        if (index == Graph::operation_count - 2U) {
-                            probe_words(116U, 0xC0DE000000000C07ULL, (const void *) (parameters[a[7]] + 8192U));
-                            probe_words(117U, 0xC0DE000000000C07ULL, (const void *) (parameters[a[7]] + 32768U));
-                            probe_words(118U, 0xC0DE000000000C07ULL, (const void *) parameters[a[7]]);
-                            probe_words(119U, 0xC0DE000000000C07ULL, (const void *) (parameters[a[7]] + 24576U));
-                        }
-                    }
-                }
             }
             continue;
         }
