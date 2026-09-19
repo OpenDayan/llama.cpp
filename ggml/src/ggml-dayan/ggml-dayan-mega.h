@@ -11,6 +11,7 @@ struct ggml_backend_dayan_mega_runtime {
     void * context;
     bool   enabled;
     bool (*resolve)(void *, const void *, size_t, npu_buffer_t **, uint64_t *);
+    int (*prepare_workspace)(void *, size_t, npu_buffer_t **);
     int (*launch)(void *, uint16_t, const void *, size_t, npu_buffer_t * const *);
 };
 

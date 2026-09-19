@@ -88,10 +88,245 @@ static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
     return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
 }
 
+static inline uint64_t moe_dispatch_base() {
+    return (uint64_t) (uintptr_t) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES;
+}
+
+static inline volatile uint32_t * moe_dispatch_counts() {
+    return (volatile uint32_t *) (uintptr_t) moe_dispatch_base();
+}
+
+static inline uint32_t * moe_dispatch_positions() {
+    return (uint32_t *) (uintptr_t) (moe_dispatch_base() + (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t));
+}
+
+static inline uint32_t * moe_dispatch_offsets(uint32_t total) {
+    return (uint32_t *) (uintptr_t) (moe_dispatch_base() + (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t) +
+                                      (uint64_t) total * sizeof(uint32_t));
+}
+
+static inline bool moe_dispatch_fits(uint32_t experts, uint32_t total) {
+    const uint64_t end = (uint64_t) MATMUL_DAYAN_4C_ATOMIC_BYTES +
+                         (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t) +
+                         (uint64_t) (total + experts + 1U) * sizeof(uint32_t);
+    return shared != nullptr && end <= DAYAN_SORT_ATOMIC_BYTES;
+}
+
+static inline void moe_copy_mxfp4_row(void * destination, const DayanMxfp4Layout & destination_layout,
+                                      uint32_t destination_row,
+                                      void * destination_scales, const DayanMxfp4Layout & source_layout,
+                                      uint32_t source_row, const void * source, const void * source_scales,
+                                      uint64_t source_scale_stride) {
+    memory_copy_device((char *) destination + (uint64_t) destination_row * destination_layout.row_stride,
+                       (const char *) source + (uint64_t) source_row * source_layout.row_stride,
+                       destination_layout.row_stride);
+    const uint32_t planes = (uint32_t) ((source_layout.columns + 127U) / 128U);
+    for (uint32_t plane = 0; plane < planes; ++plane) {
+        // TODO: replace these short D2D copies with one address-table Scatter when the firmware wrapper is exposed.
+        memory_copy_device((char *) destination_scales + (uint64_t) plane * destination_layout.scale_stride +
+                               (uint64_t) destination_row * 4,
+                           (const char *) source_scales + (uint64_t) plane * source_scale_stride +
+                               (uint64_t) source_row * 4,
+                           4);
+    }
+}
+
+static inline void moe_copy_output_row(void * destination, uint64_t destination_stride, void * destination_scales,
+                                       uint64_t destination_scale_stride, const DayanMxfp4Layout & destination_layout,
+                                       uint32_t destination_row, const void * source, uint64_t source_stride,
+                                       const void * source_scales, const DayanMxfp4Layout & source_layout,
+                                       uint32_t source_row, uint32_t output_type) {
+    if (output_type == kDayanDataTypeMXFP4) {
+        memory_copy_device((char *) destination + (uint64_t) destination_row * destination_stride,
+                           (const char *) source + (uint64_t) source_row * source_layout.row_stride,
+                           source_layout.row_stride);
+        const uint32_t planes = (uint32_t) ((source_layout.columns + 127U) / 128U);
+        for (uint32_t plane = 0; plane < planes; ++plane) {
+            // TODO: use a table-based D2D Scatter for payload and scale rows.
+            memory_copy_device((char *) destination_scales + (uint64_t) plane * destination_scale_stride +
+                                   (uint64_t) destination_row * 4,
+                               (const char *) source_scales + (uint64_t) plane * source_layout.scale_stride +
+                                   (uint64_t) source_row * 4,
+                               4);
+        }
+    } else {
+        memory_copy_device((char *) destination + (uint64_t) destination_row * destination_stride,
+                           (const char *) source + (uint64_t) source_row * source_stride,
+                           source_stride);
+    }
+    (void) destination_layout;
+}
+
+static inline int run_router_indexer_f32(const DayanRouterIndexerConfig * config, const float * activation,
+                                         const float * weight, float * logits, int32_t * selected) {
+    if (!config || !activation || !weight || !logits || !selected || !config->matmul.m || !config->matmul.n ||
+        !config->matmul.k || !config->experts_used || config->matmul.n > kDayanSortMaxWidth ||
+        config->experts_used > config->matmul.n ||
+        config->selected_stride < (uint64_t) config->experts_used * sizeof(int32_t)) {
+        return -22;
+    }
+    run_router_f32(&config->matmul, activation, weight, logits);
+    dayan_cluster_barrier_t * barrier =
+        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
+    int status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+
+    const bool grouped = config->grouped != 0;
+    const uint32_t total = (uint32_t) (config->matmul.m * config->experts_used);
+    if (grouped && !moe_dispatch_fits((uint32_t) config->matmul.n, total)) {
+        return -22;
+    }
+    volatile uint32_t * counts = grouped ? moe_dispatch_counts() : nullptr;
+    uint32_t * positions = grouped ? moe_dispatch_positions() : nullptr;
+    uint32_t * offsets = grouped ? moe_dispatch_offsets(total) : nullptr;
+    if (grouped && dayan_native_task_id() == 0) {
+        for (uint32_t expert = 0; expert < config->matmul.n; ++expert) {
+            counts[expert] = 0;
+        }
+    }
+    status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+
+    const uint32_t task = dayan_native_task_id();
+    const uint32_t tasks = dayan_native_task_count();
+    // TODO: replace the scalar per-token top-k scan with a FlexVec/radix selection pass.
+    for (uint32_t token = task; token < config->matmul.m; token += tasks) {
+        int32_t * row = (int32_t *) ((char *) selected + (uint64_t) token * config->selected_stride);
+        for (uint32_t rank = 0; rank < config->experts_used; ++rank) {
+            float best = -3.402823466e+38F;
+            int32_t best_expert = -1;
+            for (uint32_t expert = 0; expert < config->matmul.n; ++expert) {
+                bool already = false;
+                for (uint32_t previous = 0; previous < rank; ++previous) {
+                    already = already || row[previous] == (int32_t) expert;
+                }
+                const float value = ((const float *) ((const char *) logits +
+                                                       (uint64_t) token * config->matmul.output_stride))[expert];
+                if (!already && (best_expert < 0 || value > best)) {
+                    best = value;
+                    best_expert = (int32_t) expert;
+                }
+            }
+            if (best_expert < 0) { return -22; }
+            row[rank] = best_expert;
+            if (grouped) {
+                const uint32_t assignment = token * config->experts_used + rank;
+                positions[assignment] = __atomic_fetch_add((uint32_t *) &counts[best_expert], 1U, __ATOMIC_RELAXED);
+            }
+        }
+    }
+    status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+    if (!grouped) {
+        return dayan_cluster_barrier(4, barrier);
+    }
+    if (dayan_native_task_id() == 0) {
+        // TODO: compute this expert-count prefix with FlexVec Shuffle instead of the scalar carry loop.
+        uint32_t running = 0;
+        for (uint32_t expert = 0; expert < config->matmul.n; ++expert) {
+            offsets[expert] = running;
+            running += counts[expert];
+        }
+        offsets[config->matmul.n] = running;
+    }
+    return dayan_cluster_barrier(4, barrier);
+}
+
+static int run_mul_mat_id_mxfp4_grouped(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
+                                         const void * b, const void * bs, const void * up, const void * ups,
+                                         const int32_t * ids, void * output, void * scales, void * workspace) {
+    if (!config) {
+        return -22;
+    }
+    const auto & r = config->routing;
+    const auto & mm = config->matmul;
+    const uint32_t total = r.tokens * r.experts_used;
+    const DayanMxfp4Layout input_layout = DayanMxfp4Layout::make(total, mm.k);
+    const DayanMxfp4Layout output_layout = DayanMxfp4Layout::make(total, mm.n);
+    const uint64_t output_bytes = mm.output_type == kDayanDataTypeMXFP4 ? output_layout.bytes :
+                                                                            (uint64_t) total * mm.n * sizeof(float);
+    const uint64_t output_offset = (input_layout.bytes + 63U) & ~63ULL;
+    const uint64_t required = output_offset + ((output_bytes + 63U) & ~63ULL);
+    if (!config || !workspace || !shared || !a || !as || !b || !bs || !up || !ups || !ids || !output ||
+        !r.tokens || !r.experts_used || !r.experts || !r.activation_slots || !config->workspace_bytes ||
+        !moe_dispatch_fits(r.experts, total) || required > config->workspace_bytes || r.experts_used % r.activation_slots ||
+        mm.m != 1 || mm.weight_type != kDayanDataTypeMXFP4 ||
+        (mm.output_type == kDayanDataTypeMXFP4 && !scales)) {
+        return -22;
+    }
+    uint32_t * positions = moe_dispatch_positions();
+    uint32_t * offsets = moe_dispatch_offsets(total);
+    if (offsets[r.experts] != total) { return -22; }
+    const uint64_t grouped_a = (uintptr_t) workspace;
+    const uint64_t grouped_as = grouped_a + input_layout.scale_offset;
+    const uint64_t grouped_output = grouped_a + output_offset;
+    const uint64_t grouped_output_scales = grouped_output + output_layout.scale_offset;
+    const uint32_t task = dayan_native_task_id();
+    const uint32_t tasks = dayan_native_task_count();
+    const DayanMxfp4Layout source_layout = DayanMxfp4Layout::make(r.tokens * r.activation_slots, mm.k);
+    for (uint32_t assignment = task; assignment < total; assignment += tasks) {
+        // TODO: move address generation into a D2D Scatter address table; scalar code currently owns this mapping.
+        const uint32_t token = assignment / r.experts_used;
+        const uint32_t used = assignment % r.experts_used;
+        const int32_t expert = moe_read_expert((const int32_t *) ((const char *) ids + (uint64_t) token * r.ids_row_stride), used);
+        if (expert < 0 || (uint32_t) expert >= r.experts) { return -22; }
+        const uint32_t group_row = offsets[expert] + positions[assignment];
+        const uint32_t input_row = token * r.activation_slots + used % r.activation_slots;
+        moe_copy_mxfp4_row((void *) grouped_a, input_layout, group_row, (void *) grouped_as,
+                           source_layout, input_row, a, as, mm.a_scale_stride);
+    }
+    dayan_cluster_barrier_t * barrier =
+        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
+    int status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+
+    ggml_dayan_mxfp4_detail::Phases phases = {};
+    DayanMxfp4Config batch = mm;
+    batch.a_stride = input_layout.row_stride;
+    batch.a_scale_stride = input_layout.scale_stride;
+    batch.output_stride = mm.output_type == kDayanDataTypeMXFP4 ? output_layout.row_stride : mm.n * sizeof(float);
+    batch.output_scale_stride = mm.output_type == kDayanDataTypeMXFP4 ? output_layout.scale_stride : 0;
+    for (uint32_t expert = 0; expert < r.experts; ++expert) {
+        const uint32_t begin = offsets[expert];
+        const uint32_t count = offsets[expert + 1] - begin;
+        if (!count) { continue; }
+        batch.m = count;
+        status = ggml_dayan_mxfp4_detail::run(
+            &batch, (const void *) (grouped_a + (uint64_t) begin * input_layout.row_stride),
+            (const void *) (grouped_as + (uint64_t) begin * 4),
+            (const char *) b + (uint64_t) expert * mm.n * mm.b_stride,
+            (const char *) bs + (uint64_t) expert * mm.n * 4,
+            (const char *) up + (uint64_t) expert * mm.n * mm.b_stride,
+            (const char *) ups + (uint64_t) expert * mm.n * 4,
+            (void *) (grouped_output + (uint64_t) begin * batch.output_stride),
+            mm.output_type == kDayanDataTypeMXFP4 ? (void *) (grouped_output_scales + (uint64_t) begin * 4) : nullptr,
+            &phases);
+        if (status < 0) { return status; }
+    }
+    status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+    // TODO: use one table-based D2D Scatter for the inverse output mapping once the address-table wrapper is available.
+    for (uint32_t assignment = task; assignment < total; assignment += tasks) {
+        const uint32_t token = assignment / r.experts_used;
+        const uint32_t used = assignment % r.experts_used;
+        const int32_t expert = moe_read_expert((const int32_t *) ((const char *) ids + (uint64_t) token * r.ids_row_stride), used);
+        if (expert < 0 || (uint32_t) expert >= r.experts) { return -22; }
+        const uint32_t group_row = offsets[expert] + positions[assignment];
+        moe_copy_output_row(output, mm.output_stride, scales, mm.output_scale_stride, output_layout, assignment,
+                            (const void *) grouped_output, batch.output_stride,
+                            mm.output_type == kDayanDataTypeMXFP4 ? (const void *) grouped_output_scales : nullptr,
+                            output_layout, group_row, mm.output_type);
+    }
+    return dayan_cluster_barrier(4, barrier);
+}
+
 static int run_mul_mat_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
                                const void * b, const void * bs, const void * up, const void * ups,
-                               const int32_t * ids, void * output, void * scales) {
+                               const int32_t * ids, void * output, void * scales, void * workspace) {
     DAYAN_PARAMS_IF(!config || !a || !as || !b || !bs || !up || !ups || !ids || !output || !scales) { return -22; }
+    if (config->grouped) {
+        return run_mul_mat_id_mxfp4_grouped(config, a, as, b, bs, up, ups, ids, output, scales, workspace);
+    }
     const auto & r = config->routing;
     const auto & mm = config->matmul;
     DAYAN_PARAMS_IF(!r.k || r.k % 32 || !r.n || r.n % 16 || !r.experts || !r.experts_used || !r.tokens ||

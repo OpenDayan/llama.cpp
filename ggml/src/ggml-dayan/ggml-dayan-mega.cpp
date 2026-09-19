@@ -88,6 +88,21 @@ public:
         return add_parameter((uint16_t) root + 1, root_offset + extra_offset);
     }
 
+    bool add_buffer(npu_buffer_t * buffer) {
+        if (next_ >= count_ || buffer == nullptr) {
+            return false;
+        }
+        size_t root = 0;
+        for (; root < root_count_ && roots_[root] != buffer; ++root) {}
+        if (root == root_count_) {
+            if (root_count_ == roots_.size()) {
+                return false;
+            }
+            roots_[root_count_++] = buffer;
+        }
+        return add_parameter((uint16_t) root + 1, 0);
+    }
+
     bool finish() {
         if (next_ != count_ || data_.size() > UINT32_MAX) {
             return false;
@@ -279,7 +294,8 @@ static bool ggml_backend_dayan_mega_add_matmul(ggml_backend_dayan_mega_parameter
                                                 const ggml_tensor *                  node,
                                                 const ggml_tensor *                  up,
                                                 ggml_tensor *                        output,
-                                                uint32_t                             operation) {
+                                                uint32_t                             operation,
+                                                npu_buffer_t *                       workspace = nullptr) {
     if (node == nullptr || output == nullptr || node->src[0] == nullptr || node->src[1] == nullptr ||
         node->src[0]->type != GGML_TYPE_MXFP4 || node->src[1]->type != GGML_TYPE_MXFP4 ||
         (up != nullptr && (up->src[0] == nullptr || up->src[0]->type != GGML_TYPE_MXFP4))) {
@@ -311,6 +327,9 @@ static bool ggml_backend_dayan_mega_add_matmul(ggml_backend_dayan_mega_parameter
     config.output_type         = output_mxfp4 ? kDayanDataTypeMXFP4 : kDayanDataTypeF32;
     config.operation           = operation;
     const bool moe = node->op == GGML_OP_MUL_MAT_ID;
+    if (moe && node->src[2] == nullptr) {
+        return false;
+    }
     DayanMxfp4MoeConfig routed = {};
     if (moe) {
         config.m = 1;
@@ -318,12 +337,17 @@ static bool ggml_backend_dayan_mega_add_matmul(ggml_backend_dayan_mega_parameter
         routed.routing = {(uint32_t) config.k, (uint32_t) config.n, (uint32_t) weight->ne[2],
                           (uint32_t) node->src[2]->ne[0], (uint32_t) node->src[2]->ne[1],
                           (uint32_t) input->ne[1], node->src[2]->nb[1]};
+        routed.grouped = routed.routing.tokens > 1;
+        routed.workspace_bytes = DAYAN_MOE_WORKSPACE_BYTES;
+        if (workspace == nullptr) {
+            return false;
+        }
     }
     return (moe ? parameters->add_data(routed) : parameters->add_data(config)) && parameters->add_tensor(input) &&
            parameters->add_tensor(input, a.scale_offset) && parameters->add_tensor(weight) &&
            parameters->add_tensor(weight, b.scale_offset) && parameters->add_tensor(up_weight) &&
            parameters->add_tensor(up_weight, u.scale_offset) && (!moe || parameters->add_tensor(node->src[2])) && parameters->add_tensor(output) &&
-           parameters->add_tensor(output, output_mxfp4 ? out.scale_offset : 0);
+           parameters->add_tensor(output, output_mxfp4 ? out.scale_offset : 0) && (!moe || parameters->add_buffer(workspace));
 }
 
 static DayanMatmulConfig ggml_backend_dayan_mega_matmul_config(const ggml_tensor * weight,
@@ -1118,6 +1142,27 @@ static bool ggml_backend_dayan_mega_add_tf32(ggml_backend_dayan_mega_parameters 
            parameters->add_tensor(output->src[0]) && parameters->add_tensor(output);
 }
 
+static bool ggml_backend_dayan_mega_add_router_indexer(ggml_backend_dayan_mega_parameters * parameters,
+                                                        const ggml_backend_dayan_graph_slot & slot,
+                                                        const ggml_tensor *                  selected) {
+    const ggml_tensor * logits = slot.nodes[0];
+    if (logits == nullptr || logits->src[0] == nullptr || logits->src[1] == nullptr || selected == nullptr ||
+        logits->type != GGML_TYPE_F32 || logits->src[0]->type != GGML_TYPE_F32 ||
+        logits->src[1]->type != GGML_TYPE_F32 || selected->type != GGML_TYPE_I32 || selected->nb[0] != sizeof(int32_t) ||
+        selected->ne[0] == 0 ||
+        selected->ne[1] != logits->ne[1]) {
+        return false;
+    }
+    DayanRouterIndexerConfig config = {};
+    config.matmul = ggml_backend_dayan_mega_matmul_config(logits->src[0], logits->src[1], logits);
+    config.matmul.a_stride = config.matmul.k * sizeof(float);
+    config.experts_used = (uint32_t) selected->ne[0];
+    config.selected_stride = (uint32_t) selected->nb[1];
+    config.grouped = config.matmul.m > 1;
+    return parameters->add_data(config) && parameters->add_tensor(logits->src[1]) &&
+           parameters->add_tensor(logits->src[0]) && parameters->add_tensor(logits) && parameters->add_tensor(selected);
+}
+
 static bool ggml_backend_dayan_mega_add_routing(ggml_backend_dayan_mega_parameters * parameters,
                                                 const ggml_backend_dayan_graph_slot & slot) {
     const ggml_tensor * output = slot.nodes[0];
@@ -1203,15 +1248,17 @@ static constexpr auto ggml_backend_dayan_qwen35_moe_full_signature =
     ggml_backend_dayan_moe_signature<13>(ggml_backend_dayan_qwen35_bf16_full_signature);
 
 static bool ggml_backend_dayan_pack_qwen35_moe_ffn(ggml_backend_dayan_mega_parameters * parameters,
-                                                   const std::vector<ggml_backend_dayan_graph_slot> & slots, size_t begin) {
+                                                   const std::vector<ggml_backend_dayan_graph_slot> & slots, size_t begin,
+                                                   npu_buffer_t * workspace) {
     const auto at = [&slots, begin](size_t index) -> const ggml_backend_dayan_graph_slot & { return slots[begin + index]; };
     const ggml_tensor * gate = at(9).nodes[0];
     const ggml_tensor * up = at(9).nodes[1];
-    if (gate == nullptr || gate->src[2] == nullptr || gate->src[2]->ne[0] != 8 || up == nullptr || up->src[2] != gate->src[2]) {
+    if (workspace == nullptr || gate == nullptr || gate->src[2] == nullptr || gate->src[2]->ne[0] != 8 ||
+        up == nullptr || up->src[2] != gate->src[2]) {
         return false;
     }
     if (!(ggml_backend_dayan_mega_add_norm(parameters, at(0), true) &&
-          ggml_backend_dayan_mega_add_tf32(parameters, at(1)) &&
+          ggml_backend_dayan_mega_add_router_indexer(parameters, at(1), gate->src[2]) &&
           ggml_backend_dayan_mega_add_routing(parameters, at(2)) &&
           ggml_backend_dayan_mega_add_routing(parameters, at(3)) &&
           ggml_backend_dayan_mega_add_rows(parameters, at(4), false) &&
@@ -1219,8 +1266,8 @@ static bool ggml_backend_dayan_pack_qwen35_moe_ffn(ggml_backend_dayan_mega_param
           ggml_backend_dayan_mega_add_routing(parameters, at(6)) &&
           ggml_backend_dayan_mega_add_binary(parameters, at(7)) &&
           ggml_backend_dayan_mega_add_quantize(parameters, at(8)) &&
-          ggml_backend_dayan_mega_add_matmul(parameters, gate, up, at(9).nodes[3], 2) &&
-          ggml_backend_dayan_mega_add_matmul(parameters, at(10).nodes[0], nullptr, at(10).nodes[0], 0) &&
+          ggml_backend_dayan_mega_add_matmul(parameters, gate, up, at(9).nodes[3], 2, workspace) &&
+          ggml_backend_dayan_mega_add_matmul(parameters, at(10).nodes[0], nullptr, at(10).nodes[0], 0, workspace) &&
           ggml_backend_dayan_mega_add_binary(parameters, at(11)))) { return false; }
     for (size_t i = 12; i < 19; ++i) {
         if (!ggml_backend_dayan_mega_add_binary(parameters, at(i))) { return false; }
@@ -1310,6 +1357,13 @@ ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
         return result;
     }
 
+    npu_buffer_t * workspace = nullptr;
+    const bool moe = graph == kDayanMegaQwen35MoeLinear || graph == kDayanMegaQwen35MoeFull;
+    if (moe && (runtime.prepare_workspace == nullptr ||
+                runtime.prepare_workspace(runtime.context, DAYAN_MOE_WORKSPACE_BYTES, &workspace) < 0)) {
+        result.end = begin;
+        return result;
+    }
     ggml_backend_dayan_mega_parameters parameters(runtime, graph, parameter_count);
     bool packed = false;
     switch (graph) {
@@ -1327,11 +1381,11 @@ ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
             break;
         case kDayanMegaQwen35MoeLinear:
             packed = ggml_backend_dayan_pack_qwen35_bf16_linear_attention(&parameters, slots, begin, decode) &&
-                     ggml_backend_dayan_pack_qwen35_moe_ffn(&parameters, slots, begin + (decode ? 24 : 26));
+                     ggml_backend_dayan_pack_qwen35_moe_ffn(&parameters, slots, begin + (decode ? 24 : 26), workspace);
             break;
         case kDayanMegaQwen35MoeFull:
             packed = ggml_backend_dayan_pack_qwen35_bf16_full_attention(&parameters, slots, begin) &&
-                     ggml_backend_dayan_pack_qwen35_moe_ffn(&parameters, slots, begin + 13);
+                     ggml_backend_dayan_pack_qwen35_moe_ffn(&parameters, slots, begin + 13, workspace);
             break;
     }
     if (!packed || !parameters.finish()) {

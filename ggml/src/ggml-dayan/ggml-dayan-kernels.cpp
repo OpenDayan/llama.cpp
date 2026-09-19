@@ -64,10 +64,10 @@ __kernel__ void router_f32(const DayanMatmulConfig * config, const float * activ
 
 __kernel__ void mul_mat_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
                                 const void * b, const void * bs, const void * up, const void * ups,
-                                const int32_t * ids, void * output, void * scales) {
+                                const int32_t * ids, void * output, void * scales, void * workspace) {
     dayan_acquire_config(config);
     ggml_dayan_matmul_detail::matmul_check(
-        ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(config, a, as, b, bs, up, ups, ids, output, scales));
+        ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(config, a, as, b, bs, up, ups, ids, output, scales, workspace));
 }
 
 __kernel__ void quantize_mxfp4(const DayanMxfp4Config * config, const void * input, void * output, void * scales) {

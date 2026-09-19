@@ -1429,6 +1429,7 @@ static int ggml_backend_dayan_mxfp4_matmul(ggml_backend_dayan_context * ctx, ggm
         moe_config.routing = {(uint32_t) config.k, (uint32_t) config.n, (uint32_t) weight->ne[2],
                               (uint32_t) node->src[2]->ne[0], (uint32_t) node->src[2]->ne[1],
                               (uint32_t) input->ne[1], node->src[2]->nb[1]};
+        moe_config.grouped = 0;
     }
     ggml_backend_dayan_buffers buffers;
     status = ggml_backend_dayan_prepare_launch_buffers(ctx, moe ? (const void *) &moe_config : &config,
@@ -1442,7 +1443,8 @@ static int ggml_backend_dayan_mxfp4_matmul(ggml_backend_dayan_context * ctx, ggm
             status = mul_mat_id_mxfp4(buffers.config, a, as ? as : a, weight_buffer, b->scales,
                                      up ? ggml_backend_dayan_tensor_buffer(up->src[0]) : weight_buffer, u->scales,
                                      ggml_backend_dayan_tensor_buffer(node->src[2]), ggml_backend_dayan_tensor_buffer(output),
-                                     out ? out->scales : ggml_backend_dayan_tensor_buffer(output), &attrs);
+                                     out ? out->scales : ggml_backend_dayan_tensor_buffer(output),
+                                     ggml_backend_dayan_tensor_buffer(output), &attrs);
         } else {
             status = ggml_backend_dayan_matmul_kernel(ctx, matmul_mxfp4_1c, matmul_mxfp4_4c)(buffers.config, a, as ? as : a, weight_buffer, mx ? b->scales : weight_buffer,
                                 up ? ggml_backend_dayan_tensor_buffer(up->src[0]) : weight_buffer,
@@ -3342,6 +3344,19 @@ static bool ggml_backend_dayan_mega_resolve(void *,
     return true;
 }
 
+static int ggml_backend_dayan_mega_prepare_workspace(void * context, size_t size, npu_buffer_t ** buffer) {
+    if (context == nullptr || buffer == nullptr) {
+        return -1;
+    }
+    ggml_backend_dayan_buffers buffers;
+    const int status = ggml_backend_dayan_prepare_slot_workspace(
+        (ggml_backend_dayan_context *) context, size, &buffers);
+    if (status == 0) {
+        *buffer = buffers.input2;
+    }
+    return status;
+}
+
 static int ggml_backend_dayan_mega_launch(void * context,
                                           uint16_t graph,
                                           const void * config,
@@ -3432,6 +3447,7 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
         ctx,
         ggml_backend_dayan_mega_enabled(ctx),
         ggml_backend_dayan_mega_resolve,
+        ggml_backend_dayan_mega_prepare_workspace,
         ggml_backend_dayan_mega_launch,
     };
     bool split_boundary = false;

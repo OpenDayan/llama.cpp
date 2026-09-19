@@ -20,8 +20,8 @@ enum : uint32_t {
     kDayanMegaQwen35DenseMxfp4FullParameters   = 137,
     kDayanMegaQwen35DenseBf16LinearParameters  = 129,
     kDayanMegaQwen35DenseBf16FullParameters    = 89,
-    kDayanMegaQwen35MoeLinearParameters       = 224,
-    kDayanMegaQwen35MoeFullParameters         = 184,
+    kDayanMegaQwen35MoeLinearParameters       = 226,
+    kDayanMegaQwen35MoeFullParameters         = 186,
 };
 
 struct DayanMegaConfig {
@@ -88,6 +88,7 @@ int matmul_swiglu_bf16(const uintptr_t *, const uint16_t *);
 int matmul_quantized_bf16(const uintptr_t *, const uint16_t *);
 int gated_output_projection_bf16(const uintptr_t *, const uint16_t *);
 int matmul_tf32(const uintptr_t *, const uint16_t *);
+int router_indexer(const uintptr_t *, const uint16_t *);
 int matmul_id_mxfp4(const uintptr_t *, const uint16_t *);
 int argsort(const uintptr_t *, const uint16_t *);
 int softmax(const uintptr_t *, const uint16_t *);

@@ -326,6 +326,17 @@ struct DayanMulMatIdPairConfig {
 struct DayanMxfp4MoeConfig {
     DayanMxfp4Config matmul;
     DayanMulMatIdConfig routing;
+    uint32_t grouped;
+    uint32_t reserved;
+    uint64_t workspace_bytes;
+};
+
+struct DayanRouterIndexerConfig {
+    DayanMatmulConfig matmul;
+    uint32_t experts_used;
+    uint32_t selected_stride;
+    uint32_t grouped;
+    uint32_t reserved;
 };
 
 struct DayanAddIdConfig {
@@ -348,6 +359,10 @@ enum : uint32_t {
     kDayanSortMaxWidth = 4096,
     kDayanSortOrderAsc  = 0,
     kDayanSortOrderDesc = 1,
+};
+
+enum : uint32_t {
+    DAYAN_MOE_WORKSPACE_BYTES = 16U * 1024U * 1024U,
 };
 
 struct DayanClampConfig {
@@ -446,6 +461,7 @@ int router_f32(npu_buffer_t * config, npu_buffer_t * activation, npu_buffer_t * 
                const npu_kernel_launch_attrs_t * attrs);
 int mul_mat_id_mxfp4(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
                      npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * ids, npu_buffer_t * output, npu_buffer_t * scales,
+                     npu_buffer_t * workspace,
                      const npu_kernel_launch_attrs_t * attrs);
 int quantize_mxfp4(npu_buffer_t * config, npu_buffer_t * input, npu_buffer_t * output, npu_buffer_t * scales,
                    const npu_kernel_launch_attrs_t * attrs);

@@ -377,6 +377,15 @@ int matmul_tf32(const uintptr_t * parameters, const uint16_t * indices) {
     return 0;
 }
 
+int router_indexer(const uintptr_t * parameters, const uint16_t * indices) {
+    return ggml_dayan_matmul_detail::run_router_indexer_f32(
+        parameter<const DayanRouterIndexerConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<const float *>(parameters, indices, 2),
+        parameter<float *>(parameters, indices, 3),
+        parameter<int32_t *>(parameters, indices, 4));
+}
+
 int matmul_id_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
     reset_local_resources();
     return ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(
@@ -389,7 +398,8 @@ int matmul_id_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
         parameter<const void *>(parameters, indices, 6),
         parameter<const int32_t *>(parameters, indices, 7),
         parameter<void *>(parameters, indices, 8),
-        parameter<void *>(parameters, indices, 9));
+        parameter<void *>(parameters, indices, 9),
+        parameter<void *>(parameters, indices, 10));
 }
 
 int argsort(const uintptr_t * parameters, const uint16_t * indices) {
