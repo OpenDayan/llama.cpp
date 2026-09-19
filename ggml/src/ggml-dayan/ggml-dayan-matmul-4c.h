@@ -97,7 +97,7 @@ static int read_selected_expert_4c(const DayanMulMatIdConfig *config,
     if (lane == 0U) {
         cluster.selected_status = 0;
         const uint64_t scratch = (uint64_t)(uintptr_t)dayan_uram_base();
-        if (!scratch || dayan_uram_size() < sizeof(int32_t)) {
+        DAYAN_PARAMS_IF(!scratch || dayan_uram_size() < sizeof(int32_t)) {
             cluster.selected_status = -12;
         } else {
             long checksum = 0;

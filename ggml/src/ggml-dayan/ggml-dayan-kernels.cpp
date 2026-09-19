@@ -57,6 +57,19 @@ static inline float u32_as_float(uint32_t value) {
 #    include "ggml-dayan-gated-delta-net.h"
 #endif
 
+__kernel__ void router_f32(const DayanMatmulConfig * config, const float * activation, const float * weight, float * output) {
+    dayan_acquire_config(config);
+    ggml_dayan_matmul_detail::run_router_f32(config, activation, weight, output);
+}
+
+__kernel__ void mul_mat_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
+                                const void * b, const void * bs, const void * up, const void * ups,
+                                const int32_t * ids, void * output, void * scales) {
+    dayan_acquire_config(config);
+    ggml_dayan_matmul_detail::matmul_check(
+        ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(config, a, as, b, bs, up, ups, ids, output, scales));
+}
+
 __kernel__ void quantize_mxfp4(const DayanMxfp4Config * config, const void * input, void * output, void * scales) {
     dayan_acquire_config(config);
     ggml_dayan_mxfp4_detail::convert(config, input, output, scales);
@@ -1803,8 +1816,10 @@ DAYAN_MATMUL_1C_DESC(matmul_fp16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_inference_fp16_1c);
 DAYAN_MATMUL_4C_DESC(matmul_bf16_4c);
 DAYAN_MATMUL_1C_DESC(matmul_mxfp4_1c);
+DAYAN_MATMUL_1C_DESC(mul_mat_id_mxfp4);
 DAYAN_MATMUL_4C_DESC(matmul_mxfp4_4c);
 DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 0, 0, DAYAN_DESC_URAM_BYTES(296U * 1024U), 1, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(router_f32, 4, 0, 0, DAYAN_DESC_URAM_BYTES(120U * 1024U), 1, 1, 0, 0);
 DAYAN_MATMUL_4C_DESC(matmul_inference_bf16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_fp16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_inference_fp16_4c);
@@ -1960,8 +1975,8 @@ DAYAN_KERNEL_TASK_DESC(rms_norm_pipeline_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYA
 
 #undef DAYAN_NATIVE_KERNEL_DESC
 
-DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 0, 0);
-DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 0, 0);
+DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 0, DAYAN_SORT_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 0, DAYAN_SORT_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 1, 0);
 
 #undef DAYAN_MATMUL_4C_DESC
 #undef DAYAN_MATMUL_1C_DESC

@@ -33,6 +33,8 @@ python3 tools/dayan-trace/create-qwen35-moe-fixture.py \
 
 The four-layer GGUF is about 8.8 GB. Start cmodel with `NPU_CMODEL_MEMORY_MIB=16384` before loading it. The cmodel shared DRAM allocation and both scalar and tensor MMU bounds must support that size; increasing only the Runtime memory window is insufficient. Confirm that the frontend startup log reports 17179869184 shared DRAM bytes. Use `llama-graph-export` and `tools/graph-export/graph-export-html.py` for the complete compiled physical slot plan. A trace replay skips duplicate signatures and does not replace that graph or a full inference check.
 
+The fixture generator also accepts `--source-model`, `--expert-type mxfp4`, and `--small-vocab`. A two-layer hybrid fixture with `--full-attention-interval 2` preserves the source widths and expert count in about 953 MiB. See [Qwen3.5/3.6 MoE validation](qwen35-moe.md) for the 32 GiB cmodel workflow, standalone CPU comparisons, mega decode regression, and limited-perf presets.
+
 ## Top-8 benchmark
 
 [topk-bench.cpp](topk-bench.cpp) compares Device RISC-V selection from DRAM with VEC radix selection and the URAM insertion baseline. See [topk-bench.md](topk-bench.md) for build commands, input limits, cache handling, and the Device cycle timer scope.

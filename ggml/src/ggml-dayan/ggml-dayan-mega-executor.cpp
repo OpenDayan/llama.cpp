@@ -8,6 +8,8 @@
 #include "ggml-dayan-matmul-4c.h"
 #include "ggml-dayan-memory.h"
 #include "ggml-dayan-mxfp4.h"
+#include "ggml-dayan-moe.h"
+#include "ggml-dayan-softmax.h"
 #include "ggml-dayan-normalization.h"
 #include "ggml-dayan-rope.h"
 
@@ -40,12 +42,14 @@ static inline float u32_as_float(uint32_t value) {
 #    include "ggml-dayan-gated-delta-net.h"
 #    include "mega-graph/qwen35-dense-bf16.hpp"
 #    include "mega-graph/qwen35-dense-mxfp4.hpp"
+#    include "mega-graph/qwen35-moe.hpp"
 
 namespace ggml_dayan_mega_detail {
 
 static_assert(ggml_dayan_flash_attention_detail::kAtomicBytes <= MATMUL_DAYAN_4C_ATOMIC_BYTES,
               "Flash Attention shared state overlaps the mega barrier");
-static_assert(MATMUL_DAYAN_4C_ATOMIC_BYTES % alignof(dayan_cluster_barrier_t) == 0,
+static_assert(MATMUL_DAYAN_4C_ATOMIC_BYTES <= DAYAN_SORT_ATOMIC_BYTES, "MatMul shared state overlaps the mega barrier");
+static_assert(DAYAN_SORT_ATOMIC_BYTES % alignof(dayan_cluster_barrier_t) == 0,
               "Mega barrier is not aligned");
 
 template <typename T>
@@ -66,7 +70,7 @@ static int clear_atomic_cache(uint32_t bytes) {
         }
     }
     dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
+        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
     return dayan_cluster_barrier(4, barrier);
 }
 
@@ -364,9 +368,74 @@ int gated_output_projection_bf16(const uintptr_t * parameters, const uint16_t * 
             parameter<uint16_t *>(parameters, indices, 5));
 }
 
-template <typename Graph>
+int matmul_tf32(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_router_f32(
+        parameter<const DayanMatmulConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<const float *>(parameters, indices, 2),
+        parameter<float *>(parameters, indices, 3));
+    return 0;
+}
+
+int matmul_id_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
+    reset_local_resources();
+    return ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(
+        parameter<const DayanMxfp4MoeConfig *>(parameters, indices, 0),
+        parameter<const void *>(parameters, indices, 1),
+        parameter<const void *>(parameters, indices, 2),
+        parameter<const void *>(parameters, indices, 3),
+        parameter<const void *>(parameters, indices, 4),
+        parameter<const void *>(parameters, indices, 5),
+        parameter<const void *>(parameters, indices, 6),
+        parameter<const int32_t *>(parameters, indices, 7),
+        parameter<void *>(parameters, indices, 8),
+        parameter<void *>(parameters, indices, 9));
+}
+
+int argsort(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_sort<false>(
+        parameter<const DayanSortConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<int32_t *>(parameters, indices, 2));
+    return 0;
+}
+
+int softmax(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_softmax_f32(
+        parameter<const DayanSoftmaxConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1), nullptr, nullptr,
+        parameter<float *>(parameters, indices, 2));
+    return 0;
+}
+
+int sum_rows(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_reduce_rows_f32(
+        parameter<const DayanReduceConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<float *>(parameters, indices, 2));
+    return 0;
+}
+
+int clamp(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_clamp_f32(
+        parameter<const DayanClampConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<float *>(parameters, indices, 2));
+    return 0;
+}
+
+int divide(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_div_f32(
+        parameter<const DayanBinaryConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<const float *>(parameters, indices, 2),
+        parameter<float *>(parameters, indices, 3));
+    return 0;
+}
+
+template <typename Graph, uint16_t Count = Graph::operation_count>
 static int execute(const uintptr_t * parameters, dayan_cluster_barrier_t * barrier) {
-    for (uint16_t index = 0; index < Graph::operation_count; ++index) {
+    for (uint16_t index = 0; index < Count; ++index) {
         const Operation & operation = Graph::operations[index];
         if (operation.function == nullptr) {
             const int status = dayan_cluster_barrier(4, barrier);
@@ -433,7 +502,7 @@ __kernel__ void qwen35_dense_mega(
     }
 
     dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
+        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
     int status;
     switch (config->graph) {
         case kDayanMegaQwen35DenseMxfp4Linear:
@@ -464,6 +533,20 @@ __kernel__ void qwen35_dense_mega(
             status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph>(
                 parameters, barrier);
             break;
+        case kDayanMegaQwen35MoeLinear:
+            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeLinearGraph::parameter_count) {
+                DAYAN_PARAMS_ERROR();
+            }
+            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph, 51>(parameters, barrier);
+            if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeLinearGraph>(parameters, barrier); }
+            break;
+        case kDayanMegaQwen35MoeFull:
+            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeFullGraph::parameter_count) {
+                DAYAN_PARAMS_ERROR();
+            }
+            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph, 25>(parameters, barrier);
+            if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeFullGraph>(parameters, barrier); }
+            break;
         default:
             status = -22;
             break;
@@ -476,6 +559,6 @@ __kernel__ void qwen35_dense_mega(
 
 DAYAN_KERNEL_RESOURCE_DESC_EX(
     qwen35_dense_mega, 1, DAYAN_KERNEL_MAX_CHILD_THREADS, 0,
-    MATMUL_DAYAN_4C_ATOMIC_BYTES + sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
+    DAYAN_SORT_ATOMIC_BYTES + sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_TCSR_LOGICAL_GROUPS, 4,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_RESOURCE_LOGICAL_COUNT, DAYAN_RESOURCE_LOGICAL_COUNT);

@@ -11,6 +11,11 @@ target_include_directories(llama-dayan-operator-bench PRIVATE
 target_link_libraries(llama-dayan-operator-bench PRIVATE ggml-dayan ggml)
 target_compile_features(llama-dayan-operator-bench PRIVATE cxx_std_17)
 
+add_executable(llama-dayan-moe-bench moe-bench.cpp)
+target_include_directories(llama-dayan-moe-bench PRIVATE "${CMAKE_SOURCE_DIR}/vendor")
+target_link_libraries(llama-dayan-moe-bench PRIVATE llama ggml)
+target_compile_features(llama-dayan-moe-bench PRIVATE cxx_std_17)
+
 if(LLAMA_TOOLS_INSTALL)
-    install(TARGETS ${TARGET} llama-dayan-operator-bench RUNTIME)
+    install(TARGETS ${TARGET} llama-dayan-operator-bench llama-dayan-moe-bench RUNTIME)
 endif()

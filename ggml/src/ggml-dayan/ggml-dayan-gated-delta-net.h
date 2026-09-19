@@ -665,7 +665,7 @@ static void prepare_chunks(void * opaque) {
 
 static long run_chunked(const DayanGatedDeltaNetConfig * config, const float * q, const float * k,
                         const float * v, const float * g, const float * beta, const float * state, float * output) {
-    if (dayan_uram_size() < DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES) {
+    DAYAN_PARAMS_IF(dayan_uram_size() < DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES) {
         return -22;
     }
     const uint32_t task = dayan_task_id(DAYAN_TASK_X);

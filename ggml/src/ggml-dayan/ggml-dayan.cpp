@@ -265,6 +265,9 @@ static ggml_backend_dayan_slot_implementation
 ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot & slot, const DayanTopology & topology) {
     if (ggml_backend_dayan_is_mxfp4_slot(slot)) {
         const bool copy = slot.kind == ggml_backend_dayan_slot_kind::copy;
+        if (!copy && slot.nodes[0]->op == GGML_OP_MUL_MAT_ID) {
+            return {"ggml_backend_dayan_mxfp4_slot", "moe-mxfp4", "mul_mat_id_mxfp4", "single-core", topology.cores};
+        }
         return {"ggml_backend_dayan_mxfp4_slot", copy ? "quantize-mxfp4" : "matmul-mxfp4",
                 copy ? "quantize_mxfp4" : topology.clusters ? "matmul_mxfp4_4c" : "matmul_mxfp4_1c",
                 copy || !topology.clusters ? "single-core" : "four-core", copy || !topology.clusters ? topology.cores : 4,
@@ -286,6 +289,9 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
         four_core ? 4U : kDayanNativeMaxTasks,
     };
     const ggml_tensor * node = slot.nodes[0];
+    if (slot.kind == ggml_backend_dayan_slot_kind::mul_mat && node->src[0]->type == GGML_TYPE_F32) {
+        return {"ggml_backend_dayan_mul_mat", "ggml-router", "router_f32", "single-core", topology.cores};
+    }
 
     switch (slot.kind) {
         case ggml_backend_dayan_slot_kind::mul_mat:
@@ -1415,16 +1421,34 @@ static int ggml_backend_dayan_mxfp4_matmul(ggml_backend_dayan_context * ctx, ggm
     config.output_type = out ? kDayanDataTypeMXFP4 : output->type == GGML_TYPE_F32 ? kDayanDataTypeF32 :
                          output->type == GGML_TYPE_BF16 ? kDayanDataTypeBF16 : kDayanDataTypeF16;
     config.operation = operation;
+    const bool moe = node->op == GGML_OP_MUL_MAT_ID;
+    DayanMxfp4MoeConfig moe_config = {};
+    if (moe) {
+        config.m = 1;
+        moe_config.matmul = config;
+        moe_config.routing = {(uint32_t) config.k, (uint32_t) config.n, (uint32_t) weight->ne[2],
+                              (uint32_t) node->src[2]->ne[0], (uint32_t) node->src[2]->ne[1],
+                              (uint32_t) input->ne[1], node->src[2]->nb[1]};
+    }
     ggml_backend_dayan_buffers buffers;
-    status = ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
+    status = ggml_backend_dayan_prepare_launch_buffers(ctx, moe ? (const void *) &moe_config : &config,
+                                                       moe ? sizeof(moe_config) : sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_matmul_launch_attrs(ctx, "matmul-mxfp4", &attrs);
         npu_buffer_t * weight_buffer = ggml_backend_dayan_tensor_buffer(weight);
-        status = ggml_backend_dayan_matmul_kernel(ctx, matmul_mxfp4_1c, matmul_mxfp4_4c)(buffers.config, a, as ? as : a, weight_buffer, mx ? b->scales : weight_buffer,
+        if (moe) {
+            ggml_backend_dayan_init_native_launch_attrs(ctx, "moe-mxfp4", node->ne[1] * node->ne[2], &attrs);
+            status = mul_mat_id_mxfp4(buffers.config, a, as ? as : a, weight_buffer, b->scales,
+                                     up ? ggml_backend_dayan_tensor_buffer(up->src[0]) : weight_buffer, u->scales,
+                                     ggml_backend_dayan_tensor_buffer(node->src[2]), ggml_backend_dayan_tensor_buffer(output),
+                                     out ? out->scales : ggml_backend_dayan_tensor_buffer(output), &attrs);
+        } else {
+            status = ggml_backend_dayan_matmul_kernel(ctx, matmul_mxfp4_1c, matmul_mxfp4_4c)(buffers.config, a, as ? as : a, weight_buffer, mx ? b->scales : weight_buffer,
                                 up ? ggml_backend_dayan_tensor_buffer(up->src[0]) : weight_buffer,
                                 mx ? u->scales : weight_buffer, ggml_backend_dayan_tensor_buffer(output),
                                 out ? out->scales : ggml_backend_dayan_tensor_buffer(output), &attrs);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     if (as != nullptr) { ggml_backend_dayan_preserve_error(npu_buffer_destroy(as), &status); }
@@ -1439,10 +1463,14 @@ static bool ggml_backend_dayan_is_mxfp4_slot(const ggml_backend_dayan_graph_slot
             return slot.nodes[0]->src[0]->type == GGML_TYPE_MXFP4 || slot.nodes[1]->type == GGML_TYPE_MXFP4;
         case ggml_backend_dayan_slot_kind::mul_mat_swiglu:
         case ggml_backend_dayan_slot_kind::mul_mat_geglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_swiglu:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_geglu:
             return slot.nodes[0]->src[0]->type == GGML_TYPE_MXFP4 || slot.nodes[3]->type == GGML_TYPE_MXFP4;
         case ggml_backend_dayan_slot_kind::mul_mat:
         case ggml_backend_dayan_slot_kind::mul_mat_silu:
         case ggml_backend_dayan_slot_kind::mul_mat_pair:
+        case ggml_backend_dayan_slot_kind::mul_mat_id:
+        case ggml_backend_dayan_slot_kind::mul_mat_id_pair:
             return slot.nodes[0]->src[0]->type == GGML_TYPE_MXFP4;
         default: return false;
     }
@@ -1454,14 +1482,15 @@ static int ggml_backend_dayan_mxfp4_slot(ggml_backend_dayan_context * ctx, ggml_
         const auto * extra = (const ggml_backend_dayan_mxfp4_extra *) slot.nodes[0]->extra;
         return ggml_backend_dayan_quantize_mxfp4(ctx, slot.nodes[0]->src[0], extra->data, extra->scales);
     }
-    if (slot.kind == ggml_backend_dayan_slot_kind::mul_mat_swiglu || slot.kind == ggml_backend_dayan_slot_kind::mul_mat_geglu) {
+    if (slot.kind == ggml_backend_dayan_slot_kind::mul_mat_swiglu || slot.kind == ggml_backend_dayan_slot_kind::mul_mat_geglu ||
+        slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_swiglu || slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_geglu) {
         return ggml_backend_dayan_mxfp4_matmul(ctx, graph, slot.nodes[0], slot.nodes[1], slot.nodes[3],
-                                              slot.kind == ggml_backend_dayan_slot_kind::mul_mat_swiglu ? 2 : 3);
+                                              slot.kind == ggml_backend_dayan_slot_kind::mul_mat_swiglu || slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_swiglu ? 2 : 3);
     }
     const bool silu = slot.kind == ggml_backend_dayan_slot_kind::mul_mat_silu;
     ggml_tensor * output = silu || slot.kind == ggml_backend_dayan_slot_kind::mul_mat_quantized ? slot.nodes[1] : slot.nodes[0];
     int status = ggml_backend_dayan_mxfp4_matmul(ctx, graph, slot.nodes[0], nullptr, output, silu ? 1 : 0);
-    if (status == 0 && slot.kind == ggml_backend_dayan_slot_kind::mul_mat_pair) {
+    if (status == 0 && (slot.kind == ggml_backend_dayan_slot_kind::mul_mat_pair || slot.kind == ggml_backend_dayan_slot_kind::mul_mat_id_pair)) {
         status = ggml_backend_dayan_mxfp4_matmul(ctx, graph, slot.nodes[1], nullptr, slot.nodes[1], 0);
     }
     return status;
@@ -1474,7 +1503,7 @@ static DayanMatmulConfig ggml_backend_dayan_matmul_config(const ggml_tensor * we
     config.m                 = activation->ne[1];
     config.n                 = weight->ne[1];
     config.k                 = weight->ne[0];
-    config.a_stride          = config.k * sizeof(uint16_t);
+    config.a_stride          = config.k * (weight->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t));
     config.bt_stride         = weight->nb[1];
     config.output_stride     = output->nb[1];
 
@@ -1510,7 +1539,11 @@ static int ggml_backend_dayan_mul_mat(ggml_backend_dayan_context * ctx,
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         ggml_backend_dayan_init_matmul_launch_attrs(ctx, silu ? "ggml-mm-silu" : "ggml-mul-mat", &attrs);
-        if (weight->type == GGML_TYPE_BF16) {
+        if (weight->type == GGML_TYPE_F32) {
+            ggml_backend_dayan_init_native_launch_attrs(ctx, "ggml-router", config.m * config.n, &attrs);
+            status = router_f32(buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
+                                ggml_backend_dayan_tensor_buffer(output), &attrs);
+        } else if (weight->type == GGML_TYPE_BF16) {
             status = silu ?
                          (config.m <= 512 ? ggml_backend_dayan_matmul_kernel(ctx, matmul_silu_inference_bf16_1c, matmul_silu_inference_bf16_4c) : ggml_backend_dayan_matmul_kernel(ctx, matmul_silu_bf16_1c, matmul_silu_bf16_4c))(
                              buffers.config, activation_buffer, ggml_backend_dayan_tensor_buffer(weight),
@@ -1895,7 +1928,11 @@ static int ggml_backend_dayan_elementwise_binary(ggml_backend_dayan_context *   
     npu_buffer_t ** packed[] = { &buffers.weight0, &buffers.input3 };
     for (int source = 0; source < 2 && status == 0; ++source) {
         const ggml_tensor * input = source == 0 ? left : right;
-        if (ggml_is_contiguous(input)) {
+        if (input->nb[0] == sizeof(float)) {
+            if (!ggml_is_contiguous(input)) {
+                uint64_t * strides = source == 0 ? config.left_nb : config.right_nb;
+                for (int dimension = 1; dimension < GGML_MAX_DIMS; ++dimension) { strides[dimension - 1] = input->nb[dimension]; }
+            }
             continue;
         }
         DayanCopyConfig copy = {};
@@ -3320,9 +3357,10 @@ static int ggml_backend_dayan_mega_launch(void * context,
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
         const bool linear = graph == kDayanMegaQwen35DenseMxfp4Linear ||
-                            graph == kDayanMegaQwen35DenseBf16Linear;
+                            graph == kDayanMegaQwen35DenseBf16Linear || graph == kDayanMegaQwen35MoeLinear;
+        const char * tag = std::getenv("GGML_DAYAN_MEGA_TAG");
         ggml_backend_dayan_init_launch_attrs(
-            ctx, linear ? "q35-linear" : "q35-full-mega", &attrs);
+            ctx, tag && tag[0] ? tag : linear ? "q35-linear" : "q35-full-mega", &attrs);
         attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
         status = qwen35_dense_mega(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],

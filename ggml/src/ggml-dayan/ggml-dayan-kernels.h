@@ -35,6 +35,8 @@ enum : uint32_t {
 #    define DAYAN_SORT_TASK_URAM_BYTES (32U * 1024U)
 #endif
 
+#define DAYAN_SORT_ATOMIC_BYTES (16U * 4U * 4096U * sizeof(uint32_t))
+
 #ifndef DAYAN_SSM_CONV_TASK_URAM_BYTES
 #    define DAYAN_SSM_CONV_TASK_URAM_BYTES (256U * 1024U)
 #endif
@@ -215,13 +217,13 @@ struct DayanElementwiseConfig {
     uint64_t elements;
 };
 
-// Binary elementwise config. The right operand may broadcast: each right_ne[d]
-// must divide ne[d]. The kernel loads both operands contiguously and expands
-// the right operand inside the vector registers.
+// Zero row strides select contiguous storage. Each right_ne[d] must divide ne[d].
 struct DayanBinaryConfig {
     uint64_t elements;
     uint32_t ne[4];
     uint32_t right_ne[4];
+    uint64_t left_nb[3];
+    uint64_t right_nb[3];
 };
 
 struct DayanReduceConfig {
@@ -319,6 +321,11 @@ struct DayanMulMatIdConfig {
 struct DayanMulMatIdPairConfig {
     DayanMulMatIdConfig first;
     DayanMulMatIdConfig second;
+};
+
+struct DayanMxfp4MoeConfig {
+    DayanMxfp4Config matmul;
+    DayanMulMatIdConfig routing;
 };
 
 struct DayanAddIdConfig {
@@ -435,6 +442,11 @@ struct DayanGroupNormConfig {
 };
 
 #if !defined(__DAYAN_DEVICE__)
+int router_f32(npu_buffer_t * config, npu_buffer_t * activation, npu_buffer_t * weight, npu_buffer_t * output,
+               const npu_kernel_launch_attrs_t * attrs);
+int mul_mat_id_mxfp4(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
+                     npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * ids, npu_buffer_t * output, npu_buffer_t * scales,
+                     const npu_kernel_launch_attrs_t * attrs);
 int quantize_mxfp4(npu_buffer_t * config, npu_buffer_t * input, npu_buffer_t * output, npu_buffer_t * scales,
                    const npu_kernel_launch_attrs_t * attrs);
 int matmul_mxfp4_1c(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,

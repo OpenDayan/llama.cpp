@@ -2,16 +2,67 @@
 
 #include "ggml-dayan-memory.h"
 #include "ggml-dayan-ffn.h"
+#include "ggml-dayan-mxfp4.h"
 
 #if defined(__DAYAN_DEVICE__)
 
 namespace ggml_dayan_matmul_detail {
 
+static void run_router_f32(const DayanMatmulConfig * config, const float * activation, const float * weight, float * output) {
+    constexpr uint32_t rows = 32, columns = 64, inner_tile = 256;
+    constexpr uint32_t input_stride = 1152, output_stride = 384;
+    const uint64_t base = (uintptr_t) dayan_uram_base();
+    const uint64_t right = base + rows * input_stride;
+    const uint64_t result = right + columns * input_stride;
+    DAYAN_PARAMS_IF(!config || !activation || !weight || !output || !base ||
+                    !config->m || !config->n || !config->k || result + rows * output_stride - base > dayan_uram_size()) {
+        DAYAN_PARAMS_ERROR();
+    }
+    const uint64_t local_mask = Constants::kUramWindowStride - 1;
+    const uint64_t nt = (config->n + columns - 1) / columns;
+    __tx_mat_tcsr_write<MAT_ASTRIDE>(input_stride);
+    __tx_mat_tcsr_write<MAT_BSTRIDE>(input_stride);
+    __tx_mat_tcsr_write<MAT_CSTRIDE>(output_stride);
+    __tx_mat_tcsr_write<MAT_ASWIZZLEMBS>(0);
+    __tx_mat_tcsr_write<MAT_BSWIZZLEMBS>(0);
+    __tx_mat_tcsr_write<MAT_CSWIZZLEMBS>(0);
+    __tx_mat_tcsr_write<MAT_PERSISTENTMODE>(0);
+    __tx_mat_tcsr_write<MAT_DATATYPE>(MAT_DATATYPE_PAIR(BaseNPUInstBuilder::DT_MATIN_TF32, BaseNPUInstBuilder::DT_MATIN_TF32));
+    long checksum = 0;
+    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((config->m + rows - 1) / rows) * nt; tile += dayan_task_dim(DAYAN_TASK_X)) {
+        const uint64_t row = tile / nt * rows, column = tile % nt * columns;
+        const uint32_t m = config->m - row < rows ? config->m - row : rows;
+        const uint32_t n = config->n - column < columns ? config->n - column : columns;
+        __tx_mat_tcsr_write<MAT_M>(m - 1);
+        __tx_mat_tcsr_write<MAT_N>(n - 1);
+        for (uint64_t inner = 0; inner < config->k; inner += inner_tile) {
+            const uint32_t k = config->k - inner < inner_tile ? config->k - inner : inner_tile;
+            set_lsu_matrix<0>(checksum, m, input_stride, config->a_stride, input_stride);
+            __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(0);
+            load_matrix<0>(k * sizeof(float), m, input_stride, m, base,
+                           (uintptr_t) activation + row * config->a_stride + inner * sizeof(float));
+            set_lsu_matrix<0>(checksum, n, input_stride, config->bt_stride, input_stride);
+            load_matrix<0>(k * sizeof(float), n, input_stride, n, right,
+                           (uintptr_t) weight + column * config->bt_stride + inner * sizeof(float));
+            dayan_wait_lsu();
+            __tx_mat_tcsr_write<MAT_K>(k - 1);
+            if (inner == 0) { __tx_mat_mm<0>(result & local_mask, base & local_mask, right & local_mask); }
+            else { __tx_mat_mma<0>(result & local_mask, base & local_mask, right & local_mask); }
+            dayan_wait_mat();
+        }
+        set_lsu_matrix<0>(checksum, m, output_stride, output_stride, config->output_stride);
+        __tx_lsu_tcsr_write<LSU_URAMREADSWIZZLEMBS>(0);
+        store_matrix<0>(n * sizeof(float), m, output_stride, m, result,
+                        (uintptr_t) output + row * config->output_stride + column * sizeof(float));
+        dayan_wait_lsu();
+    }
+}
+
 struct SortUramLayout {
     enum : uint64_t {
-        kValues  = 0,
-        kIndices = kValues + (uint64_t) kDayanSortMaxWidth * sizeof(float),
-        kTotal   = kIndices + (uint64_t) kDayanSortMaxWidth * sizeof(int32_t),
+        kLanes = (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t),
+        kCounter = kLanes + 256,
+        kTotal = kCounter + 256,
     };
 };
 
@@ -37,13 +88,42 @@ static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
     return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
 }
 
+static int run_mul_mat_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
+                               const void * b, const void * bs, const void * up, const void * ups,
+                               const int32_t * ids, void * output, void * scales) {
+    DAYAN_PARAMS_IF(!config || !a || !as || !b || !bs || !up || !ups || !ids || !output || !scales) { return -22; }
+    const auto & r = config->routing;
+    const auto & mm = config->matmul;
+    DAYAN_PARAMS_IF(!r.k || r.k % 32 || !r.n || r.n % 16 || !r.experts || !r.experts_used || !r.tokens ||
+        !r.activation_slots || r.experts_used % r.activation_slots || r.ids_row_stride < r.experts_used * sizeof(int32_t) ||
+        mm.m != 1 || mm.n != r.n || mm.k != r.k || mm.weight_type != kDayanDataTypeMXFP4) { return -22; }
+    ggml_dayan_mxfp4_detail::Phases phases;
+    for (uint32_t token = 0; token < r.tokens; ++token) {
+        const int32_t * row_ids = (const int32_t *) ((const char *) ids + token * r.ids_row_stride);
+        for (uint32_t used = 0; used < r.experts_used; ++used) {
+            const int32_t expert = moe_read_expert(row_ids, used);
+            if (expert < 0 || (uint32_t) expert >= r.experts) { return -22; }
+            const uint64_t input_row = (uint64_t) token * r.activation_slots + used % r.activation_slots;
+            const uint64_t weight_row = (uint64_t) expert * r.n;
+            const uint64_t output_row = (uint64_t) token * r.experts_used + used;
+            const int status = ggml_dayan_mxfp4_detail::run(&mm,
+                (const char *) a + input_row * mm.a_stride, (const char *) as + input_row * 4,
+                (const char *) b + weight_row * mm.b_stride, (const char *) bs + weight_row * 4,
+                (const char *) up + weight_row * mm.b_stride, (const char *) ups + weight_row * 4,
+                (char *) output + output_row * mm.output_stride, (char *) scales + output_row * 4, &phases);
+            if (status < 0) { return status; }
+        }
+    }
+    return 0;
+}
+
 template <typename Format>
 static void run_mul_mat_id(const DayanMulMatIdConfig * config,
                            const uint16_t *            activation,
                            const uint16_t *            weight,
                            const int32_t *             ids,
                            float *                     output, MatmulPhases * phases = nullptr) {
-    if (config == nullptr || activation == nullptr || weight == nullptr || ids == nullptr || output == nullptr ||
+    DAYAN_PARAMS_IF(config == nullptr || activation == nullptr || weight == nullptr || ids == nullptr || output == nullptr ||
         config->k == 0 || config->n == 0 || config->experts == 0 || config->experts > INT32_MAX ||
         config->experts_used == 0 || config->tokens == 0 || config->activation_slots == 0 ||
         config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
@@ -92,7 +172,7 @@ static void run_mul_mat_id_glu(const DayanMulMatIdConfig * config,
                                const uint16_t *            up_weight,
                                const int32_t *             ids,
                                uint16_t *                  output) {
-    if (config == nullptr || activation == nullptr || gate_weight == nullptr || up_weight == nullptr ||
+    DAYAN_PARAMS_IF(config == nullptr || activation == nullptr || gate_weight == nullptr || up_weight == nullptr ||
         ids == nullptr || output == nullptr || config->k == 0 || config->n == 0 ||
         config->experts == 0 || config->experts > INT32_MAX || config->experts_used == 0 || config->tokens == 0 ||
         config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
@@ -186,55 +266,127 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     }
 }
 
+template <int Shift> static inline void sort_scan_step() {
+    __tx_vec_lsu_g2s<0>((long) (~uint64_t{0} << Shift));
+    __tx_vec_shuffle_ror<0, 0>(64 - Shift);
+    __tx_vec_vv_int32_add<0, 1, 0>();
+    __tx_vec_vv_mux2<0, 2, 0, 0>();
+}
+
 template <bool TopK> static void run_sort(const DayanSortConfig * config, const float * input, int32_t * output) {
+    using namespace ggml_dayan_vec_detail;
     memory_validate(config);
-    if (input == nullptr || output == nullptr || config->width == 0 || config->rows == 0 || config->output_width == 0 ||
-        config->width > kDayanSortMaxWidth || config->output_width > config->width || config->order > 1U ||
-        config->output_stride < config->output_width ||
-        (TopK && config->order != kDayanSortOrderDesc)) {
+    DAYAN_PARAMS_IF(!input || !output || !config->width || !config->rows || !config->output_width ||
+                    config->width > kDayanSortMaxWidth || config->output_width > config->width || config->order > 1 ||
+                    config->output_stride < config->output_width || (TopK && config->order != kDayanSortOrderDesc) ||
+                    !dayan_uram_base() || dayan_uram_size() < SortUramLayout::kTotal || dayan_native_task_count() > 16) {
         DAYAN_PARAMS_ERROR();
     }
-
-    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < SortUramLayout::kTotal) {
-        DAYAN_PARAMS_ERROR();
-    }
-
-    const uint32_t task  = dayan_native_task_id();
-    const uint32_t tasks = dayan_native_task_count();
-    const uint64_t uram  = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint32_t task = dayan_native_task_id(), tasks = dayan_native_task_count();
+    const uint64_t uram = (uintptr_t) dayan_uram_base();
+    const uint64_t lanes = uram + SortUramLayout::kLanes, counter = uram + SortUramLayout::kCounter;
+    constexpr uint64_t plane = kDayanSortMaxWidth * sizeof(uint32_t);
+    const uint64_t scratch = (uintptr_t) shared + task * 4 * plane;
+    for (uint32_t i = 0; i < 64; ++i) { ((uint32_t *) lanes)[i] = i; }
+    configure_vec_grid(1);
+    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+    const uint32_t padded = (config->width + 63) & ~63U;
     for (uint32_t row = task; row < config->rows; row += tasks) {
-        memory_load_bytes(uram + SortUramLayout::kValues, input + (uint64_t) row * config->width,
-                          (uint64_t) config->width * sizeof(float));
-        const float * values  = (const float *) (uintptr_t) (uram + SortUramLayout::kValues);
-        int32_t *     indices = (int32_t *) (uintptr_t) (uram + SortUramLayout::kIndices);
-        for (uint32_t index = 0; index < config->width; ++index) {
-            const uint32_t count    = index < config->output_width ? index : config->output_width;
-            uint32_t       position = count;
-            while (position > 0) {
-                const int32_t previous = indices[position - 1U];
-                const bool    before   = config->order == kDayanSortOrderAsc ? values[index] < values[previous] :
-                                                                               values[index] > values[previous];
-                if (!before) {
-                    break;
-                }
-                if (position < config->output_width) {
-                    indices[position] = previous;
-                }
-                --position;
-            }
-            if (position < config->output_width) {
-                indices[position] = (int32_t) index;
-            }
+        memory_load_bytes(uram, input + (uint64_t) row * config->width, config->width * sizeof(float));
+        for (uint32_t first = 0; first < padded; first += 64) {
+            const uint32_t valid = config->width - first < 64 ? config->width - first : 64;
+            begin_vec_block(19);
+            __tx_vec_lsu_u2v<0, 0>(uram + first * 4);
+            __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+            __tx_vec_vv_fp32_cmp<0, 16, 0, 0b010>();
+            __tx_vec_vv_mux2<0, 0, 16, 0>();
+            __tx_vec_lsu_g2v_broadcast32<1, 1>(31);
+            __tx_vec_vv_int32_sra<0, 0, 16>();
+            __tx_vec_lsu_g2v_broadcast32<1, 1>(0x80000000U);
+            __tx_vec_vv_int32_bitwise<0, 0, 16, 0b1110>();
+            __tx_vec_vv_int32_bitwise<0, 2, 0, 0b0110>();
+            __tx_vec_lsu_g2v_broadcast32<1, 1>(config->order == kDayanSortOrderDesc ? UINT32_MAX : 0);
+            __tx_vec_vv_int32_bitwise<0, 0, 16, 0b0110>();
+            __tx_vec_lsu_g2v_broadcast32<1, 1>(UINT32_MAX);
+            __tx_vec_lsu_g2s<0>(valid == 64 ? UINT64_MAX : (uint64_t{1} << valid) - 1);
+            __tx_vec_vv_mux2<0, 16, 0, 0>();
+            __tx_vec_lsu_v2sm<0, 0>(scratch + first * 4);
+            __tx_vec_lsu_u2v<0, 0>(lanes);
+            __tx_vec_lsu_g2v_broadcast32<1, 1>(first);
+            __tx_vec_vv_int32_add<0, 0, 16>();
+            __tx_vec_lsu_v2sm<0, 0>(scratch + plane + first * 4);
+            start_vec_block(19);
+            dayan_wait_vec();
         }
-        if constexpr (TopK) {
-            if (config->output_width > 1) {
-                const int32_t first = indices[0];
-                indices[0]          = indices[1];
-                indices[1]          = first;
+        uint64_t source = scratch, destination = scratch + 2 * plane;
+        for (uint32_t bit = 0; bit < 32; ++bit) {
+            for (uint32_t first = 0; first < padded; first += 64) {
+                begin_vec_block(36);
+                __tx_vec_lsu_sm2v<0, 0>(source + first * 4);
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(uint32_t{1} << bit);
+                __tx_vec_vv_int32_bitwise<0, 0, 16, 0b1000>();
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+                __tx_vec_vv_int32_cmp<0, 16, 0, 0b010>();
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(1);
+                __tx_vec_vv_mux2<0, 17, 16, 0>();
+                sort_scan_step<1>();
+                sort_scan_step<2>();
+                sort_scan_step<4>();
+                sort_scan_step<8>();
+                sort_scan_step<16>();
+                sort_scan_step<32>();
+                if (first == 0) { __tx_vec_lsu_g2v_broadcast32<1, 1>(0); }
+                else { __tx_vec_lsu_u2v<1, 1>(counter); }
+                __tx_vec_vv_int32_add<0, 0, 16>();
+                __tx_vec_lsu_v2u<0, 0>(uram + first * 4);
+                __tx_vec_shuffle_broadcast<0, 0>(63);
+                __tx_vec_lsu_v2u<0, 0>(counter);
+                start_vec_block(36);
+                dayan_wait_vec();
             }
+            for (uint32_t first = 0; first < padded; first += 64) {
+                begin_vec_block(22);
+                __tx_vec_lsu_u2v<0, 0>(uram + first * 4);
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(1);
+                __tx_vec_vv_int32_sub<0, 0, 16>();
+                __tx_vec_lsu_sm2v<1, 0>(source + first * 4);
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(uint32_t{1} << bit);
+                __tx_vec_vv_int32_bitwise<1, 17, 16, 0b1000>();
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
+                __tx_vec_vv_int32_cmp<17, 16, 0, 0b010>();
+                __tx_vec_lsu_u2v<1, 0>(lanes);
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(first);
+                __tx_vec_vv_int32_add<1, 17, 16>();
+                __tx_vec_vv_int32_sub<0, 16, 1>();
+                __tx_vec_lsu_u2v<1, 1>(counter);
+                __tx_vec_vv_int32_add<0, 0, 16>();
+                __tx_vec_vv_mux2<0, 0, 2, 0>();
+                __tx_vec_lsu_g2v_broadcast32<1, 1>(2);
+                __tx_vec_vv_int32_sll<0, 0, 16>();
+                __tx_vec_lsu_sm2v<1, 0>(source + first * 4);
+                __tx_vec_lsu_g2s<0>(UINT64_MAX);
+                __tx_vec_v2sm_sparse<16, 0, 0>(destination);
+                __tx_vec_lsu_sm2v<1, 0>(source + plane + first * 4);
+                __tx_vec_v2sm_sparse<16, 0, 0>(destination + plane);
+                start_vec_block(22);
+                dayan_wait_vec();
+            }
+            const uint64_t previous = source;
+            source = destination;
+            destination = previous;
         }
-        memory_store_bytes(output + (uint64_t) row * config->output_stride, uram + SortUramLayout::kIndices,
-                           (uint64_t) config->output_width * sizeof(int32_t));
+        configure_vec_grid((config->output_width + 63) / 64);
+        configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, 0);
+        configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, 0);
+        begin_vec_block(2);
+        __tx_vec_lsu_sm2v<0, 0>(source + plane);
+        __tx_vec_lsu_v2u<0, 3>(uram);
+        start_vec_block(2);
+        dayan_wait_vec();
+        configure_vec_grid(1);
+        memory_store_bytes(output + (uint64_t) row * config->output_stride, uram, config->output_width * sizeof(int32_t));
     }
 }
 

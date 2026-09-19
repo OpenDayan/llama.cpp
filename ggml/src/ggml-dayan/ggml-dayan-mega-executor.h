@@ -9,6 +9,8 @@ enum : uint16_t {
     kDayanMegaQwen35DenseMxfp4Full   = 2,
     kDayanMegaQwen35DenseBf16Linear  = 3,
     kDayanMegaQwen35DenseBf16Full    = 4,
+    kDayanMegaQwen35MoeLinear        = 5,
+    kDayanMegaQwen35MoeFull          = 6,
 };
 
 enum : uint32_t {
@@ -18,6 +20,8 @@ enum : uint32_t {
     kDayanMegaQwen35DenseMxfp4FullParameters   = 137,
     kDayanMegaQwen35DenseBf16LinearParameters  = 129,
     kDayanMegaQwen35DenseBf16FullParameters    = 89,
+    kDayanMegaQwen35MoeLinearParameters       = 224,
+    kDayanMegaQwen35MoeFullParameters         = 184,
 };
 
 struct DayanMegaConfig {
@@ -29,7 +33,7 @@ struct DayanMegaConfig {
 struct DayanMegaParameter {
     uint16_t source;
     uint16_t reserved;
-    uint32_t offset;
+    uint64_t offset;
 };
 
 #if defined(__DAYAN_DEVICE__)
@@ -83,6 +87,13 @@ int matmul_pair_bf16(const uintptr_t *, const uint16_t *);
 int matmul_swiglu_bf16(const uintptr_t *, const uint16_t *);
 int matmul_quantized_bf16(const uintptr_t *, const uint16_t *);
 int gated_output_projection_bf16(const uintptr_t *, const uint16_t *);
+int matmul_tf32(const uintptr_t *, const uint16_t *);
+int matmul_id_mxfp4(const uintptr_t *, const uint16_t *);
+int argsort(const uintptr_t *, const uint16_t *);
+int softmax(const uintptr_t *, const uint16_t *);
+int sum_rows(const uintptr_t *, const uint16_t *);
+int clamp(const uintptr_t *, const uint16_t *);
+int divide(const uintptr_t *, const uint16_t *);
 
 } // namespace ggml_dayan_mega_detail
 

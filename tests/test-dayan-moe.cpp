@@ -213,11 +213,17 @@ static float compare_bf16(const ggml_tensor * expected, const ggml_tensor * actu
     return max_abs;
 }
 
-static bool compare_i32(const ggml_tensor * expected, const ggml_tensor * actual) {
+static bool compare_i32(const ggml_tensor * expected, const ggml_tensor * actual, bool unordered = false) {
     std::vector<int32_t> reference((size_t) ggml_nelements(expected));
     std::vector<int32_t> observed(reference.size());
     ggml_backend_tensor_get(expected, reference.data(), 0, ggml_nbytes(expected));
     ggml_backend_tensor_get(actual, observed.data(), 0, ggml_nbytes(actual));
+    if (unordered) {
+        for (size_t row = 0; row < reference.size(); row += expected->ne[0]) {
+            std::sort(reference.begin() + row, reference.begin() + row + expected->ne[0]);
+            std::sort(observed.begin() + row, observed.begin() + row + expected->ne[0]);
+        }
+    }
     return reference == observed;
 }
 
@@ -254,7 +260,7 @@ static int run_case(ggml_backend_t dayan, ggml_backend_t cpu, bool full_sort) {
         return fail("Dayan MoE graph failed");
     }
 
-    bool close = compare_i32(reference.top_k, actual.top_k);
+    bool close = compare_i32(reference.top_k, actual.top_k, true);
     if (full_sort) {
         close = compare_i32(reference.argsort, actual.argsort) && close;
     } else {

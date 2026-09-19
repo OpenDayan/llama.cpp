@@ -38,16 +38,17 @@ def load_model(name=DEFAULT_MODEL):
     model = models[name]
     names = set()
     allowed = {"name", "op", "m", "n", "k", "dtype", "output_dtype", "phases", "channels", "kernel",
-               "heads", "q_heads", "kv_heads", "head_dim", "snapshots", "mode", "layers"}
+               "heads", "q_heads", "kv_heads", "head_dim", "snapshots", "mode", "layers", "experts", "experts_used", "decode_steps"}
     for case in model["cases"]:
         if not re.fullmatch(r"[a-z0-9-]+", case["name"]) or case["name"] in names or set(case) - allowed:
             raise ValueError(f"invalid or duplicate case in model {name}: {case}")
-        if case["op"] not in ("matmul", "ffn", "quantize", "gdn", "ssm_conv", "attention", "norm", "mega"):
+        if case["op"] not in ("matmul", "ffn", "moe_ffn", "moe_down", "sort", "quantize", "gdn", "ssm_conv", "attention", "norm", "mega"):
             raise ValueError(f"unsupported operator in model {name}: {case['op']}")
-        if case["op"] == "mega" and (case.get("mode") not in ("linear", "full") or case.get("layers") != 1 or
-                                             not 1 <= case.get("m", 1) <= 512 or
-                                             case.get("dtype", "bf16") != "bf16" or case.get("output_dtype", "f32") != "f32"):
-            raise ValueError(f"mega case must be one BF16 linear/full layer in model {name}: {case['name']}")
+        if case["op"] == "mega":
+            dense = case.get("mode") in ("linear", "full") and case.get("layers") == 1 and case.get("dtype", "bf16") == "bf16"
+            moe = case.get("mode") == "hybrid" and case.get("layers") == 2 and case.get("dtype") == "mxfp4" and 2 <= case.get("decode_steps", 2) <= 16
+            if not (dense or moe) or not 1 <= case.get("m", 1) <= 512 or case.get("output_dtype", "f32") != "f32":
+                raise ValueError(f"invalid dense or MoE mega case in model {name}: {case['name']}")
         names.add(case["name"])
         phases = case.get("phases", ["prefill", "decode"])
         if not phases or any(phase not in ("prefill", "decode") for phase in phases):
@@ -73,7 +74,8 @@ def make_cases(prefill, context, repeats=1, warmup=0, timeout_ms=86400000, model
                 continue
             if shape["op"] == "attention":
                 shape["kv_len"] = m if phase == "prefill" else context + 1
-            cases.append(dict(id=f"{phase}-{name}", phase=phase, m=m, repeats=repeats, warmup=warmup,
+            case_m = shape.pop("m", m)
+            cases.append(dict(id=f"{phase}-{name}", phase=phase, m=case_m, repeats=repeats, warmup=warmup,
                               timeout_ms=timeout_ms, **shape))
     return cases
 
@@ -155,7 +157,7 @@ def cycle_span(roots, tag, tasks):
 
 def shape_text(case):
     dtype, output = case_types(case)
-    shape = " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len", "mode", "layers") if key in case)
+    shape = " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "experts", "experts_used", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len", "mode", "layers", "decode_steps") if key in case)
     return f"{shape} dtype={dtype} output={output}"
 
 
@@ -187,7 +189,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
                    checked_elements=result.get("checked_elements"), reference_wall_s=result.get("reference_wall_s"))
         if case.get("cmp") and row["status"] == "ok" and row["cmp_status"] != "pass":
             row["status"] = "failed"
-            row["error"] = "requested CPU comparison did not pass"
+            row["error"] = "requested comparison did not pass"
         samples = []
         for sample in result.get("samples", []):
             if sample["warmup"] or sample["status"] != 0 or not math.isfinite(sample["wall_s"]) or sample["wall_s"] <= 0:
@@ -207,7 +209,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
     for phase, tokens in (("prefill", manifest["prefill"]), ("decode", 1)):
         terms = prediction_terms(phase, model)
         missing = [name for name, _, _ in terms if by_id.get(name, {}).get("wall_s") is None]
-        prediction = dict(phase=phase, tokens=tokens, context=0 if phase == "prefill" else manifest["context"],
+        prediction = dict(phase=phase, tokens=tokens, context=0 if phase == "prefill" else model.get("decode_context", manifest["context"]),
                           terms=[dict(case=name, factor=factor, reason=reason) for name, factor, reason in terms],
                           missing_cases=sorted(set(missing)), subtotal_wall_s=None, subtotal_cycles=None,
                           predicted_wall_s=None, predicted_cycles=None, predicted_tokens_per_s=None)
@@ -236,6 +238,14 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         "TestCluster wall predictions apply only to the same simulator/host/profiler setup and are not hardware latency. cmodel wall times and counters do not establish RTL performance.",
         "With --cmp, deterministic varied inputs are shared with a GGML CPU F32 reference. Stored BF16/MXFP4 inputs and output conversion are included in the reference. Every launch is checked outside its timing interval. These are synthetic operator inputs, not tensors captured from model inference.",
     ]
+    if model.get("comparison_reference") == "dayan-standalone":
+        notes = [
+            "Wall time measures one complete llama_decode call on the two-layer hybrid fixture, including host graph work, embedding, and final projection. Setup, reference runs, and extra decode validation steps are excluded.",
+            "Every initial and subsequent decode step compares logits with standalone Dayan and requires one mega launch per layer. This checks fusion; independent operator cases provide the CPU reference checks.",
+            "The cycle span covers both four-core mega launches and their intervening host gap. It excludes embedding and final projection. cmodel counters do not establish hardware or RTL performance.",
+            "The reported subtotal covers this fixture only. It is not a 40-layer model estimate. Decode uses two cached tokens. Repeats=1 and warmup=0 are required.",
+            f"The additional {overhead_percent:g}% is an uncalibrated allowance. Use --overhead-percent 0 for the measured subtotal.",
+        ]
     if trace_note:
         notes.append(trace_note)
     report = dict(schema=2, model=model_name, model_config=model, simulator=manifest["simulator"], run_id=manifest["run_id"],
@@ -298,7 +308,7 @@ def main():
     parser.add_argument("--case-from", help="start at this case, inclusive, in plan order after case selection")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
-    parser.add_argument("--cmp", action="store_true", help="compare every launch against a CPU gold reference using deterministic varied inputs")
+    parser.add_argument("--cmp", action="store_true", help="compare against CPU operators, or standalone Dayan for the MoE mega preset")
     parser.add_argument("--cmp-seed", type=int, default=1, help="32-bit input seed for --cmp (default: 1)")
     parser.add_argument("--timeout", type=int, default=86400, help="per-case wall deadline in seconds (default: 24 hours)")
     parser.add_argument("--overhead-percent", type=float, help="uncalibrated allowance for unmeasured work (default: 20%%, or saved report setting)")
@@ -350,8 +360,10 @@ def main():
         cases = cases[selected_ids.index(args.case_from):]
     if args.command == "plan":
         for case in cases:
-            print(f"{case['id']:20} {case['op']:10} {shape_text(case)}" + (f" cmp=cpu seed={case['seed']}" if case.get("cmp") else ""))
-        print(f"{len(cases)} cases, {len(cases) * (args.repeats + args.warmup)} kernel launches; model={model_name}; no server access.")
+            reference = model.get("comparison_reference", "cpu")
+            print(f"{case['id']:20} {case['op']:10} {shape_text(case)}" + (f" cmp={reference} seed={case['seed']}" if case.get("cmp") else ""))
+        unit = "measured inference calls" if model.get("comparison_reference") == "dayan-standalone" else "kernel launches"
+        print(f"{len(cases)} cases, {len(cases) * (args.repeats + args.warmup)} {unit}; model={model_name}; no server access.")
         return 0
     if args.command == "report":
         manifest["cases"] = cases

@@ -61,7 +61,7 @@ static void run_binary_f32(const DayanBinaryConfig * config,
                            const float *             left,
                            const float *             right,
                            float *                   output) {
-    if (config == nullptr || right == nullptr || !binary_config_valid(config)) {
+    DAYAN_PARAMS_IF(config == nullptr || right == nullptr || !binary_config_valid(config)) {
         DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, left, output);
@@ -76,7 +76,7 @@ static void run_binary_f32(const DayanBinaryConfig * config,
     const uint32_t tasks      = dayan_native_task_count();
     ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements);
 
-    if (binary_same_shape(config)) {
+    if (binary_same_shape(config) && !config->left_nb[0] && !config->right_nb[0]) {
         for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
              offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
             const uint64_t remaining = config->elements - offset;
@@ -132,11 +132,14 @@ static void run_binary_f32(const DayanBinaryConfig * config,
         const uint64_t r1      = d1 % config->right_ne[1];
         const uint64_t r2      = d2 % config->right_ne[2];
         const uint64_t r3      = d3 % config->right_ne[3];
-        const uint64_t right_base = r1 * right_row + r2 * right_row * config->right_ne[1] +
-                                    r3 * right_row * config->right_ne[1] * config->right_ne[2];
+        const uint64_t left_base = config->left_nb[0] ?
+            (d1 * config->left_nb[0] + d2 * config->left_nb[1] + d3 * config->left_nb[2]) / sizeof(float) : row * row_elements;
+        const uint64_t right_base = config->right_nb[0] ?
+            (r1 * config->right_nb[0] + r2 * config->right_nb[1] + r3 * config->right_nb[2]) / sizeof(float) :
+            r1 * right_row + r2 * right_row * config->right_ne[1] + r3 * right_row * config->right_ne[1] * config->right_ne[2];
 
         load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
-                       (uint64_t) (uintptr_t) (left + row * row_elements + column));
+                       (uint64_t) (uintptr_t) (left + left_base + column));
         if (right_full) {
             load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
                            (uint64_t) (uintptr_t) (right + right_base + column));
@@ -171,7 +174,7 @@ static void run_div_f32(const DayanBinaryConfig * config,
                         const float *             left,
                         const float *             right,
                         float *                   output) {
-    if (config == nullptr || right == nullptr || !binary_config_valid(config)) {
+    DAYAN_PARAMS_IF(config == nullptr || right == nullptr || !binary_config_valid(config)) {
         DAYAN_PARAMS_ERROR();
     }
     elementwise_validate(config->elements, left, output);
@@ -186,7 +189,7 @@ static void run_div_f32(const DayanBinaryConfig * config,
     const uint32_t tasks      = dayan_native_task_count();
     ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements);
 
-    if (binary_same_shape(config)) {
+    if (binary_same_shape(config) && !config->left_nb[0] && !config->right_nb[0]) {
         for (uint64_t offset = (uint64_t) task * NormalizationLayout::kTileElements; offset < config->elements;
              offset += (uint64_t) tasks * NormalizationLayout::kTileElements) {
             const uint64_t remaining = config->elements - offset;
@@ -240,11 +243,14 @@ static void run_div_f32(const DayanBinaryConfig * config,
         const uint64_t r1      = d1 % config->right_ne[1];
         const uint64_t r2      = d2 % config->right_ne[2];
         const uint64_t r3      = d3 % config->right_ne[3];
-        const uint64_t right_base = r1 * right_row + r2 * right_row * config->right_ne[1] +
-                                    r3 * right_row * config->right_ne[1] * config->right_ne[2];
+        const uint64_t left_base = config->left_nb[0] ?
+            (d1 * config->left_nb[0] + d2 * config->left_nb[1] + d3 * config->left_nb[2]) / sizeof(float) : row * row_elements;
+        const uint64_t right_base = config->right_nb[0] ?
+            (r1 * config->right_nb[0] + r2 * config->right_nb[1] + r3 * config->right_nb[2]) / sizeof(float) :
+            r1 * right_row + r2 * right_row * config->right_ne[1] + r3 * right_row * config->right_ne[1] * config->right_ne[2];
 
         load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
-                       (uint64_t) (uintptr_t) (left + row * row_elements + column));
+                       (uint64_t) (uintptr_t) (left + left_base + column));
         if (right_full) {
             load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
                            (uint64_t) (uintptr_t) (right + right_base + column));

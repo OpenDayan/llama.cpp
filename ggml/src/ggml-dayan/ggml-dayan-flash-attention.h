@@ -860,7 +860,7 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
         ranges_overlap(out_base_addr, out_bytes, v_base_addr, v_span)) {
         return FA_OUTPUT_ALIAS;
     }
-    if (!dayan_uram_base() || dayan_uram_size() < kUramBytes) {
+    DAYAN_PARAMS_IF(!dayan_uram_base() || dayan_uram_size() < kUramBytes) {
         return FA_INVALID_ARGUMENT;
     }
 

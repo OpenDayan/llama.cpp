@@ -74,7 +74,7 @@ public:
         npu_buffer_t * root_buffer = nullptr;
         uint64_t       root_offset = 0;
         if (!runtime_.resolve(runtime_.context, tensor->data, 1, &root_buffer, &root_offset) ||
-            root_offset > UINT32_MAX || extra_offset > UINT32_MAX - root_offset) {
+            extra_offset > UINT64_MAX - root_offset) {
             return false;
         }
         size_t root = 0;
@@ -85,7 +85,7 @@ public:
             }
             roots_[root_count_++] = root_buffer;
         }
-        return add_parameter((uint16_t) root + 1, (uint32_t) (root_offset + extra_offset));
+        return add_parameter((uint16_t) root + 1, root_offset + extra_offset);
     }
 
     bool finish() {
@@ -102,7 +102,7 @@ public:
     uint16_t next() const { return next_; }
 
 private:
-    bool add_parameter(uint16_t source, uint32_t offset) {
+    bool add_parameter(uint16_t source, uint64_t offset) {
         if (next_ >= count_) {
             return false;
         }
@@ -310,10 +310,19 @@ static bool ggml_backend_dayan_mega_add_matmul(ggml_backend_dayan_mega_parameter
     config.weight_type         = kDayanDataTypeMXFP4;
     config.output_type         = output_mxfp4 ? kDayanDataTypeMXFP4 : kDayanDataTypeF32;
     config.operation           = operation;
-    return parameters->add_data(config) && parameters->add_tensor(input) &&
+    const bool moe = node->op == GGML_OP_MUL_MAT_ID;
+    DayanMxfp4MoeConfig routed = {};
+    if (moe) {
+        config.m = 1;
+        routed.matmul = config;
+        routed.routing = {(uint32_t) config.k, (uint32_t) config.n, (uint32_t) weight->ne[2],
+                          (uint32_t) node->src[2]->ne[0], (uint32_t) node->src[2]->ne[1],
+                          (uint32_t) input->ne[1], node->src[2]->nb[1]};
+    }
+    return (moe ? parameters->add_data(routed) : parameters->add_data(config)) && parameters->add_tensor(input) &&
            parameters->add_tensor(input, a.scale_offset) && parameters->add_tensor(weight) &&
            parameters->add_tensor(weight, b.scale_offset) && parameters->add_tensor(up_weight) &&
-           parameters->add_tensor(up_weight, u.scale_offset) && parameters->add_tensor(output) &&
+           parameters->add_tensor(up_weight, u.scale_offset) && (!moe || parameters->add_tensor(node->src[2])) && parameters->add_tensor(output) &&
            parameters->add_tensor(output, output_mxfp4 ? out.scale_offset : 0);
 }
 
@@ -488,15 +497,16 @@ static bool ggml_backend_dayan_mega_add_binary(ggml_backend_dayan_mega_parameter
     ggml_tensor * output = slot.nodes[0];
     if (output == nullptr || (slot.kind != ggml_backend_dayan_slot_kind::elementwise_add &&
                               slot.kind != ggml_backend_dayan_slot_kind::residual_add &&
-                              slot.kind != ggml_backend_dayan_slot_kind::elementwise_mul) ||
+                              slot.kind != ggml_backend_dayan_slot_kind::elementwise_mul &&
+                              slot.kind != ggml_backend_dayan_slot_kind::elementwise_div) ||
         output->type != GGML_TYPE_F32) {
         return false;
     }
     // The full (output-shaped) operand is the left input; the other one may
-    // broadcast. All supported kinds are commutative, so swap when needed.
+    // broadcast. Swap operands only for commutative operations.
     const ggml_tensor * left = output->src[0];
     const ggml_tensor * right = output->src[1];
-    if (!ggml_are_same_shape(output, left)) {
+    if (!ggml_are_same_shape(output, left) && slot.kind != ggml_backend_dayan_slot_kind::elementwise_div) {
         const ggml_tensor * swap = left;
         left = right;
         right = swap;
@@ -504,7 +514,12 @@ static bool ggml_backend_dayan_mega_add_binary(ggml_backend_dayan_mega_parameter
     if (!ggml_are_same_shape(output, left)) {
         return false;
     }
+    if (left->nb[0] != sizeof(float) || right->nb[0] != sizeof(float)) { return false; }
     DayanBinaryConfig config = {};
+    for (int dimension = 1; dimension < GGML_MAX_DIMS; ++dimension) {
+        if (!ggml_is_contiguous(left)) { config.left_nb[dimension - 1] = left->nb[dimension]; }
+        if (!ggml_is_contiguous(right)) { config.right_nb[dimension - 1] = right->nb[dimension]; }
+    }
     config.elements = (uint64_t) ggml_nelements(output);
     for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
         if (right->ne[dimension] <= 0 || output->ne[dimension] % right->ne[dimension] != 0) {
@@ -904,7 +919,7 @@ static bool ggml_backend_dayan_match_signature(const std::vector<ggml_backend_da
     }
     for (size_t index = 0; index < count; ++index) {
         const auto actual = slots[begin + index].kind;
-        if (index == add_position &&
+        if ((index == add_position || signature[index] == ggml_backend_dayan_slot_kind::elementwise_add) &&
             (actual == ggml_backend_dayan_slot_kind::elementwise_add ||
              actual == ggml_backend_dayan_slot_kind::residual_add)) {
             continue;
@@ -1006,7 +1021,7 @@ static bool ggml_backend_dayan_pack_qwen35_mxfp4_full(ggml_backend_dayan_mega_pa
            ggml_backend_dayan_mega_add_residual(parameters, s[begin + 22], GGML_TYPE_F32);
 }
 
-static bool ggml_backend_dayan_pack_qwen35_bf16_linear(ggml_backend_dayan_mega_parameters * parameters,
+static bool ggml_backend_dayan_pack_qwen35_bf16_linear_attention(ggml_backend_dayan_mega_parameters * parameters,
                                                         const std::vector<ggml_backend_dayan_graph_slot> & slots,
                                                         size_t                                              begin,
                                                         bool                                                decode) {
@@ -1045,43 +1060,179 @@ static bool ggml_backend_dayan_pack_qwen35_bf16_linear(ggml_backend_dayan_mega_p
            ggml_backend_dayan_mega_add_unary(parameters, at(22)) &&
            ggml_backend_dayan_mega_add_binary(parameters, at(23)) &&
            ggml_backend_dayan_mega_add_copy(parameters, at(24)) &&
-           ggml_backend_dayan_mega_add_bf16_matmul(parameters, at(25).nodes[0], at(25).nodes[0]) &&
-           ggml_backend_dayan_mega_add_copy(parameters, at(26)) &&
-           ggml_backend_dayan_mega_add_norm(parameters, at(27), true) &&
-           ggml_backend_dayan_mega_add_bf16_swiglu(parameters, at(28)) &&
-           ggml_backend_dayan_mega_add_bf16_quantized(parameters, at(29)) &&
-           ggml_backend_dayan_mega_add_residual(parameters, at(30), GGML_TYPE_BF16);
+           ggml_backend_dayan_mega_add_bf16_matmul(parameters, at(25).nodes[0], at(25).nodes[0]);
 }
 
-static bool ggml_backend_dayan_pack_qwen35_bf16_full(ggml_backend_dayan_mega_parameters * parameters,
+static bool ggml_backend_dayan_pack_qwen35_bf16_linear(ggml_backend_dayan_mega_parameters * parameters,
+                                                       const std::vector<ggml_backend_dayan_graph_slot> & slots,
+                                                       size_t begin, bool decode) {
+    const size_t ffn = begin + (decode ? 24 : 26);
+    return ggml_backend_dayan_pack_qwen35_bf16_linear_attention(parameters, slots, begin, decode) &&
+           ggml_backend_dayan_mega_add_copy(parameters, slots[ffn]) &&
+           ggml_backend_dayan_mega_add_norm(parameters, slots[ffn + 1], true) &&
+           ggml_backend_dayan_mega_add_bf16_swiglu(parameters, slots[ffn + 2]) &&
+           ggml_backend_dayan_mega_add_bf16_quantized(parameters, slots[ffn + 3]) &&
+           ggml_backend_dayan_mega_add_residual(parameters, slots[ffn + 4], GGML_TYPE_BF16);
+}
+
+static bool ggml_backend_dayan_pack_qwen35_bf16_full_attention(ggml_backend_dayan_mega_parameters * parameters,
                                                       const std::vector<ggml_backend_dayan_graph_slot> & slots,
                                                       size_t begin) {
     const auto & s = slots;
-#define PACK_STEP(index, expression) \
-    if (!(expression)) { \
-        GGML_LOG_ERROR("Qwen3.5 BF16 full pack failed at slot %d (%s)\\n", index, s[begin + index].nodes[0] ? s[begin + index].nodes[0]->name : "null"); \
-        return false; \
+    return ggml_backend_dayan_mega_add_norm(parameters, s[begin], false) &&
+           ggml_backend_dayan_mega_add_bf16_matmul(parameters, s[begin + 1].nodes[0], s[begin + 1].nodes[0]) &&
+           ggml_backend_dayan_mega_add_rms_norm(parameters, s[begin + 2]) &&
+           ggml_backend_dayan_mega_add_binary(parameters, s[begin + 3]) &&
+           ggml_backend_dayan_mega_add_rope(parameters, s[begin + 4]) &&
+           ggml_backend_dayan_mega_add_bf16_matmul_pair(parameters, s[begin + 5]) &&
+           ggml_backend_dayan_mega_add_norm(parameters, s[begin + 6], false) &&
+           ggml_backend_dayan_mega_add_rope(parameters, s[begin + 7]) &&
+           ggml_backend_dayan_mega_add_rows(parameters, s[begin + 8], true) &&
+           ggml_backend_dayan_mega_add_rows(parameters, s[begin + 9], true) &&
+           ggml_backend_dayan_mega_add_copy(parameters, s[begin + 10]) &&
+           ggml_backend_dayan_mega_add_flash_attention(parameters, s[begin + 11]) &&
+           ggml_backend_dayan_mega_add_bf16_gated_projection(parameters, s[begin + 12], s[begin + 10].nodes[0]);
+}
+
+static bool ggml_backend_dayan_pack_qwen35_bf16_full(ggml_backend_dayan_mega_parameters * parameters,
+                                                     const std::vector<ggml_backend_dayan_graph_slot> & slots,
+                                                     size_t begin) {
+    return ggml_backend_dayan_pack_qwen35_bf16_full_attention(parameters, slots, begin) &&
+           ggml_backend_dayan_mega_add_copy(parameters, slots[begin + 13]) &&
+           ggml_backend_dayan_mega_add_norm(parameters, slots[begin + 14], true) &&
+           ggml_backend_dayan_mega_add_bf16_swiglu(parameters, slots[begin + 15]) &&
+           ggml_backend_dayan_mega_add_bf16_quantized(parameters, slots[begin + 16]) &&
+           ggml_backend_dayan_mega_add_residual(parameters, slots[begin + 17], GGML_TYPE_BF16);
+}
+
+static bool ggml_backend_dayan_mega_add_tf32(ggml_backend_dayan_mega_parameters * parameters,
+                                             const ggml_backend_dayan_graph_slot & slot) {
+    const ggml_tensor * output = slot.nodes[0];
+    if (output == nullptr || output->src[0] == nullptr || output->src[1] == nullptr ||
+        output->src[0]->type != GGML_TYPE_F32 || output->src[1]->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32) {
+        return false;
     }
-    PACK_STEP(0, ggml_backend_dayan_mega_add_norm(parameters, s[begin + 0], false));
-    PACK_STEP(1, ggml_backend_dayan_mega_add_bf16_matmul(parameters, s[begin + 1].nodes[0], s[begin + 1].nodes[0]));
-    PACK_STEP(2, ggml_backend_dayan_mega_add_rms_norm(parameters, s[begin + 2]));
-    PACK_STEP(3, ggml_backend_dayan_mega_add_binary(parameters, s[begin + 3]));
-    PACK_STEP(4, ggml_backend_dayan_mega_add_rope(parameters, s[begin + 4]));
-    PACK_STEP(5, ggml_backend_dayan_mega_add_bf16_matmul_pair(parameters, s[begin + 5]));
-    PACK_STEP(6, ggml_backend_dayan_mega_add_norm(parameters, s[begin + 6], false));
-    PACK_STEP(7, ggml_backend_dayan_mega_add_rope(parameters, s[begin + 7]));
-    PACK_STEP(8, ggml_backend_dayan_mega_add_rows(parameters, s[begin + 8], true));
-    PACK_STEP(9, ggml_backend_dayan_mega_add_rows(parameters, s[begin + 9], true));
-    PACK_STEP(10, ggml_backend_dayan_mega_add_copy(parameters, s[begin + 10]));
-    PACK_STEP(11, ggml_backend_dayan_mega_add_flash_attention(parameters, s[begin + 11]));
-    PACK_STEP(12, ggml_backend_dayan_mega_add_bf16_gated_projection(parameters, s[begin + 12], s[begin + 10].nodes[0]));
-    PACK_STEP(13, ggml_backend_dayan_mega_add_copy(parameters, s[begin + 13]));
-    PACK_STEP(14, ggml_backend_dayan_mega_add_norm(parameters, s[begin + 14], true));
-    PACK_STEP(15, ggml_backend_dayan_mega_add_bf16_swiglu(parameters, s[begin + 15]));
-    PACK_STEP(16, ggml_backend_dayan_mega_add_bf16_quantized(parameters, s[begin + 16]));
-    PACK_STEP(17, ggml_backend_dayan_mega_add_residual(parameters, s[begin + 17], GGML_TYPE_BF16));
-#undef PACK_STEP
-    return true;
+    DayanMatmulConfig config = ggml_backend_dayan_mega_matmul_config(output->src[0], output->src[1], output);
+    config.a_stride = config.k * sizeof(float);
+    return parameters->add_data(config) && parameters->add_tensor(output->src[1]) &&
+           parameters->add_tensor(output->src[0]) && parameters->add_tensor(output);
+}
+
+static bool ggml_backend_dayan_mega_add_routing(ggml_backend_dayan_mega_parameters * parameters,
+                                                const ggml_backend_dayan_graph_slot & slot) {
+    const ggml_tensor * output = slot.nodes[0];
+    if (output == nullptr || output->src[0] == nullptr) { return false; }
+    bool packed = false;
+    switch (slot.kind) {
+        case ggml_backend_dayan_slot_kind::softmax: {
+            if (output->src[1] != nullptr || output->src[2] != nullptr) { return false; }
+            DayanSoftmaxConfig config = {(uint32_t) output->ne[0], (uint32_t) output->ne[1],
+                (uint32_t) output->ne[2], (uint32_t) output->ne[3], 1, 1, 1, kDayanDataTypeF32, 0, 0, 0, 0};
+            std::memcpy(&config.scale_bits, output->op_params, sizeof(config.scale_bits));
+            std::memcpy(&config.max_bias_bits, (const char *) output->op_params + sizeof(float), sizeof(config.max_bias_bits));
+            packed = parameters->add_data(config);
+            break;
+        }
+        case ggml_backend_dayan_slot_kind::argsort: {
+            if (ggml_get_op_params_i32(output, 0) != GGML_SORT_ORDER_DESC) { return false; }
+            const DayanSortConfig config = {(uint32_t) output->ne[0], (uint32_t) ggml_nrows(output),
+                slot.sort_k ? slot.sort_k : (uint32_t) output->ne[0], kDayanSortOrderDesc, (uint32_t) output->ne[0]};
+            packed = parameters->add_data(config);
+            break;
+        }
+        case ggml_backend_dayan_slot_kind::sum_rows: {
+            const DayanReduceConfig config = {(uint32_t) output->src[0]->ne[0], (uint32_t) ggml_nrows(output), 0x3f800000U, 0};
+            packed = parameters->add_data(config);
+            break;
+        }
+        case ggml_backend_dayan_slot_kind::clamp: {
+            DayanClampConfig config = {(uint64_t) ggml_nelements(output), 0, 0};
+            std::memcpy(&config.min_bits, output->op_params, sizeof(config.min_bits));
+            std::memcpy(&config.max_bits, (const char *) output->op_params + sizeof(float), sizeof(config.max_bits));
+            packed = parameters->add_data(config);
+            break;
+        }
+        default: return false;
+    }
+    return packed && parameters->add_tensor(output->src[0]) && parameters->add_tensor(output);
+}
+
+static constexpr ggml_backend_dayan_slot_kind ggml_backend_dayan_qwen35_moe_ffn_signature[] = {
+    ggml_backend_dayan_slot_kind::norm_pipeline,
+    ggml_backend_dayan_slot_kind::mul_mat,
+    ggml_backend_dayan_slot_kind::softmax,
+    ggml_backend_dayan_slot_kind::argsort,
+    ggml_backend_dayan_slot_kind::get_rows,
+    ggml_backend_dayan_slot_kind::sum_rows,
+    ggml_backend_dayan_slot_kind::clamp,
+    ggml_backend_dayan_slot_kind::elementwise_div,
+    ggml_backend_dayan_slot_kind::copy,
+    ggml_backend_dayan_slot_kind::mul_mat_id_swiglu,
+    ggml_backend_dayan_slot_kind::mul_mat_id,
+    ggml_backend_dayan_slot_kind::elementwise_mul,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::elementwise_add,
+    ggml_backend_dayan_slot_kind::copy,
+    ggml_backend_dayan_slot_kind::mul_mat_swiglu,
+    ggml_backend_dayan_slot_kind::mul_mat,
+    ggml_backend_dayan_slot_kind::mul_mat,
+    ggml_backend_dayan_slot_kind::sigmoid,
+    ggml_backend_dayan_slot_kind::elementwise_mul,
+    ggml_backend_dayan_slot_kind::residual_add,
+    ggml_backend_dayan_slot_kind::norm_pipeline,
+};
+
+template <size_t Prefix, size_t N>
+static constexpr auto ggml_backend_dayan_moe_signature(const ggml_backend_dayan_slot_kind (&attention)[N], bool decode = false) {
+    std::array<ggml_backend_dayan_slot_kind, Prefix + 27> result = {};
+    for (size_t i = 0; i < Prefix; ++i) { result[i] = attention[i + (decode ? (i >= 6 ? 2 : i >= 1 ? 1 : 0) : 0)]; }
+    for (size_t i = 0; i < 27; ++i) { result[Prefix + i] = ggml_backend_dayan_qwen35_moe_ffn_signature[i]; }
+    return result;
+}
+
+static constexpr auto ggml_backend_dayan_qwen35_moe_linear_signature =
+    ggml_backend_dayan_moe_signature<26>(ggml_backend_dayan_qwen35_bf16_linear_signature);
+static constexpr auto ggml_backend_dayan_qwen35_moe_linear_decode_signature =
+    ggml_backend_dayan_moe_signature<24>(ggml_backend_dayan_qwen35_bf16_linear_signature, true);
+static constexpr auto ggml_backend_dayan_qwen35_moe_full_signature =
+    ggml_backend_dayan_moe_signature<13>(ggml_backend_dayan_qwen35_bf16_full_signature);
+
+static bool ggml_backend_dayan_pack_qwen35_moe_ffn(ggml_backend_dayan_mega_parameters * parameters,
+                                                   const std::vector<ggml_backend_dayan_graph_slot> & slots, size_t begin) {
+    const auto at = [&slots, begin](size_t index) -> const ggml_backend_dayan_graph_slot & { return slots[begin + index]; };
+    const ggml_tensor * gate = at(9).nodes[0];
+    const ggml_tensor * up = at(9).nodes[1];
+    if (gate == nullptr || gate->src[2] == nullptr || gate->src[2]->ne[0] != 8 || up == nullptr || up->src[2] != gate->src[2]) {
+        return false;
+    }
+    if (!(ggml_backend_dayan_mega_add_norm(parameters, at(0), true) &&
+          ggml_backend_dayan_mega_add_tf32(parameters, at(1)) &&
+          ggml_backend_dayan_mega_add_routing(parameters, at(2)) &&
+          ggml_backend_dayan_mega_add_routing(parameters, at(3)) &&
+          ggml_backend_dayan_mega_add_rows(parameters, at(4), false) &&
+          ggml_backend_dayan_mega_add_routing(parameters, at(5)) &&
+          ggml_backend_dayan_mega_add_routing(parameters, at(6)) &&
+          ggml_backend_dayan_mega_add_binary(parameters, at(7)) &&
+          ggml_backend_dayan_mega_add_quantize(parameters, at(8)) &&
+          ggml_backend_dayan_mega_add_matmul(parameters, gate, up, at(9).nodes[3], 2) &&
+          ggml_backend_dayan_mega_add_matmul(parameters, at(10).nodes[0], nullptr, at(10).nodes[0], 0) &&
+          ggml_backend_dayan_mega_add_binary(parameters, at(11)))) { return false; }
+    for (size_t i = 12; i < 19; ++i) {
+        if (!ggml_backend_dayan_mega_add_binary(parameters, at(i))) { return false; }
+    }
+    return ggml_backend_dayan_mega_add_copy(parameters, at(19)) &&
+           ggml_backend_dayan_mega_add_bf16_swiglu(parameters, at(20)) &&
+           ggml_backend_dayan_mega_add_bf16_matmul(parameters, at(21).nodes[0], at(21).nodes[0]) &&
+           ggml_backend_dayan_mega_add_tf32(parameters, at(22)) &&
+           ggml_backend_dayan_mega_add_unary(parameters, at(23)) &&
+           ggml_backend_dayan_mega_add_binary(parameters, at(24)) &&
+           ggml_backend_dayan_mega_add_binary(parameters, at(25)) &&
+           ggml_backend_dayan_mega_add_residual(parameters, at(26), GGML_TYPE_F32);
 }
 
 ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
@@ -1140,6 +1291,21 @@ ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
         graph = kDayanMegaQwen35DenseBf16Full;
         parameter_count = kDayanMegaQwen35DenseBf16FullParameters;
         result.end = begin + bf16_full_count - 1;
+    } else if (ggml_backend_dayan_match_signature(slots, begin, ggml_backend_dayan_qwen35_moe_linear_signature.data(), ggml_backend_dayan_qwen35_moe_linear_signature.size(), 13)) {
+        graph = kDayanMegaQwen35MoeLinear;
+        parameter_count = kDayanMegaQwen35MoeLinearParameters;
+        decode = false;
+        result.end = begin + ggml_backend_dayan_qwen35_moe_linear_signature.size() - 1;
+    } else if (ggml_backend_dayan_match_signature(slots, begin, ggml_backend_dayan_qwen35_moe_linear_decode_signature.data(), ggml_backend_dayan_qwen35_moe_linear_decode_signature.size(), 11)) {
+        graph = kDayanMegaQwen35MoeLinear;
+        parameter_count = kDayanMegaQwen35MoeLinearParameters;
+        decode = true;
+        result.end = begin + ggml_backend_dayan_qwen35_moe_linear_decode_signature.size() - 1;
+    } else if (ggml_backend_dayan_match_signature(slots, begin, ggml_backend_dayan_qwen35_moe_full_signature.data(), ggml_backend_dayan_qwen35_moe_full_signature.size(), no_add)) {
+        graph = kDayanMegaQwen35MoeFull;
+        parameter_count = kDayanMegaQwen35MoeFullParameters;
+        decode = false;
+        result.end = begin + ggml_backend_dayan_qwen35_moe_full_signature.size() - 1;
     } else {
         return result;
     }
@@ -1158,6 +1324,14 @@ ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
             break;
         case kDayanMegaQwen35DenseBf16Full:
             packed = ggml_backend_dayan_pack_qwen35_bf16_full(&parameters, slots, begin);
+            break;
+        case kDayanMegaQwen35MoeLinear:
+            packed = ggml_backend_dayan_pack_qwen35_bf16_linear_attention(&parameters, slots, begin, decode) &&
+                     ggml_backend_dayan_pack_qwen35_moe_ffn(&parameters, slots, begin + (decode ? 24 : 26));
+            break;
+        case kDayanMegaQwen35MoeFull:
+            packed = ggml_backend_dayan_pack_qwen35_bf16_full_attention(&parameters, slots, begin) &&
+                     ggml_backend_dayan_pack_qwen35_moe_ffn(&parameters, slots, begin + 13);
             break;
     }
     if (!packed || !parameters.finish()) {

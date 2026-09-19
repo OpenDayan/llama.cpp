@@ -598,8 +598,7 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     s.output_bytes = OutputBytes == sizeof(uint16_t) ? (uint64_t) s.slice_m * s.c_columns * OutputBytes : 0;
     address += kMatmulSlices * s.output_bytes;
     s.scratch = s.physical + address - s.uram;
-    const uint64_t required = address - s.uram + InputScratchBytes;
-    if (!s.physical || required > dayan_uram_size() || required > Constants::kUramWindowStride - s.uram) {
+    DAYAN_PARAMS_IF(!s.physical || address - s.uram + InputScratchBytes > dayan_uram_size() || address + InputScratchBytes > Constants::kUramWindowStride) {
         return -12;
     }
     if constexpr (Cores == 4) {

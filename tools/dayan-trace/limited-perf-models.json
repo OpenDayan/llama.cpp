@@ -1,6 +1,44 @@
 {
   "schema": 1,
   "models": {
+    "qwen36-35B-A3B-mxfp4-moe-bf16": {
+      "description": "Qwen3.6-35B-A3B qwen35moe: 40 blocks (30 linear, 10 full), hidden=2048, 256 MXFP4 experts, top-8, expert/shared FFN=512, BF16 attention/shared experts, F32 router on TF32 MAT. Batch=1, one final-token logit row. Excludes routing postprocessing, small gates/layouts, and MTP; cmodel is functional validation only.",
+      "cases": [
+        {"name": "router", "op": "matmul", "n": 256, "k": 2048, "dtype": "f32"},
+        {"name": "top8", "op": "sort", "n": 256, "experts_used": 8, "dtype": "f32", "output_dtype": "i32"},
+        {"name": "shared-router", "op": "matmul", "n": 1, "k": 2048, "dtype": "f32"},
+        {"name": "expert-ffn", "op": "moe_ffn", "n": 512, "k": 2048, "experts": 256, "experts_used": 8, "dtype": "mxfp4", "output_dtype": "mxfp4"},
+        {"name": "expert-down", "op": "moe_down", "n": 2048, "k": 512, "experts": 256, "experts_used": 8, "dtype": "mxfp4", "output_dtype": "f32"},
+        {"name": "shared-ffn", "op": "ffn", "n": 512, "k": 2048},
+        {"name": "shared-down", "op": "matmul", "n": 2048, "k": 512},
+        {"name": "input", "op": "matmul", "n": 8192, "k": 2048},
+        {"name": "output", "op": "matmul", "n": 2048, "k": 4096},
+        {"name": "quantize-input", "op": "quantize", "n": 2048, "dtype": "f32", "output_dtype": "mxfp4"},
+        {"name": "gdn", "op": "gdn", "heads": 32, "q_heads": 16, "head_dim": 128, "snapshots": 1},
+        {"name": "conv", "op": "ssm_conv", "channels": 8192, "kernel": 4},
+        {"name": "attention", "op": "attention", "q_heads": 16, "kv_heads": 2, "head_dim": 256},
+        {"name": "norm", "op": "norm", "n": 2048, "output_dtype": "f32"},
+        {"name": "vocab", "op": "matmul", "n": 8192, "k": 2048, "m": 1, "phases": ["decode"]}
+      ],
+      "prediction_terms": [
+        {"case": "{phase}-router", "factor": 40, "reason": "one 256-expert TF32 router per block"},
+        {"case": "{phase}-top8", "factor": 40, "reason": "FlexVec radix selection of top-8 indices per block; excludes softmax and weight normalization"},
+        {"case": "{phase}-shared-router", "factor": 40, "reason": "one TF32 shared-expert gate projection per block"},
+        {"case": "{phase}-expert-ffn", "factor": 40, "reason": "top-8 expert gate/up, SwiGLU and MXFP4 output conversion per block; eight experts already included"},
+        {"case": "{phase}-expert-down", "factor": 40, "reason": "top-8 expert down projections per block; eight experts already included"},
+        {"case": "{phase}-shared-ffn", "factor": 40, "reason": "BF16 shared expert gate/up and SwiGLU per block"},
+        {"case": "{phase}-shared-down", "factor": 40, "reason": "BF16 shared expert down projection per block"},
+        {"case": "{phase}-input", "factor": 462720, "divisor": 8192, "reason": "30 linear layers with QKV=8192, gate=4096, alpha/beta=64; 10 full layers with Q/gate=8192, K/V=1024; projection-width proxy"},
+        {"case": "{phase}-output", "factor": 40, "reason": "4096-to-2048 attention output projection per block"},
+        {"case": "{phase}-quantize-input", "factor": 40, "reason": "shared expert-input MXFP4 cast per block"},
+        {"case": "{phase}-gdn", "factor": 30, "reason": "30 linear-attention recurrences"},
+        {"case": "{phase}-conv", "factor": 30, "reason": "30 depthwise convolutions and SiLU"},
+        {"case": "{phase}-attention", "factor": 10, "reason": "10 full-attention layers; BF16 proxy for the FP16 KV path"},
+        {"case": "{phase}-norm", "factor": 80, "reason": "two residual/norm/scale proxies per block, retaining F32 residuals"},
+        {"case": "decode-norm", "factor": 1, "reason": "one final-token norm proxy"},
+        {"case": "decode-vocab", "factor": 248320, "divisor": 8192, "reason": "one final-token BF16 vocabulary projection, scaled from N=8192"}
+      ]
+    },
     "qwen35-0.8B-bf16": {
       "description": "Qwen3.5-0.8B BF16: 24 inference blocks (18 linear, 6 full attention), hidden=1024, FFN=3584, vocab=248320; excludes MTP. Batch=1, one final-token logit row.",
       "cases": [
@@ -54,6 +92,17 @@
         {"case": "{phase}-norm", "factor": 48, "reason": "two residual/norm/scale proxies per block, with F32 output"},
         {"case": "decode-norm", "factor": 1, "reason": "one final-token norm proxy"},
         {"case": "decode-vocab", "factor": 248320, "divisor": 6144, "reason": "one final-token BF16 vocabulary projection, N scaled from 6144 to 248320; excludes its BF16 activation cast"}
+      ]
+    },
+    "qwen36-35B-A3B-moe-mega": {
+      "comparison_reference": "dayan-standalone",
+      "decode_context": 2,
+      "description": "Two random Qwen3.6 MoE layers (one linear, one full) at source dimensions. Compare mega with standalone Dayan through initial and consecutive decode steps. Requires DAYAN_MOE_MODEL and llama-dayan-moe-bench. Reports fixture latency only, not a 40-layer model estimate.",
+      "cases": [
+        {"name": "mega-hybrid", "op": "mega", "dtype": "mxfp4", "mode": "hybrid", "layers": 2, "decode_steps": 2}
+      ],
+      "prediction_terms": [
+        {"case": "{phase}-mega-hybrid", "factor": 1, "reason": "one two-layer hybrid fixture; excludes validation and follow-up decode steps"}
       ]
     },
     "qwen35-mega-bf16": {

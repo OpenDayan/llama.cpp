@@ -25,6 +25,23 @@ def events(tag, intervals):
 
 
 class PerfReportTests(unittest.TestCase):
+    def test_moe_model_plan_keeps_selected_experts_inside_each_case(self):
+        model = perf.load_model("qwen36-35B-A3B-mxfp4-moe-bf16")
+        cases = {case["id"]: case for case in perf.make_cases(5, 16, model=model)}
+        self.assertEqual((cases["prefill-router"]["dtype"], cases["prefill-router"]["n"]), ("f32", 256))
+        expert = cases["prefill-expert-ffn"]
+        self.assertEqual((expert["m"], expert["experts"], expert["experts_used"]), (5, 256, 8))
+        terms = {name: factor for name, factor, _ in perf.prediction_terms("prefill", model)}
+        self.assertEqual(terms["prefill-expert-ffn"], 40)
+        self.assertEqual(cases["decode-vocab"]["m"], 1)
+
+    def test_moe_mega_plan_records_decode_regression_and_reference(self):
+        argv = ["limited-perf.py", "plan", "--model", "qwen36-35B-A3B-moe-mega", "--prefill", "5", "--cmp"]
+        with patch("sys.argv", argv), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(perf.main(), 0)
+        self.assertIn("decode_steps=2", output.getvalue())
+        self.assertIn("cmp=dayan-standalone", output.getvalue())
+
     def test_cmp_plan_and_old_client_rejection(self):
         with patch("sys.argv", ["limited-perf.py", "plan", "--cmp", "--cmp-seed", "42"]), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(perf.main(), 0)

@@ -140,15 +140,10 @@ static void store_quantized(uint64_t packed, uint64_t scales, uint64_t output, u
     long checksum = 0;
     set_lsu_matrix<0>(checksum, rows, columns / 2, packed_stride, output_stride);
     __tx_lsu_dma_u2d<0>(output, packed);
-    const int scale_bytes = ((rows + 7) & ~7) * 4;
-    const int request_bytes = scale_bytes % 64 ? 32 : 64;
-    set_lsu_matrix<0>(checksum, columns / 128, 64, scale_stride, output_scale_stride);
-    __tx_lsu_tcsr_write<LSU_DIM0>(scale_bytes / request_bytes - 1);
-    __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(request_bytes);
-    __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(request_bytes);
-    __tx_lsu_tcsr_write<LSU_REQUESTREADSIZE>(request_bytes - 1);
-    __tx_lsu_tcsr_write<LSU_REQUESTWRITESIZE>(request_bytes - 1);
-    __tx_lsu_dma_u2d<0>(output_scales, scales);
+    const int scale_bytes = rows * 4;
+    const int padded = (scale_bytes + 63) & ~63;
+    set_lsu_matrix<0>(checksum, columns / 128, padded, scale_stride, output_scale_stride);
+    store_matrix<0>(scale_bytes, columns / 128, padded, columns / 128, scales, output_scales);
 }
 
 static void convert(const DayanMxfp4Config * cfg, const void * input, void * output, void * scales) {
@@ -189,8 +184,14 @@ static void convert(const DayanMxfp4Config * cfg, const void * input, void * out
     }
 }
 
+struct Phases {
+    uint64_t mat = 0;
+    uint64_t post = 0;
+};
+
 struct State {
     const DayanMxfp4Config * cfg;
+    Phases * phases;
     DayanMxfp4Tile shape;
     uint64_t input[3], scales[3], output, output_scales;
     uint64_t physical, local, packed, packed_scales;
@@ -255,7 +256,7 @@ static void load(void * arg) {
 
 static void calculate(State & s) {
     const auto & shape = s.shape;
-    uint64_t phases = 0;
+    uint64_t & phases = s.phases->mat;
     __tx_mat_tcsr_write<MAT_ASTRIDE>(shape.input_stride);
     __tx_mat_tcsr_write<MAT_BSTRIDE>(shape.input_stride);
     __tx_mat_tcsr_write<MAT_CSTRIDE>(s.c_stride);
@@ -304,7 +305,7 @@ static void calculate(State & s) {
 static void post(void * arg) {
     State & s = *(State *) arg;
     using namespace ggml_dayan_vec_detail;
-    uint64_t phases = 0;
+    uint64_t & phases = s.phases->post;
     long checksum = 0;
     for (uint64_t out = 0; out < s.tiles; ++out) {
         for (int slice = 0; slice < 2; ++slice) {
@@ -363,9 +364,11 @@ static void post(void * arg) {
 }
 
 static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, const void * b, const void * bs,
-               const void * up, const void * ups, void * output, void * output_scales) {
+               const void * up, const void * ups, void * output, void * output_scales, Phases * phases = nullptr) {
+    Phases local_phases;
     State s = {};
     s.cfg = cfg;
+    s.phases = phases ? phases : &local_phases;
     s.input[0] = (uintptr_t) a; s.input[1] = (uintptr_t) b; s.input[2] = (uintptr_t) up;
     s.scales[0] = (uintptr_t) as; s.scales[1] = (uintptr_t) bs; s.scales[2] = (uintptr_t) ups;
     s.output = (uintptr_t) output; s.output_scales = (uintptr_t) output_scales;
@@ -377,7 +380,7 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
     s.kt = (cfg->k + shape.k - 1) / shape.k;
     s.nt = (cfg->n + shape.n - 1) / shape.n;
     const uint64_t tasks = (uint64_t) dayan_task_dim(DAYAN_TASK_X) * dayan_task_dim(DAYAN_TASK_Y);
-    if (!tasks || dayan_task_dim(DAYAN_TASK_Z) != 1) { return -22; }
+    DAYAN_PARAMS_IF(!tasks || dayan_task_dim(DAYAN_TASK_Z) != 1) { return -22; }
     s.tiles = (((cfg->m + shape.m - 1) / shape.m) * s.nt + tasks - 1) / tasks;
     s.physical = (uintptr_t) dayan_uram_base();
     s.local = s.physical & (Constants::kUramWindowStride - 1);
@@ -396,10 +399,10 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
     }
     s.packed = s.physical + shape.scratch_offset();
     s.packed_scales = s.packed + (shape.post ? shape.m * s.slice_n / 2 : 0);
-    if (!s.physical || shape.bytes() > dayan_uram_size() || shape.bytes() > Constants::kUramWindowStride - s.local) { return -12; }
-    if ((s.packed | s.packed_scales) & 31) { return -22; }
+    DAYAN_PARAMS_IF(!s.physical || shape.bytes() > dayan_uram_size() || shape.bytes() > Constants::kUramWindowStride - s.local) { return -12; }
+    DAYAN_PARAMS_IF((s.packed | s.packed_scales) & 31) { return -22; }
     for (int i = 0; i < 2; ++i) {
-        if (((s.a[i] | s.b[i] | s.c[i]) & 1023) || ((s.as[i] | s.bs[i]) & 31)) { return -22; }
+        DAYAN_PARAMS_IF(((s.a[i] | s.b[i] | s.c[i]) & 1023) || ((s.as[i] | s.bs[i]) & 31)) { return -22; }
     }
     dayan_thread_resources_t resources = {};
     resources.lsu_tcsr_count = 1;

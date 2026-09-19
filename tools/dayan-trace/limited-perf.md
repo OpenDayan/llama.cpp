@@ -201,3 +201,7 @@ python3 -m unittest discover -s tools/dayan-trace -p 'test_*.py'
 ```
 
 The parser tests cover overlapping cores, counter wrap, partial files, missing exits, zero counters, child exclusion, and prediction dependencies. No TestCluster run is needed for these checks.
+
+## Qwen3.5/3.6 MoE
+
+Use `--model qwen36-35B-A3B-mxfp4-moe-bf16` for independent operator cases with TF32 routers and MXFP4 Top-8 expert products. Use `--model qwen36-35B-A3B-moe-mega --client build-dayan/bin/llama-dayan-moe-bench` for a two-layer hybrid fixture and consecutive decode regression. The latter compares with standalone Dayan, requires `DAYAN_MOE_MODEL`, and measures one complete `llama_decode` call rather than an isolated kernel. See [the MoE workflow](qwen35-moe.md) for the 32 GiB cmodel setup, fixture generation, CPU reference semantics, and measurement limits.

@@ -52,10 +52,14 @@ bool ggml_backend_dayan_supports_mul_mat(const ggml_tensor * op) {
     const int64_t       dimension_limit = 0x7ffff000LL;
 
     const bool mx = weight != nullptr && weight->type == GGML_TYPE_MXFP4;
+    const bool f32 = weight != nullptr && weight->type == GGML_TYPE_F32;
+    if (f32 && (weight->ne[2] != 1 || weight->ne[3] != 1 || activation == nullptr || activation->type != GGML_TYPE_F32)) {
+        return false;
+    }
     if (mx && (weight->ne[0] % 32 != 0 || weight->ne[2] != 1 || weight->ne[3] != 1)) {
         return false;
     }
-    if (weight == nullptr || activation == nullptr || (!mx && !ggml_backend_dayan_is_storage_type(weight->type)) ||
+    if (weight == nullptr || activation == nullptr || (!mx && !f32 && !ggml_backend_dayan_is_storage_type(weight->type)) ||
         (activation->type != GGML_TYPE_F32 && activation->type != weight->type &&
          !(mx && ggml_backend_dayan_is_storage_type(activation->type))) || op->type != GGML_TYPE_F32 ||
         weight->ne[0] != activation->ne[0] || op->ne[0] != weight->ne[1] || op->ne[1] != activation->ne[1] ||
@@ -89,6 +93,7 @@ static bool ggml_backend_dayan_mul_mat_has_single_batch(const ggml_tensor * op) 
 bool ggml_backend_dayan_supports_mul_mat_silu(const ggml_tensor * op) {
     return op != nullptr && op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_SILU &&
            op->src[0] != nullptr && ggml_backend_dayan_supports_mul_mat(op->src[0]) && op->type == GGML_TYPE_F32 &&
+           op->src[0]->src[0]->type != GGML_TYPE_F32 &&
            ggml_is_contiguous(op) && ggml_are_same_shape(op, op->src[0]);
 }
 
@@ -101,7 +106,8 @@ bool ggml_backend_dayan_supports_mul_mat_id(const ggml_tensor * op) {
     const ggml_tensor * weight     = op->src[0];
     const ggml_tensor * activation = op->src[1];
     const ggml_tensor * ids        = op->src[2];
-    if (!ggml_backend_dayan_is_storage_type(weight->type) ||
+    const bool mx = weight->type == GGML_TYPE_MXFP4;
+    if ((mx && weight->ne[0] % 32 != 0) || (!mx && !ggml_backend_dayan_is_storage_type(weight->type)) ||
         (activation->type != GGML_TYPE_F32 && activation->type != weight->type) || ids->type != GGML_TYPE_I32 ||
         op->type != GGML_TYPE_F32 || weight->ne[3] != 1 || activation->ne[3] != 1 || ids->ne[2] != 1 ||
         ids->ne[3] != 1 || op->ne[3] != 1 || weight->ne[0] != activation->ne[0] || ids->ne[1] != activation->ne[2] ||
@@ -134,7 +140,7 @@ bool ggml_backend_dayan_supports_glu(const ggml_tensor * op) {
     const enum ggml_glu_op glu  = ggml_get_glu_op(op);
 
     return (glu == GGML_GLU_OP_SWIGLU || glu == GGML_GLU_OP_GEGLU) && ggml_backend_dayan_supports_mul_mat(gate) &&
-           ggml_backend_dayan_supports_mul_mat(up) && gate->src[1] == up->src[1] &&
+           ggml_backend_dayan_supports_mul_mat(up) && gate->src[0]->type != GGML_TYPE_F32 && gate->src[1] == up->src[1] &&
            ggml_backend_dayan_mul_mat_has_single_batch(gate) &&
            ggml_backend_dayan_mul_mat_has_single_batch(up) && gate->src[0]->type == up->src[0]->type &&
            ggml_are_same_shape(gate, up) && ggml_are_same_shape(op, gate);
@@ -158,7 +164,7 @@ bool ggml_backend_dayan_supports_mul_mat_id_glu(const ggml_tensor * op) {
 
 bool ggml_backend_dayan_supports_quantized_mul_mat(const ggml_tensor * op) {
     if (op == nullptr || op->op != GGML_OP_CPY || op->src[0] == nullptr ||
-        !ggml_backend_dayan_supports_mul_mat(op->src[0]) ||
+        !ggml_backend_dayan_supports_mul_mat(op->src[0]) || op->src[0]->src[0]->type == GGML_TYPE_F32 ||
         !ggml_backend_dayan_mul_mat_has_single_batch(op->src[0]) || !ggml_is_contiguous(op)) {
         return false;
     }
@@ -179,7 +185,7 @@ bool ggml_backend_dayan_supports_quantized_glu(const ggml_tensor * op) {
 
     const ggml_tensor * glu = op->src[0];
     const bool mx = op->type == GGML_TYPE_MXFP4 && op->ne[0] % 32 == 0 &&
-                    glu->src[0]->op == GGML_OP_MUL_MAT;
+                    (glu->src[0]->op == GGML_OP_MUL_MAT || glu->src[0]->src[0]->type == GGML_TYPE_MXFP4);
     return (mx || (op->type != GGML_TYPE_MXFP4 && op->type == glu->src[0]->src[0]->type)) && ggml_are_same_shape(op, glu);
 }
 
@@ -1345,7 +1351,7 @@ static bool ggml_backend_dayan_preserve_mxfp4_inputs(const ggml_cgraph * graph) 
         ggml_tensor * up = nullptr;
         if (ggml_backend_dayan_supports_quantized_mul_mat(output) || ggml_backend_dayan_supports_mul_mat_silu(output)) {
             gate = output->src[0];
-        } else if (ggml_backend_dayan_supports_quantized_glu(output) && output->src[0]->src[0]->op == GGML_OP_MUL_MAT) {
+        } else if (ggml_backend_dayan_supports_quantized_glu(output)) {
             gate = output->src[0]->src[0];
             up = output->src[0]->src[1];
         }
@@ -1356,6 +1362,9 @@ static bool ggml_backend_dayan_preserve_mxfp4_inputs(const ggml_cgraph * graph) 
         if (!ggml_backend_dayan_add_dependency(output, gate->src[0]) ||
             !ggml_backend_dayan_add_dependency(output, gate->src[1]) ||
             (up != nullptr && !ggml_backend_dayan_add_dependency(output, up->src[0]))) {
+            return false;
+        }
+        if (gate->op == GGML_OP_MUL_MAT_ID && !ggml_backend_dayan_add_dependency(output, gate->src[2])) {
             return false;
         }
     }
@@ -1472,6 +1481,7 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
     }
     for (ggml_tensor * node : nodes) {
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
+            node->src[0]->type != GGML_TYPE_F32 &&
             (node->src[1]->type == GGML_TYPE_F32 || (node->src[0]->type == GGML_TYPE_MXFP4 && node->src[1]->type != GGML_TYPE_MXFP4)) &&
             (node->src[0]->type == GGML_TYPE_MXFP4 || !ggml_backend_dayan_supports_gated_attention(node->src[1]))) {
             auto inserted = activation_types.emplace(node->src[1], node->src[0]->type);
@@ -1491,6 +1501,7 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
 
     for (ggml_tensor * node : nodes) {
         if ((ggml_backend_dayan_supports_mul_mat(node) || ggml_backend_dayan_supports_mul_mat_id(node)) &&
+            node->src[0]->type != GGML_TYPE_F32 &&
             (node->src[1]->type == GGML_TYPE_F32 || (node->src[0]->type == GGML_TYPE_MXFP4 && node->src[1]->type != GGML_TYPE_MXFP4))) {
             if (node->src[0]->type != GGML_TYPE_MXFP4 && ggml_backend_dayan_supports_gated_attention(node->src[1])) {
                 ggml_backend_dayan_gated_cast rewrite;
@@ -1641,7 +1652,8 @@ static bool ggml_backend_dayan_mxfp4_inputs_live(const ggml_tensor * output, con
     if (output->type != GGML_TYPE_MXFP4 && first->src[0]->type != GGML_TYPE_MXFP4) {
         return true;
     }
-    const ggml_tensor * inputs[] = {first->src[0], first->src[1], second ? second->src[0] : first->src[0]};
+    const ggml_tensor * inputs[] = {first->src[0], first->src[1], second ? second->src[0] : first->src[0],
+                                   first->op == GGML_OP_MUL_MAT_ID ? first->src[2] : first->src[0]};
     for (const ggml_tensor * input : inputs) {
         bool found = false;
         for (const ggml_tensor * source : output->src) { found |= source == input; }
@@ -2168,6 +2180,7 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
                     ggml_backend_dayan_can_elide_glu_intermediates(cgraph, i, pair_index, glu_index) &&
                     ggml_backend_dayan_supports_mul_mat_id_glu(cgraph->nodes[glu_index]) &&
                     ggml_backend_dayan_supports_quantized_glu(cgraph->nodes[cast_index]) &&
+                    ggml_backend_dayan_mxfp4_inputs_live(cgraph->nodes[cast_index], node, pair) &&
                     ((cgraph->nodes[glu_index]->src[0] == node && cgraph->nodes[glu_index]->src[1] == pair) ||
                      (cgraph->nodes[glu_index]->src[0] == pair && cgraph->nodes[glu_index]->src[1] == node)) &&
                     cgraph->nodes[cast_index]->src[0] == cgraph->nodes[glu_index]) {
@@ -2205,6 +2218,12 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
         slot.node_count = 1;
 
         const auto quantized = quantized_outputs.find(node);
+        if (node->src[0]->type == GGML_TYPE_F32) {
+            slot.kind = ggml_backend_dayan_slot_kind::mul_mat;
+            ++i;
+            plan->slots.push_back(slot);
+            continue;
+        }
         if (quantized != quantized_outputs.end()) {
             slot.kind       = ggml_backend_dayan_slot_kind::mul_mat_quantized;
             slot.nodes[1]   = quantized->second;

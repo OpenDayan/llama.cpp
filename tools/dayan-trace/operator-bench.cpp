@@ -214,7 +214,20 @@ static std::vector<float> cpu_reference(const json & spec, const std::vector<std
     };
     ggml_tensor * output = nullptr;
     ggml_tensor * mask = nullptr;
-    if (op == "matmul" || op == "ffn") {
+    ggml_tensor * ids = nullptr;
+    if (op == "sort") {
+        output = ggml_cont(ctx.get(), ggml_argsort_top_k(ctx.get(), tensor(n, m), spec.at("experts_used")));
+    } else if (op == "moe_ffn" || op == "moe_down") {
+        const int64_t experts = spec.at("experts"), used = spec.at("experts_used");
+        auto a = tensor(k, op == "moe_ffn" ? 1 : used, m), b = tensor(k, n, experts);
+        ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, experts, m);
+        auto selected = ggml_view_2d(ctx.get(), ids, used, m, ids->nb[1], 0);
+        output = ggml_mul_mat_id(ctx.get(), b, a, selected);
+        if (op == "moe_ffn") {
+            auto up = ggml_mul_mat_id(ctx.get(), tensor(k, n, experts), a, selected);
+            output = ggml_mul(ctx.get(), ggml_silu(ctx.get(), output), up);
+        }
+    } else if (op == "matmul" || op == "ffn") {
         auto a = tensor(k, m), b = tensor(k, n);
         output = ggml_mul_mat(ctx.get(), b, a);
         ggml_mul_mat_set_prec(output, GGML_PREC_F32);
@@ -229,7 +242,8 @@ static std::vector<float> cpu_reference(const json & spec, const std::vector<std
         output = ggml_silu(ctx.get(), ggml_ssm_conv(ctx.get(), a, b));
     } else if (op == "gdn") {
         const int64_t heads = spec.value("heads", 16), dim = spec.value("head_dim", 128);
-        auto q = tensor(dim, heads, m), key = tensor(dim, heads, m), v = tensor(dim, heads, m);
+        const int64_t q_heads = spec.value("q_heads", heads);
+        auto q = tensor(dim, q_heads, m), key = tensor(dim, q_heads, m), v = tensor(dim, heads, m);
         auto g = tensor(1, heads, m), beta = tensor(1, heads, m), state = tensor(dim, dim, heads);
         output = ggml_gated_delta_net(ctx.get(), q, key, v, g, beta, state, 1);
     } else if (op == "attention") {
@@ -253,6 +267,15 @@ static std::vector<float> cpu_reference(const json & spec, const std::vector<std
         if ((size_t) ggml_nelements(tensors[i]) != inputs[i].size()) { throw std::runtime_error("CPU reference input size mismatch"); }
         ggml_backend_tensor_set(tensors[i], inputs[i].data(), 0, ggml_nbytes(tensors[i]));
     }
+    if (ids) {
+        std::vector<int32_t> values((size_t) ggml_nelements(ids), 0);
+        for (int64_t token = 0; token < m; ++token) {
+            for (int64_t used = 0; used < spec.at("experts_used").get<int64_t>(); ++used) {
+                values[token * ids->ne[0] + used] = ids->ne[0] - 1 - (token * 7 + used * 13) % ids->ne[0];
+            }
+        }
+        ggml_backend_tensor_set(ids, values.data(), 0, ggml_nbytes(ids));
+    }
     if (mask) {
         std::vector<ggml_fp16_t> values((size_t) ggml_nelements(mask));
         for (int64_t row = 0; row < m; ++row) {
@@ -264,7 +287,13 @@ static std::vector<float> cpu_reference(const json & spec, const std::vector<std
     }
     if (ggml_backend_graph_compute(cpu.get(), graph) != GGML_STATUS_SUCCESS) { throw std::runtime_error("CPU reference graph failed"); }
     std::vector<float> reference((size_t) ggml_nelements(output));
-    ggml_backend_tensor_get(output, reference.data(), 0, ggml_nbytes(output));
+    if (op == "sort") {
+        std::vector<int32_t> indices(reference.size());
+        ggml_backend_tensor_get(output, indices.data(), 0, ggml_nbytes(output));
+        std::copy(indices.begin(), indices.end(), reference.begin());
+    } else {
+        ggml_backend_tensor_get(output, reference.data(), 0, ggml_nbytes(output));
+    }
     return reference;
 }
 
@@ -324,12 +353,18 @@ int main(int argc, char ** argv) {
             repeats + warmup > 100 || tag.empty() || tag.size() > 11) {
             throw std::runtime_error("invalid shape, repetition count, or tag");
         }
-        const bool matrix = op == "matmul" || op == "ffn";
+        const bool moe = op == "moe_ffn" || op == "moe_down";
+        const uint32_t experts = spec.value("experts", 1U), used = spec.value("experts_used", 1U);
+        if (moe && (!experts || experts > 4096 || !used || used > experts || dtype != "mxfp4" || n % 16 ||
+                    (uint64_t) experts * n * k > 512ULL * 1024 * 1024)) {
+            throw std::runtime_error("invalid MXFP4 expert shape");
+        }
+        const bool matrix = op == "matmul" || op == "ffn" || moe;
         const bool mx = dtype == "mxfp4";
-        if ((matrix && (dtype != "bf16" && !mx)) ||
+        if ((matrix && (dtype != "bf16" && !mx && !(dtype == "f32" && op == "matmul"))) ||
             (matrix && !mx && output_dtype != (op == "ffn" ? "bf16" : "f32")) ||
             (!matrix && dtype != (op == "attention" ? "bf16" : "f32")) ||
-            (output_dtype != "f32" && output_dtype != "bf16" && output_dtype != "mxfp4") ||
+            (output_dtype != "f32" && output_dtype != "bf16" && output_dtype != "mxfp4" && !(op == "sort" && output_dtype == "i32")) ||
             (mx && k % 32 != 0) || (output_dtype == "mxfp4" && n % 32 != 0) ||
             (op == "quantize" && output_dtype != "mxfp4") ||
             (op == "norm" && output_dtype != "f32" && output_dtype != "bf16") ||
@@ -366,11 +401,23 @@ int main(int argc, char ** argv) {
         std::vector<float> residual_reference;
         const bool lowp_output = output_dtype == "bf16";
         const bool mxfp4_output = output_dtype == "mxfp4";
-        const auto output_layout = DayanMxfp4Layout::make(m, n);
+        const auto output_layout = DayanMxfp4Layout::make((uint64_t) m * (moe ? used : 1), n);
         std::function<int()> launch;
         const float nan = std::numeric_limits<float>::quiet_NaN();
 
-        if ((matrix && mx) || op == "quantize") {
+        if (op == "sort") {
+            if (!used || used > n || n > kDayanSortMaxWidth || output_dtype != "i32") { throw std::runtime_error("invalid routing sort shape"); }
+            const DayanSortConfig config{n, m, used, kDayanSortOrderDesc, used};
+            auto cfg = device.upload(&config, sizeof(config));
+            auto a = device.input((size_t) m * n, 1.0f);
+            output = device.filled((size_t) m * used, nan);
+            attrs.config = topology.launch(false);
+            result["kernel"] = "argsort_f32_1c";
+            launch = [&, cfg, a]() { return argsort_f32_1c(cfg, a, output, &attrs); };
+            for (uint32_t token = 0; token < m; ++token) {
+                for (uint32_t i = 0; i < used; ++i) { reference.push_back(i); }
+            }
+        } else if ((matrix && mx) || op == "quantize") {
             DayanMxfp4Config config{};
             config.m = m; config.n = n; config.k = k;
             config.output_stride = mxfp4_output ? output_layout.row_stride : n * (lowp_output ? 2ULL : 4ULL);
@@ -382,7 +429,7 @@ int main(int argc, char ** argv) {
                 output = device.upload(sentinel.data(), sentinel.size());
                 scales = device.view(output, output_layout.scale_offset, output_layout.bytes - output_layout.scale_offset);
             } else {
-                output = device.filled((size_t) m * n, nan, lowp_output);
+                output = device.filled((size_t) output_layout.rows * n, nan, lowp_output);
                 scales = output;
             }
             float value = 1.0f / 64;
@@ -400,29 +447,56 @@ int main(int argc, char ** argv) {
                 launch = [&, cfg, a, scales]() { return quantize_mxfp4(cfg, a, output, scales, &attrs); };
             } else {
                 attrs.config = topology.launch(true);
-                const auto a_layout = DayanMxfp4Layout::make(m, k), b_layout = DayanMxfp4Layout::make(n, k);
+                const auto a_layout = DayanMxfp4Layout::make((uint64_t) m * (op == "moe_down" ? used : 1), k);
+                const auto b_layout = DayanMxfp4Layout::make((uint64_t) n * (moe ? experts : 1), k);
                 config.source_type = config.weight_type = kDayanDataTypeMXFP4;
                 config.a_stride = a_layout.row_stride; config.b_stride = b_layout.row_stride;
                 config.a_scale_stride = a_layout.scale_stride; config.b_scale_stride = b_layout.scale_stride;
-                config.operation = op == "ffn" ? 2 : 0;
+                config.operation = op == "ffn" || op == "moe_ffn" ? 2 : 0;
                 auto cfg = device.upload(&config, sizeof(config));
                 auto a = mxfp4_input(device, a_layout, value), b = mxfp4_input(device, b_layout, value);
                 auto as = device.view(a, a_layout.scale_offset, a_layout.bytes - a_layout.scale_offset);
                 auto bs = device.view(b, b_layout.scale_offset, b_layout.bytes - b_layout.scale_offset);
-                auto up = op == "ffn" ? mxfp4_input(device, b_layout, value) : b;
-                auto ups = op == "ffn" ? device.view(up, b_layout.scale_offset, b_layout.bytes - b_layout.scale_offset) : bs;
+                auto up = config.operation == 2 ? mxfp4_input(device, b_layout, value) : b;
+                auto ups = config.operation == 2 ? device.view(up, b_layout.scale_offset, b_layout.bytes - b_layout.scale_offset) : bs;
                 result["kernel"] = topology.clusters ? "matmul_mxfp4_4c" : "matmul_mxfp4_1c";
                 launch = [&, cfg, a, as, b, bs, up, ups, scales]() {
                     return (topology.clusters ? matmul_mxfp4_4c : matmul_mxfp4_1c)(cfg, a, as, b, bs, up, ups, output, scales, &attrs);
                 };
+                if (moe) {
+                    config.m = 1;
+                    const DayanMxfp4MoeConfig moe_config = {config, {k, n, experts, used, m, op == "moe_down" ? used : 1, experts * sizeof(int32_t)}};
+                    auto moe_cfg = device.upload(&moe_config, sizeof(moe_config));
+                    std::vector<int32_t> values((size_t) experts * m, 0);
+                    for (uint32_t token = 0; token < m; ++token) {
+                        for (uint32_t slot = 0; slot < used; ++slot) {
+                            values[token * experts + slot] = experts - 1 - (token * 7 + slot * 13) % experts;
+                        }
+                    }
+                    auto ids = device.upload(values.data(), values.size() * sizeof(values[0]));
+                    attrs.config = topology.launch(false);
+                    result["kernel"] = "mul_mat_id_mxfp4";
+                    launch = [&, moe_cfg, a, as, b, bs, up, ups, ids, scales]() {
+                        return mul_mat_id_mxfp4(moe_cfg, a, as, b, bs, up, ups, ids, output, scales, &attrs);
+                    };
+                }
                 value = k / 4096.0f;
-                if (op == "ffn") { value = value * value / (1.0f + std::exp(-value)); }
+                if (config.operation == 2) { value = value * value / (1.0f + std::exp(-value)); }
             }
             if (mxfp4_output) {
                 uint8_t scale, code;
                 value = mxfp4_constant(value, scale, code);
             }
-            reference.assign((size_t) m * n, value);
+            reference.assign((size_t) output_layout.rows * n, value);
+        } else if (matrix && dtype == "f32") {
+            const DayanMatmulConfig config{m, n, k, k * 4ULL, k * 4ULL, n * 4ULL};
+            auto cfg = device.upload(&config, sizeof(config));
+            auto a = device.input((size_t) m * k, 1.0f / 64), b = device.input((size_t) n * k, 1.0f / 64);
+            output = device.filled((size_t) m * n, nan);
+            attrs.config = topology.launch(false);
+            result["kernel"] = "router_f32";
+            launch = [&, cfg, a, b]() { return router_f32(cfg, a, b, output, &attrs); };
+            reference.assign((size_t) m * n, k / 4096.0f);
         } else if (matrix) {
             attrs.config = topology.launch(true);
             DayanMatmulConfig config{m, n, k, k * 2ULL, k * 2ULL, n * (lowp_output ? 2ULL : 4ULL)};
@@ -458,20 +532,23 @@ int main(int argc, char ** argv) {
         } else if (op == "gdn") {
             DayanGatedDeltaNetConfig config{};
             config.head_dim = spec.value("head_dim", 128U);
-            config.heads = config.q_heads = config.k_heads = spec.value("heads", 16U);
-            if (config.head_dim != 128 || config.heads == 0 || config.heads > 128 || spec.value("snapshots", 1U) != 1) {
-                throw std::runtime_error("GDN needs head_dim=128, 1..128 heads, and one snapshot");
+            config.heads = spec.value("heads", 16U);
+            config.q_heads = config.k_heads = spec.value("q_heads", config.heads);
+            if (config.head_dim != 128 || config.heads == 0 || config.heads > 128 || !config.q_heads ||
+                config.heads % config.q_heads || spec.value("snapshots", 1U) != 1) {
+                throw std::runtime_error("GDN needs head_dim=128, 1..128 value heads divisible by query heads, and one snapshot");
             }
             const size_t width = config.head_dim * config.heads, state_elements = width * config.head_dim;
             config.tokens = m;
             config.sequences = config.snapshots = config.gate_width = config.q_sequences = config.k_sequences = 1;
             config.scale_bits = float_bits(1.0f / std::sqrt(128.0f));
             attrs.config = topology.launch(false, (uint64_t) config.heads * config.sequences);
-            for (auto nb : {config.q_nb, config.k_nb, config.v_nb}) { strides(nb, 128, config.heads, m); }
+            for (auto nb : {config.q_nb, config.k_nb}) { strides(nb, 128, config.q_heads, m); }
+            strides(config.v_nb, 128, config.heads, m);
             for (auto nb : {config.g_nb, config.beta_nb}) { strides(nb, 1, config.heads, m); }
             auto cfg = device.upload(&config, sizeof(config));
-            auto q = device.input(m * width, 1.0f / 16);
-            auto key = device.input(m * width, 1.0f / 16);
+            auto q = device.input((size_t) m * config.head_dim * config.q_heads, 1.0f / 16);
+            auto key = device.input((size_t) m * config.head_dim * config.k_heads, 1.0f / 16);
             auto v = device.input(m * width, 1.0f / 32);
             auto g = device.input((size_t) m * config.heads, -0.1f, false, true);
             auto beta = device.input((size_t) m * config.heads, 0.5f, false, true);
@@ -553,6 +630,16 @@ int main(int argc, char ** argv) {
         std::vector<uint8_t> reference_bytes;
         if (device.compare) {
             const auto start = std::chrono::steady_clock::now();
+            if (op == "matmul" && dtype == "f32") {
+                for (auto & input : device.inputs) {
+                    for (float & value : input) {
+                        uint32_t bits;
+                        std::memcpy(&bits, &value, sizeof(bits));
+                        bits &= 0xffffe000U;
+                        std::memcpy(&value, &bits, sizeof(value));
+                    }
+                }
+            }
             reference = cpu_reference(spec, device.inputs);
             if (mxfp4_output) { reference_bytes = quantize_mxfp4_reference(reference); }
             if (lowp_output) {
@@ -566,6 +653,9 @@ int main(int argc, char ** argv) {
             result["input_seed"] = spec.value("seed", 1U);
         }
         result["validation"] = device.compare ? "GGML CPU F32 reference with stored input values and device output conversion" : "constant-input analytical reference";
+        if (device.compare && op == "matmul" && dtype == "f32") {
+            result["validation"] = "GGML CPU F32 accumulation with MAT TF32 input truncation";
+        }
         result["comparisons"] = json::array();
         result["max_abs_error"] = 0.0;
         for (int iteration = 0; iteration < warmup + repeats; ++iteration) {
@@ -602,6 +692,10 @@ int main(int argc, char ** argv) {
                     const uint8_t code = (logical[block + 1 + i % 16] >> (i % 32 / 16 * 4)) & 15;
                     observed[i] = mxfp4_value(logical[block], code);
                 }
+            } else if (op == "sort") {
+                std::vector<int32_t> indices(reference.size());
+                device.download(output, indices.data(), indices.size() * sizeof(indices[0]));
+                std::copy(indices.begin(), indices.end(), observed.begin());
             } else if (lowp_output) {
                 std::vector<ggml_bf16_t> values(reference.size());
                 device.download(output, values.data(), values.size() * sizeof(values[0]));
@@ -614,6 +708,7 @@ int main(int argc, char ** argv) {
                 atol = 1e-6;
                 rtol = lowp_output ? 0.01 : 0.001;
                 l2_limit = rtol;
+                if (op == "sort") { atol = rtol = l2_limit = 0; }
                 if (op == "attention") { atol = 2e-5; rtol = l2_limit = 0.003; }
                 if (op == "gdn") { atol = m >= 16 ? 2e-4 : 1e-6; rtol = l2_limit = m >= 16 ? 0.003 : 1e-4; }
                 if (mxfp4_output) { l2_limit = 0.01; }

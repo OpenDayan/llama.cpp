@@ -110,6 +110,7 @@ add_custom_command(
         ggml-dayan-mega-executor.h
         mega-graph/qwen35-dense-bf16.hpp
         mega-graph/qwen35-dense-mxfp4.hpp
+        mega-graph/qwen35-moe.hpp
         ggml-dayan-kernels.h
         ggml-dayan-activation.h
         ggml-dayan-attention.h
@@ -127,6 +128,8 @@ add_custom_command(
         ggml-dayan-memory.h
         ggml-dayan-normalization.h
         ggml-dayan-rope.h
+        ggml-dayan-moe.h
+        ggml-dayan-softmax.h
         device_include/cstdint
         device_include/cstdio
         device_include/type_traits

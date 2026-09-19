@@ -278,7 +278,7 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
     }
     s.packed = s.physical + address - s.uram;
     address += (uint64_t) s.slice_m * s.output_stride;
-    if (!s.physical || address - s.uram > dayan_uram_size() || address > ggml_dayan_matmul_detail::Constants::kUramWindowStride) {
+    DAYAN_PARAMS_IF(!s.physical || address - s.uram > dayan_uram_size() || address > ggml_dayan_matmul_detail::Constants::kUramWindowStride) {
         return -12;
     }
     if constexpr (Cores == 4) {

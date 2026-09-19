@@ -91,7 +91,7 @@ Measure prefill and decode throughput with the profiler stopped:
 
 #### Qwen3.5 mega executor
 
-The mega executor is enabled automatically when a supported Qwen3.5 Dense Transformer block runs on one four-core Cluster. It currently recognizes the Linear Attention and Full Attention blocks in the BF16 and MXFP4 Qwen3.5 Dense models. No additional CMake option is required. Leave `GGML_DAYAN_MEGA` unset or set it to `1`:
+The mega executor is enabled automatically when a supported Qwen3.5 Transformer block runs on one four-core Cluster. It recognizes BF16 and MXFP4 dense blocks, and Qwen3.5/3.6 MoE blocks with BF16 attention/shared experts, MXFP4 routed experts, F32 routers, and Top-8 routing. Both initial graphs and decode graphs without the two state SCALE nodes are supported. No additional CMake option is required. Leave `GGML_DAYAN_MEGA` unset or set it to `1`:
 
 ```sh
 export GGML_DAYAN_MEGA=1
@@ -109,6 +109,8 @@ GGML_DAYAN_MEGA=0 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
 ```
 
 Restart a long-running inference process after changing `GGML_DAYAN_MEGA`.
+
+MoE mega reuses the dense BF16 attention segment and then executes routing, MXFP4 experts, shared experts, and the F32 residual inside the same launch. Parameter offsets are 64-bit so weights beyond 4 GiB remain addressable. `GGML_DAYAN_MEGA_DEBUG=1` reports graph slots and actual launch counts. `GGML_DAYAN_MEGA_TAG` overrides the profiler name for benchmark clients. See [MoE validation](../../../tools/dayan-trace/qwen35-moe.md) for cmodel commands and numerical limits.
 
 ### Run operator tests
 
@@ -192,7 +194,7 @@ Independent workers and cooperative groups partition output columns; attention p
 
 The backend supports contiguous `GGML_OP_MUL_MAT` with BF16 or FP16 weights, including broadcastable `ne2` and `ne3` batches. Activations are stored with the same type as the weights, matrix accumulation uses F32, and an unfused matrix multiplication returns the F32 result required by ggml.
 
-Dense MXFP4 MatMul and FFN use `ggml-dayan-mxfp4.h`. MXFP4 weights must have one matrix batch, contiguous rows, and K divisible by 32. Activation batches are flattened into M. Attention operators and KV storage keep their existing floating-point paths. MXFP4 expert routing is not supported.
+Dense MXFP4 MatMul and FFN use `ggml-dayan-mxfp4.h`. MXFP4 weights must have one matrix batch, contiguous rows, and K divisible by 32. Activation batches are flattened into M. Attention operators and KV storage keep their existing floating-point paths. MXFP4 expert matrices use the same payload and scale layout, with one product per selected expert. Resource phases persist across these products, and partial scale stores write only the active rows.
 
 The GGUF representation remains the standard 17-byte block: one E8M0 scale followed by 32 FP4 values. Upload splits this into consecutive low-nibble-first FP4 payload and a separate scale view stored in `tensor->extra`. Readback restores the GGUF representation, including partial transfers. The arena allocation includes payload row padding and all scale planes, so the graph allocator owns both lifetimes.
 
@@ -240,11 +242,13 @@ Both one-core and four-core FFN entries use the same shape-dependent pipeline an
 
 The MoE path has separate kernels for `MUL_MAT_ID`, `ADD_ID`, `ARGSORT`, and `TOP_K`. The graph compiler also recognizes `MUL_MAT_ID + MUL_MAT_ID + SWIGLU/GEGLU + CPY`. This fused slot selects both expert matrices and runs the same dedicated FFN pipeline for each selected expert. Expert ID views are read with their actual row strides, and routing rows support up to 4096 entries.
 
+F32 matrix products, including the expert router and scalar shared gate, execute on MAT as TF32 inputs with F32 accumulation and output. The TF32 tile is M=32, N=64, K=256 with 1152-byte input strides and a 384-byte output stride. VisualSwizzle checks of A, B, and C give peak bank multiplicity 1 with identity swizzle.
+
 Graphs containing `MUL_MAT_ID` retain F32 residual storage. Rounding the residual stream to BF16 can change close router scores and select different experts in later layers.
 
-When an `ARGSORT` result is used only by zero-offset prefix views, the slot selects and sorts only the largest required prefix. This changes routing selection from O(E^2) to O(E*K), retains the original row stride, and preserves the sorted order required by `ggml_argsort_top_k`. Full outputs and other consumers retain full sorting. `GET_ROWS` accepts strided I32/I64 indices, including these routing views. Sorting uses independent Procs with no child Threads or Named Resources.
+`ARGSORT` and `TOP_K` use a stable 32-bit FlexVec radix sort. VEC transforms float keys, computes prefix sums and bucket totals with Shuffle, and scatters keys and indices into SparseMem. Prefix carries stay in URAM and return directly to VEC; scalar code only controls loops. Signed zero is canonicalized and equal keys retain index order. Prefix consumers store only the requested indices with the original row stride. `GET_ROWS` accepts these strided I32/I64 views. Sorting uses independent Procs with no child Threads or Named Resources.
 
-F32 binary operators pack strided inputs with the existing Device copy kernel before arithmetic or broadcast. This covers the expert output views used in MoE aggregation. These copies are runtime staging within the binary slot. CLAMP accepts infinite bounds, including the lower-only clamp used to normalize selected routing weights.
+F32 binary operators read strided rows directly, including the expert output views used in MoE aggregation. Inputs with a noncontiguous first dimension still use Device copy staging. CLAMP accepts infinite bounds, including the lower-only clamp used to normalize selected routing weights.
 
 The one-core and four-core MatMul entries use the same pipeline: two input loader Threads, the root MAT worker, and a post Thread. The general four-core loaders use DAPI Resource producer election to share A across columns and B across rows. Local Resources protect MAT inputs and accumulators; Shared Resources keep each source alive until the peer copy finishes. Each worker tracks Resource phases across batches and repeated expert products. LSU supports partial output rows, including the single-column shared expert gate.
 
