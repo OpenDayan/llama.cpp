@@ -3,12 +3,16 @@
 #include "ggml-dayan-kernels.h"
 #include "ggml-dayan-mxfp4-layout.h"
 #include "ggml-impl.h"
+#include "mega-graph/qwen35-moe.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
+
+static_assert(ggml_dayan_mega_detail::Qwen35MoeFfnParameterLayout<0>::parameter_count == 122,
+              "Qwen35 MoE host parameter layout mismatch");
 
 static bool ggml_backend_dayan_mega_type_code(enum ggml_type type, uint32_t * code) {
     switch (type) {

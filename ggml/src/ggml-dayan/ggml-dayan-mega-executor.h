@@ -20,8 +20,8 @@ enum : uint32_t {
     kDayanMegaQwen35DenseMxfp4FullParameters   = 137,
     kDayanMegaQwen35DenseBf16LinearParameters  = 129,
     kDayanMegaQwen35DenseBf16FullParameters    = 89,
-    kDayanMegaQwen35MoeLinearParameters       = 226,
-    kDayanMegaQwen35MoeFullParameters         = 186,
+    kDayanMegaQwen35MoeLinearParameters       = 227,
+    kDayanMegaQwen35MoeFullParameters         = 187,
 };
 
 struct DayanMegaConfig {
