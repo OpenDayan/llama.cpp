@@ -305,8 +305,8 @@ static inline MatmulNode matmul_node(const MatmulState & s, uint64_t generation,
 }
 
 static inline void matmul_check(int status) {
-    if (status < 0) {
-        dayan_thread_exit(status);
+    DAYAN_PARAMS_IF(status < 0) {
+        DAYAN_PARAMS_ERROR();
     }
 }
 
@@ -386,7 +386,7 @@ static void matmul_load(void * argument) {
                     __tx_lsu_dma_d2u<0>((long) dst.uram, (long) src);
                     matmul_check(dayan_resource_produce_lsu(dst.resource, users, ready_mask));
                 } else {
-                    dayan_thread_exit(-22);
+                    DAYAN_PARAMS_ERROR();
                 }
                 phases ^= ready_mask;
             }

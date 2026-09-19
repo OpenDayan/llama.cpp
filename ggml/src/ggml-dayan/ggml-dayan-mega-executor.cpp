@@ -468,9 +468,10 @@ __kernel__ void qwen35_dense_mega(
             status = -22;
             break;
     }
-    if (status < 0) {
-        dayan_thread_exit(status);
+    DAYAN_PARAMS_IF(status < 0) {
+        DAYAN_PARAMS_ERROR();
     }
+    (void) status;
 }
 
 DAYAN_KERNEL_RESOURCE_DESC_EX(

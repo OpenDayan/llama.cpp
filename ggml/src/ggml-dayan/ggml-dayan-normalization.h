@@ -154,8 +154,8 @@ static inline void normalization_validate(const DayanNormConfig * config) {
         DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+        DAYAN_PARAMS_ERROR();
     }
 }
 
@@ -785,8 +785,8 @@ static inline void run_group_norm(const DayanGroupNormConfig * config, const flo
     }
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -819,8 +819,8 @@ static inline void run_residual_add(const DayanElementwiseConfig * config,
     constexpr uint32_t input_bytes = InputType == kDayanDataTypeF32 ? sizeof(float) : sizeof(uint16_t);
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();

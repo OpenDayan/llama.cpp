@@ -130,8 +130,8 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
     }
 
     const uint64_t uram_address = (uint64_t) (uintptr_t) dayan_uram_base();
-    if (uram_address == 0) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(uram_address == 0) {
+        DAYAN_PARAMS_ERROR();
     }
 
     const uint32_t task = dayan_task_id(DAYAN_TASK_X);
@@ -148,8 +148,8 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
     const uint64_t shard_channels = channel_end - channel_begin;
     const uint64_t bytes_per_channel = ssm_conv_uram_layout(token_tile, config->kernel_size, Constants::kVecLanes).total / Constants::kVecLanes;
     const uint64_t max_channel_tile = dayan_uram_size() / bytes_per_channel / Constants::kVecLanes * Constants::kVecLanes;
-    if (max_channel_tile == 0) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(max_channel_tile == 0) {
+        DAYAN_PARAMS_ERROR();
     }
     const uint64_t channel_tiles = (shard_channels + max_channel_tile - 1U) / max_channel_tile;
     const uint32_t channel_tile = (uint32_t) align_up((shard_channels + channel_tiles - 1U) / channel_tiles, Constants::kVecLanes);

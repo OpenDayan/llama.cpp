@@ -380,8 +380,8 @@ static inline GdnChunk gdn_chunk(const GdnPipeline & pipeline, uint64_t generati
 }
 
 static inline void gdn_check(int status) {
-    if (status < 0) {
-        dayan_thread_exit(status);
+    DAYAN_PARAMS_IF(status < 0) {
+        DAYAN_PARAMS_ERROR();
     }
 }
 

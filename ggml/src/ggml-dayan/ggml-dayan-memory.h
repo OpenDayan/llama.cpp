@@ -398,8 +398,8 @@ static inline void memory_validate(const void * config) {
         DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+        DAYAN_PARAMS_ERROR();
     }
 }
 

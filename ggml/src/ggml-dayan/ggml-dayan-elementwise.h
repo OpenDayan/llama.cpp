@@ -17,8 +17,8 @@ static inline void elementwise_validate(uint64_t elements, const void * input, v
         DAYAN_PARAMS_ERROR();
     }
     (void) dayan_native_task_id();
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+        DAYAN_PARAMS_ERROR();
     }
 }
 
@@ -551,8 +551,8 @@ static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const f
     }
     const uint32_t task  = dayan_native_task_id();
     const uint32_t tasks = dayan_native_task_count();
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+        DAYAN_PARAMS_ERROR();
     }
 
     configure_normalization_lsu();
@@ -583,6 +583,11 @@ static inline void run_reduce_rows_f32(const DayanReduceConfig * config, const f
 static inline void run_scale_f32(const DayanScaleConfig * config, const float * input, float * output) {
     if (config == nullptr) {
         DAYAN_PARAMS_ERROR();
+    }
+    // zero-element scale is the decode no-op that keeps the mega parameter
+    // layout aligned: nothing to read or write
+    if (config->elements == 0) {
+        return;
     }
     elementwise_validate(config->elements, input, output);
     configure_normalization_lsu();

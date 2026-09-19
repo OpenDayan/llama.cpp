@@ -3357,6 +3357,32 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
     }
     const double compile_ms = (double) (ggml_time_us() - compile_start_us) / 1000.0;
 
+    const bool mega_debug = std::getenv("GGML_DAYAN_MEGA_DEBUG") != nullptr;
+    if (mega_debug) {
+        std::string sequence;
+        sequence.reserve(plan.slots.size() * 32);
+        for (size_t index = 0; index < plan.slots.size(); ++index) {
+            const ggml_backend_dayan_graph_slot & slot = plan.slots[index];
+            sequence += std::to_string(index);
+            sequence += ':';
+            sequence += std::to_string((int) slot.kind);
+            if (slot.nodes[0] != nullptr) {
+                sequence += '(';
+                sequence += ggml_op_desc(slot.nodes[0]);
+                const char * name = ggml_get_name(slot.nodes[0]);
+                if (name != nullptr && name[0] != '\0') {
+                    sequence += ' ';
+                    sequence += name;
+                }
+                sequence += ')';
+            }
+            sequence += ' ';
+        }
+        fprintf(stderr, "%s: mega debug graph %lld nodes, %zu slots: %s\n", __func__, (long long) cgraph->n_nodes,
+                plan.slots.size(), sequence.c_str());
+        fflush(stderr);
+    }
+
     ggml_backend_dayan_graph_buffers graph_buffers;
     int                              status = 0;
 
@@ -3672,6 +3698,11 @@ static enum ggml_status ggml_backend_dayan_graph_compute(ggml_backend_t backend,
             local_f16_widen_slots, local_f16_widen_elements, graph_buffers.runtime_bf16_casts,
             graph_buffers.runtime_bf16_cast_elements, graph_buffers.runtime_f16_casts,
             graph_buffers.runtime_f16_cast_elements, compile_ms);
+    }
+    if (mega_debug) {
+        fprintf(stderr, "%s: mega debug done, status=%d, total mega launches=%llu\n", __func__, status,
+                (unsigned long long) ggml_backend_dayan_mega_launch_count);
+        fflush(stderr);
     }
     return GGML_STATUS_SUCCESS;
 }

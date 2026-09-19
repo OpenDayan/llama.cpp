@@ -159,8 +159,12 @@ static void convert(const DayanMxfp4Config * cfg, const void * input, void * out
     const int bytes = cfg->source_type == kDayanDataTypeF32 ? 4 : 2;
     const int value_stride = Columns * bytes;
     const uint64_t packed = base + Rows * value_stride, scale = packed + Rows * Columns / 2;
-    if (!base || scale + Rows * Columns / 32 + 64 - base > dayan_uram_size()) { dayan_thread_exit(-12); }
-    if ((base | packed | scale) & 31) { dayan_thread_exit(-22); }
+    DAYAN_PARAMS_IF(!base || scale + Rows * Columns / 32 + 64 - base > dayan_uram_size()) {
+        DAYAN_PARAMS_ERROR();
+    }
+    DAYAN_PARAMS_IF((base | packed | scale) & 31) {
+        DAYAN_PARAMS_ERROR();
+    }
     long checksum = 0;
     for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((cfg->m + Rows - 1) / Rows) * nt; tile += dayan_task_dim(DAYAN_TASK_X)) {
         const uint64_t row = tile / nt * Rows, col = tile % nt * Columns;

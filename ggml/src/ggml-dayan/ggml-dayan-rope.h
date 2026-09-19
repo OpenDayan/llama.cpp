@@ -281,8 +281,8 @@ static inline void run_rope_f32(const DayanRopeConfig * config,
                     (config->mode != 0U && config->mode != 2U && config->mode != 8U && config->mode != 40U)) {
         DAYAN_PARAMS_ERROR();
     }
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < RopeUramLayout::kTotal) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < RopeUramLayout::kTotal) {
+        DAYAN_PARAMS_ERROR();
     }
 
     const uint32_t position_axes = (config->mode & 8U) != 0U ? 4U : 1U;

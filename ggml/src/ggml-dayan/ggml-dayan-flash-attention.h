@@ -49,8 +49,8 @@ static inline uint64_t uram_addr(long offset) { return (uint64_t) dayan_uram_bas
 static inline long min_long(long a, long b) { return a < b ? a : b; }
 static inline long extent(long n, long size) { return n <= 0 ? 0 : min_long(n, size); }
 static inline void check(int status) {
-    if (status < 0) {
-        dayan_thread_exit(status);
+    DAYAN_PARAMS_IF(status < 0) {
+        DAYAN_PARAMS_ERROR();
     }
 }
 
@@ -378,7 +378,7 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
                 __tx_lsu_dma_d2u<1>(uram_addr(offset), cluster.uram[owner] + offset);
                 check(dayan_resource_produce_lsu(local, users, shared_mask));
             } else {
-                dayan_thread_exit(-22);
+                DAYAN_PARAMS_ERROR();
             }
             phases ^= shared_mask;
         }

@@ -31,8 +31,8 @@ static inline bool moe_allocation_fits(uint64_t element_size, uint64_t ne0, uint
 
 static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
     const uint64_t scratch = (uint64_t) (uintptr_t) dayan_uram_base();
-    if (scratch == 0 || dayan_uram_size() < sizeof(int32_t)) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(scratch == 0 || dayan_uram_size() < sizeof(int32_t)) {
+        DAYAN_PARAMS_ERROR();
     }
     return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
 }
@@ -195,8 +195,8 @@ template <bool TopK> static void run_sort(const DayanSortConfig * config, const 
         DAYAN_PARAMS_ERROR();
     }
 
-    if (dayan_uram_base() == nullptr || dayan_uram_size() < SortUramLayout::kTotal) {
-        dayan_thread_exit(-12);
+    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < SortUramLayout::kTotal) {
+        DAYAN_PARAMS_ERROR();
     }
 
     const uint32_t task  = dayan_native_task_id();

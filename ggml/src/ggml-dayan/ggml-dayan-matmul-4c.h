@@ -23,8 +23,8 @@ static inline ClusterShared & cluster_shared() {
 
 static inline void initialize_resources() {
     const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
-    if (!shared || lane >= 4) {
-        dayan_thread_exit(-22);
+    DAYAN_PARAMS_IF(!shared || lane >= 4) {
+        DAYAN_PARAMS_ERROR();
     }
     cluster_shared().phases[lane] = {};
     if (lane == 0) {
