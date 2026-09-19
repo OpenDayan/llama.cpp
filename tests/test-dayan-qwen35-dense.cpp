@@ -1077,6 +1077,7 @@ int main(int argc, char ** argv) {
     }
 
     const model_case cases[] = {
+        { GGML_TYPE_BF16, 1, 35U, 1, model_mode::linear },
         { GGML_TYPE_BF16, 4, 0x351004U, 4, model_mode::hybrid },
         { GGML_TYPE_F16,  4, 0x351104U, 4, model_mode::hybrid },
     };

@@ -82,6 +82,7 @@ On four-core cmodel with 32 GiB DRAM:
 | Full 40-layer trained GGUF, one input token | 40 mega launches, 2476 compute nodes on Dayan, 248320 finite logits |
 | Existing MXFP4, BF16 MoE, and Top-K regressions | Passed |
 | Existing BF16 full-attention dense mega, one token | Passed |
+| BF16 linear dense, one token and seed 35 | CPU comparison passed with mega enabled and disabled after the input-lifetime fix |
 | limited-perf Python regressions | 23 passed |
 
 Artifacts are under `build-dayan/moe-validation/`, including `limited-operators-final/report.json`, `limited-mega/report.json`, and per-case results. The initial graphs contain two state SCALE slots; both subsequent decode graphs omit them. The saved Device assembly in `device-review/router-sort.asm` contains MAT MM/MMA for the router and VEC Shuffle/SparseMem scatter for sorting. Bucket totals and prefix carries use VEC loads and stores, with no scalar load of the counter.
@@ -92,4 +93,6 @@ For the five-token random fixture, standard GGML CPU inference without the Dayan
 
 The full GGUF test used token ID 3 and a 21032.24 MiB model buffer. Dayan and standard CPU both selected token ID 16. Final-logit relative L2 error was 0.24337 and cosine was 0.97256; the different activation precision remains visible. The result is saved in `build-dayan/moe-validation/full-model/result.json`. This checks complete-model execution and mega addresses beyond 4 GiB, not language quality.
 
-A separate existing dense linear fixture (BF16, one token, seed 35) failed its numerical comparison at the FFN output; see `regression-dense-linear.log`. An isolated HEAD build reached runtime error -12, so that baseline did not establish whether the numerical failure predates this change. This check remains unresolved and is not counted as a pass. The dense full-attention fixture passed.
+The dense linear fixture (BF16, one token, seed 35) exposed early buffer reuse in fused FFN operations. Its BF16 input, SwiGLU output, and down-projection output shared an address because input lifetime protection covered only MXFP4. Extending that protection to all supported matmul storage types fixes both standalone and mega execution, without changing slot signatures. The graph has no REPEAT slots. Layer-output maximum error falls from 11.4961 to 0.08724 and logit maximum error from 3.04512 to 0.02247, within the test tolerances. This case is now included in the default dense regression. See `dense-linear-fixed-mega1.result.json` and `dense-linear-fixed-mega0.result.json`.
+
+The standalone diagnostic intentionally disables mega. Its numerical comparison passes, but the mega-only benchmark protocol reports a missing mega launch. `dense-linear-fixed-official.result.json` records the normal benchmark run.

@@ -1,49 +1,59 @@
 # Dayan backend
 
-BF16, FP16, and MXFP4 weights use the same `ggml-dayan` backend and kernel module. Enabling `GGML_DAYAN` compiles all three paths together; runtime dispatch selects operators by tensor type. Switching between these GGUF weight formats requires no format-specific CMake flags or rebuild.
+MXFP4 dense, BF16 dense, and MXFP4 MoE models use the same `ggml-dayan` backend and kernel module. Enabling `GGML_DAYAN` compiles the BF16, FP16, and MXFP4 operator paths together; runtime dispatch selects operators by tensor type. Switching model groups requires no format-specific CMake flags or rebuild.
 
 ## Common commands
 
-Run these commands from the llama.cpp repository root. Set the SDK path and Runtime socket in each terminal:
+Run commands from the llama.cpp repository root. The examples cover these three model groups:
+
+| Model group | GGUF | Operator preset |
+| --- | --- | --- |
+| MXFP4 dense | Qwen3.5-0.8B, including MXFP4 embedding/LM head | `qwen35-0.8B-mxfp4-vocab` |
+| BF16 dense | Qwen3.5-0.8B | `qwen35-0.8B-bf16` |
+| MXFP4 MoE | Qwen3.6-35B-A3B, BF16 attention/shared experts and F32 routers | `qwen36-35B-A3B-mxfp4-moe-bf16` |
+
+Set the SDK, Runtime socket, and model paths in each client terminal:
 
 ```sh
 export DAYAN_ROOT="$HOME/npu-firmware"
 export DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock
+export DAYAN_MODEL_MXFP4=/share/models/Qwen3.5-0.8B-MXFP4/Qwen3.5-0.8B-MXFP4-Vocab-MXFP4.gguf
+export DAYAN_MODEL_BF16=/share/models/Qwen3.5-0.8B/Qwen3.5-0.8B-BF16.gguf
+export DAYAN_MODEL_MOE=/share/models/Qwen3.6-35B-A3B-MXFP4_MOE_BF16.gguf
 ```
 
-### Build
+For the dense MXFP4 GGUF with a BF16 vocabulary head, select `Qwen3.5-0.8B-MXFP4.gguf` and the `qwen35-0.8B-mxfp4` operator preset instead.
 
-Build on Linux with the Dayan SDK's `dycc`, host and Device API headers, and `libDayanRuntime.a` available. For a source checkout, build the host dependencies and profiler once:
+### Build all three model paths
+
+Build on Linux with the Dayan SDK's `dycc`, host and Device API headers, and `libDayanRuntime.a`. One build supports all three model groups:
 
 ```sh
 make -C "$DAYAN_ROOT" -j6 host-driver dycc dyperf
-```
-
-From the llama.cpp repository root, configure one build directory for all supported weight formats:
-
-```sh
 cmake -S . -B build-dayan \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_DAYAN=ON \
     -DDAYAN_ROOT="$DAYAN_ROOT" \
+    -DDAYAN_DYCC="$DAYAN_ROOT/host/dycc/dycc" \
+    -DDAYAN_INCLUDE_DIR="$DAYAN_ROOT/host/include" \
     -DLLAMA_BUILD_TOOLS=ON \
     -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_SERVER=ON
 cmake --build build-dayan -j6
 ```
 
-Executables are written to `build-dayan/bin`, including `llama-cli`, `llama-server`, `llama-bench`, `llama-dayan-trace`, and `llama-dayan-operator-bench`. `LLAMA_BUILD_SERVER=ON` also enables the CLI target in this checkout. To rebuild only the inference tools and Dayan tests after a change:
+Executables are written to `build-dayan/bin`. To rebuild the tools used below after a change:
 
 ```sh
 cmake --build build-dayan -j6 --target \
-    llama-cli llama-server llama-bench llama-dayan-trace llama-dayan-operator-bench \
+    llama-cli llama-server llama-bench llama-dayan-trace \
+    llama-dayan-operator-bench llama-dayan-moe-bench \
     test-backend-ops test-dayan-topology test-dayan-matmul test-dayan-graph \
-    test-dayan-mxfp4 test-dayan-attention-projection test-dayan-flash-attention
+    test-dayan-mxfp4 test-dayan-moe test-dayan-qwen35-dense \
+    test-dayan-attention-projection test-dayan-flash-attention
 ```
 
-The same inference binaries accept BF16, FP16, and MXFP4 models. Select the model at runtime with `-m /path/to/model.gguf` and the server connection with `DAYAN_SERVER_SOCKET`; the build directory name does not select a weight format.
-
-### Start the simulator and Runtime server
+### Start cmodel and the Runtime server
 
 Rebuild cmodel after changing its source or instruction implementations. The firmware launcher builds firmware and the Runtime server, but does not rebuild cmodel:
 
@@ -51,27 +61,49 @@ Rebuild cmodel after changing its source or instruction implementations. The fir
 make -C "$HOME/rvtng-cmodel" -j6
 ```
 
-In a separate terminal, start a four-core cmodel server and wait for `Dayan cmodel server is ready`:
+| Model group | Example memory capacity |
+| --- | --- |
+| MXFP4 dense, 0.8B | 4096 MiB |
+| BF16 dense, 0.8B | 4096 MiB |
+| MXFP4 MoE, 35B-A3B | 32768 MiB |
+
+In a separate terminal with `DAYAN_ROOT` and `DAYAN_SERVER_SOCKET` set, start one four-core server. This 32 GiB configuration can be reused for all three groups:
 
 ```sh
-NPU_CMODEL_HARTS=4 NPU_CMODEL_MEMORY_MIB=4096 \
+NPU_CMODEL_HARTS=4 NPU_CMODEL_MEMORY_MIB=32768 \
     bash "$DAYAN_ROOT/run_cmodel_server.sh"
 ```
 
-For a single-core run, stop this launcher with Ctrl-C and restart it with `NPU_CMODEL_HARTS=1`. The backend reads the enabled topology automatically; client commands stay the same. Increase `NPU_CMODEL_MEMORY_MIB` when the model and graph buffers need more memory. If using an existing TestCluster or hardware server, set its socket instead of starting cmodel. Run one inference or operator client at a time.
+Wait for `Dayan cmodel server is ready`. Run one inference or operator client at a time, and stop the launcher with Ctrl-C after testing. A single-core operator run uses `NPU_CMODEL_HARTS=1`; mega requires one complete four-core Cluster. If using an existing server, select its socket instead of starting another simulator.
 
 ### Run model inference
 
-Select a GGUF with actual model weights, then generate a short response:
+Run the command for the desired model. Mega is enabled by default when the graph and topology match:
 
 ```sh
-export DAYAN_MODEL=/share/models/Qwen3.5-0.8B-MXFP4/Qwen3.5-0.8B-MXFP4-Vocab-MXFP4.gguf
-./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
+# MXFP4 dense
+./build-dayan/bin/llama-cli -m "$DAYAN_MODEL_MXFP4" \
     --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
-    -n 16 --no-warmup --single-turn -p "Hello, Who are you? Introduce yourself."
+    -n 16 --no-warmup --single-turn -p "Hello"
+
+# BF16 dense
+./build-dayan/bin/llama-cli -m "$DAYAN_MODEL_BF16" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    -n 16 --no-warmup --single-turn -p "Hello"
+
+# MXFP4 MoE
+./build-dayan/bin/llama-cli -m "$DAYAN_MODEL_MOE" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    -n 16 --no-warmup --single-turn -p "Hello"
 ```
 
-For an HTTP inference server:
+For HTTP serving, choose one model from this table, then run the shared server command:
+
+| Model group | Selection |
+| --- | --- |
+| MXFP4 dense | `export DAYAN_MODEL="$DAYAN_MODEL_MXFP4"` |
+| BF16 dense | `export DAYAN_MODEL="$DAYAN_MODEL_BF16"` |
+| MXFP4 MoE | `export DAYAN_MODEL="$DAYAN_MODEL_MOE"` |
 
 ```sh
 ./build-dayan/bin/llama-server -m "$DAYAN_MODEL" \
@@ -79,98 +111,191 @@ For an HTTP inference server:
     --parallel 1 --no-warmup --host 127.0.0.1 --port 8080
 ```
 
-Measure prefill and decode throughput with the profiler stopped:
+Set `GGML_DAYAN_MEGA=0` before any of these commands to use standalone operators, or `GGML_DAYAN_MEGA=1 GGML_DAYAN_MEGA_DEBUG=1` to enable mega and print slot sequences and launch counts. Restart a running inference process after changing these settings. A slot trace or slot filter callback disables mega. Both initial graphs and subsequent decode graphs without the two state SCALE nodes are supported.
 
-```sh
-./build-dayan/bin/llama-bench -m "$DAYAN_MODEL" \
-    --device DAYAN -ngl 99 -fa on -p 128 -n 16 -b 128 -ub 128 \
-    -r 1 --no-warmup
-```
+### Check standalone operators before mega
 
-`--no-warmup` keeps these smoke runs short. Omit it and increase repetitions for warm measurements. On cmodel, the reported wall time and tokens/s measure simulator execution, not hardware throughput.
-
-#### Qwen3.5 mega executor
-
-The mega executor is enabled automatically when a supported Qwen3.5 Transformer block runs on one four-core Cluster. It recognizes BF16 and MXFP4 dense blocks, and Qwen3.5/3.6 MoE blocks with BF16 attention/shared experts, MXFP4 routed experts, F32 routers, and Top-8 routing. Both initial graphs and decode graphs without the two state SCALE nodes are supported. No additional CMake option is required. Leave `GGML_DAYAN_MEGA` unset or set it to `1`:
-
-```sh
-export GGML_DAYAN_MEGA=1
-./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
-    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
-    -n 16 --no-warmup --single-turn -p "Hello"
-```
-
-The backend uses the regular per-operator path when the topology or graph does not match, or when a slot trace or slot filter callback is active. To force this fallback for comparison or debugging, set `GGML_DAYAN_MEGA=0` before starting the inference process:
-
-```sh
-GGML_DAYAN_MEGA=0 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL" \
-    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
-    -n 16 --no-warmup --single-turn -p "Hello"
-```
-
-Restart a long-running inference process after changing `GGML_DAYAN_MEGA`.
-
-MoE mega reuses the dense BF16 attention segment and then executes routing, MXFP4 experts, shared experts, and the F32 residual inside the same launch. Parameter offsets are 64-bit so weights beyond 4 GiB remain addressable. `GGML_DAYAN_MEGA_DEBUG=1` reports graph slots and actual launch counts. `GGML_DAYAN_MEGA_TAG` overrides the profiler name for benchmark clients. See [MoE validation](../../../tools/dayan-trace/qwen35-moe.md) for cmodel commands and numerical limits.
-
-### Run operator tests
-
-Check topology selection and MXFP4 packing without a device:
+Check topology selection and MXFP4 packing without a simulator:
 
 ```sh
 ctest --test-dir build-dayan -R '^test-dayan-topology$' --output-on-failure
 ./build-dayan/bin/test-dayan-mxfp4 --host-only
 ```
 
-With the Runtime server ready, run numerical checks for MatMul, graph fusion, attention projections, and FlashAttention:
+With the Runtime server ready, select the model group:
 
 ```sh
-./build-dayan/bin/test-dayan-matmul 3 481 513
-./build-dayan/bin/test-dayan-graph
-./build-dayan/bin/test-dayan-attention-projection launch
-./build-dayan/bin/test-dayan-flash-attention
+# MXFP4 dense: packing, conversions, MatMul, fused FFN, tails, and repeated launches
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-mxfp4
+
+# BF16 dense: MatMul and graph fusion, including FP16 variants
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-matmul 3 481 513
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-graph
+
+# MXFP4 MoE: routing regression and exact FlexVec radix-sort indices
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-moe
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o ARGSORT \
+    -p 'ne=\[(63|64|65|256|4096),3,1,1\]'
+GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o TOP_K \
+    -p 'ne=\[256,5,1,1\],k=8'
 ```
 
-For more selectors and individual GGML operators, see [Dedicated tests](#dedicated-tests) and [Test a specific operator](#test-a-specific-operator).
+`test-dayan-moe` uses BF16 expert weights. The MXFP4 expert products and TF32 routers are checked by the MoE operator preset in [Operator benchmarks](#operator-benchmarks-with-limited-perfpy); run that preset before the MoE mega test. Shared attention, recurrence, memory, and RoPE selectors are listed under [Dedicated tests](#dedicated-tests) and [Test a specific operator](#test-a-specific-operator).
 
-### Run limited-perf.py
+### Check mega and decode graphs
 
-`--cmp` checks the selected preset cases. It does not cover every operator in a model graph. In particular, row reads/writes, RoPE, layout copies, small gates, and the model's FP16 attention path need separate backend tests. MXFP4 conversion uses a scalar reference for the device's scale selection and truncation; the GGML CPU quantizer uses different rules.
+These commands use different references. Dense MXFP4 uses a trained-GGUF smoke run plus the standalone CPU checks above. Dense BF16 uses a random layer against CPU. MoE compares a random two-layer mega graph with standalone Dayan; its CPU operator checks remain separate.
 
-`--model` selects representative operator shapes, not a GGUF file. Preview the BF16 prefill/decode cases without contacting a server:
+MoE mega reuses the BF16 attention segment and includes routing, MXFP4 experts, shared experts, and the F32 residual in one launch per layer. Parameter offsets are 64-bit for weights beyond 4 GiB. Benchmark clients can set `GGML_DAYAN_MEGA_TAG` to override the profiler name.
+
+#### MXFP4 dense
+
+Run the trained model with launch diagnostics. Several generated tokens exercise the first and later decode graphs:
 
 ```sh
-python3 tools/dayan-trace/limited-perf.py plan \
-    --model qwen35-0.8B-bf16 --prefill 128 --context 512 --cmp
+GGML_DAYAN_MEGA=1 GGML_DAYAN_MEGA_DEBUG=1 \
+./build-dayan/bin/llama-cli -m "$DAYAN_MODEL_MXFP4" \
+    --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
+    -n 3 --no-warmup --single-turn -p "Hello"
 ```
 
-With the Runtime server ready, start dyperf in another terminal and leave it collecting:
+Inspect the mega launch count; successful inference alone does not prove fusion. There is no dedicated dense MXFP4 mega preset in `limited-perf.py`.
+
+#### BF16 dense
+
+Run the default random dense regressions, or reproduce just the single-token linear case that checks fused BF16 input lifetimes:
+
+```sh
+GGML_DAYAN_MEGA=1 ./build-dayan/bin/test-dayan-qwen35-dense
+
+mkdir -p build-dayan/mega-bf16
+cat > build-dayan/mega-bf16/linear-decode.case.json <<'JSON'
+{"op":"mega","dtype":"bf16","mode":"linear","layers":1,"m":1,"seed":35,"repeats":1,"warmup":0,"cmp":true}
+JSON
+GGML_DAYAN_MEGA=1 GGML_DAYAN_MEGA_DEBUG=1 \
+./build-dayan/bin/test-dayan-qwen35-dense \
+    build-dayan/mega-bf16/linear-decode.case.json \
+    build-dayan/mega-bf16/linear-decode.result.json dense-linear
+```
+
+The case protocol requires both a CPU comparison pass and a mega launch. Disabling mega deliberately makes that protocol fail its launch check, even if the numerical comparison passes. The default suite also checks four-layer BF16/FP16 hybrid graphs.
+
+#### MXFP4 MoE
+
+Generate a random two-layer fixture with the source widths, 256 experts, one linear-attention layer, one full-attention layer, and a small vocabulary. It is about 953 MiB and avoids loading the full trained weight payloads:
+
+```sh
+python3 tools/dayan-trace/create-qwen35-moe-fixture.py \
+    --source-model "$DAYAN_MODEL_MOE" \
+    --expert-type mxfp4 --layers 2 --full-attention-interval 2 --small-vocab \
+    --output build-dayan/moe-validation/hybrid.gguf
+export DAYAN_MOE_MODEL="$PWD/build-dayan/moe-validation/hybrid.gguf"
+
+cat > build-dayan/moe-validation/decode.case.json <<'JSON'
+{"op":"mega","dtype":"mxfp4","mode":"hybrid","layers":2,"m":1,"phase":"decode","decode_steps":2,"seed":35,"repeats":1,"warmup":0,"cmp":true}
+JSON
+GGML_DAYAN_MEGA_DEBUG=1 ./build-dayan/bin/llama-dayan-moe-bench \
+    build-dayan/moe-validation/decode.case.json \
+    build-dayan/moe-validation/decode.result.json moe-decode
+```
+
+This checks an initial single token followed by two decode steps. Each step compares logits and requires two mega launches, including graphs where state SCALE nodes disappear. The client switches between standalone and mega internally. Use the MoE mega preset below to check both prefill and initial-single-token sequences. See [MoE validation](../../../tools/dayan-trace/qwen35-moe.md) for the full-model smoke result and quantization limits.
+
+### Operator benchmarks with limited-perf.py
+
+`--model` selects operator shapes, not a GGUF file. These three presets use the same client and run CPU comparisons on stored BF16/MXFP4 inputs or TF32-rounded inputs. Each MoE expert case already executes all eight selected experts; its layer factor is 40, not 320.
+
+Preview all three groups without contacting a server:
+
+```sh
+for preset in qwen35-0.8B-mxfp4-vocab qwen35-0.8B-bf16 qwen36-35B-A3B-mxfp4-moe-bf16; do
+    python3 tools/dayan-trace/limited-perf.py plan \
+        --model "$preset" --prefill 4 --context 16 --cmp --cmp-seed 35
+done
+```
+
+With cmodel ready, run the desired presets sequentially. Remove names from the loop to test only one model group. Each run has its own trace and output directory:
+
+```sh
+for preset in qwen35-0.8B-mxfp4-vocab qwen35-0.8B-bf16 qwen36-35B-A3B-mxfp4-moe-bf16; do
+    "$DAYAN_ROOT/build/host/dyperf/dyperf" \
+        --socket "$DAYAN_SERVER_SOCKET" --follow -o "/tmp/dayan-$preset.json" -- \
+        python3 tools/dayan-trace/limited-perf.py run \
+            --model "$preset" --client build-dayan/bin/llama-dayan-operator-bench \
+            --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+            --perf-trace "/tmp/dayan-$preset.json" --output "build-dayan/perf-$preset" \
+            --prefill 4 --context 16 --cmp --cmp-seed 35
+    python3 tools/dayan-trace/limited-perf.py report --output "build-dayan/perf-$preset"
+done
+```
+
+The profiler flushes its trace after the client exits. The initial `run` can return 2 for missing cycle records; the following `report` reads the completed trace without rerunning operators. Inspect both comparison status and cycle records. Output includes `report.md`, `report.json`, `operators.csv`, and per-case inputs, results, and logs.
+
+For a short run, add one of these filters to `plan` and `run`, using a separate output directory:
+
+| Model group | Example filter |
+| --- | --- |
+| MXFP4 dense | `--cases decode-ffn decode-down` |
+| BF16 dense | `--cases decode-ffn decode-down` |
+| MXFP4 MoE | `--cases decode-router decode-top8 decode-expert-ffn decode-expert-down` |
+
+`--cmp` covers the selected cases, not every model operator. Row reads/writes, RoPE, layouts, and small gates need the separate tests above. Hardware MXFP4 conversion differs from GGML's nearest-value quantizer. For larger samples, adjust `--prefill` and `--context`; use `--warmup 1 --repeats 3` for repeated operator measurements. `--resume` requires the original trace, output directory, binaries, and parameters. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for prediction formulas and exit statuses.
+
+### Mega benchmarks
+
+| Model group | Benchmark path |
+| --- | --- |
+| MXFP4 dense | Use the GGUF `llama-bench` commands below; no separate mega preset |
+| BF16 dense | `qwen35-mega-bf16`, random linear/full layers against CPU |
+| MXFP4 MoE | `qwen36-35B-A3B-moe-mega`, two-layer fixture against standalone Dayan |
+
+For BF16 dense, benchmark both attention modes in prefill and decode:
 
 ```sh
 "$DAYAN_ROOT/build/host/dyperf/dyperf" \
-    --socket "$DAYAN_SERVER_SOCKET" --follow -o /tmp/dayan-perf.json
+    --socket "$DAYAN_SERVER_SOCKET" --follow -o /tmp/dayan-mega-bf16.json -- \
+    python3 tools/dayan-trace/limited-perf.py run \
+        --model qwen35-mega-bf16 --client build-dayan/bin/test-dayan-qwen35-dense \
+        --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+        --perf-trace /tmp/dayan-mega-bf16.json --output build-dayan/perf-mega-bf16 \
+        --prefill 4 --context 16 --cmp --cmp-seed 35
+python3 tools/dayan-trace/limited-perf.py report --output build-dayan/perf-mega-bf16
 ```
 
-Run all cases in the preview, including CPU reference comparisons:
+For MXFP4 MoE, use `DAYAN_MOE_MODEL` from the fixture step:
 
 ```sh
-python3 tools/dayan-trace/limited-perf.py run \
-    --model qwen35-0.8B-bf16 \
-    --client build-dayan/bin/llama-dayan-operator-bench \
-    --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
-    --perf-trace /tmp/dayan-perf.json --output build-dayan/limited-perf-cmodel \
-    --prefill 128 --context 512 --cmp
+"$DAYAN_ROOT/build/host/dyperf/dyperf" \
+    --socket "$DAYAN_SERVER_SOCKET" --follow -o /tmp/dayan-mega-moe.json -- \
+    python3 tools/dayan-trace/limited-perf.py run \
+        --model qwen36-35B-A3B-moe-mega --client build-dayan/bin/llama-dayan-moe-bench \
+        --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+        --perf-trace /tmp/dayan-mega-moe.json --output build-dayan/perf-mega-moe \
+        --prefill 4 --context 2 --cmp --cmp-seed 35
+python3 tools/dayan-trace/limited-perf.py report --output build-dayan/perf-mega-moe
 ```
 
-For a short run, add `--cases decode-ffn decode-down` to both `plan` and `run`, and use a separate output directory. Other common options are `--case-from prefill-conv`, `--warmup 1 --repeats 3`, and `--timeout 3600` (seconds per case). Use `--model qwen35-0.8B-mxfp4` or `--model qwen35-0.8B-mxfp4-vocab` to select the MXFP4 presets with the same build. For an existing RTL server/profiler, use `--simulator testcluster` and their socket/trace paths; this option only labels results and does not start a simulator.
+Mega presets require cmodel, `--repeats 1`, and `--warmup 0` (the defaults). The MoE sample measures one `llama_decode` call on the two-layer fixture; it is not a 40-layer model estimate. cmodel wall times and counters do not establish hardware or RTL performance.
 
-After the run finishes, stop dyperf with Ctrl-C to flush its remaining records, then regenerate the report without rerunning operators:
+### Benchmark full-model inference
+
+Stop the profiler, then run each desired model sequentially. These commands measure real GGUF prefill and decode with mega enabled:
 
 ```sh
-python3 tools/dayan-trace/limited-perf.py report \
-    --output build-dayan/limited-perf-cmodel
+# MXFP4 dense
+GGML_DAYAN_MEGA=1 ./build-dayan/bin/llama-bench -m "$DAYAN_MODEL_MXFP4" \
+    --device DAYAN -ngl 99 -fa on -p 128 -n 16 -b 128 -ub 128 -r 1 --no-warmup
+
+# BF16 dense
+GGML_DAYAN_MEGA=1 ./build-dayan/bin/llama-bench -m "$DAYAN_MODEL_BF16" \
+    --device DAYAN -ngl 99 -fa on -p 128 -n 16 -b 128 -ub 128 -r 1 --no-warmup
+
+# MXFP4 MoE, with the 32 GiB server
+GGML_DAYAN_MEGA=1 ./build-dayan/bin/llama-bench -m "$DAYAN_MODEL_MOE" \
+    --device DAYAN -ngl 99 -fa on -p 128 -n 16 -b 128 -ub 128 -r 1 --no-warmup
 ```
 
-The output directory contains `report.md`, `report.json`, `operators.csv`, and per-case inputs, results, and logs. Exit code 0 means the selected cases passed with complete cycle records; 1 means a run or comparison failure; 2 means operators passed but cycle records are incomplete. To resume an interrupted run, repeat its original `run` command with `--resume`, keeping the same trace, output directory, binaries, and parameters. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for measurement scope and prediction formulas.
+Use `GGML_DAYAN_MEGA=0` for standalone comparisons. `--no-warmup` keeps smoke runs short; omit it and increase repetitions for warm measurements. On cmodel, wall time and tokens/s describe simulator execution.
 
 ## Runtime topology and task dimensions
 
@@ -294,15 +419,9 @@ Decode, short prefill, vector gates (KDA), and multiple state snapshots use the 
 
 ## Profiling
 
-Device operators contain no custom cycle counters or performance buffers. Use the firmware profiler for scheduling traces:
+Device operators contain no custom cycle counters or performance buffers. The [operator benchmark commands](#operator-benchmarks-with-limited-perfpy) collect firmware scheduling traces for MXFP4 dense, BF16 dense, and MXFP4 MoE. The [full-model commands](#benchmark-full-model-inference) measure GGUF inference with the profiler stopped. Record the model, prompt/generation lengths, batch sizes, repetitions, and simulator configuration.
 
-```sh
-DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock "$DAYAN_ROOT/build/host/dyperf/dyperf" -o /tmp/dayan-trace.json -- ./build-dayan/bin/test-dayan-matmul
-```
-
-Use `llama-bench` for actual host elapsed time and tokens per second on cmodel. Record the model, prompt/generation lengths, batch sizes, repetitions, and simulator configuration. Keep the profiler disabled for these wall-clock measurements and run one client at a time.
-
-For a limited TestCluster operator sample with an existing server and dyperf, use [limited-perf.py](../../../tools/dayan-trace/limited-perf.md). It reports measured host wall time and profiler cycle spans by shape, plus an explicit Qwen3.5-0.8B prefill/decode extrapolation, without loading a whole model or running a shape sweep.
+For an existing RTL server, operator presets also accept `--simulator testcluster` with that server's socket. This labels the report; it does not start TestCluster. Mega presets currently require cmodel. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for measurement boundaries and extrapolation factors.
 
 ## Test a specific operator
 
@@ -413,16 +532,16 @@ The direct attention pipeline test covers both launch modes, BF16/FP16, all supp
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-pipeline
 ```
 
-The Qwen3.5 dense test builds the minimum four-layer hybrid cycle with three gated DeltaNet layers and one causal full-attention layer. Every layer also contains RMSNorm, dense SWIGLU FFN, and residual paths. It compares Dayan outputs and final logits against a CPU graph with the same low-precision boundaries. Gated Delta Net uses a 128-element head so the test exercises the device kernel instead of CPU fallback:
+The Qwen3.5 dense test includes the BF16 single-token linear regression with seed 35, then four-layer BF16/FP16 hybrid cycles with three gated DeltaNet layers and one full-attention layer. Every layer also contains RMSNorm, dense SWIGLU FFN, and residual paths. It compares Dayan outputs and final logits against a CPU reference. Gated Delta Net uses a 128-element head so the test exercises the device kernel instead of CPU fallback. For the single-case JSON command, see [BF16 dense mega checks](#bf16-dense).
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-qwen35-dense
 ```
 
-The MoE smoke test covers 512 experts, a narrow `ARGSORT` view, `TOP_K`, fused BF16 SWIGLU expert projections, the down expert projection, `ADD_ID`, and expert-weighted aggregation:
+The BF16 MoE routing regression covers 512 experts, a narrow `ARGSORT` view, `TOP_K`, fused SWIGLU expert projections, the down expert projection, `ADD_ID`, and expert-weighted aggregation. For MXFP4 expert and TF32 router CPU comparisons, use the [MoE operator preset](#operator-benchmarks-with-limited-perfpy); for the random hybrid graph, use [MXFP4 MoE mega checks](#mxfp4-moe).
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-moe
 ```
 
-Both matrix launch modes use four consumer slices. `MUL_MAT_ID` still requires the expert output width to be a multiple of 16. Arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention has native BF16 and FP16 entries and requires Q/K/V to share one storage type. Full-model inference requires enough Device memory for all persistent weights and graph arenas; `run_cmodel_server.sh` defaults to a 4096 MiB memory window. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.
+Both matrix launch modes use four consumer slices. `MUL_MAT_ID` still requires the expert output width to be a multiple of 16. Arbitrary attention masks, attention sinks, and Flash-Attention soft caps are not implemented. Flash-Attention has native BF16 and FP16 entries and requires Q/K/V to share one storage type. Full-model inference requires enough Device memory for all persistent weights and graph arenas. The launcher defaults to 4096 MiB; the 35B-A3B MoE commands above use 32768 MiB. A llama model using Dayan rejects any non-metadata model graph node assigned to another backend. Sampling stays on CPU and is not inserted into the Dayan graph.

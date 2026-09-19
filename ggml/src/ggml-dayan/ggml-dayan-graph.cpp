@@ -1344,7 +1344,7 @@ static bool ggml_backend_dayan_preserve_norm_pipeline_inputs(const ggml_cgraph *
     return true;
 }
 
-static bool ggml_backend_dayan_preserve_mxfp4_inputs(const ggml_cgraph * graph) {
+static bool ggml_backend_dayan_preserve_matmul_inputs(const ggml_cgraph * graph) {
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * output = graph->nodes[i];
         ggml_tensor * gate = nullptr;
@@ -1355,10 +1355,10 @@ static bool ggml_backend_dayan_preserve_mxfp4_inputs(const ggml_cgraph * graph) 
             gate = output->src[0]->src[0];
             up = output->src[0]->src[1];
         }
-        if (gate == nullptr || (output->type != GGML_TYPE_MXFP4 && gate->src[0]->type != GGML_TYPE_MXFP4)) {
+        if (gate == nullptr) {
             continue;
         }
-        // The fused post stage must not reuse an input's payload or scale plane.
+        // Keep inputs live until the fused output, including payload and scale planes.
         if (!ggml_backend_dayan_add_dependency(output, gate->src[0]) ||
             !ggml_backend_dayan_add_dependency(output, gate->src[1]) ||
             (up != nullptr && !ggml_backend_dayan_add_dependency(output, up->src[0]))) {
@@ -1545,7 +1545,7 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
 
     if (cast_keys.empty()) {
         const bool success = ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) &&
-                             ggml_backend_dayan_preserve_mxfp4_inputs(cgraph);
+                             ggml_backend_dayan_preserve_matmul_inputs(cgraph);
         GGML_LOG_DEBUG("%s: no activation casts, embedding-lowp=%zu, residual-lowp=%zu, gated-f32=%zu, time=%.3f ms\n",
                        __func__, embedding_lowp, residual_lowp, gated_f32,
                        (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
@@ -1598,7 +1598,7 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
             ggml_build_forward_expand(cgraph, node);
         }
     }
-    if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) || !ggml_backend_dayan_preserve_mxfp4_inputs(cgraph)) {
+    if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) || !ggml_backend_dayan_preserve_matmul_inputs(cgraph)) {
         GGML_LOG_WARN("%s: graph has no source slots for fused input dependencies\n", __func__);
         return false;
     }
