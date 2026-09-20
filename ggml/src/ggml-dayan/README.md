@@ -241,6 +241,8 @@ For a short run, add one of these filters to `plan` and `run`, using a separate 
 
 `--cmp` covers the selected cases, not every model operator. Row reads/writes, RoPE, layouts, and small gates need the separate tests above. Hardware MXFP4 conversion differs from GGML's nearest-value quantizer. For larger samples, adjust `--prefill` and `--context`; use `--warmup 1 --repeats 3` for repeated operator measurements. `--resume` requires the original trace, output directory, binaries, and parameters. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for prediction formulas and exit statuses.
 
+Top-8 routing uses four measured prefill rows by default and scales only that sort term to the requested `--prefill` in the report. Use `--sort-rows 0` when a full-size sorting measurement is required; this can be very slow on cmodel. Other MoE operator cases still use the requested prefill size.
+
 ### Mega benchmarks
 
 | Model group | Benchmark path |

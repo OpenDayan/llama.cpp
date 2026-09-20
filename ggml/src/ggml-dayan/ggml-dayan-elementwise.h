@@ -6,6 +6,13 @@
 
 namespace ggml_dayan_matmul_detail {
 
+template <long Group>
+static inline void configure_memory_lsu(uint32_t transactions,
+                                        uint64_t input_stride,
+                                        uint64_t output_stride,
+                                        uint32_t read_bytes,
+                                        uint32_t write_bytes);
+
 static constexpr float kDayanLog2E       = 1.4426950408889634f;
 static constexpr float kDayanLn2         = 0.6931471805599453f;
 static constexpr float kDayanGeluA       = 0.044715f;
@@ -39,8 +46,7 @@ static inline bool binary_config_valid(const DayanBinaryConfig * config) {
     if (elements != config->elements) {
         return false;
     }
-    // A partial right row must fill whole vector lanes so one contiguous load
-    // can feed every 64-lane grid step of the broadcast iterator.
+    // A partial right row must divide one vector so the broadcast iterator can reuse complete lanes.
     if (config->right_ne[0] != config->ne[0] && (Constants::kVecLanes % config->right_ne[0]) != 0) {
         return false;
     }
@@ -54,6 +60,43 @@ static inline bool binary_same_shape(const DayanBinaryConfig * config) {
         }
     }
     return true;
+}
+
+static inline bool binary_reusable_right(const DayanBinaryConfig * config) {
+    return config->right_ne[0] <= Constants::kVecLanes && config->right_ne[1] == 1 &&
+           config->right_ne[2] == 1 && config->right_ne[3] == 1;
+}
+
+static inline void binary_preload_right(const DayanBinaryConfig * config, const float * right, uint64_t right_uram) {
+    const uint32_t row = config->right_ne[0];
+    if (row == 1) {
+        load_matrix<0>(sizeof(float), 1, sizeof(float), 1, right_uram, (uint64_t) (uintptr_t) right);
+    } else if (row <= 32) {
+        const uint32_t bytes  = row * sizeof(float);
+        const uint32_t copies = Constants::kVecLanes / row;
+        if (row <= 8) {
+            for (uint32_t copy = 0; copy < copies; ++copy) {
+                load_matrix<0>(bytes, 1, NormalizationLayout::kFloatBytes, 1, right_uram + copy * bytes,
+                               (uint64_t) (uintptr_t) right);
+            }
+        } else if (row <= 16) {
+            load_matrix<0>(bytes, 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                           (uint64_t) (uintptr_t) right);
+            for (uint32_t filled = 1; filled < copies; filled *= 2) {
+                configure_memory_lsu<0>(filled, bytes, bytes, bytes, bytes);
+                __tx_lsu_dma_u2u<0>((long) (right_uram + filled * bytes), (long) right_uram);
+            }
+        } else {
+            load_matrix<0>(bytes, 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                           (uint64_t) (uintptr_t) right);
+            configure_memory_lsu<0>(2, 64, 64, 64, 64);
+            __tx_lsu_dma_u2u<0>((long) (right_uram + bytes), (long) right_uram);
+        }
+    } else {
+        load_matrix<0>((uint64_t) row * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1,
+                       right_uram, (uint64_t) (uintptr_t) right);
+    }
+    dayan_wait_lsu();
 }
 
 template <BinaryOperation Operation>
@@ -120,6 +163,11 @@ static void run_binary_f32(const DayanBinaryConfig * config,
     ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements,
                                               right_full ? (long) Constants::kVecBytes : 0);
 
+    const bool reusable_right = binary_reusable_right(config);
+    if (reusable_right && task < rows * units_per_row) {
+        binary_preload_right(config, right, right_uram);
+    }
+
     for (uint64_t unit_index = (uint64_t) task; unit_index < rows * units_per_row;
          unit_index += (uint64_t) tasks) {
         const uint64_t row     = unit_index / units_per_row;
@@ -140,15 +188,17 @@ static void run_binary_f32(const DayanBinaryConfig * config,
 
         load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
                        (uint64_t) (uintptr_t) (left + left_base + column));
-        if (right_full) {
-            load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
-                           (uint64_t) (uintptr_t) (right + right_base + column));
-        } else {
-            const uint64_t right_bytes =
-                right_scalar ? sizeof(float) : right_row * sizeof(float);
-            for (uint64_t copy = 0; copy < right_copies; ++copy) {
-                load_matrix<0>(right_bytes, 1, NormalizationLayout::kFloatBytes, 1,
-                               right_uram + copy * right_bytes, (uint64_t) (uintptr_t) (right + right_base));
+        if (!reusable_right) {
+            if (right_full) {
+                load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                               (uint64_t) (uintptr_t) (right + right_base + column));
+            } else {
+                const uint64_t right_bytes =
+                    right_scalar ? sizeof(float) : right_row * sizeof(float);
+                for (uint64_t copy = 0; copy < right_copies; ++copy) {
+                    load_matrix<0>(right_bytes, 1, NormalizationLayout::kFloatBytes, 1,
+                                   right_uram + copy * right_bytes, (uint64_t) (uintptr_t) (right + right_base));
+                }
             }
         }
         dayan_wait_lsu();
@@ -218,7 +268,7 @@ static void run_div_f32(const DayanBinaryConfig * config,
     }
 
     // Broadcast layout, mirroring run_binary_f32: the reciprocal is taken on
-    // the right operand land after a scalar, tiled, or full-row load.
+    // the right operand after a scalar, tiled, or full-row load.
     const uint64_t row_elements = config->ne[0];
     const uint64_t rows         = config->elements / row_elements;
     const uint64_t right_row    = config->right_ne[0];
@@ -230,6 +280,11 @@ static void run_div_f32(const DayanBinaryConfig * config,
     const uint64_t right_copies  = right_full || right_scalar ? 1 : Constants::kVecLanes / right_row;
     ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements,
                                               right_full ? (long) Constants::kVecBytes : 0);
+
+    const bool reusable_right = binary_reusable_right(config);
+    if (reusable_right && task < rows * units_per_row) {
+        binary_preload_right(config, right, right_uram);
+    }
 
     for (uint64_t unit_index = (uint64_t) task; unit_index < rows * units_per_row;
          unit_index += (uint64_t) tasks) {
@@ -251,15 +306,17 @@ static void run_div_f32(const DayanBinaryConfig * config,
 
         load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
                        (uint64_t) (uintptr_t) (left + left_base + column));
-        if (right_full) {
-            load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
-                           (uint64_t) (uintptr_t) (right + right_base + column));
-        } else {
-            const uint64_t right_bytes =
-                right_scalar ? sizeof(float) : right_row * sizeof(float);
-            for (uint64_t copy = 0; copy < right_copies; ++copy) {
-                load_matrix<0>(right_bytes, 1, NormalizationLayout::kFloatBytes, 1,
-                               right_uram + copy * right_bytes, (uint64_t) (uintptr_t) (right + right_base));
+        if (!reusable_right) {
+            if (right_full) {
+                load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
+                               (uint64_t) (uintptr_t) (right + right_base + column));
+            } else {
+                const uint64_t right_bytes =
+                    right_scalar ? sizeof(float) : right_row * sizeof(float);
+                for (uint64_t copy = 0; copy < right_copies; ++copy) {
+                    load_matrix<0>(right_bytes, 1, NormalizationLayout::kFloatBytes, 1,
+                                   right_uram + copy * right_bytes, (uint64_t) (uintptr_t) (right + right_base));
+                }
             }
         }
         dayan_wait_lsu();

@@ -165,6 +165,8 @@ Use `--warmup 1 --repeats 1` for one unmeasured warmup and one measured launch p
 
 Each case has a wall deadline of 24 hours, covering setup, uploads, execution, and teardown; change it with `--timeout SECONDS`. A failure stops further launches. After a timeout or interruption, check the device/server state before resuming: terminating a host client does not prove the Device has stopped executing it.
 
+`--sort-rows` limits only measured prefill rows for `sort` cases. It defaults to 4 because the MoE Top-8 sort has linear row cost and a full 1024-row sample can take hours on cmodel. The case records the requested row count as `target_m`, and the report scales only that sort term by `target_m / m`. Set `--sort-rows 0` to measure the full requested prefill. Matrix, attention, expert, and other cases keep the requested prefill unchanged. The scaling is a model estimate: launch overhead and task occupancy can make a small sample differ from a full batch.
+
 Resume with the original options plus `--resume`. It skips completed cases and rejects changed shapes, repetition counts, socket, trace path, or executable/backend hashes. Keep the same trace file: restarting dyperf with `-o` on that file truncates earlier cycle records. Use `report` rather than `run --resume` when only the report needs updating. Retries get new task names, so incomplete old launches cannot be mistaken for a new result.
 
 ## Measurement and prediction meanings

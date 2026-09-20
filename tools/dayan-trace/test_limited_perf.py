@@ -42,6 +42,58 @@ class PerfReportTests(unittest.TestCase):
         self.assertIn("decode_steps=2", output.getvalue())
         self.assertIn("cmp=dayan-standalone", output.getvalue())
 
+    def test_sort_sampling_keeps_other_shapes_and_supports_full_size(self):
+        model = perf.load_model("qwen36-35B-A3B-mxfp4-moe-bf16")
+        for prefill, limit, measured in ((1024, 4, 4), (2, 4, 2), (1024, 0, 1024), (1024, 8, 8)):
+            with self.subTest(prefill=prefill, limit=limit):
+                cases = {case["id"]: case for case in perf.make_cases(prefill, 16, model=model, sort_rows=limit)}
+                self.assertEqual(cases["prefill-top8"]["m"], measured)
+                self.assertEqual(cases["prefill-top8"].get("target_m", measured), prefill)
+                self.assertEqual(cases["decode-top8"]["m"], 1)
+                self.assertNotIn("target_m", cases["decode-top8"])
+                for op in ("router", "expert-ffn", "gdn", "attention"):
+                    self.assertEqual(cases[f"prefill-{op}"]["m"], prefill)
+
+    def test_sort_report_scales_only_prediction_and_preserves_old_runs(self):
+        model = perf.load_model("qwen36-35B-A3B-mxfp4-moe-bf16")
+        model["prediction_terms"] = [{"case": "{phase}-top8", "factor": 40, "reason": "40 layers"}]
+        cases = [case for case in perf.make_cases(1024, 16, model=model) if case["op"] == "sort"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / "trace.json"
+            records = []
+            for case in cases:
+                tag = case["id"]
+                records.extend(events(tag, [(100, 200)] * 4))
+                perf.write_json(root / (tag + ".result.json"), dict(status="ok", samples=[
+                    dict(tag=tag, warmup=False, wall_s=2, tasks=4, status=0)]))
+            perf.write_json(trace, dict(traceEvents=records))
+            manifest = dict(model_config=model, cases=cases, simulator="cmodel", run_id="sort", prefill=1024, context=16)
+            for legacy in (False, True):
+                if legacy:
+                    cases[0]["m"] = cases[0].pop("target_m")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(perf.make_report(root, manifest, trace, 0, None), 0)
+                report = json.loads((root / "report.json").read_text())
+                factor = 40 if legacy else 40 * 256
+                self.assertEqual(report["cases"][0]["wall_s"], 2)
+                self.assertEqual(report["cases"][0]["cycles"], 100)
+                self.assertEqual(report["predictions"][0]["terms"][0]["factor"], factor)
+                self.assertEqual(report["predictions"][0]["subtotal_wall_s"], 2 * factor)
+                self.assertEqual(report["predictions"][0]["subtotal_cycles"], 100 * factor)
+                self.assertEqual(report["predictions"][1]["subtotal_wall_s"], 80)
+
+    def test_sort_sampling_plan_displays_target_and_rejects_invalid_limit(self):
+        argv = ["limited-perf.py", "plan", "--model", "qwen36-35B-A3B-mxfp4-moe-bf16", "--cases", "prefill-top8"]
+        with patch("sys.argv", argv), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(perf.main(), 0)
+        self.assertIn("m=4", output.getvalue())
+        self.assertIn("target_m=1024 row_scale=256", output.getvalue())
+        for value in ("-1", "1025"):
+            with patch("sys.argv", argv + ["--sort-rows", value]), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    perf.main()
+
     def test_cmp_plan_and_old_client_rejection(self):
         with patch("sys.argv", ["limited-perf.py", "plan", "--cmp", "--cmp-seed", "42"]), contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(perf.main(), 0)

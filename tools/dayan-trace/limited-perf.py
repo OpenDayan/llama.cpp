@@ -63,7 +63,7 @@ def load_model(name=DEFAULT_MODEL):
     return model
 
 
-def make_cases(prefill, context, repeats=1, warmup=0, timeout_ms=86400000, model=None):
+def make_cases(prefill, context, repeats=1, warmup=0, timeout_ms=86400000, model=None, sort_rows=4):
     model = load_model() if model is None else model
     cases = []
     for phase, m in (("prefill", prefill), ("decode", 1)):
@@ -75,15 +75,27 @@ def make_cases(prefill, context, repeats=1, warmup=0, timeout_ms=86400000, model
             if shape["op"] == "attention":
                 shape["kv_len"] = m if phase == "prefill" else context + 1
             case_m = shape.pop("m", m)
+            if phase == "prefill" and shape["op"] == "sort" and sort_rows and case_m > sort_rows:
+                shape["target_m"] = case_m
+                case_m = sort_rows
             cases.append(dict(id=f"{phase}-{name}", phase=phase, m=case_m, repeats=repeats, warmup=warmup,
                               timeout_ms=timeout_ms, **shape))
     return cases
 
 
-def prediction_terms(phase, model=None):
+def prediction_terms(phase, model=None, cases=()):
     model = load_model() if model is None else model
-    return [(term["case"].replace("{phase}", phase), term["factor"] / term.get("divisor", 1), term["reason"])
-            for term in model["prediction_terms"]]
+    sampled = {case["id"]: case for case in cases if "target_m" in case}
+    terms = []
+    for term in model["prediction_terms"]:
+        name = term["case"].replace("{phase}", phase)
+        factor, reason = term["factor"] / term.get("divisor", 1), term["reason"]
+        if name in sampled:
+            case = sampled[name]
+            factor *= case["target_m"] / case["m"]
+            reason += f"; estimated row scaling {case['target_m']}/{case['m']}"
+        terms.append((name, factor, reason))
+    return terms
 
 
 def case_types(case):
@@ -158,7 +170,8 @@ def cycle_span(roots, tag, tasks):
 def shape_text(case):
     dtype, output = case_types(case)
     shape = " ".join(f"{key}={case[key]}" for key in ("m", "n", "k", "experts", "experts_used", "channels", "kernel", "heads", "q_heads", "kv_heads", "head_dim", "kv_len", "mode", "layers", "decode_steps") if key in case)
-    return f"{shape} dtype={dtype} output={output}"
+    target = f" target_m={case['target_m']} row_scale={case['target_m'] / case['m']:g}" if "target_m" in case else ""
+    return f"{shape} dtype={dtype} output={output}{target}"
 
 
 def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
@@ -207,7 +220,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
     by_id = {row["id"]: row for row in rows}
     predictions = []
     for phase, tokens in (("prefill", manifest["prefill"]), ("decode", 1)):
-        terms = prediction_terms(phase, model)
+        terms = prediction_terms(phase, model, manifest["cases"])
         missing = [name for name, _, _ in terms if by_id.get(name, {}).get("wall_s") is None]
         prediction = dict(phase=phase, tokens=tokens, context=0 if phase == "prefill" else model.get("decode_context", manifest["context"]),
                           terms=[dict(case=name, factor=factor, reason=reason) for name, factor, reason in terms],
@@ -248,6 +261,9 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         ]
     if trace_note:
         notes.append(trace_note)
+    for case in manifest["cases"]:
+        if "target_m" in case:
+            notes.append(f"{case['id']} measures {case['m']} rows and estimates {case['target_m']} rows using a {case['target_m'] / case['m']:g}x factor. The measured row remains unscaled. This assumes linear row cost; launch overhead and task occupancy can bias the estimate, especially when the sample does not fill all cores.")
     report = dict(schema=2, model=model_name, model_config=model, simulator=manifest["simulator"], run_id=manifest["run_id"],
                   perf_trace=str(trace_path), overhead_percent=overhead_percent, clock_hz=clock_hz,
                   cases=rows, predictions=predictions, notes=notes)
@@ -273,7 +289,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         lines.append(f"| {p['phase']} | {p['tokens']} | {p['context']} | {number(p['subtotal_wall_s'])} / {number(p['subtotal_cycles'], 0)} | {number(p['predicted_wall_s'])} / {number(p['predicted_cycles'], 0)} | {number(p['predicted_tokens_per_s'])} |")
     lines += ["", "Projection factors (also saved in report.json):", ""]
     for phase in ("prefill", "decode"):
-        lines.append(f"- {phase}: " + "; ".join(f"{name} * {factor:g}" for name, factor, _ in prediction_terms(phase, model)))
+        lines.append(f"- {phase}: " + "; ".join(f"{name} * {factor:g}" for name, factor, _ in prediction_terms(phase, model, manifest["cases"])))
     lines += ["", *[f"- {note}" for note in notes], ""]
     for row in rows:
         if row.get("error"):
@@ -302,6 +318,7 @@ def main():
     parser.add_argument("--socket", default=os.environ.get("DAYAN_SERVER_SOCKET", "/tmp/dayan-server.sock"))
     parser.add_argument("--simulator", choices=("testcluster", "cmodel"), default="testcluster")
     parser.add_argument("--prefill", type=int, default=1024, help="prefill tokens (default: 1024)")
+    parser.add_argument("--sort-rows", type=int, default=4, help="maximum measured prefill rows for sorting; estimate the requested prefill by row scaling (default: 4; 0: full size)")
     parser.add_argument("--context", type=int, default=1024, help="decode prefix tokens, excluding the new token (default: 1024)")
     parser.add_argument("--case", dest="cases", action="append", help="select one case; repeat to select several")
     parser.add_argument("--cases", action="extend", nargs="+", help="select a group of cases; defaults to all cases in the model preset")
@@ -319,7 +336,7 @@ def main():
         parser.error("--cmp-seed must be an unsigned 32-bit integer")
     if args.cmp_seed != 1 and not args.cmp:
         parser.error("--cmp-seed requires --cmp")
-    if not (1 <= args.prefill <= 1024 and 0 <= args.context < 65536 and 1 <= args.repeats <= 100 and
+    if not (1 <= args.prefill <= 1024 and 0 <= args.sort_rows <= 1024 and 0 <= args.context < 65536 and 1 <= args.repeats <= 100 and
             0 <= args.warmup <= 99 and args.repeats + args.warmup <= 100 and 1 <= args.timeout <= 4294967):
         parser.error("invalid shape, repetitions, or timeout")
     if (args.overhead_percent is not None and (not math.isfinite(args.overhead_percent) or args.overhead_percent < 0)) or (
@@ -340,7 +357,7 @@ def main():
             model = load_model(model_name)
         except (ValueError, KeyError, TypeError, ZeroDivisionError) as error:
             parser.error(str(error))
-        cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000, model)
+        cases = make_cases(args.prefill, args.context, args.repeats, args.warmup, args.timeout * 1000, model, args.sort_rows)
         if args.cmp:
             for case in cases:
                 case.update(cmp=True, seed=args.cmp_seed)
@@ -388,7 +405,7 @@ def main():
         if any(case["op"] == "mega" for case in cases) and "mega" not in capabilities.get("ops", []):
             parser.error("mega cases need --client build-dayan/bin/test-dayan-qwen35-dense")
     fingerprint = hashlib.sha256(client.read_bytes()).hexdigest()
-    configuration = dict(model=model_name, model_config=model, simulator=args.simulator, prefill=args.prefill, context=args.context,
+    configuration = dict(model=model_name, model_config=model, simulator=args.simulator, prefill=args.prefill, sort_rows=args.sort_rows, context=args.context,
                          cases=cases, client=str(client), client_sha256=fingerprint,
                          backend_sha256=hashlib.sha256((client.parent / "libggml-dayan.so").read_bytes()).hexdigest()
                          if (client.parent / "libggml-dayan.so").exists() else None,
