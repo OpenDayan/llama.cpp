@@ -477,7 +477,7 @@ int main(int argc, char ** argv) {
                     attrs.config = topology.launch(false);
                     result["kernel"] = "mul_mat_id_mxfp4";
                     launch = [&, moe_cfg, a, as, b, bs, up, ups, ids, scales]() {
-                        return mul_mat_id_mxfp4(moe_cfg, a, as, b, bs, up, ups, ids, output, scales, &attrs);
+                        return mul_mat_id_mxfp4(moe_cfg, a, as, b, bs, up, ups, ids, output, scales, output, &attrs);
                     };
                 }
                 value = k / 4096.0f;
