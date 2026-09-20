@@ -13,12 +13,10 @@ struct Qwen35DenseMxfp4LinearGraph {
         p_rows0     = NextParameter<p_scale0, 3>::value,
         p_quant0    = NextParameter<p_rows0, 4>::value,
         p_qkv       = NextParameter<p_quant0, 4>::value,
-        p_concat    = NextParameter<p_qkv, 9>::value,
-        p_copy0     = NextParameter<p_concat, 4>::value,
-        p_scale1    = NextParameter<p_copy0, 3>::value,
+        p_scale1    = NextParameter<p_qkv, 9>::value,
         p_rows1     = NextParameter<p_scale1, 3>::value,
-        p_conv      = NextParameter<p_rows1, 4>::value,
-        p_l2q       = NextParameter<p_conv, 4>::value,
+        p_conv_split = NextParameter<p_rows1, 4>::value,
+        p_l2q       = NextParameter<p_conv_split, 6>::value,
         p_l2k       = NextParameter<p_l2q, 3>::value,
         p_alpha     = NextParameter<p_l2k, 3>::value,
         p_alpha_add = NextParameter<p_alpha, 9>::value,
@@ -45,7 +43,7 @@ struct Qwen35DenseMxfp4LinearGraph {
     using B = Arguments<>;
 
     static const Operation operations[];
-    static constexpr uint16_t operation_count = 60;
+    static constexpr uint16_t operation_count = 56;
 };
 
 const Operation Qwen35DenseMxfp4LinearGraph::operations[] = {
@@ -59,15 +57,12 @@ const Operation Qwen35DenseMxfp4LinearGraph::operations[] = {
     { nullptr, nullptr },
     { matmul_mxfp4, Arguments<p_qkv + 0, p_qkv + 1, p_qkv + 2, p_qkv + 3, p_qkv + 4, p_qkv + 5, p_qkv + 6, p_qkv + 7, p_qkv + 8>::values },
     { nullptr, nullptr },
-    { concat, Arguments<p_concat + 0, p_concat + 1, p_concat + 2, p_concat + 3>::values },
     { nullptr, nullptr },
-    { copy, Arguments<p_copy0 + 0, p_copy0 + 1, p_copy0 + 2>::values },
     { nullptr, nullptr },
-    { scale, Arguments<p_scale1 + 0, p_scale1 + 1, p_scale1 + 2>::values },
     { nullptr, nullptr },
-    { get_rows, Arguments<p_rows1 + 0, p_rows1 + 1, p_rows1 + 2, p_rows1 + 3>::values },
     { nullptr, nullptr },
-    { ssm_conv, Arguments<p_conv + 0, p_conv + 1, p_conv + 2, p_conv + 3>::values },
+    { ssm_conv_split, Arguments<p_conv_split + 0, p_conv_split + 1, p_conv_split + 2, p_conv_split + 3,
+                                p_conv_split + 4, p_conv_split + 5>::values },
     { nullptr, nullptr },
     { l2_norm, Arguments<p_l2q + 0, p_l2q + 1, p_l2q + 2>::values },
     { l2_norm, Arguments<p_l2k + 0, p_l2k + 1, p_l2k + 2>::values },

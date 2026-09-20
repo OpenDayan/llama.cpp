@@ -1458,6 +1458,17 @@ __kernel__ void ssm_conv_f32_1c(const DayanSSMConvConfig * config,
     run_ssm_conv(config, input, weight, output);
 }
 
+__kernel__ void ssm_conv_split_f32_1c(const DayanSSMConvConfig * config,
+                                      const float *              state,
+                                      const float *              weight,
+                                      float *                    output,
+                                      const float *              qkv,
+                                      float *                    state_output) {
+    dayan_acquire_config(config);
+    using namespace ggml_dayan_matmul_detail;
+    run_ssm_conv(config, state, weight, output, qkv, state_output);
+}
+
 __kernel__ void residual_add_f32_1c(const DayanElementwiseConfig * config,
                                     const float *                  left,
                                     const float *                  right,
@@ -1920,6 +1931,8 @@ DAYAN_MATMUL_4C_DESC(project_gated_output_f32_gate_bf16_4c);
 DAYAN_MATMUL_1C_DESC(project_gated_output_f32_gate_fp16_1c);
 DAYAN_MATMUL_4C_DESC(project_gated_output_f32_gate_fp16_4c);
 DAYAN_KERNEL_TASK_DESC(ssm_conv_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
+                       1, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(ssm_conv_split_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
                        1, 0, 1, 0);
 #define DAYAN_NATIVE_KERNEL_DESC(kernel) \
     DAYAN_KERNEL_TASK_DESC(kernel, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NATIVE_TASK_URAM_BYTES), 2, 0, 1, 0)

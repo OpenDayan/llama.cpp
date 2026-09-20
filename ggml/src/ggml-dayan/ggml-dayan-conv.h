@@ -41,7 +41,6 @@ static inline void load_ssm_transposed(uint64_t destination,
         return;
     }
 
-    // Stage unaligned rows and partial 16x16 blocks.
     set_lsu_matrix<0>(checksum, channels, row_bytes, source_stride, row_bytes);
     load_matrix<0>((uint64_t) columns * sizeof(float), channels, row_bytes, channels, staging, source_address);
     dayan_wait_lsu();
@@ -117,23 +116,31 @@ static inline void store_ssm_output(float *  output,
 static inline void run_ssm_conv(const DayanSSMConvConfig * config,
                                 const float *              input,
                                 const float *              weight,
-                                float *                    output) {
+                                float *                    output,
+                                const float *              qkv = nullptr,
+                                float *                    state_output = nullptr) {
     DAYAN_PARAMS_IF(config == nullptr || input == nullptr || weight == nullptr || output == nullptr || config->input_length == 0 || config->channels == 0 || config->tokens == 0 ||
                     config->sequences == 0 || config->kernel_size == 0 ||
                     config->kernel_size > kDayanSSMConvMaxKernelSize ||
                     (uint64_t) config->input_length != (uint64_t) config->kernel_size - 1U + config->tokens ||
-                    (config->flags & ~1U) != 0 || !dayan_native_task_mode_valid() ||
+                    (config->flags & ~(kDayanSSMConvFlagSilu | kDayanSSMConvFlagNoStateCopy)) != 0 || !dayan_native_task_mode_valid() ||
                     dayan_task_dim(DAYAN_TASK_X) == 0U ||
                     dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         DAYAN_PARAMS_ERROR();
     }
+    DAYAN_PARAMS_IF(qkv != nullptr && (config->flags & kDayanSSMConvFlagNoStateCopy) == 0 &&
+                    state_output == nullptr && config->kernel_size > 1) {
+        DAYAN_PARAMS_ERROR();
+    }
+    static_assert(kDayanSSMConvTokenTile >= kDayanSSMConvMaxKernelSize, "SSM token tiles must cover the history");
 
     const uint64_t uram_address = (uint64_t) (uintptr_t) dayan_uram_base();
     DAYAN_PARAMS_IF(uram_address == 0) {
         DAYAN_PARAMS_ERROR();
     }
 
+    const bool update_state = qkv != nullptr && (config->flags & kDayanSSMConvFlagNoStateCopy) == 0;
     const uint32_t task = dayan_task_id(DAYAN_TASK_X);
     const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
     const uint32_t token_tile = config->tokens < kDayanSSMConvTokenTile ? config->tokens : kDayanSSMConvTokenTile;
@@ -173,10 +180,28 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
             const uint32_t token_base = (uint32_t) ((work % token_tiles) * token_tile);
             const uint32_t token_count = config->tokens - token_base < token_tile ? config->tokens - token_base : token_tile;
             const uint32_t input_rows = token_count + config->kernel_size - 1U;
-            const float * source = input + ((uint64_t) sequence * config->channels + channel_base) * config->input_length + token_base;
-
-            load_ssm_transposed(input_uram, staging_uram, source, input_rows, channel_count, tile_elements,
-                                 (uint64_t) config->input_length * sizeof(float));
+            const uint32_t history = config->kernel_size - 1U;
+            const uint64_t row_stride = (uint64_t) tile_elements * sizeof(float);
+            if (qkv != nullptr) {
+                const uint32_t state_rows = token_base == 0 ? history : 0;
+                if (state_rows != 0) {
+                    load_ssm_transposed(input_uram, staging_uram,
+                        input + ((uint64_t) sequence * config->channels + channel_base) * history,
+                        history, channel_count, tile_elements, (uint64_t) history * sizeof(float));
+                    dayan_wait_lsu();
+                }
+                const uint32_t qkv_token = token_base == 0 ? 0 : token_base - history;
+                const uint32_t qkv_rows = input_rows - state_rows;
+                const float * source = qkv + ((uint64_t) sequence * config->tokens + qkv_token) * config->channels + channel_base;
+                long checksum = 0;
+                set_lsu_matrix<0>(checksum, qkv_rows, row_stride, (uint64_t) config->channels * sizeof(float), row_stride);
+                load_matrix<0>((uint64_t) channel_count * sizeof(float), qkv_rows, row_stride, qkv_rows,
+                               input_uram + state_rows * row_stride, (uint64_t) source);
+            } else {
+                const float * source = input + ((uint64_t) sequence * config->channels + channel_base) * config->input_length + token_base;
+                load_ssm_transposed(input_uram, staging_uram, source, input_rows, channel_count, tile_elements,
+                                     (uint64_t) config->input_length * sizeof(float));
+            }
             dayan_wait_lsu();
 
             issue_ssm_depthwise_f32(input_uram, weight_uram, output_uram, token_count, channel_count, tile_elements, config);
@@ -193,6 +218,40 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
             store_ssm_output(output, output_uram, config->tokens, token_count, config->channels, (uint32_t) channel_base,
                                channel_count, tile_elements, sequence, token_base);
             dayan_wait_lsu();
+            if (update_state && token_base + token_count == config->tokens) {
+                if (history == 0) {
+                    continue;
+                }
+                const uint32_t old_rows = config->tokens < history ? history - config->tokens : 0;
+                const uint32_t qkv_rows = history - old_rows;
+                const uint32_t old_start = config->tokens < history ? config->tokens : 0;
+                if (old_rows != 0) {
+                    load_ssm_transposed(input_uram, staging_uram,
+                        input + ((uint64_t) sequence * config->channels + channel_base) * history + old_start,
+                        old_rows, channel_count, tile_elements, (uint64_t) history * sizeof(float));
+                    dayan_wait_lsu();
+                }
+                if (qkv_rows != 0) {
+                    const float * state_source = qkv + ((uint64_t) sequence * config->tokens + config->tokens - qkv_rows) * config->channels + channel_base;
+                    long checksum = 0;
+                    set_lsu_matrix<0>(checksum, qkv_rows, row_stride, (uint64_t) config->channels * sizeof(float), row_stride);
+                    load_matrix<0>((uint64_t) channel_count * sizeof(float), qkv_rows, row_stride, qkv_rows,
+                                   input_uram + old_rows * row_stride, (uint64_t) state_source);
+                    dayan_wait_lsu();
+                }
+                const uint64_t state_stride = align_up(history, 16) * sizeof(float);
+                long checksum = 0;
+                set_lsu_matrix<0, true, 2>(checksum, align_up(history, 16), row_stride,
+                                            row_stride, state_stride);
+                __tx_lsu_dma_u2u<0>(staging_uram, input_uram);
+                dayan_wait_lsu();
+                set_lsu_matrix<0>(checksum, channel_count, state_stride, state_stride,
+                                  history * sizeof(float));
+                store_matrix<0>(history * sizeof(float), channel_count, state_stride, channel_count,
+                                staging_uram, (uint64_t) (state_output +
+                                ((uint64_t) sequence * config->channels + channel_base) * history));
+                dayan_wait_lsu();
+            }
         }
     }
 }

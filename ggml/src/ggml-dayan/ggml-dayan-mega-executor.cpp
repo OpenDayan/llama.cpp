@@ -192,6 +192,17 @@ int ssm_conv(const uintptr_t * parameters, const uint16_t * indices) {
     return 0;
 }
 
+int ssm_conv_split(const uintptr_t * parameters, const uint16_t * indices) {
+    ggml_dayan_matmul_detail::run_ssm_conv(
+        parameter<const DayanSSMConvConfig *>(parameters, indices, 0),
+        parameter<const float *>(parameters, indices, 1),
+        parameter<const float *>(parameters, indices, 2),
+        parameter<float *>(parameters, indices, 3),
+        parameter<const float *>(parameters, indices, 4),
+        parameter<float *>(parameters, indices, 5));
+    return 0;
+}
+
 int l2_norm(const uintptr_t * parameters, const uint16_t * indices) {
     ggml_dayan_matmul_detail::run_l2_norm(
         parameter<const DayanNormConfig *>(parameters, indices, 0),
@@ -547,7 +558,7 @@ __kernel__ void qwen35_dense_mega(
             DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeLinearGraph::parameter_count) {
                 DAYAN_PARAMS_ERROR();
             }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph, 51>(parameters, barrier);
+            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph, 47>(parameters, barrier);
             if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeLinearGraph>(parameters, barrier); }
             break;
         case kDayanMegaQwen35MoeFull:

@@ -216,6 +216,16 @@ static bool ggml_backend_dayan_mega_add_noop_scale(ggml_backend_dayan_mega_param
            parameters->add_tensor(placeholder);
 }
 
+static bool ggml_backend_dayan_mega_add_noop_rows(ggml_backend_dayan_mega_parameters * parameters,
+                                                  const ggml_tensor *                   placeholder) {
+    if (placeholder == nullptr || placeholder->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const DayanRowsConfig config = {};
+    return parameters->add_data(config) && parameters->add_tensor(placeholder) && parameters->add_tensor(placeholder) &&
+           parameters->add_tensor(placeholder);
+}
+
 static bool ggml_backend_dayan_mega_add_rows(ggml_backend_dayan_mega_parameters * parameters,
                                               const ggml_backend_dayan_graph_slot & slot,
                                               bool                                  set) {
@@ -508,6 +518,49 @@ static bool ggml_backend_dayan_mega_add_ssm_conv(ggml_backend_dayan_mega_paramet
     std::memcpy(&config.one_bits, &one, sizeof(one));
     return parameters->add_data(config) && parameters->add_tensor(input) && parameters->add_tensor(weight) &&
            parameters->add_tensor(output);
+}
+
+static bool ggml_backend_dayan_mega_add_ssm_conv_split(ggml_backend_dayan_mega_parameters * parameters,
+                                                        const ggml_backend_dayan_graph_slot & concat_slot,
+                                                        const ggml_backend_dayan_graph_slot & copy_slot,
+                                                        const ggml_backend_dayan_graph_slot & conv_slot) {
+    ggml_tensor * concat = concat_slot.nodes[0];
+    ggml_tensor * copy = copy_slot.nodes[0];
+    const ggml_tensor * conv = conv_slot.nodes[0];
+    ggml_tensor * output = conv_slot.nodes[1];
+    const ggml_tensor * state = concat != nullptr ? concat->src[0] : nullptr;
+    const ggml_tensor * transposed = concat != nullptr ? concat->src[1] : nullptr;
+    const ggml_tensor * qkv = transposed != nullptr ? transposed->view_src : nullptr;
+    const ggml_tensor * weight = conv != nullptr ? conv->src[1] : nullptr;
+    const bool state_update = concat != nullptr && qkv != nullptr && copy != nullptr && copy->src[0] != nullptr &&
+                              copy->src[0]->view_src == concat &&
+                              copy->src[0]->view_offs == ggml_row_size(concat->type, qkv->ne[1]);
+    const bool scratch_copy = copy != nullptr && copy->src[0] == concat;
+    if (concat_slot.kind != ggml_backend_dayan_slot_kind::concat || copy_slot.kind != ggml_backend_dayan_slot_kind::copy ||
+        conv_slot.kind != ggml_backend_dayan_slot_kind::ssm_conv_silu || concat == nullptr || copy == nullptr ||
+        conv == nullptr || output == nullptr || state == nullptr || transposed == nullptr || qkv == nullptr ||
+        weight == nullptr || copy->src[1] == nullptr || transposed->op != GGML_OP_TRANSPOSE ||
+        concat->src[0] != state || copy->src[0] == nullptr || (!state_update && !scratch_copy) ||
+        ggml_get_op_params_i32(concat, 0) != 0 || state->type != GGML_TYPE_F32 || qkv->type != GGML_TYPE_F32 ||
+        weight->type != GGML_TYPE_F32 || output->type != GGML_TYPE_F32 || !ggml_is_contiguous(state) ||
+        !ggml_is_contiguous(qkv) || !ggml_is_contiguous(weight) || !ggml_is_contiguous(output) ||
+        state->ne[0] + qkv->ne[1] != concat->ne[0] || state->ne[1] != qkv->ne[0] ||
+        state->ne[2] != qkv->ne[2] || weight->ne[1] != state->ne[1] ||
+        weight->ne[0] <= 1 || weight->ne[0] > kDayanSSMConvMaxKernelSize || output->ne[1] != qkv->ne[1] ||
+        output->ne[2] != qkv->ne[2] || copy->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    DayanSSMConvConfig config = {
+        (uint32_t) concat->ne[0], (uint32_t) concat->ne[1], (uint32_t) output->ne[1],
+        (uint32_t) concat->ne[2], (uint32_t) weight->ne[0],
+        1U | (state_update ? 0U : kDayanSSMConvFlagNoStateCopy), 0, 0,
+    };
+    const float neg_log2e = -1.4426950408889634f;
+    const float one = 1.0f;
+    std::memcpy(&config.neg_log2e_bits, &neg_log2e, sizeof(neg_log2e));
+    std::memcpy(&config.one_bits, &one, sizeof(one));
+    return parameters->add_data(config) && parameters->add_tensor(state) && parameters->add_tensor(weight) &&
+           parameters->add_tensor(output) && parameters->add_tensor(qkv) && parameters->add_tensor(state_update ? copy : state);
 }
 
 static bool ggml_backend_dayan_mega_add_l2_norm(ggml_backend_dayan_mega_parameters * parameters,
@@ -970,20 +1023,16 @@ static bool ggml_backend_dayan_pack_qwen35_mxfp4_linear(ggml_backend_dayan_mega_
         const size_t skip = decode ? (index > 7 ? 2 : (index > 1 ? 1 : 0)) : 0;
         return s[begin + index - skip];
     };
-    const ggml_tensor * noop_scale = decode ? s[begin + 1].nodes[0] : nullptr;
     return ggml_backend_dayan_mega_add_norm(parameters, at(0), false) &&
-           (decode ? ggml_backend_dayan_mega_add_noop_scale(parameters, noop_scale)
+           (decode ? ggml_backend_dayan_mega_add_noop_scale(parameters, s[begin + 1].nodes[0])
                    : ggml_backend_dayan_mega_add_scale(parameters, at(1))) &&
            ggml_backend_dayan_mega_add_rows(parameters, at(2), false) &&
            ggml_backend_dayan_mega_add_quantize(parameters, at(3)) &&
            ggml_backend_dayan_mega_add_matmul(parameters, at(4).nodes[0], nullptr,
                                                at(4).nodes[0], 0) &&
-           ggml_backend_dayan_mega_add_concat(parameters, at(5)) &&
-           ggml_backend_dayan_mega_add_copy(parameters, at(6)) &&
-           (decode ? ggml_backend_dayan_mega_add_noop_scale(parameters, noop_scale)
-                   : ggml_backend_dayan_mega_add_scale(parameters, at(7))) &&
-           ggml_backend_dayan_mega_add_rows(parameters, at(8), false) &&
-           ggml_backend_dayan_mega_add_ssm_conv(parameters, at(9)) &&
+           ggml_backend_dayan_mega_add_noop_scale(parameters, at(9).nodes[0]->src[0]->view_src) &&
+           ggml_backend_dayan_mega_add_noop_rows(parameters, at(9).nodes[0]->src[0]->view_src) &&
+           ggml_backend_dayan_mega_add_ssm_conv_split(parameters, at(5), at(6), at(9)) &&
            ggml_backend_dayan_mega_add_l2_norm(parameters, at(10)) &&
            ggml_backend_dayan_mega_add_l2_norm(parameters, at(11)) &&
            ggml_backend_dayan_mega_add_matmul(parameters, at(12).nodes[0], nullptr,
@@ -1060,19 +1109,15 @@ static bool ggml_backend_dayan_pack_qwen35_bf16_linear_attention(ggml_backend_da
         const size_t skip = decode ? (index > 7 ? 2 : (index > 1 ? 1 : 0)) : 0;
         return s[begin + index - skip];
     };
-    const ggml_tensor * noop_scale = decode ? s[begin + 1].nodes[0] : nullptr;
     return ggml_backend_dayan_mega_add_norm(parameters, at(0), false) &&
-           (decode ? ggml_backend_dayan_mega_add_noop_scale(parameters, noop_scale)
+           (decode ? ggml_backend_dayan_mega_add_noop_scale(parameters, s[begin + 1].nodes[0])
                    : ggml_backend_dayan_mega_add_scale(parameters, at(1))) &&
            ggml_backend_dayan_mega_add_rows(parameters, at(2), false) &&
            ggml_backend_dayan_mega_add_copy(parameters, at(3)) &&
            ggml_backend_dayan_mega_add_bf16_matmul(parameters, at(4).nodes[0], at(4).nodes[0]) &&
-           ggml_backend_dayan_mega_add_concat(parameters, at(5)) &&
-           ggml_backend_dayan_mega_add_copy(parameters, at(6)) &&
-           (decode ? ggml_backend_dayan_mega_add_noop_scale(parameters, noop_scale)
-                   : ggml_backend_dayan_mega_add_scale(parameters, at(7))) &&
-           ggml_backend_dayan_mega_add_rows(parameters, at(8), false) &&
-           ggml_backend_dayan_mega_add_ssm_conv(parameters, at(9)) &&
+           ggml_backend_dayan_mega_add_noop_scale(parameters, at(9).nodes[0]->src[0]->view_src) &&
+           ggml_backend_dayan_mega_add_noop_rows(parameters, at(9).nodes[0]->src[0]->view_src) &&
+           ggml_backend_dayan_mega_add_ssm_conv_split(parameters, at(5), at(6), at(9)) &&
            ggml_backend_dayan_mega_add_l2_norm(parameters, at(10)) &&
            ggml_backend_dayan_mega_add_l2_norm(parameters, at(11)) &&
            ggml_backend_dayan_mega_add_bf16_matmul(parameters, at(12).nodes[0], at(12).nodes[0]) &&

@@ -89,7 +89,7 @@ Run the command for the desired model. Mega is enabled by default when the graph
 # BF16 dense
 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL_BF16" \
     --device DAYAN -ngl 99 -fa on -c 512 -b 128 -ub 128 \
-    -n 16 --no-warmup --single-turn -p "Hello"
+    -n 16 --no-warmup --single-turn -p "Hello, Introduce yourself"
 
 # MXFP4 MoE
 ./build-dayan/bin/llama-cli -m "$DAYAN_MODEL_MOE" \

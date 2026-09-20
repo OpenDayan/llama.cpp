@@ -16,11 +16,11 @@ enum : uint16_t {
 enum : uint32_t {
     kDayanMegaMaxParameters                    = 256,
     kDayanMegaRootCount                        = 16,
-    kDayanMegaQwen35DenseMxfp4LinearParameters = 166,
+    kDayanMegaQwen35DenseMxfp4LinearParameters = 161,
     kDayanMegaQwen35DenseMxfp4FullParameters   = 137,
-    kDayanMegaQwen35DenseBf16LinearParameters  = 129,
+    kDayanMegaQwen35DenseBf16LinearParameters  = 124,
     kDayanMegaQwen35DenseBf16FullParameters    = 89,
-    kDayanMegaQwen35MoeLinearParameters       = 227,
+    kDayanMegaQwen35MoeLinearParameters       = 222,
     kDayanMegaQwen35MoeFullParameters         = 187,
 };
 
@@ -72,6 +72,7 @@ int concat(const uintptr_t *, const uint16_t *);
 int copy(const uintptr_t *, const uint16_t *);
 int repeat(const uintptr_t *, const uint16_t *);
 int ssm_conv(const uintptr_t *, const uint16_t *);
+int ssm_conv_split(const uintptr_t *, const uint16_t *);
 int l2_norm(const uintptr_t *, const uint16_t *);
 int add(const uintptr_t *, const uint16_t *);
 int multiply(const uintptr_t *, const uint16_t *);

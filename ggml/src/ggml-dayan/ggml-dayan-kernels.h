@@ -201,6 +201,11 @@ struct DayanSSMConvConfig {
     uint32_t one_bits;
 };
 
+enum : uint32_t {
+    kDayanSSMConvFlagSilu        = 1U << 0,
+    kDayanSSMConvFlagNoStateCopy = 1U << 1,
+};
+
 static inline uint32_t dayan_ssm_conv_task_count(uint32_t channels, uint32_t tokens, uint32_t sequences, uint32_t max_tasks = kDayanSSMConvMaxTasks) {
     const uint64_t channel_groups = ((uint64_t) channels + 63U) / 64U;
     const uint64_t row_groups     = ((uint64_t) tokens + kDayanSSMConvTokenTile - 1U) / kDayanSSMConvTokenTile * sequences;
@@ -1096,6 +1101,13 @@ int ssm_conv_f32_1c(npu_buffer_t *                    config,
                     npu_buffer_t *                    weight,
                     npu_buffer_t *                    output,
                     const npu_kernel_launch_attrs_t * launch_attrs);
+int ssm_conv_split_f32_1c(npu_buffer_t *                    config,
+                          npu_buffer_t *                    state,
+                          npu_buffer_t *                    weight,
+                          npu_buffer_t *                    output,
+                          npu_buffer_t *                    qkv,
+                          npu_buffer_t *                    state_output,
+                          const npu_kernel_launch_attrs_t * launch_attrs);
 int residual_add_f32_1c(npu_buffer_t *                    config,
                         npu_buffer_t *                    left,
                         npu_buffer_t *                    right,
