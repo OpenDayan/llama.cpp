@@ -48,8 +48,7 @@ namespace ggml_dayan_mega_detail {
 
 static_assert(ggml_dayan_flash_attention_detail::kAtomicBytes <= MATMUL_DAYAN_4C_ATOMIC_BYTES,
               "Flash Attention shared state overlaps the mega barrier");
-static_assert(MATMUL_DAYAN_4C_ATOMIC_BYTES <= DAYAN_SORT_ATOMIC_BYTES, "MatMul shared state overlaps the mega barrier");
-static_assert(DAYAN_SORT_ATOMIC_BYTES % alignof(dayan_cluster_barrier_t) == 0,
+static_assert(MATMUL_DAYAN_4C_ATOMIC_BYTES % alignof(dayan_cluster_barrier_t) == 0,
               "Mega barrier is not aligned");
 
 template <typename T>
@@ -70,7 +69,7 @@ static int clear_atomic_cache(uint32_t bytes) {
         }
     }
     dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
+        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
     return dayan_cluster_barrier(4, barrier);
 }
 
@@ -398,7 +397,8 @@ int router_indexer(const uintptr_t * parameters, const uint16_t * indices) {
         parameter<const float *>(parameters, indices, 1),
         parameter<const float *>(parameters, indices, 2),
         parameter<float *>(parameters, indices, 3),
-        parameter<int32_t *>(parameters, indices, 4));
+        parameter<int32_t *>(parameters, indices, 4),
+        parameter<void *>(parameters, indices, 5));
 }
 
 int matmul_id_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
@@ -417,13 +417,6 @@ int matmul_id_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
         parameter<void *>(parameters, indices, 10));
 }
 
-int argsort(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_sort<false>(
-        parameter<const DayanSortConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<int32_t *>(parameters, indices, 2));
-    return 0;
-}
 
 int softmax(const uintptr_t * parameters, const uint16_t * indices) {
     ggml_dayan_matmul_detail::run_softmax_f32(
@@ -477,6 +470,96 @@ static int execute(const uintptr_t * parameters, dayan_cluster_barrier_t * barri
     return 0;
 }
 
+template <bool Moe>
+static void run(const DayanMegaConfig * config, const void * const * sources) {
+    DAYAN_PARAMS_IF(config == nullptr) {
+        DAYAN_PARAMS_ERROR();
+    }
+    dayan_cache_invalidate(config, sizeof(*config));
+    const DayanMegaParameter * encoded = (const DayanMegaParameter *) (config + 1);
+    DAYAN_PARAMS_IF(shared == nullptr || dayan_task_mode() != 4U || dayan_task_dim(DAYAN_TASK_X) != 4U ||
+                    dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
+        DAYAN_PARAMS_ERROR();
+    }
+    DAYAN_PARAMS_IF(config->parameter_count > kDayanMegaMaxParameters ||
+                    config->total_bytes < sizeof(*config) + (uint32_t) config->parameter_count * sizeof(DayanMegaParameter)) {
+        DAYAN_PARAMS_ERROR();
+    }
+    dayan_cache_invalidate(config, config->total_bytes);
+
+    uintptr_t parameters[kDayanMegaMaxParameters];
+    for (uint16_t index = 0; index < config->parameter_count; ++index) {
+        DAYAN_PARAMS_IF(encoded[index].source > kDayanMegaRootCount || sources[encoded[index].source] == nullptr ||
+                        (encoded[index].source == 0 && encoded[index].offset >= config->total_bytes)) {
+            DAYAN_PARAMS_ERROR();
+        }
+        parameters[index] = (uintptr_t) sources[encoded[index].source] + encoded[index].offset;
+    }
+
+    dayan_cluster_barrier_t * barrier =
+        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
+    int status;
+    if constexpr (!Moe) {
+        switch (config->graph) {
+            case kDayanMegaQwen35DenseMxfp4Linear:
+                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph::parameter_count) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph>(
+                    parameters, barrier);
+                break;
+            case kDayanMegaQwen35DenseMxfp4Full:
+                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph::parameter_count) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph>(
+                    parameters, barrier);
+                break;
+            case kDayanMegaQwen35DenseBf16Linear:
+                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph::parameter_count) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph>(
+                    parameters, barrier);
+                break;
+            case kDayanMegaQwen35DenseBf16Full:
+                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph::parameter_count) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph>(
+                    parameters, barrier);
+                break;
+            default:
+                status = -22;
+                break;
+        }
+    } else {
+        switch (config->graph) {
+            case kDayanMegaQwen35MoeLinear:
+                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeLinearGraph::parameter_count) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph, 47>(parameters, barrier);
+                if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeLinearGraph>(parameters, barrier); }
+                break;
+            case kDayanMegaQwen35MoeFull:
+                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeFullGraph::parameter_count) {
+                    DAYAN_PARAMS_ERROR();
+                }
+                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph, 25>(parameters, barrier);
+                if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeFullGraph>(parameters, barrier); }
+                break;
+            default:
+                status = -22;
+                break;
+        }
+    }
+    DAYAN_PARAMS_IF(status < 0) {
+        DAYAN_PARAMS_ERROR();
+    }
+    (void) status;
+}
+
 } // namespace ggml_dayan_mega_detail
 #endif
 
@@ -498,92 +581,46 @@ __kernel__ void qwen35_dense_mega(
     const void * root13,
     const void * root14,
     const void * root15) {
-    DAYAN_PARAMS_IF(config == nullptr) {
-        DAYAN_PARAMS_ERROR();
-    }
-    dayan_cache_invalidate(config, sizeof(*config));
-    const DayanMegaParameter * encoded = (const DayanMegaParameter *) (config + 1);
-    DAYAN_PARAMS_IF(shared == nullptr || dayan_task_mode() != 4U || dayan_task_dim(DAYAN_TASK_X) != 4U ||
-                    dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
-        DAYAN_PARAMS_ERROR();
-    }
-    DAYAN_PARAMS_IF(config->parameter_count > kDayanMegaMaxParameters ||
-                    config->total_bytes < sizeof(*config) + (uint32_t) config->parameter_count * sizeof(DayanMegaParameter)) {
-        DAYAN_PARAMS_ERROR();
-    }
-    dayan_cache_invalidate(config, config->total_bytes);
-
     const void * sources[] = {
         config, root0, root1, root2, root3, root4, root5, root6, root7,
         root8, root9, root10, root11, root12, root13, root14, root15,
     };
-    uintptr_t parameters[kDayanMegaMaxParameters];
-    for (uint16_t index = 0; index < config->parameter_count; ++index) {
-        DAYAN_PARAMS_IF(encoded[index].source > kDayanMegaRootCount || sources[encoded[index].source] == nullptr ||
-                        (encoded[index].source == 0 && encoded[index].offset >= config->total_bytes)) {
-            DAYAN_PARAMS_ERROR();
-        }
-        parameters[index] = (uintptr_t) sources[encoded[index].source] + encoded[index].offset;
-    }
-
-    dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
-    int status;
-    switch (config->graph) {
-        case kDayanMegaQwen35DenseMxfp4Linear:
-            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph::parameter_count) {
-                DAYAN_PARAMS_ERROR();
-            }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph>(
-                parameters, barrier);
-            break;
-        case kDayanMegaQwen35DenseMxfp4Full:
-            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph::parameter_count) {
-                DAYAN_PARAMS_ERROR();
-            }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph>(
-                parameters, barrier);
-            break;
-        case kDayanMegaQwen35DenseBf16Linear:
-            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph::parameter_count) {
-                DAYAN_PARAMS_ERROR();
-            }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph>(
-                parameters, barrier);
-            break;
-        case kDayanMegaQwen35DenseBf16Full:
-            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph::parameter_count) {
-                DAYAN_PARAMS_ERROR();
-            }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph>(
-                parameters, barrier);
-            break;
-        case kDayanMegaQwen35MoeLinear:
-            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeLinearGraph::parameter_count) {
-                DAYAN_PARAMS_ERROR();
-            }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph, 47>(parameters, barrier);
-            if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeLinearGraph>(parameters, barrier); }
-            break;
-        case kDayanMegaQwen35MoeFull:
-            DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeFullGraph::parameter_count) {
-                DAYAN_PARAMS_ERROR();
-            }
-            status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph, 25>(parameters, barrier);
-            if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeFullGraph>(parameters, barrier); }
-            break;
-        default:
-            status = -22;
-            break;
-    }
-    DAYAN_PARAMS_IF(status < 0) {
-        DAYAN_PARAMS_ERROR();
-    }
-    (void) status;
+    ggml_dayan_mega_detail::run<false>(config, sources);
 }
 
 DAYAN_KERNEL_RESOURCE_DESC_EX(
     qwen35_dense_mega, 1, DAYAN_KERNEL_MAX_CHILD_THREADS, 0,
-    DAYAN_SORT_ATOMIC_BYTES + sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
+    MATMUL_DAYAN_4C_ATOMIC_BYTES + sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
+    DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_TCSR_LOGICAL_GROUPS, 4,
+    DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_RESOURCE_LOGICAL_COUNT, DAYAN_RESOURCE_LOGICAL_COUNT);
+
+__kernel__ void qwen35_moe_mega(
+    const DayanMegaConfig * config,
+    const void * root0,
+    const void * root1,
+    const void * root2,
+    const void * root3,
+    const void * root4,
+    const void * root5,
+    const void * root6,
+    const void * root7,
+    const void * root8,
+    const void * root9,
+    const void * root10,
+    const void * root11,
+    const void * root12,
+    const void * root13,
+    const void * root14,
+    const void * root15) {
+    const void * sources[] = {
+        config, root0, root1, root2, root3, root4, root5, root6, root7,
+        root8, root9, root10, root11, root12, root13, root14, root15,
+    };
+    ggml_dayan_mega_detail::run<true>(config, sources);
+}
+
+DAYAN_KERNEL_RESOURCE_DESC_EX(
+    qwen35_moe_mega, 1, DAYAN_KERNEL_MAX_CHILD_THREADS, 0,
+    MATMUL_DAYAN_4C_ATOMIC_BYTES + sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_TCSR_LOGICAL_GROUPS, 4,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_RESOURCE_LOGICAL_COUNT, DAYAN_RESOURCE_LOGICAL_COUNT);

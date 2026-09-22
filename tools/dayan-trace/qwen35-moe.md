@@ -2,7 +2,7 @@
 
 The tested source is `Qwen3.6-35B-A3B-MXFP4_MOE_BF16.gguf`, architecture `qwen35moe`: 40 layers, hidden width 2048, 256 experts, Top-8, expert/shared FFN width 512, 30 linear-attention layers and 10 full-attention layers. Attention and shared expert weights are BF16; routed experts are MXFP4; both routers are F32.
 
-The backend supports these operators. F32 matrix products use MAT TF32 with F32 accumulation. Routed products use the existing W4A4 pipeline and actual expert-ID row strides. Routing uses FlexVec radix sorting, including stable ties and partial output views. Bucket counts, cross-block prefix carries, and scatter positions stay in VEC/URAM; scalar code only controls loops and addresses. Mega combines a BF16 attention segment with routing, experts, shared experts, and the F32 residual. It accepts initial and later decode graphs, including omitted state SCALE slots and contiguous ADD slots lowered as residual adds.
+The backend supports these operators. F32 matrix products use MAT TF32 with F32 accumulation. Routed products use the existing W4A4 pipeline and actual expert-ID row strides. Standalone sorting uses a stable four-pass scalar radix sort in each Proc's private URAM, including partial output views. It reserves 96 KiB of URAM and no Atomic Cache. MoE mega selects experts from logits in URAM and builds per-core dispatch tables in a reusable device workspace, without shared atomic counters. Its separate `qwen35_moe_mega` entry combines a BF16 attention segment with routing, experts, shared experts, and the F32 residual. It accepts initial and later decode graphs, including omitted state SCALE slots and contiguous ADD slots lowered as residual adds.
 
 ## cmodel and fixture
 

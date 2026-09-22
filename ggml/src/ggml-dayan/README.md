@@ -132,7 +132,7 @@ GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-mxfp4
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-matmul 3 481 513
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-graph
 
-# MXFP4 MoE: routing regression and exact FlexVec radix-sort indices
+# MXFP4 MoE: routing regression and exact URAM radix-sort indices
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-moe
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o ARGSORT \
     -p 'ne=\[(63|64|65|256|4096),3,1,1\]'
@@ -145,6 +145,8 @@ GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o TOP_K \
 ### Check mega and decode graphs
 
 These commands use different references. Dense MXFP4 uses a trained-GGUF smoke run plus the standalone CPU checks above. Dense BF16 uses a random layer against CPU. MoE compares a random two-layer mega graph with standalone Dayan; its CPU operator checks remain separate.
+
+Dense and MoE graphs launch separate kernels, `qwen35_dense_mega` and `qwen35_moe_mega`. Each reserves 272 bytes of Atomic Cache for matrix synchronization and the cluster barrier; the Runtime aligns initialization to 320 bytes. Sorting uses private URAM and reserves no Atomic Cache. MoE routing builds per-core counts and positions in URAM, then stores them in a reusable device workspace sized for the graph. Single-token decode does not use this dispatch workspace.
 
 MoE mega reuses the BF16 attention segment and includes routing, MXFP4 experts, shared experts, and the F32 residual in one launch per layer. Parameter offsets are 64-bit for weights beyond 4 GiB. Benchmark clients can set `GGML_DAYAN_MEGA_TAG` to override the profiler name.
 

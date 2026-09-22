@@ -60,9 +60,9 @@ static void run_router_f32(const DayanMatmulConfig * config, const float * activ
 
 struct SortUramLayout {
     enum : uint64_t {
-        kLanes = (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t),
-        kCounter = kLanes + 256,
-        kTotal = kCounter + 256,
+        kPlane = (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t),
+        kHistogram = 4 * kPlane,
+        kTotal = kHistogram + 256 * sizeof(uint32_t),
     };
 };
 
@@ -86,30 +86,6 @@ static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
         DAYAN_PARAMS_ERROR();
     }
     return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
-}
-
-static inline uint64_t moe_dispatch_base() {
-    return (uint64_t) (uintptr_t) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES;
-}
-
-static inline volatile uint32_t * moe_dispatch_counts() {
-    return (volatile uint32_t *) (uintptr_t) moe_dispatch_base();
-}
-
-static inline uint32_t * moe_dispatch_positions() {
-    return (uint32_t *) (uintptr_t) (moe_dispatch_base() + (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t));
-}
-
-static inline uint32_t * moe_dispatch_offsets(uint32_t total) {
-    return (uint32_t *) (uintptr_t) (moe_dispatch_base() + (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t) +
-                                      (uint64_t) total * sizeof(uint32_t));
-}
-
-static inline bool moe_dispatch_fits(uint32_t experts, uint32_t total) {
-    const uint64_t end = (uint64_t) MATMUL_DAYAN_4C_ATOMIC_BYTES +
-                         (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t) +
-                         (uint64_t) (total + experts + 1U) * sizeof(uint32_t);
-    return shared != nullptr && end <= DAYAN_SORT_ATOMIC_BYTES;
 }
 
 static inline void moe_copy_mxfp4_row(void * destination, const DayanMxfp4Layout & destination_layout,
@@ -158,50 +134,54 @@ static inline void moe_copy_output_row(void * destination, uint64_t destination_
 }
 
 static inline int run_router_indexer_f32(const DayanRouterIndexerConfig * config, const float * activation,
-                                         const float * weight, float * logits, int32_t * selected) {
+                                         const float * weight, float * logits, int32_t * selected, void * workspace) {
     if (!config || !activation || !weight || !logits || !selected || !config->matmul.m || !config->matmul.n ||
         !config->matmul.k || !config->experts_used || config->matmul.n > kDayanSortMaxWidth ||
-        config->experts_used > config->matmul.n ||
-        config->selected_stride < (uint64_t) config->experts_used * sizeof(int32_t)) {
+        config->matmul.m > UINT32_MAX || config->experts_used > config->matmul.n ||
+        config->selected_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
+        dayan_native_task_count() != 4) {
+        return -22;
+    }
+    const uint32_t task = dayan_native_task_id();
+    const uint32_t tokens = (uint32_t) config->matmul.m;
+    const uint32_t experts = (uint32_t) config->matmul.n;
+    const bool grouped = config->grouped != 0;
+    const auto layout = DayanMoeDispatchLayout::make(tokens, experts, config->experts_used);
+    const uint64_t uram = (uintptr_t) dayan_uram_base();
+    const uint64_t logits_uram = uram + (grouped ? layout.count_stride + layout.position_stride : 0);
+    const uint64_t selected_uram = logits_uram + layout.count_stride;
+    const uint64_t prefix_bytes = 4 * layout.count_stride + ((experts + 1ULL) * sizeof(uint32_t));
+    if (!shared || (grouped && (!workspace || layout.bytes > config->workspace_bytes)) ||
+        selected_uram - uram + config->experts_used * sizeof(int32_t) > dayan_uram_size() ||
+        prefix_bytes > dayan_uram_size()) {
         return -22;
     }
     run_router_f32(&config->matmul, activation, weight, logits);
     dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
+        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
     int status = dayan_cluster_barrier(4, barrier);
     if (status < 0) { return status; }
 
-    const bool grouped = config->grouped != 0;
-    const uint32_t total = (uint32_t) (config->matmul.m * config->experts_used);
-    if (grouped && !moe_dispatch_fits((uint32_t) config->matmul.n, total)) {
-        return -22;
-    }
-    volatile uint32_t * counts = grouped ? moe_dispatch_counts() : nullptr;
-    uint32_t * positions = grouped ? moe_dispatch_positions() : nullptr;
-    uint32_t * offsets = grouped ? moe_dispatch_offsets(total) : nullptr;
-    if (grouped && dayan_native_task_id() == 0) {
-        for (uint32_t expert = 0; expert < config->matmul.n; ++expert) {
+    uint32_t * counts = (uint32_t *) uram;
+    uint32_t * positions = (uint32_t *) (uram + layout.count_stride);
+    if (grouped) {
+        for (uint32_t expert = 0; expert < experts; ++expert) {
             counts[expert] = 0;
         }
     }
-    status = dayan_cluster_barrier(4, barrier);
-    if (status < 0) { return status; }
-
-    const uint32_t task = dayan_native_task_id();
-    const uint32_t tasks = dayan_native_task_count();
-    // TODO: replace the scalar per-token top-k scan with a FlexVec/radix selection pass.
-    for (uint32_t token = task; token < config->matmul.m; token += tasks) {
-        int32_t * row = (int32_t *) ((char *) selected + (uint64_t) token * config->selected_stride);
+    for (uint32_t token = task; token < tokens; token += 4) {
+        memory_load_bytes(logits_uram, (const char *) logits + (uint64_t) token * config->matmul.output_stride,
+                          (uint64_t) experts * sizeof(float));
+        int32_t * row = (int32_t *) selected_uram;
         for (uint32_t rank = 0; rank < config->experts_used; ++rank) {
             float best = -3.402823466e+38F;
             int32_t best_expert = -1;
-            for (uint32_t expert = 0; expert < config->matmul.n; ++expert) {
+            for (uint32_t expert = 0; expert < experts; ++expert) {
                 bool already = false;
                 for (uint32_t previous = 0; previous < rank; ++previous) {
                     already = already || row[previous] == (int32_t) expert;
                 }
-                const float value = ((const float *) ((const char *) logits +
-                                                       (uint64_t) token * config->matmul.output_stride))[expert];
+                const float value = ((const float *) logits_uram)[expert];
                 if (!already && (best_expert < 0 || value > best)) {
                     best = value;
                     best_expert = (int32_t) expert;
@@ -210,24 +190,40 @@ static inline int run_router_indexer_f32(const DayanRouterIndexerConfig * config
             if (best_expert < 0) { return -22; }
             row[rank] = best_expert;
             if (grouped) {
-                const uint32_t assignment = token * config->experts_used + rank;
-                positions[assignment] = __atomic_fetch_add((uint32_t *) &counts[best_expert], 1U, __ATOMIC_RELAXED);
+                positions[(uint64_t) (token / 4) * config->experts_used + rank] = counts[best_expert]++;
             }
         }
+        memory_store_bytes((char *) selected + (uint64_t) token * config->selected_stride, selected_uram,
+                           (uint64_t) config->experts_used * sizeof(int32_t));
     }
-    status = dayan_cluster_barrier(4, barrier);
-    if (status < 0) { return status; }
     if (!grouped) {
         return dayan_cluster_barrier(4, barrier);
     }
-    if (dayan_native_task_id() == 0) {
-        // TODO: compute this expert-count prefix with FlexVec Shuffle instead of the scalar carry loop.
+    memory_store_bytes((char *) workspace + task * layout.count_stride, uram, experts * sizeof(uint32_t));
+    const uint64_t local_tokens = ((uint64_t) tokens + 3U - task) / 4U;
+    if (local_tokens) {
+        memory_store_bytes((char *) workspace + layout.positions_offset + task * layout.position_stride,
+                           (uintptr_t) positions, local_tokens * config->experts_used * sizeof(uint32_t));
+    }
+    status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+    if (task == 0) {
+        memory_load_bytes(uram, workspace, 4 * layout.count_stride);
+        uint32_t * offsets = (uint32_t *) (uram + 4 * layout.count_stride);
         uint32_t running = 0;
-        for (uint32_t expert = 0; expert < config->matmul.n; ++expert) {
+        for (uint32_t expert = 0; expert < experts; ++expert) {
             offsets[expert] = running;
-            running += counts[expert];
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+                uint32_t & count = ((uint32_t *) (uram + lane * layout.count_stride))[expert];
+                const uint32_t size = count;
+                count = running - offsets[expert];
+                running += size;
+            }
         }
-        offsets[config->matmul.n] = running;
+        offsets[experts] = running;
+        memory_store_bytes(workspace, uram, 4 * layout.count_stride);
+        memory_store_bytes((char *) workspace + layout.offsets_offset, (uintptr_t) offsets,
+                           (experts + 1ULL) * sizeof(uint32_t));
     }
     return dayan_cluster_barrier(4, barrier);
 }
@@ -240,24 +236,28 @@ static int run_mul_mat_id_mxfp4_grouped(const DayanMxfp4MoeConfig * config, cons
     }
     const auto & r = config->routing;
     const auto & mm = config->matmul;
+    if (!r.experts_used || r.tokens > UINT32_MAX / r.experts_used || r.experts > kDayanSortMaxWidth) {
+        return -22;
+    }
     const uint32_t total = r.tokens * r.experts_used;
+    const auto dispatch = DayanMoeDispatchLayout::make(r.tokens, r.experts, r.experts_used);
     const DayanMxfp4Layout input_layout = DayanMxfp4Layout::make(total, mm.k);
     const DayanMxfp4Layout output_layout = DayanMxfp4Layout::make(total, mm.n);
     const uint64_t output_bytes = mm.output_type == kDayanDataTypeMXFP4 ? output_layout.bytes :
                                                                             (uint64_t) total * mm.n * sizeof(float);
     const uint64_t output_offset = (input_layout.bytes + 63U) & ~63ULL;
-    const uint64_t required = output_offset + ((output_bytes + 63U) & ~63ULL);
+    const uint64_t required = dispatch.bytes + output_offset + ((output_bytes + 63U) & ~63ULL);
     if (!config || !workspace || !shared || !a || !as || !b || !bs || !up || !ups || !ids || !output ||
         !r.tokens || !r.experts_used || !r.experts || !r.activation_slots || !config->workspace_bytes ||
-        !moe_dispatch_fits(r.experts, total) || required > config->workspace_bytes || r.experts_used % r.activation_slots ||
+        required > config->workspace_bytes || r.experts_used % r.activation_slots || dayan_native_task_count() != 4 ||
         mm.m != 1 || mm.weight_type != kDayanDataTypeMXFP4 ||
         (mm.output_type == kDayanDataTypeMXFP4 && !scales)) {
         return -22;
     }
-    uint32_t * positions = moe_dispatch_positions();
-    uint32_t * offsets = moe_dispatch_offsets(total);
+    dayan_cache_invalidate(workspace, dispatch.bytes);
+    const uint32_t * offsets = (const uint32_t *) ((const char *) workspace + dispatch.offsets_offset);
     if (offsets[r.experts] != total) { return -22; }
-    const uint64_t grouped_a = (uintptr_t) workspace;
+    const uint64_t grouped_a = (uintptr_t) workspace + dispatch.bytes;
     const uint64_t grouped_as = grouped_a + input_layout.scale_offset;
     const uint64_t grouped_output = grouped_a + output_offset;
     const uint64_t grouped_output_scales = grouped_output + output_layout.scale_offset;
@@ -270,13 +270,16 @@ static int run_mul_mat_id_mxfp4_grouped(const DayanMxfp4MoeConfig * config, cons
         const uint32_t used = assignment % r.experts_used;
         const int32_t expert = moe_read_expert((const int32_t *) ((const char *) ids + (uint64_t) token * r.ids_row_stride), used);
         if (expert < 0 || (uint32_t) expert >= r.experts) { return -22; }
-        const uint32_t group_row = offsets[expert] + positions[assignment];
+        const uint32_t * counts = (const uint32_t *) ((const char *) workspace + (token % 4) * dispatch.count_stride);
+        const uint32_t * positions = (const uint32_t *) ((const char *) workspace + dispatch.positions_offset +
+                                                        (token % 4) * dispatch.position_stride);
+        const uint32_t group_row = offsets[expert] + counts[expert] + positions[(uint64_t) (token / 4) * r.experts_used + used];
         const uint32_t input_row = token * r.activation_slots + used % r.activation_slots;
         moe_copy_mxfp4_row((void *) grouped_a, input_layout, group_row, (void *) grouped_as,
                            source_layout, input_row, a, as, mm.a_scale_stride);
     }
     dayan_cluster_barrier_t * barrier =
-        (dayan_cluster_barrier_t *) ((char *) shared + DAYAN_SORT_ATOMIC_BYTES);
+        (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
     int status = dayan_cluster_barrier(4, barrier);
     if (status < 0) { return status; }
 
@@ -311,7 +314,10 @@ static int run_mul_mat_id_mxfp4_grouped(const DayanMxfp4MoeConfig * config, cons
         const uint32_t used = assignment % r.experts_used;
         const int32_t expert = moe_read_expert((const int32_t *) ((const char *) ids + (uint64_t) token * r.ids_row_stride), used);
         if (expert < 0 || (uint32_t) expert >= r.experts) { return -22; }
-        const uint32_t group_row = offsets[expert] + positions[assignment];
+        const uint32_t * counts = (const uint32_t *) ((const char *) workspace + (token % 4) * dispatch.count_stride);
+        const uint32_t * positions = (const uint32_t *) ((const char *) workspace + dispatch.positions_offset +
+                                                        (token % 4) * dispatch.position_stride);
+        const uint32_t group_row = offsets[expert] + counts[expert] + positions[(uint64_t) (token / 4) * r.experts_used + used];
         moe_copy_output_row(output, mm.output_stride, scales, mm.output_scale_stride, output_layout, assignment,
                             (const void *) grouped_output, batch.output_stride,
                             mm.output_type == kDayanDataTypeMXFP4 ? (const void *) grouped_output_scales : nullptr,
@@ -501,127 +507,57 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     }
 }
 
-template <int Shift> static inline void sort_scan_step() {
-    __tx_vec_lsu_g2s<0>((long) (~uint64_t{0} << Shift));
-    __tx_vec_shuffle_ror<0, 0>(64 - Shift);
-    __tx_vec_vv_int32_add<0, 1, 0>();
-    __tx_vec_vv_mux2<0, 2, 0, 0>();
-}
-
 template <bool TopK> static void run_sort(const DayanSortConfig * config, const float * input, int32_t * output) {
-    using namespace ggml_dayan_vec_detail;
     memory_validate(config);
     DAYAN_PARAMS_IF(!input || !output || !config->width || !config->rows || !config->output_width ||
                     config->width > kDayanSortMaxWidth || config->output_width > config->width || config->order > 1 ||
                     config->output_stride < config->output_width || (TopK && config->order != kDayanSortOrderDesc) ||
-                    !dayan_uram_base() || dayan_uram_size() < SortUramLayout::kTotal || dayan_native_task_count() > 16) {
+                    !dayan_uram_base() || dayan_uram_size() < SortUramLayout::kTotal) {
         DAYAN_PARAMS_ERROR();
     }
     const uint32_t task = dayan_native_task_id(), tasks = dayan_native_task_count();
     const uint64_t uram = (uintptr_t) dayan_uram_base();
-    const uint64_t lanes = uram + SortUramLayout::kLanes, counter = uram + SortUramLayout::kCounter;
-    constexpr uint64_t plane = kDayanSortMaxWidth * sizeof(uint32_t);
-    const uint64_t scratch = (uintptr_t) shared + task * 4 * plane;
-    for (uint32_t i = 0; i < 64; ++i) { ((uint32_t *) lanes)[i] = i; }
-    configure_vec_grid(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
-    const uint32_t padded = (config->width + 63) & ~63U;
+    uint32_t * histogram = (uint32_t *) (uram + SortUramLayout::kHistogram);
     for (uint32_t row = task; row < config->rows; row += tasks) {
         memory_load_bytes(uram, input + (uint64_t) row * config->width, config->width * sizeof(float));
-        for (uint32_t first = 0; first < padded; first += 64) {
-            const uint32_t valid = config->width - first < 64 ? config->width - first : 64;
-            begin_vec_block(19);
-            __tx_vec_lsu_u2v<0, 0>(uram + first * 4);
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-            __tx_vec_vv_fp32_cmp<0, 16, 0, 0b010>();
-            __tx_vec_vv_mux2<0, 0, 16, 0>();
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(31);
-            __tx_vec_vv_int32_sra<0, 0, 16>();
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(0x80000000U);
-            __tx_vec_vv_int32_bitwise<0, 0, 16, 0b1110>();
-            __tx_vec_vv_int32_bitwise<0, 2, 0, 0b0110>();
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(config->order == kDayanSortOrderDesc ? UINT32_MAX : 0);
-            __tx_vec_vv_int32_bitwise<0, 0, 16, 0b0110>();
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(UINT32_MAX);
-            __tx_vec_lsu_g2s<0>(valid == 64 ? UINT64_MAX : (uint64_t{1} << valid) - 1);
-            __tx_vec_vv_mux2<0, 16, 0, 0>();
-            __tx_vec_lsu_v2sm<0, 0>(scratch + first * 4);
-            __tx_vec_lsu_u2v<0, 0>(lanes);
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(first);
-            __tx_vec_vv_int32_add<0, 0, 16>();
-            __tx_vec_lsu_v2sm<0, 0>(scratch + plane + first * 4);
-            start_vec_block(19);
-            dayan_wait_vec();
+        uint32_t * keys = (uint32_t *) uram;
+        uint32_t * ids = (uint32_t *) (uram + SortUramLayout::kPlane);
+        uint32_t * next_keys = (uint32_t *) (uram + 2 * SortUramLayout::kPlane);
+        uint32_t * next_ids = (uint32_t *) (uram + 3 * SortUramLayout::kPlane);
+        for (uint32_t index = 0; index < config->width; ++index) {
+            uint32_t bits = keys[index];
+            // Equal signed zeros keep their input order.
+            if ((bits & 0x7fffffffU) == 0) { bits = 0; }
+            const uint32_t key = bits ^ ((bits & 0x80000000U) ? UINT32_MAX : 0x80000000U);
+            keys[index] = config->order == kDayanSortOrderDesc ? ~key : key;
+            ids[index] = index;
         }
-        uint64_t source = scratch, destination = scratch + 2 * plane;
-        for (uint32_t bit = 0; bit < 32; ++bit) {
-            for (uint32_t first = 0; first < padded; first += 64) {
-                begin_vec_block(36);
-                __tx_vec_lsu_sm2v<0, 0>(source + first * 4);
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(uint32_t{1} << bit);
-                __tx_vec_vv_int32_bitwise<0, 0, 16, 0b1000>();
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-                __tx_vec_vv_int32_cmp<0, 16, 0, 0b010>();
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(1);
-                __tx_vec_vv_mux2<0, 17, 16, 0>();
-                sort_scan_step<1>();
-                sort_scan_step<2>();
-                sort_scan_step<4>();
-                sort_scan_step<8>();
-                sort_scan_step<16>();
-                sort_scan_step<32>();
-                if (first == 0) { __tx_vec_lsu_g2v_broadcast32<1, 1>(0); }
-                else { __tx_vec_lsu_u2v<1, 1>(counter); }
-                __tx_vec_vv_int32_add<0, 0, 16>();
-                __tx_vec_lsu_v2u<0, 0>(uram + first * 4);
-                __tx_vec_shuffle_broadcast<0, 0>(63);
-                __tx_vec_lsu_v2u<0, 0>(counter);
-                start_vec_block(36);
-                dayan_wait_vec();
+        for (uint32_t shift = 0; shift < 32; shift += 8) {
+            for (uint32_t bin = 0; bin < 256; ++bin) { histogram[bin] = 0; }
+            for (uint32_t index = 0; index < config->width; ++index) {
+                ++histogram[(keys[index] >> shift) & 255U];
             }
-            for (uint32_t first = 0; first < padded; first += 64) {
-                begin_vec_block(22);
-                __tx_vec_lsu_u2v<0, 0>(uram + first * 4);
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(1);
-                __tx_vec_vv_int32_sub<0, 0, 16>();
-                __tx_vec_lsu_sm2v<1, 0>(source + first * 4);
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(uint32_t{1} << bit);
-                __tx_vec_vv_int32_bitwise<1, 17, 16, 0b1000>();
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-                __tx_vec_vv_int32_cmp<17, 16, 0, 0b010>();
-                __tx_vec_lsu_u2v<1, 0>(lanes);
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(first);
-                __tx_vec_vv_int32_add<1, 17, 16>();
-                __tx_vec_vv_int32_sub<0, 16, 1>();
-                __tx_vec_lsu_u2v<1, 1>(counter);
-                __tx_vec_vv_int32_add<0, 0, 16>();
-                __tx_vec_vv_mux2<0, 0, 2, 0>();
-                __tx_vec_lsu_g2v_broadcast32<1, 1>(2);
-                __tx_vec_vv_int32_sll<0, 0, 16>();
-                __tx_vec_lsu_sm2v<1, 0>(source + first * 4);
-                __tx_vec_lsu_g2s<0>(UINT64_MAX);
-                __tx_vec_v2sm_sparse<16, 0, 0>(destination);
-                __tx_vec_lsu_sm2v<1, 0>(source + plane + first * 4);
-                __tx_vec_v2sm_sparse<16, 0, 0>(destination + plane);
-                start_vec_block(22);
-                dayan_wait_vec();
+            uint32_t offset = 0;
+            for (uint32_t bin = 0; bin < 256; ++bin) {
+                const uint32_t count = histogram[bin];
+                histogram[bin] = offset;
+                offset += count;
             }
-            const uint64_t previous = source;
-            source = destination;
-            destination = previous;
+            for (uint32_t index = 0; index < config->width; ++index) {
+                const uint32_t key = keys[index];
+                const uint32_t destination = histogram[(key >> shift) & 255U]++;
+                next_keys[destination] = key;
+                next_ids[destination] = ids[index];
+            }
+            uint32_t * previous = keys;
+            keys = next_keys;
+            next_keys = previous;
+            previous = ids;
+            ids = next_ids;
+            next_ids = previous;
         }
-        configure_vec_grid((config->output_width + 63) / 64);
-        configure_vec_iterator<kVecV0Base>(0, 0, Constants::kVecBytes, 0);
-        configure_vec_iterator<kVecV3Base>(0, 0, Constants::kVecBytes, 0);
-        begin_vec_block(2);
-        __tx_vec_lsu_sm2v<0, 0>(source + plane);
-        __tx_vec_lsu_v2u<0, 3>(uram);
-        start_vec_block(2);
-        dayan_wait_vec();
-        configure_vec_grid(1);
-        memory_store_bytes(output + (uint64_t) row * config->output_stride, uram, config->output_width * sizeof(int32_t));
+        memory_store_bytes(output + (uint64_t) row * config->output_stride, (uintptr_t) ids,
+                           config->output_width * sizeof(int32_t));
     }
 }
 

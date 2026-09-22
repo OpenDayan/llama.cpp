@@ -91,7 +91,6 @@ int gated_output_projection_bf16(const uintptr_t *, const uint16_t *);
 int matmul_tf32(const uintptr_t *, const uint16_t *);
 int router_indexer(const uintptr_t *, const uint16_t *);
 int matmul_id_mxfp4(const uintptr_t *, const uint16_t *);
-int argsort(const uintptr_t *, const uint16_t *);
 int softmax(const uintptr_t *, const uint16_t *);
 int sum_rows(const uintptr_t *, const uint16_t *);
 int clamp(const uintptr_t *, const uint16_t *);
@@ -120,5 +119,26 @@ int qwen35_dense_mega(
     npu_buffer_t * root14,
     npu_buffer_t * root15,
     const npu_kernel_launch_attrs_t * attrs);
+
+int qwen35_moe_mega(
+    npu_buffer_t * config,
+    npu_buffer_t * root0,
+    npu_buffer_t * root1,
+    npu_buffer_t * root2,
+    npu_buffer_t * root3,
+    npu_buffer_t * root4,
+    npu_buffer_t * root5,
+    npu_buffer_t * root6,
+    npu_buffer_t * root7,
+    npu_buffer_t * root8,
+    npu_buffer_t * root9,
+    npu_buffer_t * root10,
+    npu_buffer_t * root11,
+    npu_buffer_t * root12,
+    npu_buffer_t * root13,
+    npu_buffer_t * root14,
+    npu_buffer_t * root15,
+    const npu_kernel_launch_attrs_t * attrs);
+
 
 #endif

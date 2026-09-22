@@ -32,10 +32,8 @@ enum : uint32_t {
 };
 
 #ifndef DAYAN_SORT_TASK_URAM_BYTES
-#    define DAYAN_SORT_TASK_URAM_BYTES (32U * 1024U)
+#    define DAYAN_SORT_TASK_URAM_BYTES (96U * 1024U)
 #endif
-
-#define DAYAN_SORT_ATOMIC_BYTES (16U * 4U * 4096U * sizeof(uint32_t))
 
 #ifndef DAYAN_SSM_CONV_TASK_URAM_BYTES
 #    define DAYAN_SSM_CONV_TASK_URAM_BYTES (256U * 1024U)
@@ -342,6 +340,22 @@ struct DayanRouterIndexerConfig {
     uint32_t selected_stride;
     uint32_t grouped;
     uint32_t reserved;
+    uint64_t workspace_bytes;
+};
+
+struct DayanMoeDispatchLayout {
+    uint64_t count_stride;
+    uint64_t position_stride;
+    uint64_t positions_offset;
+    uint64_t offsets_offset;
+    uint64_t bytes;
+
+    static DayanMoeDispatchLayout make(uint32_t tokens, uint32_t experts, uint32_t used) {
+        const uint64_t counts = ((uint64_t) experts * sizeof(uint32_t) + 63U) & ~63ULL;
+        const uint64_t positions = ((((uint64_t) tokens + 3U) / 4U) * used * sizeof(uint32_t) + 63U) & ~63ULL;
+        const uint64_t offsets = (((uint64_t) experts + 1U) * sizeof(uint32_t) + 63U) & ~63ULL;
+        return {counts, positions, 4U * counts, 4U * (counts + positions), 4U * (counts + positions) + offsets};
+    }
 };
 
 struct DayanAddIdConfig {
@@ -364,10 +378,6 @@ enum : uint32_t {
     kDayanSortMaxWidth = 4096,
     kDayanSortOrderAsc  = 0,
     kDayanSortOrderDesc = 1,
-};
-
-enum : uint32_t {
-    DAYAN_MOE_WORKSPACE_BYTES = 16U * 1024U * 1024U,
 };
 
 struct DayanClampConfig {

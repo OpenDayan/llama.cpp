@@ -3399,7 +3399,9 @@ static int ggml_backend_dayan_mega_launch(void * context,
         ggml_backend_dayan_init_launch_attrs(
             ctx, tag && tag[0] ? tag : linear ? "q35-linear" : "q35-full-mega", &attrs);
         attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
-        status = qwen35_dense_mega(
+        const bool moe = graph == kDayanMegaQwen35MoeLinear || graph == kDayanMegaQwen35MoeFull;
+        const auto launch = moe ? qwen35_moe_mega : qwen35_dense_mega;
+        status = launch(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
             arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],
             arguments[13], arguments[14], arguments[15], &attrs);

@@ -154,7 +154,7 @@ const Operation Qwen35MoeFfnGraph<Base>::operations[] = {
                               P::p_norm_residual, P::p_norm_rms, P::p_norm_scaled, P::p_norm_lowp>::values },
     { nullptr, nullptr },
     { router_indexer, Arguments<P::p_router_config, P::p_router_weight, P::p_router_input, P::p_router_logits,
-                                 P::p_router_selected>::values },
+                                 P::p_router_selected, P::p_experts_workspace>::values },
     { nullptr, nullptr },
     { softmax, Arguments<P::p_probs_config, P::p_probs_input, P::p_probs_output>::values },
     { nullptr, nullptr },

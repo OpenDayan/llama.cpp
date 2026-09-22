@@ -5846,7 +5846,7 @@ struct test_argsort : public test_case {
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        data[i] = (i - t->ne[0] / 2) * 0.125f;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -9378,6 +9378,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t width : {63, 64, 65, 256, 4096}) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {width, 3, 1, 1}, order));
         }
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {4096, 17, 1, 1}, order));
         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i, 1, 1, 1}));
