@@ -285,20 +285,6 @@ static inline void memory_issue_fill(uint64_t destination, uint64_t source, uint
     memory_issue_fill_dimensions(destination, source, bytes, nullptr, 0);
 }
 
-static inline void memory_issue_copy_rows(uint64_t destination,
-                                          uint64_t source,
-                                          uint64_t row_bytes,
-                                          const uint64_t counts[3],
-                                          const uint64_t input_strides[3],
-                                          const uint64_t output_strides[3]) {
-    MemoryCopyDimension dimensions[3] = {
-        { counts[0], input_strides[0], output_strides[0] },
-        { counts[1], input_strides[1], output_strides[1] },
-        { counts[2], input_strides[2], output_strides[2] },
-    };
-    memory_issue_copy_dimensions(destination, source, row_bytes, dimensions, 3);
-}
-
 static inline bool memory_issue_linear_copy(uint64_t destination,
                                             uint64_t source,
                                             uint64_t bytes) {
@@ -329,6 +315,44 @@ static inline bool memory_issue_linear_copy(uint64_t destination,
     return issued;
 }
 
+template <long ElementLog2>
+static inline void memory_transpose_copy(uint64_t destination, uint64_t source, const uint32_t ne[4],
+                                         const uint64_t input_nb[4], const uint64_t output_nb[4]) {
+    constexpr uint32_t tile = 32;
+    constexpr uint32_t bytes = 1U << ElementLog2;
+    constexpr uint32_t stride = tile * bytes;
+    const uint64_t staging = (uint64_t) dayan_uram_base();
+    const uint64_t transposed = staging + tile * stride;
+    static_assert(2 * tile * stride <= DAYAN_NATIVE_TASK_URAM_BYTES, "Transpose tile exceeds URAM");
+    for (uint32_t i3 = 0; i3 < ne[3]; ++i3) {
+        for (uint32_t i2 = 0; i2 < ne[2]; ++i2) {
+            for (uint32_t i0 = 0; i0 < ne[0]; i0 += tile) {
+                const uint32_t rows = min_int(tile, ne[0] - i0);
+                for (uint32_t i1 = 0; i1 < ne[1]; i1 += tile) {
+                    const uint32_t columns = min_int(tile, ne[1] - i1);
+                    const uint64_t src = source + i3 * input_nb[3] + i2 * input_nb[2] + i0 * input_nb[0] + i1 * bytes;
+                    const uint64_t dst = destination + i3 * output_nb[3] + i2 * output_nb[2] + i0 * bytes + i1 * output_nb[1];
+                    long checksum = 0;
+                    if (((src | input_nb[0]) & 63U) == 0 && rows % (64 / bytes) == 0 && columns % (64 / bytes) == 0) {
+                        set_lsu_matrix<0, true, ElementLog2>(checksum, rows, columns * bytes, input_nb[0], stride);
+                        __tx_lsu_dma_d2u<0>(transposed, src);
+                    } else {
+                        set_lsu_matrix<0>(checksum, rows, stride, input_nb[0], stride);
+                        load_matrix<0>(columns * bytes, rows, stride, rows, staging, src);
+                        dayan_wait_lsu();
+                        set_lsu_matrix<0, true, ElementLog2>(checksum, tile, stride, stride, stride);
+                        __tx_lsu_dma_u2u<0>(transposed, staging);
+                    }
+                    dayan_wait_lsu();
+                    set_lsu_matrix<0>(checksum, columns, stride, stride, output_nb[1]);
+                    store_matrix<0>(rows * bytes, columns, stride, columns, transposed, dst);
+                    dayan_wait_lsu();
+                }
+            }
+        }
+    }
+}
+
 static inline bool memory_issue_tensor_copy(uint64_t destination,
                                             uint64_t source,
                                             const uint32_t ne[4],
@@ -340,56 +364,42 @@ static inline bool memory_issue_tensor_copy(uint64_t destination,
             return false;
         }
     }
-    uint64_t linear_bytes = element_bytes;
-    uint32_t first_outer  = 0;
-    for (; first_outer < 4U; ++first_outer) {
-        if (ne[first_outer] <= 1U) {
-            continue;
+    uint64_t row_bytes = element_bytes;
+    bool merged[4] = {};
+    for (uint32_t pass = 0; pass < 4; ++pass) {
+        for (uint32_t dimension = 0; dimension < 4; ++dimension) {
+            if (!merged[dimension] && (ne[dimension] == 1 ||
+                (input_nb[dimension] == row_bytes && output_nb[dimension] == row_bytes))) {
+                row_bytes *= ne[dimension];
+                merged[dimension] = true;
+            }
         }
-        if (input_nb[first_outer] != linear_bytes || output_nb[first_outer] != linear_bytes) {
-            break;
-        }
-        linear_bytes *= ne[first_outer];
     }
-    bool remaining_unit = true;
-    for (uint32_t dimension = first_outer; dimension < 4U; ++dimension) {
-        remaining_unit = remaining_unit && ne[dimension] == 1U;
-    }
-    if (remaining_unit) {
-        return memory_issue_linear_copy(destination, source, linear_bytes);
-    }
-
-    MemoryCopyDimension dimensions[4] = {
-        { 1, 0, 0 },
-        { 1, 0, 0 },
-        { 1, 0, 0 },
-        { 1, 0, 0 },
-    };
+    MemoryCopyDimension dimensions[4] = {};
     uint32_t dimension_count = 0;
-    uint64_t row_bytes       = linear_bytes;
-    if (row_bytes == element_bytes && first_outer == 0U) {
-        dimensions[dimension_count++] = { ne[0], input_nb[0], output_nb[0] };
-        first_outer = 1U;
+    for (uint32_t dimension = 0; dimension < 4; ++dimension) {
+        if (!merged[dimension]) {
+            dimensions[dimension_count++] = { ne[dimension], input_nb[dimension], output_nb[dimension] };
+        }
     }
-    for (uint32_t dimension = first_outer; dimension < 4U; ++dimension) {
-        dimensions[dimension_count++] = { ne[dimension], input_nb[dimension], output_nb[dimension] };
+    if (dimension_count == 0) {
+        return memory_issue_linear_copy(destination, source, row_bytes);
     }
-    dimension_count = memory_compact_dimensions(dimensions, dimension_count);
-
-    if (row_bytes == element_bytes) {
-        memory_issue_region(destination, source, (uint32_t) row_bytes, dimensions, dimension_count);
-        return true;
+    if (input_nb[1] == element_bytes && output_nb[0] == element_bytes &&
+        input_nb[0] >= (uint64_t) ne[1] * element_bytes && output_nb[1] >= (uint64_t) ne[0] * element_bytes &&
+        input_nb[0] <= kMemoryLsuMaxStride / 32 && memory_stride_fits(output_nb[1])) {
+        // Transpose aligned URAM tiles instead of issuing one DRAM request per element.
+        dayan_wait_lsu();
+        if (element_bytes == 4) {
+            memory_transpose_copy<2>(destination, source, ne, input_nb, output_nb);
+            return true;
+        }
+        if (element_bytes == 2) {
+            memory_transpose_copy<1>(destination, source, ne, input_nb, output_nb);
+            return true;
+        }
     }
-
-    uint64_t counts[3]         = { 1, 1, 1 };
-    uint64_t input_strides[3]  = { 0, 0, 0 };
-    uint64_t output_strides[3] = { 0, 0, 0 };
-    for (uint32_t index = 0; index < dimension_count; ++index) {
-        counts[index]         = dimensions[index].count;
-        input_strides[index]  = dimensions[index].input_stride;
-        output_strides[index] = dimensions[index].output_stride;
-    }
-    memory_issue_copy_rows(destination, source, row_bytes, counts, input_strides, output_strides);
+    memory_issue_copy_dimensions(destination, source, row_bytes, dimensions, dimension_count);
     return true;
 }
 

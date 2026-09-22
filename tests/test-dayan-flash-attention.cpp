@@ -129,7 +129,8 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
     constexpr int64_t kv_heads = 2;
     constexpr int64_t batch    = 1;
 
-    attention_graph reference = build_graph(GGML_TYPE_F32, type, head_dim, q_len, physical_kv_len, q_heads,
+    // Keep reference accumulation in F32 for long decode sequences.
+    attention_graph reference = build_graph(GGML_TYPE_F32, GGML_TYPE_F32, head_dim, q_len, physical_kv_len, q_heads,
                                             kv_heads, batch, true, true);
     attention_graph actual    = build_graph(type, type, head_dim, q_len, physical_kv_len, q_heads,
                                             kv_heads, batch, true, true);
@@ -153,7 +154,8 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
     for (size_t index = 0; index < q_f32.size(); ++index) {
         const float value = distribution(generator);
         q_lowp[index] = type == GGML_TYPE_BF16 ? ggml_fp32_to_bf16(value).bits : ggml_fp32_to_fp16(value);
-        q_f32[index] = type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_bf16_t{q_lowp[index]}) : ggml_fp16_to_fp32(q_lowp[index]);
+        // MAT drops the low three FP16 fraction bits.
+        q_f32[index] = type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_bf16_t{q_lowp[index]}) : ggml_fp16_to_fp32(q_lowp[index] & 0xfff8U);
     }
     for (uint16_t & value : k) {
         const float input = distribution(generator);
@@ -173,9 +175,16 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
 
     ggml_backend_tensor_set(reference.q_input, q_f32.data(), 0, ggml_nbytes(reference.q_input));
     ggml_backend_tensor_set(actual.q_input, q_lowp.data(), 0, ggml_nbytes(actual.q_input));
+    std::vector<float> k_f32(k.size()), v_f32(v.size());
+    for (size_t i = 0; i < k.size(); ++i) {
+        k_f32[i] = type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_bf16_t{k[i]}) : ggml_fp16_to_fp32(k[i] & 0xfff8U);
+        v_f32[i] = type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_bf16_t{v[i]}) : ggml_fp16_to_fp32(v[i] & 0xfff8U);
+    }
+    ggml_backend_tensor_set(reference.k_input, k_f32.data(), 0, ggml_nbytes(reference.k_input));
+    ggml_backend_tensor_set(reference.v_input, v_f32.data(), 0, ggml_nbytes(reference.v_input));
+    ggml_backend_tensor_set(actual.k_input, k.data(), 0, ggml_nbytes(actual.k_input));
+    ggml_backend_tensor_set(actual.v_input, v.data(), 0, ggml_nbytes(actual.v_input));
     for (attention_graph * graph : { &reference, &actual }) {
-        ggml_backend_tensor_set(graph->k_input, k.data(), 0, ggml_nbytes(graph->k_input));
-        ggml_backend_tensor_set(graph->v_input, v.data(), 0, ggml_nbytes(graph->v_input));
         ggml_backend_tensor_set(graph->mask, mask.data(), 0, ggml_nbytes(graph->mask));
     }
 
@@ -188,16 +197,14 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
 
     float max_abs;
     float max_rel;
-    if (!compare_outputs(reference.output, actual.output, &max_abs, &max_rel)) {
-        return fail("permuted numerical comparison failed");
-    }
+    const bool close = compare_outputs(reference.output, actual.output, &max_abs, &max_rel);
 
     std::printf(
         "permuted type=%s q_len=%lld physical_kv_len=%lld effective_kv_len=%lld head_dim=%lld "
         "max_abs=%g max_rel=%g\n",
         ggml_type_name(type), (long long) q_len, (long long) physical_kv_len, (long long) effective_kv_len, (long long) head_dim, max_abs,
         max_rel);
-    return 0;
+    return close ? 0 : fail("permuted numerical comparison failed");
 }
 
 int main() {
@@ -296,6 +303,8 @@ int main() {
         test_permuted_cache_layout(dayan.get(), cpu.get(), 4, 4, 4, 0x35f26U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 1, 0x35f18U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 2048, 1025, 0x35f20U) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 2048, 1025, 0x35f27U, GGML_TYPE_F16) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 2048, 1026, 0x35f28U, GGML_TYPE_F16) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 513, 0x35f21U, GGML_TYPE_F16) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 128, 512, 128, 0x35f24U, GGML_TYPE_F16) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 512, 129, 0x35f25U, GGML_TYPE_F16) != 0 ||

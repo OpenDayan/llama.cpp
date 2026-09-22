@@ -241,8 +241,13 @@ static size_t ggml_backend_dayan_slot_outputs(const ggml_backend_dayan_graph_slo
         case ggml_backend_dayan_slot_kind::gated_output_projection:
             outputs[0] = slot.nodes[2];
             return 1;
+        case ggml_backend_dayan_slot_kind::ssm_conv:
         case ggml_backend_dayan_slot_kind::ssm_conv_silu:
-            outputs[0] = slot.nodes[1];
+            outputs[0] = slot.nodes[1] != nullptr ? slot.nodes[1] : slot.nodes[0];
+            if (slot.nodes[3] != nullptr) {
+                outputs[1] = slot.nodes[3];
+                return 2;
+            }
             return 1;
         default:
             outputs[0] = slot.nodes[0];
@@ -596,6 +601,11 @@ ggml_backend_dayan_slot_implementation_info(const ggml_backend_dayan_graph_slot 
     if (slot.kind == ggml_backend_dayan_slot_kind::gated_delta_net) {
         result.task_dim_x = topology.launch(false, node->src[2]->ne[1] * node->src[2]->ne[3]).task_dim.x;
     }
+    if (slot.nodes[2] != nullptr && (slot.kind == ggml_backend_dayan_slot_kind::ssm_conv ||
+        slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu)) {
+        result.launch_name = "ssm-conv-split";
+        result.kernel = "ssm_conv_split_f32_1c";
+    }
     if (slot.kind == ggml_backend_dayan_slot_kind::ssm_conv || slot.kind == ggml_backend_dayan_slot_kind::ssm_conv_silu) {
         result.task_dim_x = dayan_ssm_conv_task_count(node->ne[0], node->ne[1], node->ne[2], topology.cores);
     }
@@ -734,7 +744,12 @@ static void ggml_backend_dayan_slot_inputs(const ggml_backend_dayan_graph_slot &
         } break;
         case ggml_backend_dayan_slot_kind::ssm_conv:
         case ggml_backend_dayan_slot_kind::ssm_conv_silu:
-            ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            if (slot.nodes[2] != nullptr) {
+                ggml_backend_dayan_plan_add_input(result, slot.nodes[2]->src[0], "state");
+                ggml_backend_dayan_plan_add_input(result, slot.nodes[2]->src[1]->src[0], "qkv");
+            } else {
+                ggml_backend_dayan_plan_add_input(result, node->src[0], "input");
+            }
             ggml_backend_dayan_plan_add_input(result, node->src[1], "weight");
             break;
         default:
@@ -3012,10 +3027,17 @@ static int ggml_backend_dayan_ssm_conv(ggml_backend_dayan_context * ctx, const g
         ggml_backend_dayan_prepare_launch_buffers(ctx, &config, sizeof(config), 0, &buffers);
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        ggml_backend_dayan_init_launch_attrs(ctx, "ssm-conv", &attrs);
+        ggml_backend_dayan_init_launch_attrs(ctx, slot.nodes[2] != nullptr ? "ssm-conv-split" : "ssm-conv", &attrs);
         attrs.config = ctx->device->topology.launch(false, dayan_ssm_conv_task_count(config.channels, config.tokens, config.sequences, ctx->device->topology.cores));
-        status = ssm_conv_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(input),
-                                 ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(output), &attrs);
+        if (slot.nodes[2] != nullptr) {
+            status = ssm_conv_split_f32_1c(buffers.config,
+                ggml_backend_dayan_tensor_buffer(slot.nodes[2]->src[0]), ggml_backend_dayan_tensor_buffer(weight),
+                ggml_backend_dayan_tensor_buffer(output), ggml_backend_dayan_tensor_buffer(slot.nodes[2]->src[1]),
+                ggml_backend_dayan_tensor_buffer(slot.nodes[3]), &attrs);
+        } else {
+            status = ssm_conv_f32_1c(buffers.config, ggml_backend_dayan_tensor_buffer(input),
+                                     ggml_backend_dayan_tensor_buffer(weight), ggml_backend_dayan_tensor_buffer(output), &attrs);
+        }
     }
     ggml_backend_dayan_buffers_free(&buffers, &status);
     if (status < 0) {

@@ -35,7 +35,7 @@ static run_result run(llama_model * model, launch_counter counter, const json & 
     params.n_threads = params.n_threads_batch = 8;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model, params), llama_free);
-    if (!ctx) { throw std::runtime_error("cannot create MoE context"); }
+    if (!ctx) { throw std::runtime_error("cannot create model context"); }
     const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     run_result result;
     for (int step = 0; step < steps; ++step) {
@@ -47,7 +47,7 @@ static run_result run(llama_model * model, launch_counter counter, const json & 
         const uint64_t before = counter();
         const auto start = std::chrono::steady_clock::now();
         if (llama_decode(ctx.get(), llama_batch_get_one(input.data(), count)) != 0) {
-            throw std::runtime_error("MoE inference failed");
+            throw std::runtime_error("model inference failed");
         }
         llama_synchronize(ctx.get());
         if (measured) { result.wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
@@ -68,7 +68,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     if (argc != 4) {
-        std::fprintf(stderr, "usage: %s CASE.json RESULT.json TAG (DAYAN_MOE_MODEL selects the random fixture)\n", argv[0]);
+        std::fprintf(stderr, "usage: %s CASE.json RESULT.json TAG (DAYAN_MEGA_MODEL or DAYAN_MOE_MODEL selects the fixture)\n", argv[0]);
         return 1;
     }
     json result = {{"status", "failed"}, {"samples", json::array()}};
@@ -78,14 +78,15 @@ int main(int argc, char ** argv) {
         std::ifstream input(argv[1]);
         const json spec = json::parse(input);
         result["case"] = spec;
-        if (spec.value("op", "") != "mega" || spec.value("mode", "") != "hybrid" || spec.value("layers", 0) != 2 ||
-            spec.value("dtype", "") != "mxfp4" || spec.value("m", 0) < 1 || spec.value("m", 0) > 512 ||
+        if (spec.value("op", "") != "mega" || spec.value("mode", "") != "hybrid" || spec.value("layers", 0) < 1 ||
+            spec.value("dtype", "") != "mxfp4" || spec.value("m", 0) < 1 || spec.value("m", 0) > 1024 ||
             spec.value("repeats", 1) != 1 || spec.value("warmup", 0) != 0 ||
             spec.value("decode_steps", 2) < 2 || spec.value("decode_steps", 2) > 16 || !argv[3][0] || std::strlen(argv[3]) > 15) {
-            throw std::runtime_error("expected a two-layer MoE hybrid case with at least two follow-up decode steps");
+            throw std::runtime_error("expected a hybrid case with at least two follow-up decode steps");
         }
-        const char * path = std::getenv("DAYAN_MOE_MODEL");
-        if (!path || !path[0]) { throw std::runtime_error("set DAYAN_MOE_MODEL to the two-layer MXFP4 MoE fixture"); }
+        const char * path = std::getenv("DAYAN_MEGA_MODEL");
+        if (!path || !path[0]) { path = std::getenv("DAYAN_MOE_MODEL"); }
+        if (!path || !path[0]) { throw std::runtime_error("set DAYAN_MEGA_MODEL to an MXFP4 model or fixture"); }
         ggml_backend_load_all();
         ggml_backend_dev_t device = ggml_backend_dev_by_name("DAYAN");
         if (!device) { throw std::runtime_error("Dayan backend is unavailable"); }
@@ -96,10 +97,12 @@ int main(int argc, char ** argv) {
         params.devices = devices;
         params.n_gpu_layers = -1;
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(llama_model_load_from_file(path, params), llama_model_free);
-        if (!model || llama_model_n_layer(model.get()) != 2) { throw std::runtime_error("fixture must contain two layers"); }
+        if (!model || llama_model_n_layer(model.get()) != spec.at("layers").get<int>()) {
+            throw std::runtime_error("model layer count does not match the case");
+        }
         char architecture[64];
         if (llama_model_meta_val_str(model.get(), "general.architecture", architecture, sizeof(architecture)) < 0 ||
-            std::strcmp(architecture, "qwen35moe") != 0) { throw std::runtime_error("fixture must use qwen35moe"); }
+            (std::strcmp(architecture, "qwen35moe") != 0 && std::strcmp(architecture, "qwen35") != 0)) { throw std::runtime_error("fixture must use qwen35 or qwen35moe"); }
         const auto reference_start = std::chrono::steady_clock::now();
         const run_result reference = run(model.get(), counter, spec, argv[3], false);
         result["reference_wall_s"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - reference_start).count();
@@ -124,7 +127,7 @@ int main(int argc, char ** argv) {
         result["model"] = path;
         result["steps"] = steps;
         result["mega_launched"] = true;
-        result["validation"] = "MoE mega versus standalone Dayan, including initial and consecutive decode graphs; CPU operator checks are separate";
+        result["validation"] = "mega versus standalone Dayan, including initial and consecutive decode graphs; CPU operator checks are separate";
         result["checked_elements"] = checked;
         result["max_abs_error"] = max_abs;
         result["comparison"] = {{"status", mismatches ? "fail" : "pass"}, {"checked_elements", checked}, {"mismatched_elements", mismatches},

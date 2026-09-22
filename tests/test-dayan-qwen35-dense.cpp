@@ -39,7 +39,8 @@ struct layer_graph {
     ggml_tensor * attention_norm;
     ggml_tensor * conv_silu;
     ggml_tensor * gated_delta;
-    ggml_tensor * linear_gdn_lowp;
+    ggml_tensor * linear_conv_copy;
+    ggml_tensor * linear_state_copy;
     ggml_tensor * flash_q;
     ggml_tensor * flash_k;
     ggml_tensor * flash_v;
@@ -184,7 +185,7 @@ static ggml_tensor * quantize_to_f32(ggml_context * ctx, ggml_tensor * input, en
     return ggml_cast(ctx, ggml_cast(ctx, input, type), GGML_TYPE_F32);
 }
 
-static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
+static ggml_tensor * build_linear_attention(ggml_context *     ctx,
                                                    const model_case & config,
                                                    ggml_tensor *      input,
                                                    int                layer,
@@ -202,7 +203,7 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     std::snprintf(name, sizeof(name), "blk.%d.ssm_conv.weight", layer);
     ggml_tensor * conv_weight = new_input_2d(ctx, GGML_TYPE_F32, kConvKernel, kConvChannels, name);
     std::snprintf(name, sizeof(name), "blk.%d.ssm_history", layer);
-    ggml_tensor * history = new_input_3d(ctx, GGML_TYPE_F32, kConvKernel - 1, kConvChannels, 1, name);
+    ggml_tensor * history = new_input_2d(ctx, GGML_TYPE_F32, (kConvKernel - 1) * kConvChannels, 1, name);
     std::snprintf(name, sizeof(name), "blk.%d.ssm_state", layer);
     ggml_tensor * state = new_input_4d(ctx, GGML_TYPE_F32, kLinearHeadDim, kLinearHeadDim, kLinearHeads, 1, name);
     std::snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", layer);
@@ -210,9 +211,7 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     std::snprintf(name, sizeof(name), "blk.%d.ssm_a", layer);
     ggml_tensor * a = new_input_1d(ctx, GGML_TYPE_F32, kLinearHeads, name);
     std::snprintf(name, sizeof(name), "blk.%d.linear_indices", layer);
-    ggml_tensor * indices = new_input_1d(ctx, GGML_TYPE_I32, config.n_tokens, name);
-    std::snprintf(name, sizeof(name), "blk.%d.conv_indices", layer);
-    ggml_tensor * conv_indices = new_input_1d(ctx, GGML_TYPE_I32, kConvChannels, name);
+    ggml_tensor * indices = new_input_1d(ctx, GGML_TYPE_I32, 1, name);
     std::snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", layer);
     ggml_tensor * norm_weight = new_input_1d(ctx, GGML_TYPE_F32, kLinearHeadDim, name);
     std::snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", layer);
@@ -221,8 +220,7 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     // CPU mul_mat needs F32 activations for non-BF16 weight types; the Dayan
     // graph casts activations straight to the weight type.
     const bool lowp_activations = !(cpu_reference && config.type != GGML_TYPE_BF16);
-    ggml_tensor * qkv_rows = ggml_get_rows(ctx, ggml_scale(ctx, input, 1.0f), indices);
-    ggml_tensor * qkv_input = lowp_activations ? ggml_cast(ctx, qkv_rows, config.type) : qkv_rows;
+    ggml_tensor * qkv_input = lowp_activations ? ggml_cast(ctx, input, config.type) : input;
     ggml_tensor * qkv   = ggml_mul_mat(ctx, qkv_weight, qkv_input);
     ggml_tensor * z     = ggml_mul_mat(ctx, z_weight, qkv_input);
     ggml_tensor * beta  = ggml_sigmoid(ctx, ggml_mul_mat(ctx, beta_weight, qkv_input));
@@ -230,13 +228,17 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     alpha               = ggml_softplus(ctx, ggml_add(ctx, alpha, dt));
     alpha               = ggml_mul(ctx, alpha, a);
     qkv                 = ggml_transpose(ctx, ggml_reshape_3d(ctx, qkv, kConvChannels, config.n_tokens, 1));
-    ggml_tensor * conv_input = ggml_concat(ctx, history, qkv, 0);
-    ggml_tensor * conv_copy  = ggml_cpy(ctx, conv_input, ggml_dup_tensor(ctx, conv_input));
-    ggml_tensor * conv_scale = ggml_scale(ctx, conv_copy, 1.0f);
-    ggml_tensor * conv_rows  = ggml_get_rows(ctx, conv_scale, conv_indices);
-    ggml_tensor * conv  = ggml_ssm_conv(ctx, ggml_reshape_3d(ctx, conv_rows,
-                                                              kConvKernel - 1 + config.n_tokens,
-                                                              kConvChannels, 1), conv_weight);
+    ggml_tensor * history_rows = ggml_get_rows(ctx, ggml_scale(ctx, history, 1.0f), indices);
+    history_rows = ggml_reshape_3d(ctx, history_rows, kConvKernel - 1, kConvChannels, 1);
+    ggml_tensor * conv_input = ggml_concat(ctx, history_rows, qkv, 0);
+    ggml_tensor * last = ggml_view_3d(ctx, conv_input, kConvKernel - 1, kConvChannels, 1,
+                                    conv_input->nb[1], conv_input->nb[2], config.n_tokens * sizeof(float));
+    result->linear_conv_copy = ggml_cpy(ctx, last, history);
+    ggml_tensor * state_rows = ggml_reshape_2d(ctx, state, kLinearHeadDim * kLinearHeadDim * kLinearHeads, 1);
+    state_rows = ggml_get_rows(ctx, ggml_scale(ctx, state_rows, 1.0f), indices);
+    state_rows = ggml_reshape_4d(ctx, state_rows, kLinearHeadDim, kLinearHeadDim, kLinearHeads, 1);
+    ggml_tensor * conv = ggml_ssm_conv(ctx, conv_input, conv_weight);
+    conv->src[2] = state_rows;
     result->conv_silu   = ggml_silu(ctx, conv);
     ggml_set_output(result->conv_silu);
     const size_t head_stride = kLinearHeadDim * sizeof(float);
@@ -247,10 +249,11 @@ static ggml_tensor * build_linear_attention_legacy(ggml_context *     ctx,
     ggml_tensor * v = ggml_view_4d(ctx, result->conv_silu, kLinearHeadDim, kLinearHeads, config.n_tokens, 1, head_stride, token_stride, seq_stride, 2 * kLinearWidth * sizeof(float));
     beta = ggml_reshape_4d(ctx, beta, 1, kLinearHeads, config.n_tokens, 1);
     alpha = ggml_reshape_4d(ctx, alpha, 1, kLinearHeads, config.n_tokens, 1);
-    result->gated_delta = ggml_gated_delta_net(ctx, q, k, v, alpha, beta, state, 1);
+    result->gated_delta = ggml_gated_delta_net(ctx, q, k, v, alpha, beta, state_rows, 1);
     ggml_set_output(result->gated_delta);
-    result->linear_gdn_lowp = ggml_cast(ctx, result->gated_delta, GGML_TYPE_BF16);
-    ggml_set_output(result->linear_gdn_lowp);
+    ggml_tensor * next_state = ggml_view_4d(ctx, result->gated_delta, kLinearHeadDim, kLinearHeadDim, kLinearHeads, 1,
+        state->nb[1], state->nb[2], state->nb[3], kLinearWidth * config.n_tokens * sizeof(float));
+    result->linear_state_copy = ggml_cpy(ctx, next_state, state);
     ggml_tensor * core = ggml_view_4d(ctx, result->gated_delta, kLinearHeadDim, kLinearHeads, config.n_tokens, 1, kLinearHeadDim * sizeof(float), kLinearWidth * sizeof(float), kLinearWidth * config.n_tokens * sizeof(float), 0);
     core = build_rms_norm(ctx, core, norm_weight, 1.0e-6f);
     core = ggml_mul(ctx, core, ggml_silu(ctx, ggml_reshape_4d(ctx, z, kLinearHeadDim, kLinearHeads, config.n_tokens, 1)));
@@ -456,7 +459,7 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
         ggml_set_output(layer_graph.attention_norm);
         ggml_tensor * attention =
             layer_graph.recurrent ?
-                    build_linear_attention_legacy(ctx, config, normalized, layer, cpu_reference, &layer_graph) :
+                    build_linear_attention(ctx, config, normalized, layer, cpu_reference, &layer_graph) :
                 build_full_attention(ctx, config, normalized, result.positions, result.mask, layer, cpu_reference,
                                      &layer_graph);
         // The BF16 signature models an explicit residual-stream cast; other
@@ -518,9 +521,11 @@ static model_graph build_model_graph(const model_case & config, bool cpu_referen
             ggml_build_forward_expand(result.graph, layer.flash_q);
         }
     }
-    if (config.mode == model_mode::linear) {
-        for (const layer_graph & layer : result.layers) {
-            ggml_build_forward_expand(result.graph, layer.linear_gdn_lowp);
+    for (const layer_graph & layer : result.layers) {
+        if (layer.recurrent) {
+            ggml_build_forward_expand(result.graph, layer.attention_norm);
+            ggml_build_forward_expand(result.graph, layer.linear_conv_copy);
+            ggml_build_forward_expand(result.graph, layer.linear_state_copy);
         }
     }
     ggml_build_forward_expand(result.graph, result.logits);
@@ -849,6 +854,13 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         }
     }
     ggml_graph_clear(reference.graph);
+    for (const auto & layer : reference.layers) {
+        if (layer.recurrent) {
+            ggml_build_forward_expand(reference.graph, layer.attention_norm);
+            ggml_build_forward_expand(reference.graph, layer.linear_conv_copy);
+            ggml_build_forward_expand(reference.graph, layer.linear_state_copy);
+        }
+    }
     ggml_build_forward_expand(reference.graph, reference.logits);
     const tensor_blobs      reference_blobs = make_tensor_blobs(reference, config);
     const tensor_blobs      actual_blobs    = make_tensor_blobs(actual, config);
@@ -872,6 +884,10 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         ggml_backend_sched_set_tensor_backend(scheduler.get(), actual.residual_input, dayan);
     }
     for (const layer_graph & layer : actual.layers) {
+        if (layer.recurrent) {
+            ggml_backend_sched_set_tensor_backend(scheduler.get(), layer.linear_conv_copy->src[1], dayan);
+            ggml_backend_sched_set_tensor_backend(scheduler.get(), layer.linear_state_copy->src[1], dayan);
+        }
         if (!layer.recurrent) {
             ggml_backend_sched_set_tensor_backend(scheduler.get(), layer.full_k_cache, dayan);
             ggml_backend_sched_set_tensor_backend(scheduler.get(), layer.full_v_cache, dayan);

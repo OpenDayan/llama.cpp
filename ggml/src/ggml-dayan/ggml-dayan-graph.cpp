@@ -1371,6 +1371,30 @@ static bool ggml_backend_dayan_preserve_matmul_inputs(const ggml_cgraph * graph)
     return true;
 }
 
+static bool ggml_backend_dayan_preserve_ssm_conv_inputs(const ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * output = graph->nodes[i];
+        ggml_tensor * conv = ggml_backend_dayan_supports_ssm_conv_silu(output) ? output->src[0] : output;
+        if (!ggml_backend_dayan_supports_ssm_conv(conv) || conv->src[0]->op != GGML_OP_CONCAT) {
+            continue;
+        }
+        ggml_tensor * concat = conv->src[0];
+        if (!ggml_backend_dayan_add_dependency(output, concat->src[0]) ||
+            !ggml_backend_dayan_add_dependency(output, concat->src[1]) ||
+            !ggml_backend_dayan_add_dependency(output, conv->src[1])) {
+            return false;
+        }
+        for (int j = 0; j < i; ++j) {
+            ggml_tensor * copy = graph->nodes[j];
+            if (copy->op == GGML_OP_CPY && copy->src[0]->view_src == concat &&
+                !ggml_backend_dayan_add_dependency(output, copy)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx, ggml_cgraph * cgraph) {
     GGML_UNUSED(backend);
 
@@ -1545,7 +1569,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
 
     if (cast_keys.empty()) {
         const bool success = ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) &&
-                             ggml_backend_dayan_preserve_matmul_inputs(cgraph);
+                             ggml_backend_dayan_preserve_matmul_inputs(cgraph) &&
+                             ggml_backend_dayan_preserve_ssm_conv_inputs(cgraph);
         GGML_LOG_DEBUG("%s: no activation casts, embedding-lowp=%zu, residual-lowp=%zu, gated-f32=%zu, time=%.3f ms\n",
                        __func__, embedding_lowp, residual_lowp, gated_f32,
                        (double) (ggml_time_us() - rewrite_start_us) / 1000.0);
@@ -1598,7 +1623,8 @@ bool ggml_backend_dayan_graph_rewrite(ggml_backend_t backend, ggml_context * ctx
             ggml_build_forward_expand(cgraph, node);
         }
     }
-    if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) || !ggml_backend_dayan_preserve_matmul_inputs(cgraph)) {
+    if (!ggml_backend_dayan_preserve_norm_pipeline_inputs(cgraph) || !ggml_backend_dayan_preserve_matmul_inputs(cgraph) ||
+        !ggml_backend_dayan_preserve_ssm_conv_inputs(cgraph)) {
         GGML_LOG_WARN("%s: graph has no source slots for fused input dependencies\n", __func__);
         return false;
     }
@@ -1682,6 +1708,96 @@ static void ggml_backend_dayan_set_norm_pipeline_outputs(const ggml_cgraph *    
     } else {
         slot->output_mask |= kDayanNormSlotOutputScaled;
     }
+}
+
+static void ggml_backend_dayan_fuse_ssm_conv(const ggml_cgraph * graph, ggml_backend_dayan_graph_plan * plan) {
+    std::unordered_set<const ggml_tensor *> elided;
+    for (auto & slot : plan->slots) {
+        if (slot.kind != ggml_backend_dayan_slot_kind::ssm_conv && slot.kind != ggml_backend_dayan_slot_kind::ssm_conv_silu) {
+            continue;
+        }
+        ggml_tensor * conv = slot.nodes[0];
+        ggml_tensor * concat = conv->src[0];
+        if (concat->op != GGML_OP_CONCAT || ggml_get_op_params_i32(concat, 0) != 0 ||
+            concat->src[1]->op != GGML_OP_TRANSPOSE || (concat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        ggml_tensor * state = concat->src[0];
+        ggml_tensor * qkv = concat->src[1]->src[0];
+        const int64_t history = conv->src[1]->ne[0] - 1;
+        if (history < 1 || state->type != GGML_TYPE_F32 || qkv->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(state) || !ggml_is_contiguous(qkv) || state->ne[0] != history ||
+            state->ne[1] != qkv->ne[0] || state->ne[2] != qkv->ne[2] || state->ne[3] != 1 || qkv->ne[3] != 1) {
+            continue;
+        }
+        ggml_tensor * copy = nullptr;
+        bool found_concat = false;
+        for (const auto & candidate : plan->slots) {
+            if (candidate.nodes[0] == conv) {
+                break;
+            }
+            found_concat |= candidate.nodes[0] == concat;
+            ggml_tensor * node = candidate.nodes[0];
+            if (candidate.kind == ggml_backend_dayan_slot_kind::copy && node->src[0]->view_src == concat) {
+                if (copy != nullptr) {
+                    copy = nullptr;
+                    break;
+                }
+                copy = node;
+            }
+        }
+        if (!found_concat || copy == nullptr || copy->src[0]->op != GGML_OP_VIEW ||
+            copy->src[0]->view_offs != (size_t) qkv->ne[1] * sizeof(float) ||
+            copy->type != GGML_TYPE_F32 || !ggml_is_contiguous(copy) ||
+            copy->src[0]->ne[0] != history || copy->src[0]->ne[1] != state->ne[1] ||
+            copy->src[0]->ne[2] != state->ne[2] || ggml_nelements(copy) != ggml_nelements(state) ||
+            copy->src[0]->nb[0] != concat->nb[0] || copy->src[0]->nb[1] != concat->nb[1] ||
+            copy->src[0]->nb[2] != concat->nb[2] ||
+            (copy->src[0]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            continue;
+        }
+        const ggml_tensor * output = slot.nodes[1] != nullptr ? slot.nodes[1] : conv;
+        bool inputs_live = true;
+        for (const ggml_tensor * input : { state, concat->src[1], conv->src[1], copy }) {
+            bool found = false;
+            for (const ggml_tensor * source : output->src) { found |= source == input; }
+            inputs_live &= found;
+        }
+        if (!inputs_live) {
+            continue;
+        }
+        const ggml_tensor * destination = copy->view_src != nullptr ? copy->view_src : copy;
+        const ggml_tensor * state_root = state->view_src != nullptr ? state->view_src : state;
+        const ggml_tensor * qkv_root = qkv->view_src != nullptr ? qkv->view_src : qkv;
+        bool compatible = destination != state_root && destination != qkv_root;
+        bool before_conv = false;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (node == conv) { before_conv = false; }
+            for (int source = 0; source < GGML_MAX_SRC; ++source) {
+                const ggml_tensor * input = node->src[source];
+                if ((input == concat && node != conv && node != copy->src[0]) ||
+                    (input == copy->src[0] && node != copy)) {
+                    compatible = false;
+                }
+                if (before_conv && !ggml_backend_dayan_supports_layout(node) && input != nullptr &&
+                    (input->view_src != nullptr ? input->view_src : input) == destination) {
+                    compatible = false;
+                }
+            }
+            if (node == copy) { before_conv = true; }
+        }
+        if (!compatible) {
+            continue;
+        }
+        slot.nodes[2] = concat;
+        slot.nodes[3] = copy;
+        slot.node_count = 4;
+        elided.insert(concat);
+        elided.insert(copy);
+    }
+    plan->slots.erase(std::remove_if(plan->slots.begin(), plan->slots.end(),
+        [&elided](const ggml_backend_dayan_graph_slot & slot) { return elided.count(slot.nodes[0]) != 0; }), plan->slots.end());
 }
 
 bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
@@ -2292,5 +2408,6 @@ bool ggml_backend_dayan_compile_graph(const ggml_cgraph *             cgraph,
         plan->slots.push_back(slot);
     }
 
+    ggml_backend_dayan_fuse_ssm_conv(cgraph, plan);
     return true;
 }

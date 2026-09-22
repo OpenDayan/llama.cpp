@@ -297,6 +297,10 @@ int flash_attention_fp16(const uintptr_t * parameters, const uint16_t * indices)
     const uint16_t * k = parameter<const uint16_t *>(parameters, indices, 2);
     const uint16_t * v = parameter<const uint16_t *>(parameters, indices, 3);
     float * output = parameter<float *>(parameters, indices, 4);
+    if (dayan_flash_attention_use_split_kv(config->q_len, config->kv_len)) {
+        return ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 4, true>(
+            config, q, k, v, output);
+    }
     return ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 1>(
         config, q, k, v, output);
 }

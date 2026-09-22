@@ -199,6 +199,8 @@ GGML_DAYAN_MEGA_DEBUG=1 ./build-dayan/bin/llama-dayan-moe-bench \
     build-dayan/moe-validation/decode.result.json moe-decode
 ```
 
+The same client accepts a dense `qwen35` model or fixture through `DAYAN_MEGA_MODEL`, with `m` up to 1024 and `layers` set to the model layer count. It uses the model graph builder and requires one mega launch per layer at every step.
+
 This checks an initial single token followed by two decode steps. Each step compares logits and requires two mega launches, including graphs where state SCALE nodes disappear. The client switches between standalone and mega internally. Use the MoE mega preset below to check both prefill and initial-single-token sequences. See [MoE validation](../../../tools/dayan-trace/qwen35-moe.md) for the full-model smoke result and quantization limits.
 
 ### Operator benchmarks with limited-perf.py
@@ -413,6 +415,8 @@ Online softmax follows `FlexVecAttentionSpec.scala`: each 64-lane VEC context pr
 
 For Qwen3.5 linear-attention layers, `SSM_CONV` followed by SiLU uses one dedicated device function. LSU gathers the F32 channel-major input and depthwise weights into tap-major URAM tiles. VEC performs one elementwise multiply per tap, accumulates the taps in F32, and optionally applies the common SiLU implementation before one output writeback. The kernel does not construct diagonal matrices or use MAT convolution. It supports kernel widths up to 63 and uses 64-token tiles. The convolution remains a separate operator from the delta-net core.
 
+When convolution consumes `concat(history, transpose(qkv))` with a final history copy, the graph compiler folds both memory operations into `ssm_conv_split_f32_1c`. The kernel loads raw QKV rows directly into URAM and writes the final history. This applies to standalone and mega execution; graphs with other concat consumers keep the ordinary path. General concat copies merge contiguous dimensions and use LSU Transpose for F32/F16/BF16 matrix transposes.
+
 Gated Delta Net assigns heads and sequences to independent single-core tasks, limited by the enabled core count. Scalar-gate prefill with at least 16 tokens and one final state snapshot uses 64-token chunks. Each task has a loader Thread, a precompute Thread, and the root state-update loop. Two input slots and two prepared slots use four Local Resources for backpressure. Precompute builds the gate coefficients and jointly solves U and W with 256 independent RHS rows. The root computes the corrected values as U - W S, then produces outputs and updates the FP32 state. MAT, VEC, and LSU work from different chunks can overlap. Resource phases continue across heads and sequences; there is no separate limit on how far a producer can advance.
 
 Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The pipeline uses 758.5 KiB within a 768 KiB task reservation, with up to two resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation. Prepared Q becomes output storage after its last MAT read, and the prepared Resource stays held until the output DMA completes.
@@ -494,6 +498,8 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-graph ro
 | --- | --- |
 | `rope` | NORMAL, NEOX, MROPE, and IMROPE |
 | `ssm-conv` | SSM convolution and fused SiLU |
+| `ssm-split` | Raw QKV convolution, final state writeback, two rounds, and concat fanout |
+| `concat` | Contiguous and transposed inputs, all axes, F32/BF16/F16 |
 | `gated-output` | Gated attention output projection |
 | `copy` | Device copy paths |
 | `get-rows` | Indexed row reads |

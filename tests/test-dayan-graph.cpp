@@ -1,5 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-dayan.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1895,6 +1896,132 @@ static int run_ssm_conv_case(ggml_backend_t dayan,
     return close ? 0 : fail("SSM convolution numerical comparison failed");
 }
 
+static int run_ssm_conv_split_case(ggml_backend_t dayan, ggml_backend_t cpu, int64_t kernel, int64_t tokens,
+                                   int64_t channels, int64_t sequences, bool fanout = false) {
+    constexpr int graph_size = 64;
+    ggml_context_ptr contexts[2];
+    ggml_backend_buffer_ptr buffers[2];
+    ggml_cgraph * graphs[2];
+    ggml_tensor * inputs[2];
+    ggml_tensor * states[2];
+    ggml_tensor * outputs[2];
+    ggml_backend_t backends[] = { cpu, dayan };
+    std::vector<float> initial((kernel - 1) * channels * sequences), weights(kernel * channels);
+    std::vector<float> qkv(tokens * channels * sequences);
+    std::vector<int32_t> indices(sequences);
+    for (size_t i = 0; i < initial.size(); ++i) { initial[i] = ((int) (i % 31) - 15) / 32.0f; }
+    for (size_t i = 0; i < weights.size(); ++i) { weights[i] = ((int) (i % 17) - 8) / 64.0f; }
+    for (int64_t i = 0; i < sequences; ++i) { indices[i] = i; }
+    for (int b = 0; b < 2; ++b) {
+        ggml_init_params params = { ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false), nullptr, true };
+        contexts[b].reset(ggml_init(params));
+        auto * ctx = contexts[b].get();
+        states[b] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (kernel - 1) * channels, sequences);
+        inputs[b] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, tokens, sequences);
+        auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kernel, channels);
+        auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
+        auto * history = ggml_reshape_3d(ctx, ggml_get_rows(ctx, states[b], ids), kernel - 1, channels, sequences);
+        auto * concat = ggml_concat(ctx, history, ggml_transpose(ctx, inputs[b]), 0);
+        auto * last = ggml_view_3d(ctx, concat, kernel - 1, channels, sequences, concat->nb[1], concat->nb[2], tokens * sizeof(float));
+        auto * copy = ggml_cpy(ctx, last, states[b]);
+        outputs[b] = ggml_silu(ctx, ggml_ssm_conv(ctx, concat, weight));
+        ggml_set_output(outputs[b]);
+        if (fanout) { ggml_set_output(concat); }
+        graphs[b] = ggml_new_graph_custom(ctx, graph_size, false);
+        ggml_build_forward_expand(graphs[b], copy);
+        ggml_build_forward_expand(graphs[b], outputs[b]);
+        if (b == 1) {
+            if (!rewrite_graph(dayan, ctx, graphs[b])) { return fail("split convolution rewrite failed"); }
+            auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(dayan));
+            auto get_plan = (ggml_backend_dayan_get_graph_plan_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dayan_get_graph_plan");
+            int split = 0;
+            if (!get_plan || !get_plan(graphs[b], [](const ggml_backend_dayan_graph_plan_slot * slot, void * count) {
+                if (std::strcmp(slot->kernel, "ssm_conv_split_f32_1c") == 0) { ++*(int *) count; }
+            }, &split) || split != (fanout ? 0 : 1)) { return fail("unexpected split convolution plan"); }
+        }
+        buffers[b].reset(ggml_backend_alloc_ctx_tensors(ctx, backends[b]));
+        if (!buffers[b]) { return fail("split convolution allocation failed"); }
+        ggml_backend_tensor_set(states[b], initial.data(), 0, initial.size() * sizeof(float));
+        ggml_backend_tensor_set(weight, weights.data(), 0, weights.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, indices.data(), 0, indices.size() * sizeof(int32_t));
+    }
+    float max_abs = 0;
+    for (int round = 0; round < 2; ++round) {
+        for (size_t i = 0; i < qkv.size(); ++i) { qkv[i] = ((int) ((i + round * 7) % 37) - 18) / 32.0f; }
+        for (int b = 0; b < 2; ++b) {
+            ggml_backend_tensor_set(inputs[b], qkv.data(), 0, qkv.size() * sizeof(float));
+            if (ggml_backend_graph_compute(backends[b], graphs[b]) != GGML_STATUS_SUCCESS) { return fail("split convolution compute failed"); }
+        }
+        for (int state = 0; state < 2; ++state) {
+            auto * expected = state ? states[0] : outputs[0];
+            auto * actual = state ? states[1] : outputs[1];
+            std::vector<float> ref(ggml_nelements(expected)), got(ref.size());
+            ggml_backend_tensor_get(expected, ref.data(), 0, ggml_nbytes(expected));
+            ggml_backend_tensor_get(actual, got.data(), 0, ggml_nbytes(actual));
+            for (size_t i = 0; i < ref.size(); ++i) {
+                if (!std::isfinite(got[i]) || std::abs(got[i] - ref[i]) > (state ? 0.0f : 1e-5f)) {
+                    return fail(state ? "split convolution state mismatch" : "split convolution output mismatch");
+                }
+                max_abs = std::max(max_abs, std::abs(got[i] - ref[i]));
+            }
+        }
+    }
+    std::printf("SSM split kernel=%lld tokens=%lld channels=%lld sequences=%lld fanout=%d rounds=2 max_abs=%g state=exact\n",
+                (long long) kernel, (long long) tokens, (long long) channels, (long long) sequences, fanout, max_abs);
+    return 0;
+}
+
+static int run_concat_layout_case(ggml_backend_t dayan, ggml_type type, int axis, bool transpose, bool aligned = false) {
+    constexpr int graph_size = 16;
+    ggml_init_params params = { ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    int64_t ne[2][4] = { { 65, 130, 2, 2 }, { 65, 130, 2, 2 } };
+    if (aligned) {
+        ne[0][0] = ne[1][0] = 64;
+        ne[0][1] = ne[1][1] = 128;
+    }
+    ne[1][axis] = axis == 0 ? 33 : axis == 1 ? 17 : 1;
+    ggml_tensor * source[2];
+    ggml_tensor * input[2];
+    for (int b = 0; b < 2; ++b) {
+        source[b] = ggml_new_tensor_4d(ctx.get(), type, ne[b][transpose ? 1 : 0], ne[b][transpose ? 0 : 1], ne[b][2], ne[b][3]);
+        input[b] = transpose ? ggml_transpose(ctx.get(), source[b]) : source[b];
+    }
+    auto * output = ggml_concat(ctx.get(), input[0], input[1], axis);
+    auto * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) { return fail("concat allocation failed"); }
+    std::vector<float> values[2];
+    for (int b = 0; b < 2; ++b) {
+        values[b].resize(ggml_nelements(source[b]));
+        for (size_t i = 0; i < values[b].size(); ++i) { values[b][i] = ((int) (i % 127) - 63 + b) / 16.0f; }
+        if (type == GGML_TYPE_F32) {
+            ggml_backend_tensor_set(source[b], values[b].data(), 0, ggml_nbytes(source[b]));
+        } else {
+            std::vector<uint16_t> lowp(values[b].size());
+            for (size_t i = 0; i < lowp.size(); ++i) { lowp[i] = encode_lowp(type, values[b][i]); }
+            ggml_backend_tensor_set(source[b], lowp.data(), 0, ggml_nbytes(source[b]));
+        }
+    }
+    if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) { return fail("concat compute failed"); }
+    std::vector<uint8_t> data(ggml_nbytes(output));
+    ggml_backend_tensor_get(output, data.data(), 0, data.size());
+    for (int64_t i = 0; i < ggml_nelements(output); ++i) {
+        int64_t index = i, coordinate[4];
+        for (int d = 0; d < 4; ++d) { coordinate[d] = index % output->ne[d]; index /= output->ne[d]; }
+        const int b = coordinate[axis] >= ne[0][axis];
+        if (b) { coordinate[axis] -= ne[0][axis]; }
+        size_t offset = 0;
+        for (int d = 0; d < 4; ++d) { offset += coordinate[d] * input[b]->nb[d]; }
+        const float expected = values[b][offset / ggml_type_size(type)];
+        const float observed = type == GGML_TYPE_F32 ? ((float *) data.data())[i] : decode_lowp(type, ((uint16_t *) data.data())[i]);
+        if (observed != expected) { return fail("concat layout mismatch"); }
+    }
+    std::printf("concat type=%s axis=%d transpose=%d aligned=%d exact\n", ggml_type_name(type), axis, transpose, aligned);
+    return 0;
+}
+
 static int run_ssm_conv_cases(ggml_backend_t dayan) {
     return run_ssm_conv_case(dayan, 1, 5, 128, 1, false) != 0 ||
            run_ssm_conv_case(dayan, 4, 5, 130, 2, true) != 0 ||
@@ -2329,6 +2456,23 @@ int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "rope") == 0) {
         return run_rope_cases(dayan.get(), cpu.get());
     }
+    if (argc == 2 && std::strcmp(argv[1], "ssm-split") == 0) {
+        return run_ssm_conv_split_case(dayan.get(), cpu.get(), 4, 1, 6144, 1) ||
+               run_ssm_conv_split_case(dayan.get(), cpu.get(), 4, 1024, 6144, 1) ||
+               run_ssm_conv_split_case(dayan.get(), cpu.get(), 4, 69, 130, 2) ||
+               run_ssm_conv_split_case(dayan.get(), cpu.get(), 63, 5, 33, 3) ||
+               run_ssm_conv_split_case(dayan.get(), cpu.get(), 4, 5, 130, 1, true);
+    }
+    if (argc == 2 && std::strcmp(argv[1], "concat") == 0) {
+        for (auto type : { GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16 }) {
+            if (run_concat_layout_case(dayan.get(), type, 0, true, true)) { return 1; }
+            for (int axis = 0; axis < 4; ++axis) {
+                if (run_concat_layout_case(dayan.get(), type, axis, false) ||
+                    run_concat_layout_case(dayan.get(), type, axis, true)) { return 1; }
+            }
+        }
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "ssm-conv") == 0) {
         return run_ssm_conv_cases(dayan.get());
     }
@@ -2365,7 +2509,7 @@ int main(int argc, char ** argv) {
                        run_empty_output_case(dayan.get(), GGML_TYPE_MXFP4) != 0 ? 1 : 0;
     }
     if (argc != 1) {
-        return fail("usage: test-dayan-graph [rope|ssm-conv|gated-output|copy|get-rows|embedding-norm|norm|memory|empty]");
+        return fail("usage: test-dayan-graph [rope|ssm-conv|ssm-split|concat|gated-output|copy|get-rows|embedding-norm|norm|memory|empty]");
     }
 
     if (run_norm_cached_cases(dayan.get()) != 0 ||
