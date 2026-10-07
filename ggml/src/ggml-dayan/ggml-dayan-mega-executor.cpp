@@ -40,9 +40,6 @@ static inline float u32_as_float(uint32_t value) {
 
 #    include "ggml-dayan-flash-attention.h"
 #    include "ggml-dayan-gated-delta-net.h"
-#    include "mega-graph/qwen35-dense-bf16.hpp"
-#    include "mega-graph/qwen35-dense-mxfp4.hpp"
-#    include "mega-graph/qwen35-moe.hpp"
 
 namespace ggml_dayan_mega_detail {
 
@@ -50,11 +47,6 @@ static_assert(ggml_dayan_flash_attention_detail::kAtomicBytes <= MATMUL_DAYAN_4C
               "Flash Attention shared state overlaps the mega barrier");
 static_assert(MATMUL_DAYAN_4C_ATOMIC_BYTES % alignof(dayan_cluster_barrier_t) == 0,
               "Mega barrier is not aligned");
-
-template <typename T>
-static inline T parameter(const uintptr_t * parameters, const uint16_t * indices, uint32_t index) {
-    return (T) parameters[indices[index]];
-}
 
 static inline void reset_local_resources() {
     // The mega descriptor owns physical Local Resources 0..31.
@@ -83,219 +75,121 @@ static int prepare_matmul_4c() {
     return 0;
 }
 
-int norm_pipeline(const uintptr_t * parameters, const uint16_t * indices) {
+int norm_pipeline(const DayanNormPipelineConfig * config, const void * input, const void * right, const float * scale, void * residual, float * rms, float * scaled, uint16_t * lowp) {
     using namespace ggml_dayan_matmul_detail;
-    run_rms_norm_pipeline(parameter<const DayanNormPipelineConfig *>(parameters, indices, 0),
-                          parameter<const void *>(parameters, indices, 1),
-                          parameter<const void *>(parameters, indices, 2),
-                          parameter<const float *>(parameters, indices, 3),
-                          parameter<void *>(parameters, indices, 4),
-                          parameter<float *>(parameters, indices, 5),
-                          parameter<float *>(parameters, indices, 6),
-                          parameter<uint16_t *>(parameters, indices, 7));
+    run_rms_norm_pipeline(config, input, right, scale, residual, rms, scaled, lowp);
     return 0;
 }
 
-int residual_add(const uintptr_t * parameters, const uint16_t * indices) {
+int residual_add(const DayanElementwiseConfig * config, const void * left, const void * right, void * output) {
     using namespace ggml_dayan_matmul_detail;
-    run_residual_add<Bf16Format, kDayanDataTypeF32, normalization_load_f32>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<void *>(parameters, indices, 3));
+    run_residual_add<Bf16Format, kDayanDataTypeF32, normalization_load_f32>(config, left, right, output);
     return 0;
 }
 
-int residual_add_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+int residual_add_bf16(const DayanElementwiseConfig * config, const void * left, const void * right, void * output) {
     using namespace ggml_dayan_matmul_detail;
     run_residual_add<Bf16Format, kDayanDataTypeBF16,
-                     normalization_load_lowp<__tx_vec_cvt_fp32_bf16<0, 0, 0>>>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<void *>(parameters, indices, 3));
+                     normalization_load_lowp<__tx_vec_cvt_fp32_bf16<0, 0, 0>>>(config, left, right, output);
     return 0;
 }
 
-int rms_norm(const uintptr_t * parameters, const uint16_t * indices) {
+int rms_norm(const DayanNormConfig * config, const void * input, float * output) {
     using namespace ggml_dayan_matmul_detail;
-    run_rms_norm(parameter<const DayanNormConfig *>(parameters, indices, 0),
-                 parameter<const void *>(parameters, indices, 1),
-                 parameter<float *>(parameters, indices, 2));
+    run_rms_norm(config, input, output);
     return 0;
 }
 
-int scale(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_scale_f32(
-        parameter<const DayanScaleConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int scale(const DayanScaleConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_scale_f32(config, input, output);
     return 0;
 }
 
-int get_rows(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_get_rows(
-        parameter<const DayanRowsConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<void *>(parameters, indices, 3));
+int get_rows(const DayanRowsConfig * config, const void * input, const void * indices, void * output) {
+    return ggml_dayan_matmul_detail::run_get_rows(config, input, indices, output);
+}
+
+int quantize_mxfp4(const DayanMxfp4Config * config, const void * input, void * output, void * scales) {
+    ggml_dayan_mxfp4_detail::convert(config, input, output, scales);
     return 0;
 }
 
-int quantize_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_mxfp4_detail::convert(
-        parameter<const DayanMxfp4Config *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<void *>(parameters, indices, 2),
-        parameter<void *>(parameters, indices, 3));
-    return 0;
-}
-
-int matmul_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
+int matmul_mxfp4(const DayanMxfp4Config * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, void * output, void * output_scales) {
     reset_local_resources();
-    return ggml_dayan_mxfp4_detail::run(
-        parameter<const DayanMxfp4Config *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<const void *>(parameters, indices, 3),
-        parameter<const void *>(parameters, indices, 4),
-        parameter<const void *>(parameters, indices, 5),
-        parameter<const void *>(parameters, indices, 6),
-        parameter<void *>(parameters, indices, 7),
-        parameter<void *>(parameters, indices, 8));
+    return ggml_dayan_mxfp4_detail::run(config, input, input_scales, weight, weight_scales, up, up_scales, output, output_scales);
 }
 
-int concat(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_concat(
-        parameter<const DayanConcatConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<void *>(parameters, indices, 3));
+int concat(const DayanConcatConfig * config, const void * left, const void * right, void * output) {
+    ggml_dayan_matmul_detail::run_concat(config, left, right, output);
     return 0;
 }
 
-int copy(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_copy(
-        parameter<const DayanCopyConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<void *>(parameters, indices, 2));
+int copy(const DayanCopyConfig * config, const void * input, void * output) {
+    ggml_dayan_matmul_detail::run_copy(config, input, output);
     return 0;
 }
 
-int ssm_conv(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_ssm_conv(
-        parameter<const DayanSSMConvConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3));
+int ssm_conv(const DayanSSMConvConfig * config, const float * input, const float * weight, float * output) {
+    ggml_dayan_matmul_detail::run_ssm_conv(config, input, weight, output);
     return 0;
 }
 
-int ssm_conv_split(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_ssm_conv(
-        parameter<const DayanSSMConvConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3),
-        parameter<const float *>(parameters, indices, 4),
-        parameter<float *>(parameters, indices, 5));
+int ssm_conv_split(const DayanSSMConvConfig * config, const float * input, const float * weight, float * output, const float * current, float * state) {
+    ggml_dayan_matmul_detail::run_ssm_conv(config, input, weight, output, current, state);
     return 0;
 }
 
-int l2_norm(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_l2_norm(
-        parameter<const DayanNormConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int l2_norm(const DayanNormConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_l2_norm(config, input, output);
     return 0;
 }
 
-int add(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_binary_f32<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(
-        parameter<const DayanBinaryConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3));
+int add(const DayanBinaryConfig * config, const float * left, const float * right, float * output) {
+    ggml_dayan_matmul_detail::run_binary_f32<__tx_vec_vv_fp32_add<0, 0, 16, 0>>(config, left, right, output);
     return 0;
 }
 
-int multiply(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_binary_f32<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
-        parameter<const DayanBinaryConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3));
+int multiply(const DayanBinaryConfig * config, const float * left, const float * right, float * output) {
+    ggml_dayan_matmul_detail::run_binary_f32<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(config, left, right, output);
     return 0;
 }
 
-int softplus(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_unary_f32<ggml_dayan_matmul_detail::softplus_tile>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int softplus(const DayanElementwiseConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_unary_f32<ggml_dayan_matmul_detail::softplus_tile>(config, input, output);
     return 0;
 }
 
-int sigmoid(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_unary_f32<ggml_dayan_matmul_detail::sigmoid_tile>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int sigmoid(const DayanElementwiseConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_unary_f32<ggml_dayan_matmul_detail::sigmoid_tile>(config, input, output);
     return 0;
 }
 
-int silu(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_unary_f32<ggml_dayan_matmul_detail::silu_tile>(
-        parameter<const DayanElementwiseConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int silu(const DayanElementwiseConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_unary_f32<ggml_dayan_matmul_detail::silu_tile>(config, input, output);
     return 0;
 }
 
-int gated_delta_net(const uintptr_t * parameters, const uint16_t * indices) {
+int gated_delta_net(const DayanGatedDeltaNetConfig * config, const float * q, const float * k, const float * v, const float * g, const float * beta, const float * state, float * output) {
     reset_local_resources();
-    return (int) ggml_dayan_gdn_detail::run_gated_delta_net(
-        parameter<const DayanGatedDeltaNetConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<const float *>(parameters, indices, 3),
-        parameter<const float *>(parameters, indices, 4),
-        parameter<const float *>(parameters, indices, 5),
-        parameter<const float *>(parameters, indices, 6),
-        parameter<float *>(parameters, indices, 7));
+    return (int) ggml_dayan_gdn_detail::run_gated_delta_net(config, q, k, v, g, beta, state, output);
 }
 
-int rope(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_rope_f32(
-        parameter<const DayanRopeConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const int32_t *>(parameters, indices, 2),
-        parameter<const float *>(parameters, indices, 3),
-        parameter<float *>(parameters, indices, 4));
+int rope(const DayanRopeConfig * config, const float * input, const int32_t * positions, const float * factors, float * output) {
+    ggml_dayan_matmul_detail::run_rope_f32(config, input, positions, factors, output);
     return 0;
 }
 
-int set_rows(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_set_rows(
-        parameter<const DayanRowsConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<void *>(parameters, indices, 3));
+int set_rows(const DayanRowsConfig * config, const float * input, const void * indices, void * output) {
+    ggml_dayan_matmul_detail::run_set_rows(config, input, indices, output);
     return 0;
 }
 
-int flash_attention_fp16(const uintptr_t * parameters, const uint16_t * indices) {
+int flash_attention_fp16(const DayanFlashAttentionConfig * config, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * output) {
     reset_local_resources();
     const int clear_status = clear_atomic_cache(ggml_dayan_flash_attention_detail::kAtomicBytes);
     if (clear_status < 0) {
         return clear_status;
     }
-    const DayanFlashAttentionConfig * config =
-        parameter<const DayanFlashAttentionConfig *>(parameters, indices, 0);
-    const uint16_t * q = parameter<const uint16_t *>(parameters, indices, 1);
-    const uint16_t * k = parameter<const uint16_t *>(parameters, indices, 2);
-    const uint16_t * v = parameter<const uint16_t *>(parameters, indices, 3);
-    float * output = parameter<float *>(parameters, indices, 4);
     if (dayan_flash_attention_use_split_kv(config->q_len, config->kv_len)) {
         return ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 4, true>(
             config, q, k, v, output);
@@ -304,15 +198,11 @@ int flash_attention_fp16(const uintptr_t * parameters, const uint16_t * indices)
         config, q, k, v, output);
 }
 
-int matmul_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+int matmul_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, float * output) {
     const int status = prepare_matmul_4c();
     if (status < 0) {
         return status;
     }
-    const DayanMatmulConfig * config = parameter<const DayanMatmulConfig *>(parameters, indices, 0);
-    const uint16_t * input = parameter<const uint16_t *>(parameters, indices, 1);
-    const uint16_t * weight = parameter<const uint16_t *>(parameters, indices, 2);
-    float * output = parameter<float *>(parameters, indices, 3);
     return config->m <= 512 ?
                ggml_dayan_matmul_4c_detail::run_matmul_4c<ggml_dayan_matmul_detail::Bf16Format, true>(
                    config, input, weight, output) :
@@ -320,30 +210,19 @@ int matmul_bf16(const uintptr_t * parameters, const uint16_t * indices) {
                    config, input, weight, output);
 }
 
-int matmul_pair_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+int matmul_pair_bf16(const DayanMatmulPairConfig * config, const uint16_t * input, const uint16_t * first, const uint16_t * second, float * first_output, float * second_output) {
     const int status = prepare_matmul_4c();
     if (status < 0) {
         return status;
     }
-    return ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(
-        parameter<const DayanMatmulPairConfig *>(parameters, indices, 0),
-        parameter<const uint16_t *>(parameters, indices, 1),
-        parameter<const uint16_t *>(parameters, indices, 2),
-        parameter<const uint16_t *>(parameters, indices, 3),
-        parameter<float *>(parameters, indices, 4),
-        parameter<float *>(parameters, indices, 5));
+    return ggml_dayan_matmul_4c_detail::run_matmul_pair_4c<ggml_dayan_matmul_detail::Bf16Format>(config, input, first, second, first_output, second_output);
 }
 
-int matmul_swiglu_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+int matmul_swiglu_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * gate, const uint16_t * up, uint16_t * output) {
     const int status = prepare_matmul_4c();
     if (status < 0) {
         return status;
     }
-    const DayanMatmulConfig * config = parameter<const DayanMatmulConfig *>(parameters, indices, 0);
-    const uint16_t * input = parameter<const uint16_t *>(parameters, indices, 1);
-    const uint16_t * gate = parameter<const uint16_t *>(parameters, indices, 2);
-    const uint16_t * up = parameter<const uint16_t *>(parameters, indices, 3);
-    uint16_t * output = parameter<uint16_t *>(parameters, indices, 4);
     return config->m <= 512 ?
                ggml_dayan_matmul_4c_detail::run_matmul_glu_4c<ggml_dayan_matmul_detail::Bf16Format, false, true>(
                    config, input, gate, up, output) :
@@ -351,15 +230,11 @@ int matmul_swiglu_bf16(const uintptr_t * parameters, const uint16_t * indices) {
                    config, input, gate, up, output);
 }
 
-int matmul_quantized_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+int matmul_quantized_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, uint16_t * output) {
     const int status = prepare_matmul_4c();
     if (status < 0) {
         return status;
     }
-    const DayanMatmulConfig * config = parameter<const DayanMatmulConfig *>(parameters, indices, 0);
-    const uint16_t * input = parameter<const uint16_t *>(parameters, indices, 1);
-    const uint16_t * weight = parameter<const uint16_t *>(parameters, indices, 2);
-    uint16_t * output = parameter<uint16_t *>(parameters, indices, 3);
     return config->m <= 512 ?
                ggml_dayan_matmul_4c_detail::run_matmul_quantized_4c<ggml_dayan_matmul_detail::Bf16Format, true>(
                    config, input, weight, output) :
@@ -367,104 +242,87 @@ int matmul_quantized_bf16(const uintptr_t * parameters, const uint16_t * indices
                    config, input, weight, output);
 }
 
-int gated_output_projection_bf16(const uintptr_t * parameters, const uint16_t * indices) {
+int gated_output_projection_bf16(const DayanGatedProjectionConfig * config, const float * input, const float * gate, const uint16_t * weight, float * output, uint16_t * scratch) {
     const int status = prepare_matmul_4c();
     if (status < 0) {
         return status;
     }
     return ggml_dayan_matmul_4c_detail::run_gated_output_projection_f32_gate_4c<
         ggml_dayan_matmul_detail::Bf16Format>(
-            parameter<const DayanGatedProjectionConfig *>(parameters, indices, 0),
-            parameter<const float *>(parameters, indices, 1),
-            parameter<const float *>(parameters, indices, 2),
-            parameter<const uint16_t *>(parameters, indices, 3),
-            parameter<float *>(parameters, indices, 4),
-            parameter<uint16_t *>(parameters, indices, 5));
+            config,
+            input,
+            gate,
+            weight,
+            output,
+            scratch);
 }
 
-int matmul_tf32(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_router_f32(
-        parameter<const DayanMatmulConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3));
+int matmul_tf32(const DayanMatmulConfig * config, const float * input, const float * weight, float * output) {
+    ggml_dayan_matmul_detail::run_router_f32(config, input, weight, output);
     return 0;
 }
 
-int router_indexer(const uintptr_t * parameters, const uint16_t * indices) {
-    return ggml_dayan_matmul_detail::run_router_indexer_f32(
-        parameter<const DayanRouterIndexerConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3),
-        parameter<int32_t *>(parameters, indices, 4),
-        parameter<void *>(parameters, indices, 5));
+int router_indexer(const DayanRouterIndexerConfig * config, const float * input, const float * weight, float * logits, int32_t * selected, void * workspace) {
+    return ggml_dayan_matmul_detail::run_router_indexer_f32(config, input, weight, logits, selected, workspace);
 }
 
-int matmul_id_mxfp4(const uintptr_t * parameters, const uint16_t * indices) {
+int matmul_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, const int32_t * selected, void * output, void * output_scales, void * workspace) {
     reset_local_resources();
-    return ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(
-        parameter<const DayanMxfp4MoeConfig *>(parameters, indices, 0),
-        parameter<const void *>(parameters, indices, 1),
-        parameter<const void *>(parameters, indices, 2),
-        parameter<const void *>(parameters, indices, 3),
-        parameter<const void *>(parameters, indices, 4),
-        parameter<const void *>(parameters, indices, 5),
-        parameter<const void *>(parameters, indices, 6),
-        parameter<const int32_t *>(parameters, indices, 7),
-        parameter<void *>(parameters, indices, 8),
-        parameter<void *>(parameters, indices, 9),
-        parameter<void *>(parameters, indices, 10));
+    return ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(config, input, input_scales, weight, weight_scales, up, up_scales, selected, output, output_scales, workspace);
 }
 
 
-int softmax(const uintptr_t * parameters, const uint16_t * indices) {
+int softmax(const DayanSoftmaxConfig * config, const float * input, float * output) {
     ggml_dayan_matmul_detail::run_softmax_f32(
-        parameter<const DayanSoftmaxConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1), nullptr, nullptr,
-        parameter<float *>(parameters, indices, 2));
+        config,
+        input, nullptr, nullptr,
+        output);
     return 0;
 }
 
-int sum_rows(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_reduce_rows_f32(
-        parameter<const DayanReduceConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int sum_rows(const DayanReduceConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_reduce_rows_f32(config, input, output);
     return 0;
 }
 
-int clamp(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_clamp_f32(
-        parameter<const DayanClampConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<float *>(parameters, indices, 2));
+int clamp(const DayanClampConfig * config, const float * input, float * output) {
+    ggml_dayan_matmul_detail::run_clamp_f32(config, input, output);
     return 0;
 }
 
-int divide(const uintptr_t * parameters, const uint16_t * indices) {
-    ggml_dayan_matmul_detail::run_div_f32(
-        parameter<const DayanBinaryConfig *>(parameters, indices, 0),
-        parameter<const float *>(parameters, indices, 1),
-        parameter<const float *>(parameters, indices, 2),
-        parameter<float *>(parameters, indices, 3));
+int divide(const DayanBinaryConfig * config, const float * left, const float * right, float * output) {
+    ggml_dayan_matmul_detail::run_div_f32(config, left, right, output);
     return 0;
 }
 
-template <typename Graph, uint16_t Count = Graph::operation_count>
-static int execute(const uintptr_t * parameters, dayan_cluster_barrier_t * barrier) {
-    for (uint16_t index = 0; index < Count; ++index) {
-        const Operation & operation = Graph::operations[index];
-        if (operation.function == nullptr) {
-            const int status = dayan_cluster_barrier(4, barrier);
+int noop() { return 0; }
+
+#define MEGA_GRAPH_BEGIN(Name, Id, Moe, Linear) namespace Name { static const Operation operations[] = {
+#define MEGA_STEP(Name, Kind, Function, Barriers, Mode, ...) \
+    { Binding<decltype(&ggml_dayan_mega_detail::Function), &ggml_dayan_mega_detail::Function>::call, Signature<decltype(&ggml_dayan_mega_detail::Function)>::count, Barriers, #Name },
+#define MEGA_GRAPH_END() }; }
+#include "mega-graph/qwen35.inc"
+#undef MEGA_GRAPH_BEGIN
+#undef MEGA_STEP
+#undef MEGA_GRAPH_END
+
+template <unsigned Count>
+static int execute(const Operation (&operations)[Count], const uintptr_t * parameters, dayan_cluster_barrier_t * barrier) {
+    for (const Operation & operation : operations) {
+        int status = dayan_set_proc_name(operation.name);
+        if (status < 0) {
+            return status;
+        }
+        status = operation.function(parameters);
+        if (status < 0) {
+            return status;
+        }
+        parameters += operation.argument_count;
+        for (uint16_t index = 0; index < operation.barriers; ++index) {
+            status = dayan_cluster_barrier(4, barrier);
             if (status < 0) {
                 return status;
             }
-            continue;
-        }
-        const int status = operation.function(parameters, operation.arguments);
-        if (status < 0) {
-            return status;
         }
     }
     return 0;
@@ -498,61 +356,22 @@ static void run(const DayanMegaConfig * config, const void * const * sources) {
 
     dayan_cluster_barrier_t * barrier =
         (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
-    int status;
-    if constexpr (!Moe) {
-        switch (config->graph) {
-            case kDayanMegaQwen35DenseMxfp4Linear:
-                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph::parameter_count) {
-                    DAYAN_PARAMS_ERROR();
-                }
-                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4LinearGraph>(
-                    parameters, barrier);
-                break;
-            case kDayanMegaQwen35DenseMxfp4Full:
-                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph::parameter_count) {
-                    DAYAN_PARAMS_ERROR();
-                }
-                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseMxfp4FullGraph>(
-                    parameters, barrier);
-                break;
-            case kDayanMegaQwen35DenseBf16Linear:
-                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph::parameter_count) {
-                    DAYAN_PARAMS_ERROR();
-                }
-                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph>(
-                    parameters, barrier);
-                break;
-            case kDayanMegaQwen35DenseBf16Full:
-                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph::parameter_count) {
-                    DAYAN_PARAMS_ERROR();
-                }
-                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph>(
-                    parameters, barrier);
-                break;
-            default:
-                status = -22;
-                break;
-        }
-    } else {
-        switch (config->graph) {
-            case kDayanMegaQwen35MoeLinear:
-                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeLinearGraph::parameter_count) {
-                    DAYAN_PARAMS_ERROR();
-                }
-                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16LinearGraph, 47>(parameters, barrier);
-                if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeLinearGraph>(parameters, barrier); }
-                break;
-            case kDayanMegaQwen35MoeFull:
-                DAYAN_PARAMS_IF(config->parameter_count != ggml_dayan_mega_detail::Qwen35MoeFullGraph::parameter_count) {
-                    DAYAN_PARAMS_ERROR();
-                }
-                status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35DenseBf16FullGraph, 25>(parameters, barrier);
-                if (status == 0) { status = ggml_dayan_mega_detail::execute<ggml_dayan_mega_detail::Qwen35MoeFullGraph>(parameters, barrier); }
-                break;
-            default:
-                status = -22;
-                break;
-        }
+    int status = -22;
+    switch (config->graph) {
+#define MEGA_GRAPH_BEGIN(Name, Id, IsMoe, Linear) \
+        case Id: \
+            if constexpr (Moe == IsMoe) { \
+                DAYAN_PARAMS_IF(config->parameter_count != Name::parameter_count) { DAYAN_PARAMS_ERROR(); } \
+                status = execute(Name::operations, parameters, barrier); \
+            } \
+            break;
+#define MEGA_STEP(...)
+#define MEGA_GRAPH_END()
+#include "mega-graph/qwen35.inc"
+#undef MEGA_GRAPH_BEGIN
+#undef MEGA_STEP
+#undef MEGA_GRAPH_END
+        default: break;
     }
     DAYAN_PARAMS_IF(status < 0) {
         DAYAN_PARAMS_ERROR();

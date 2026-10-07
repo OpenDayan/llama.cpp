@@ -47,6 +47,13 @@ message(STATUS "ggml-dayan: dycc: ${DAYAN_DYCC}")
 message(STATUS "ggml-dayan: runtime: ${DAYAN_RUNTIME_LIBRARY}")
 message(STATUS "ggml-dayan: Device API: ${DAYAN_DEVICE_INCLUDE_DIR}")
 
+set(DAYAN_MEGA_GRAPHS
+    mega-graph/qwen35.inc
+    mega-graph/linear.inc
+    mega-graph/full.inc
+    mega-graph/dense-ffn.inc
+    mega-graph/moe-ffn.inc)
+
 set(DAYAN_KERNEL_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/ggml-dayan-kernels.o")
 set(DAYAN_MEGA_EXECUTOR_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/ggml-dayan-mega-executor.o")
 
@@ -83,6 +90,7 @@ add_custom_command(
         ggml-dayan-normalization.h
         ggml-dayan-rope.h
         ggml-dayan-softmax.h
+        ggml-dayan-workers.h
         device_include/cstdint
         device_include/cstdio
         device_include/type_traits
@@ -108,9 +116,7 @@ add_custom_command(
     DEPENDS
         ggml-dayan-mega-executor.cpp
         ggml-dayan-mega-executor.h
-        mega-graph/qwen35-dense-bf16.hpp
-        mega-graph/qwen35-dense-mxfp4.hpp
-        mega-graph/qwen35-moe.hpp
+        ${DAYAN_MEGA_GRAPHS}
         ggml-dayan-kernels.h
         ggml-dayan-activation.h
         ggml-dayan-attention.h
@@ -130,6 +136,7 @@ add_custom_command(
         ggml-dayan-rope.h
         ggml-dayan-moe.h
         ggml-dayan-softmax.h
+        ggml-dayan-workers.h
         device_include/cstdint
         device_include/cstdio
         device_include/type_traits
@@ -151,8 +158,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-mega.cpp
     ggml-dayan-mega.h
     ggml-dayan-mega-executor.h
-    mega-graph/qwen35-dense-bf16.hpp
-    mega-graph/qwen35-dense-mxfp4.hpp
+    ${DAYAN_MEGA_GRAPHS}
     ggml-dayan-kernels.h
     ggml-dayan-activation.h
     ggml-dayan-common.h

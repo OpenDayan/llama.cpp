@@ -26,8 +26,8 @@ static inline uint32_t layout_wrap(int64_t index, uint32_t size) {
     return (uint32_t) wrapped;
 }
 
-static inline void layout_validate_f32(const DayanLayoutConfig * config, const float * input, float * output) {
-    memory_validate(config);
+static inline void layout_validate_f32(const DayanLayoutConfig * config, const float * input, float * output, const NativeContext & context = {}) {
+    memory_validate(config, context);
     if (input == nullptr || output == nullptr || config->type != kDayanDataTypeF32) {
         DAYAN_PARAMS_ERROR();
     }
@@ -38,13 +38,13 @@ static inline void layout_validate_f32(const DayanLayoutConfig * config, const f
     }
 }
 
-static inline uint64_t layout_scratch() {
-    return (uint64_t) (uintptr_t) dayan_uram_base() + NormalizationLayout::kInput;
+static inline uint64_t layout_scratch(const NativeContext & context = {}) {
+    return native_uram(context) + NormalizationLayout::kInput;
 }
 
-static inline void layout_make_constant(uint32_t bits) {
-    const uint64_t scratch = layout_scratch();
-    uint32_t *     scalar  = (uint32_t *) ((uintptr_t) dayan_uram_base() + NormalizationLayout::kScalar);
+static inline void layout_make_constant(uint32_t bits, const NativeContext & context = {}) {
+    const uint64_t scratch = layout_scratch(context);
+    uint32_t *     scalar  = (uint32_t *) (native_uram(context) + NormalizationLayout::kScalar);
     *scalar                = bits;
 
     ggml_dayan_vec_detail::configure_vec_grid(NormalizationLayout::kTileElements / Constants::kVecLanes);
@@ -74,7 +74,7 @@ static inline uint64_t layout_offset(const uint64_t nb[4], const uint32_t index[
 static inline bool layout_issue_wrapped_copy(const DayanLayoutConfig * config,
                                              const float *             input,
                                              float *                   output,
-                                             const int32_t             offsets[4]) {
+                                             const int32_t             offsets[4], const NativeContext & context = {}) {
     uint64_t input_nb[4];
     uint64_t output_nb[4];
     layout_contiguous_strides(config->input_ne, input_nb);
@@ -95,7 +95,7 @@ static inline bool layout_issue_wrapped_copy(const DayanLayoutConfig * config,
 
         issued = memory_issue_tensor_copy(reinterpret_cast<uint64_t>(output) + layout_offset(output_nb, destination),
                                           reinterpret_cast<uint64_t>(input) + layout_offset(input_nb, source), extent,
-                                          input_nb, output_nb, sizeof(float)) ||
+                                          input_nb, output_nb, sizeof(float), context) ||
                  issued;
 
         bool done = true;
@@ -113,8 +113,8 @@ static inline bool layout_issue_wrapped_copy(const DayanLayoutConfig * config,
     }
 }
 
-static inline void run_set(const DayanSetConfig * config, const void * base, const void * source, void * output) {
-    memory_validate(config);
+static inline void run_set(const DayanSetConfig * config, const void * base, const void * source, void * output, const NativeContext & context = {}) {
+    memory_validate(config, context);
     if (base == nullptr || source == nullptr || output == nullptr || config->output_bytes == 0 ||
         config->element_bytes == 0) {
         DAYAN_PARAMS_ERROR();
@@ -132,7 +132,7 @@ static inline void run_set(const DayanSetConfig * config, const void * base, con
     }
     (void) base;
 
-    if (dayan_native_task_id() != 0U) {
+    if (dayan_native_task_id(context) != 0U) {
         return;
     }
     const uint64_t source_nb[4] = {
@@ -149,25 +149,25 @@ static inline void run_set(const DayanSetConfig * config, const void * base, con
     };
     const bool issued = memory_issue_tensor_copy(reinterpret_cast<uint64_t>(output) + config->destination_offset,
                                                  reinterpret_cast<uint64_t>(source), config->source_ne, source_nb,
-                                                 destination_nb, config->element_bytes);
+                                                 destination_nb, config->element_bytes, context);
     if (issued) {
         dayan_wait_lsu();
     }
 }
 
-static inline void run_diag_f32(const DayanLayoutConfig * config, const float * input, float * output) {
-    layout_validate_f32(config, input, output);
+static inline void run_diag_f32(const DayanLayoutConfig * config, const float * input, float * output, const NativeContext & context = {}) {
+    layout_validate_f32(config, input, output, context);
     if (config->input_ne[1] != 1 || config->output_ne[0] != config->input_ne[0] ||
         config->output_ne[1] != config->input_ne[0] || config->output_ne[2] != config->input_ne[2] ||
         config->output_ne[3] != config->input_ne[3]) {
         DAYAN_PARAMS_ERROR();
     }
 
-    if (dayan_native_task_id() != 0U) {
+    if (dayan_native_task_id(context) != 0U) {
         return;
     }
-    layout_make_constant(0U);
-    memory_issue_fill(reinterpret_cast<uint64_t>(output), layout_scratch(), layout_elements(config->output_ne) * sizeof(float));
+    layout_make_constant(0U, context);
+    memory_issue_fill(reinterpret_cast<uint64_t>(output), layout_scratch(context), layout_elements(config->output_ne) * sizeof(float));
     MemoryCopyDimension dimensions[3] = {
         { config->input_ne[0], sizeof(float), (uint64_t) (config->output_ne[0] + 1U) * sizeof(float) },
         { config->input_ne[2], (uint64_t) config->input_ne[0] * sizeof(float),
@@ -181,8 +181,13 @@ static inline void run_diag_f32(const DayanLayoutConfig * config, const float * 
 }
 
 template <uint32_t MaskBits>
-static void run_diag_mask_f32(const DayanLayoutConfig * config, const float * input, float * output) {
-    layout_validate_f32(config, input, output);
+static void run_diag_mask_f32(const DayanLayoutConfig * config, const float * input, float * output, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {layout_elements(config->output_ne), config->output_ne[1], 256U * 1024U}, [&](const NativeContext & worker) {
+            run_diag_mask_f32<MaskBits>(config, input, output, worker);
+        })) { return; }
+
+    layout_validate_f32(config, input, output, context);
     if (layout_elements(config->input_ne) != layout_elements(config->output_ne) ||
         config->input_ne[0] != config->output_ne[0] || config->input_ne[1] != config->output_ne[1] ||
         config->parameters[0] < 0) {
@@ -190,13 +195,13 @@ static void run_diag_mask_f32(const DayanLayoutConfig * config, const float * in
     }
 
     const uint64_t planes       = (uint64_t) config->output_ne[2] * config->output_ne[3];
-    const uint32_t task         = dayan_native_task_id();
-    const uint32_t tasks        = dayan_native_task_count();
+    const uint32_t task         = dayan_native_task_id(context);
+    const uint32_t tasks        = dayan_native_task_count(context);
     const uint64_t plane_stride = (uint64_t) config->output_ne[0] * config->output_ne[1] * sizeof(float);
     if (task >= config->output_ne[1]) {
         return;
     }
-    layout_make_constant(MaskBits);
+    layout_make_constant(MaskBits, context);
     MemoryCopyDimension plane_dimension = { planes, plane_stride, plane_stride };
     bool                issued          = false;
     for (uint32_t row = task; row < config->output_ne[1]; row += tasks) {
@@ -210,7 +215,7 @@ static void run_diag_mask_f32(const DayanLayoutConfig * config, const float * in
             issued = true;
         }
         if (prefix != config->output_ne[0]) {
-            memory_issue_fill_dimensions(reinterpret_cast<uint64_t>(output + offset + prefix), layout_scratch(),
+            memory_issue_fill_dimensions(reinterpret_cast<uint64_t>(output + offset + prefix), layout_scratch(context),
                                          (uint64_t) (config->output_ne[0] - prefix) * sizeof(float), &plane_dimension,
                                          1);
             issued = true;
@@ -222,23 +227,23 @@ static void run_diag_mask_f32(const DayanLayoutConfig * config, const float * in
 }
 
 template <bool Circular>
-static void run_pad_f32(const DayanLayoutConfig * config, const float * input, float * output) {
-    layout_validate_f32(config, input, output);
-    if (dayan_native_task_id() != 0U) {
+static void run_pad_f32(const DayanLayoutConfig * config, const float * input, float * output, const NativeContext & context = {}) {
+    layout_validate_f32(config, input, output, context);
+    if (dayan_native_task_id(context) != 0U) {
         return;
     }
     const int32_t offsets[4] = {
         config->parameters[0], config->parameters[2], config->parameters[4], config->parameters[6],
     };
     if constexpr (Circular) {
-        if (layout_issue_wrapped_copy(config, input, output, offsets)) {
+        if (layout_issue_wrapped_copy(config, input, output, offsets, context)) {
             dayan_wait_lsu();
         }
         return;
     }
 
-    layout_make_constant(0U);
-    memory_issue_fill(reinterpret_cast<uint64_t>(output), layout_scratch(), layout_elements(config->output_ne) * sizeof(float));
+    layout_make_constant(0U, context);
+    memory_issue_fill(reinterpret_cast<uint64_t>(output), layout_scratch(context), layout_elements(config->output_ne) * sizeof(float));
 
     uint64_t input_nb[4];
     uint64_t output_nb[4];
@@ -264,13 +269,13 @@ static void run_pad_f32(const DayanLayoutConfig * config, const float * input, f
     if (intersects) {
         memory_issue_tensor_copy(reinterpret_cast<uint64_t>(output) + layout_offset(output_nb, output_start),
                                  reinterpret_cast<uint64_t>(input) + layout_offset(input_nb, source_start), extent,
-                                 input_nb, output_nb, sizeof(float));
+                                 input_nb, output_nb, sizeof(float), context);
     }
     dayan_wait_lsu();
 }
 
-static inline void run_pad_reflect_1d_f32(const DayanLayoutConfig * config, const float * input, float * output) {
-    layout_validate_f32(config, input, output);
+static inline void run_pad_reflect_1d_f32(const DayanLayoutConfig * config, const float * input, float * output, const NativeContext & context = {}) {
+    layout_validate_f32(config, input, output, context);
     const int32_t left  = config->parameters[0];
     const int32_t right = config->parameters[1];
     if (left < 0 || right < 0 || left >= (int32_t) config->input_ne[0] || right >= (int32_t) config->input_ne[0] ||
@@ -278,7 +283,7 @@ static inline void run_pad_reflect_1d_f32(const DayanLayoutConfig * config, cons
         DAYAN_PARAMS_ERROR();
     }
 
-    if (dayan_native_task_id() != 0U) {
+    if (dayan_native_task_id(context) != 0U) {
         return;
     }
 
@@ -302,15 +307,15 @@ static inline void run_pad_reflect_1d_f32(const DayanLayoutConfig * config, cons
     dayan_wait_lsu();
 }
 
-static inline void run_roll_f32(const DayanLayoutConfig * config, const float * input, float * output) {
-    layout_validate_f32(config, input, output);
+static inline void run_roll_f32(const DayanLayoutConfig * config, const float * input, float * output, const NativeContext & context = {}) {
+    layout_validate_f32(config, input, output, context);
     if (layout_elements(config->input_ne) != layout_elements(config->output_ne)) {
         DAYAN_PARAMS_ERROR();
     }
-    if (dayan_native_task_id() != 0U) {
+    if (dayan_native_task_id(context) != 0U) {
         return;
     }
-    if (layout_issue_wrapped_copy(config, input, output, config->parameters)) {
+    if (layout_issue_wrapped_copy(config, input, output, config->parameters, context)) {
         dayan_wait_lsu();
     }
 }

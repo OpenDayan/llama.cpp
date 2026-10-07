@@ -1657,7 +1657,8 @@ __kernel__ void l2_norm_f32_1c(const DayanNormConfig * config, const float * inp
 __kernel__ void get_rows_1c(const DayanRowsConfig * config, const void * source, const void * indices, void * output) {
     dayan_acquire_config(config);
     using namespace ggml_dayan_matmul_detail;
-    run_get_rows(config, source, indices, output);
+    const int status = run_get_rows(config, source, indices, output);
+    if (status < 0) { dayan_thread_exit(status); }
 }
 
 __kernel__ void set_rows_1c(const DayanRowsConfig * config,
@@ -1829,8 +1830,8 @@ DAYAN_MATMUL_4C_DESC(matmul_bf16_4c);
 DAYAN_MATMUL_1C_DESC(matmul_mxfp4_1c);
 DAYAN_MATMUL_1C_DESC(mul_mat_id_mxfp4);
 DAYAN_MATMUL_4C_DESC(matmul_mxfp4_4c);
-DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 0, 0, DAYAN_DESC_URAM_BYTES(296U * 1024U), 1, 0, 1, 0);
-DAYAN_KERNEL_TASK_DESC(router_f32, 4, 0, 0, DAYAN_DESC_URAM_BYTES(120U * 1024U), 1, 1, 0, 0);
+DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 2, 0, DAYAN_DESC_URAM_BYTES(640U * 1024U), 2, 0, 2, 0);
+DAYAN_KERNEL_TASK_DESC(router_f32, 4, 2, 0, DAYAN_DESC_URAM_BYTES(512U * 1024U), 2, 2, 0, 0);
 DAYAN_MATMUL_4C_DESC(matmul_inference_bf16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_fp16_4c);
 DAYAN_MATMUL_4C_DESC(matmul_inference_fp16_4c);
@@ -1898,8 +1899,8 @@ DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_bf16_4c, 1U, 6, 0, 128, DAY
                               6, 2, 2, 0, 26, 0);
 DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
                               6, 2, 2, 0, 26, 0);
-DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 0, 0,
-                       DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 1, 1, 1, 0);
+DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 2, 0,
+                       DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 2, 0, 2, 0);
 DAYAN_KERNEL_NAMED_RESOURCE_TASK_DESC(gated_delta_net_chunk_f32_1c, 2, 2, 0,
                                      DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_CHUNK_URAM_BYTES), 3, 2, 3, 0, 4, 0);
 DAYAN_MATMUL_1C_DESC(project_qg_bf16_1c);
@@ -1930,21 +1931,23 @@ DAYAN_MATMUL_1C_DESC(project_gated_output_f32_gate_bf16_1c);
 DAYAN_MATMUL_4C_DESC(project_gated_output_f32_gate_bf16_4c);
 DAYAN_MATMUL_1C_DESC(project_gated_output_f32_gate_fp16_1c);
 DAYAN_MATMUL_4C_DESC(project_gated_output_f32_gate_fp16_4c);
-DAYAN_KERNEL_TASK_DESC(ssm_conv_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
-                       1, 0, 1, 0);
-DAYAN_KERNEL_TASK_DESC(ssm_conv_split_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
-                       1, 0, 1, 0);
+DAYAN_KERNEL_TASK_DESC(ssm_conv_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
+                       4, 0, 2, 0);
+DAYAN_KERNEL_TASK_DESC(ssm_conv_split_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SSM_CONV_TASK_URAM_BYTES),
+                       4, 0, 2, 0);
+#define DAYAN_NATIVE_WORKER_DESC(kernel) \
+    DAYAN_KERNEL_TASK_DESC(kernel, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NATIVE_TASK_URAM_BYTES), 4, 0, 2, 0)
 #define DAYAN_NATIVE_KERNEL_DESC(kernel) \
     DAYAN_KERNEL_TASK_DESC(kernel, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NATIVE_TASK_URAM_BYTES), 2, 0, 1, 0)
 
-DAYAN_NATIVE_KERNEL_DESC(residual_add_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(residual_add_bf16_1c);
-DAYAN_NATIVE_KERNEL_DESC(residual_add_fp16_1c);
-DAYAN_NATIVE_KERNEL_DESC(elementwise_add_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(elementwise_mul_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(elementwise_sub_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(elementwise_div_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(scale_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(residual_add_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(residual_add_bf16_1c);
+DAYAN_NATIVE_WORKER_DESC(residual_add_fp16_1c);
+DAYAN_NATIVE_WORKER_DESC(elementwise_add_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(elementwise_mul_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(elementwise_sub_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(elementwise_div_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(scale_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(sigmoid_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(silu_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(softplus_f32_1c);
@@ -1960,36 +1963,37 @@ DAYAN_NATIVE_KERNEL_DESC(relu_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(gelu_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(gelu_quick_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(exp_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(sum_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(sum_rows_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(mean_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(l2_norm_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(get_rows_1c);
-DAYAN_NATIVE_KERNEL_DESC(set_rows_1c);
-DAYAN_NATIVE_KERNEL_DESC(copy_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(sum_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(sum_rows_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(mean_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(l2_norm_f32_1c);
+DAYAN_KERNEL_TASK_DESC(get_rows_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_GET_ROWS_URAM_BYTES), 4, 0, 2, 0);
+DAYAN_NATIVE_WORKER_DESC(set_rows_1c);
+DAYAN_NATIVE_WORKER_DESC(copy_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(repeat_1c);
 DAYAN_NATIVE_KERNEL_DESC(set_1c);
 DAYAN_NATIVE_KERNEL_DESC(diag_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(diag_mask_inf_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(diag_mask_zero_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(diag_mask_inf_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(diag_mask_zero_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(pad_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(pad_circular_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(pad_reflect_1d_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(roll_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(add_id_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(clamp_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(softmax_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(add_id_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(clamp_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(softmax_f32_1c);
 DAYAN_NATIVE_KERNEL_DESC(concat_1c);
-DAYAN_NATIVE_KERNEL_DESC(rope_f32_1c);
-DAYAN_NATIVE_KERNEL_DESC(group_norm_f32_1c);
-DAYAN_KERNEL_TASK_DESC(rms_norm_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NORM_TASK_URAM_BYTES), 2, 0, 1, 0);
-DAYAN_KERNEL_TASK_DESC(norm_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NORM_TASK_URAM_BYTES), 2, 0, 1, 0);
-DAYAN_KERNEL_TASK_DESC(rms_norm_pipeline_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NORM_TASK_URAM_BYTES), 2, 0, 1, 0);
+DAYAN_NATIVE_WORKER_DESC(rope_f32_1c);
+DAYAN_NATIVE_WORKER_DESC(group_norm_f32_1c);
+DAYAN_KERNEL_TASK_DESC(rms_norm_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NORM_TASK_URAM_BYTES), 4, 0, 2, 0);
+DAYAN_KERNEL_TASK_DESC(norm_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NORM_TASK_URAM_BYTES), 4, 0, 2, 0);
+DAYAN_KERNEL_TASK_DESC(rms_norm_pipeline_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_NORM_TASK_URAM_BYTES), 4, 0, 2, 0);
 
 #undef DAYAN_NATIVE_KERNEL_DESC
+#undef DAYAN_NATIVE_WORKER_DESC
 
-DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 0, 0);
-DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 0, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 2, 0, 0, 0);
+DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 4, 0, 0, 0);
+DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 4, 0, 0, 0);
 
 #undef DAYAN_MATMUL_4C_DESC
 #undef DAYAN_MATMUL_1C_DESC

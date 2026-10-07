@@ -42,10 +42,12 @@ constexpr long kVtBytes = kKBytes;
 constexpr long kUramK0 = kSlices * kContextBytes;
 constexpr long kUramVt0 = kUramK0 + 2 * kKBytes;
 constexpr long kUramZero = kUramVt0 + 2 * kVtBytes;
-static_assert(kUramZero + kVecBytes <= kUramBytes, "Attention URAM exceeds allocation");
+constexpr long kUramMaskRows = kUramZero + kVecBytes;
+constexpr long kUramMaskCols = kUramMaskRows + kVecBytes;
+constexpr long kUramMaskDelta = kUramMaskCols + kVecBytes;
+static_assert(kUramMaskDelta + kVecBytes <= kUramBytes, "Attention URAM exceeds allocation");
 static_assert(kLocalResources <= 32, "Attention exceeds the Local Resource window");
 
-static inline uint64_t uram_addr(long offset) { return (uint64_t) dayan_uram_base() + offset; }
 static inline long min_long(long a, long b) { return a < b ? a : b; }
 static inline long extent(long n, long size) { return n <= 0 ? 0 : min_long(n, size); }
 static inline void check(int status) {
@@ -127,7 +129,7 @@ static inline void load_v_transposed(uint64_t v_dram, long vt_base, long rows, u
     for (long panel = 0; panel < panels; ++panel) {
         const long panel_rows = min_long(side, rows - panel * side);
         __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_BLOCK>(panel_rows - 1);
-        __tx_lsu_dma_d2u<Group>(uram_addr(vt_base) + panel * side * sizeof(uint16_t),
+        __tx_lsu_dma_d2u<Group>(vt_base + panel * side * sizeof(uint16_t),
                                 v_dram + static_cast<uint64_t>(panel * side) * row_stride);
     }
 }
@@ -298,6 +300,7 @@ constexpr long kVSwizzle = MAT_BATCH_SWIZZLE(5, 1, 5);
 
 static void load_q(void * argument) {
     const State & s = *(State *) argument;
+    const long uram = (long) dayan_uram_base();
     configure_lsu_rows<0>(s.cfg->head_dim * 2, s.split_kv ? s.cfg->q_head_stride : s.cfg->q_row_stride, s.cfg->head_dim * 2);
     __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(qk_swizzle(s.cfg->head_dim));
     for (uint64_t block = 0; block < s.blocks; ++block) {
@@ -308,7 +311,7 @@ static void load_q(void * argument) {
             }
             check(dayan_resource_wait_free(q_resource(slice)));
             set_lsu_rows<0>(rows);
-            __tx_lsu_dma_d2u<0>(uram_addr(slice * kContextBytes + kCtxQ), s.q_address(block, slice));
+            __tx_lsu_dma_d2u<0>(uram + slice * kContextBytes + kCtxQ, s.q_address(block, slice));
             check(dayan_resource_produce_lsu(q_resource(slice), 1, 0));
         }
     }
@@ -317,6 +320,7 @@ static void load_q(void * argument) {
 
 template <int Cores, bool Value> static void load_kv(void * argument) {
     const State & s = *(State *) argument;
+    const long uram = (long) dayan_uram_base();
     uint64_t phases = 0;
     uint64_t generation = 0;
     if constexpr (Value) {
@@ -359,12 +363,12 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
                         configure_lsu_rows<1>(kBc * 2 - end, 0, kBc * 2);
                         set_lsu_rows<1>(s.cfg->head_dim);
                         __tx_lsu_tcsr_write<LSU_GROUPSZ + LSU_URAMWRITESWIZZLEMBS>(kVSwizzle);
-                        __tx_lsu_dma_u2u<1>(uram_addr(offset + end), uram_addr(kUramZero));
+                        __tx_lsu_dma_u2u<1>(uram + offset + end, uram + kUramZero);
                     }
-                    load_v_transposed<0>(kv_base + ki * kBc * row_stride, offset, cols, row_stride);
+                    load_v_transposed<0>(kv_base + ki * kBc * row_stride, uram + offset, cols, row_stride);
                 } else {
                     set_lsu_rows<0>(cols);
-                    __tx_lsu_dma_d2u<0>(uram_addr(offset), kv_base + ki * kBc * row_stride);
+                    __tx_lsu_dma_d2u<0>(uram + offset, kv_base + ki * kBc * row_stride);
                 }
                 check(dayan_resource_produce_lsu(local, users, 0));
                 if constexpr (Cores == 4) {
@@ -375,7 +379,7 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
                 const long owner = cluster.owner[2 * Value + slot];
                 const long bytes = Value ? s.cfg->head_dim * kBc * 2 : cols * s.cfg->head_dim * 2;
                 configure_lsu_rows<1>(bytes, bytes, bytes);
-                __tx_lsu_dma_d2u<1>(uram_addr(offset), cluster.uram[owner] + offset);
+                __tx_lsu_dma_d2u<1>(uram + offset, cluster.uram[owner] + offset);
                 check(dayan_resource_produce_lsu(local, users, shared_mask));
             } else {
                 DAYAN_PARAMS_ERROR();
@@ -435,6 +439,10 @@ static inline void initialize_vec() {
     configure_vec_iterator<kVecV1Base>(0, 0, kVecBytes, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, kVecBytes, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 16 * 32, 0);
+    // Iterator fields are unsigned; subtract row and column positions in VEC.
+    configure_vec_iterator<VEC_S0_BASE>(0, 0, 8, 0);
+    configure_vec_iterator<VEC_S1_BASE>(0, 0, 0, 8);
+    __tx_vec_tcsr_write<VEC_S1_BASE>(kBr);
 }
 
 template <bool Mask, bool First> static inline void online_softmax(long base, long previous, long rows, uint32_t scale) {
@@ -447,10 +455,10 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0xff7fffffU);
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
     for (long part = 0; part < 16; ++part) {
-        __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileScore + part * 32));
+        __tx_vec_lsu_u2v<0, 0>(base + kTileScore + part * 32);
         __tx_vec_vv_fp32_mul<0, 0, 18, 0>();
         if constexpr (Mask) {
-            __tx_vec_lsu_u2s<0, 3>(uram_addr(base + kTileMask + part * 32));
+            __tx_vec_lsu_u2s<0, 3>(base + kTileMask + part * 32);
             __tx_vec_vv_mux2<0, 17, 0, 0>();
         }
         if (part) {
@@ -464,20 +472,20 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
     if constexpr (First) {
         __tx_vec_lsu_g2v_broadcast32<1, 0>(0xff7fffffU);
     } else {
-        __tx_vec_lsu_u2v<1, 1>(uram_addr(previous + kTileM));
+        __tx_vec_lsu_u2v<1, 1>(previous + kTileM);
     }
     __tx_vec_vv_fp32_max<1, 0, 16, 0>();
     // Q1 ages: new M=0, old M=1, zero=5, floor=6, scale=7.
     for (long part = 0; part < 16; ++part) {
-        __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileScore + part * 32));
+        __tx_vec_lsu_u2v<0, 0>(base + kTileScore + part * 32);
         __tx_vec_vv_fp32_mul<0, 0, 23, 0>();
         __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
         __tx_vec_v_fp32_eru<0, 0, 0>();
         if constexpr (Mask) {
-            __tx_vec_lsu_u2s<0, 3>(uram_addr(base + kTileMask + part * 32));
+            __tx_vec_lsu_u2s<0, 3>(base + kTileMask + part * 32);
             __tx_vec_vv_mux2<0, 21, 0, 0>();
         }
-        __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kTileScore + part * 32));
+        __tx_vec_lsu_v2u<0, 0>(base + kTileScore + part * 32);
         if (part) {
             __tx_vec_vv_fp32_add<0, Mask ? 5 : 4, 0, 0>();
         }
@@ -488,21 +496,22 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
     }
     __tx_vec_vv_fp32_sub<0, 20, 19, 0>();
     __tx_vec_v_fp32_eru<0, 0, 0>();
-    __tx_vec_lsu_v2u<0, 2>(uram_addr(base + kTileAlpha));
+    __tx_vec_lsu_v2u<0, 2>(base + kTileAlpha);
     if constexpr (First) {
         __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
     } else {
-        __tx_vec_lsu_u2v<1, 1>(uram_addr(previous + kTileL));
+        __tx_vec_lsu_u2v<1, 1>(previous + kTileL);
     }
     __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     __tx_vec_vv_fp32_add<0, 3, 0, 0>();
-    __tx_vec_lsu_v2u<0, 1>(uram_addr(base + kTileL));
-    __tx_vec_lsu_v2u<20, 1>(uram_addr(base + kTileM));
+    __tx_vec_lsu_v2u<0, 1>(base + kTileL);
+    __tx_vec_lsu_v2u<20, 1>(base + kTileM);
     __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
 
-static bool prepare_mask(const State & s, uint64_t block, long slice, long ki) {
+static bool prepare_mask(const State & s, long uram, uint64_t block, long slice, long ki) {
+    using namespace ggml_dayan_vec_detail;
     const long rows = s.rows(block, slice);
     const long cols = s.cols(ki);
     const bool causal = !s.split_kv && (s.cfg->flags & kFlagCausal);
@@ -510,24 +519,65 @@ static bool prepare_mask(const State & s, uint64_t block, long slice, long ki) {
     if (rows % 8 == 0 && cols == kBc && (!causal || first >= kBc - 1)) {
         return false;
     }
-    uint64_t * masks = (uint64_t *) uram_addr(tile_offset(slice, ki & 1) + kTileMask);
-    for (long group = 0; group < (rows + 7) / 8; ++group) {
-        for (long part = 0; part < 16; ++part) {
-            uint64_t mask = 0;
-            for (long r = 0; r < 8; ++r) {
-                const long row = group * 8 + r;
-                const long valid = row >= rows ? 0 : causal ? extent(first + row + 1, cols) : cols;
-                const long count = extent(valid - part * 8, 8);
-                mask |= ((uint64_t{1} << count) - 1) << (r * 8);
-            }
-            masks[(group * 16 + part) * 4] = mask;
-        }
+    const bool tail = rows % 8 || cols < kBc;
+    const long row_base = extent(first + kBr, kBr + kBc);
+    const long instructions = (causal ? 6 : 1) + (rows % 8 ? 7 : 0) + (cols < kBc ? 7 : 0) + (tail ? 4 : 0) + 1;
+    configure_vec_grid((rows + 7) / 8, kBc / 8);
+    __tx_vec_tcsr_write<kVecV2Base + 3>(0);
+    __tx_vec_tcsr_write<kVecV3Base + 4>(32);
+    __tx_vec_tcsr_write<VEC_S0_BASE>(row_base);
+    begin_vec_block(instructions);
+    if (causal) {
+        // Compare lane_col - lane_row with first + 8 * group - 8 * part.
+        __tx_vec_s_iter_gets<0, 0, 0, 0>();
+        __tx_vec_s_iter_gets<1, 0, 0, 1>();
+        __tx_vec_s_int32_sub<0, 0, 1>();
+        __tx_vec_lsu_s2v_broadcast32<0, 2, 0>();
+        __tx_vec_lsu_u2v<1, 2>(uram + kUramMaskDelta);
+        __tx_vec_vv_int32_cmp<16, 0, 0, 0b110>();
+    } else {
+        __tx_vec_lsu_g2s<0>(-1);
     }
+    if (tail) {
+        __tx_vec_lsu_g2v_broadcast32<0, 2>(0);
+        __tx_vec_lsu_g2v_mask_broadcast32<0, 0, 0>(1);
+    }
+    if (rows % 8) {
+        __tx_vec_s_iter_gets<1, 0, 0, 0>();
+        __tx_vec_lsu_g2s<2>(rows + row_base);
+        __tx_vec_s_int32_sub<1, 2, 1>();
+        __tx_vec_lsu_s2v_broadcast32<1, 2, 1>();
+        __tx_vec_lsu_u2v<1, 2>(uram + kUramMaskRows);
+        __tx_vec_vv_int32_cmp<16, 17, 1, 0b011>();
+        __tx_vec_lsu_g2v_mask_broadcast32<0, 0, 1>(0);
+    }
+    if (cols < kBc) {
+        __tx_vec_s_iter_gets<1, 0, 0, 1>();
+        __tx_vec_lsu_g2s<2>(cols + kBr);
+        __tx_vec_s_int32_sub<1, 2, 1>();
+        __tx_vec_lsu_s2v_broadcast32<1, 2, 1>();
+        __tx_vec_lsu_u2v<1, 2>(uram + kUramMaskCols);
+        __tx_vec_vv_int32_cmp<16, 17, 1, 0b011>();
+        __tx_vec_lsu_g2v_mask_broadcast32<0, 0, 1>(0);
+    }
+    if (tail) {
+        __tx_vec_lsu_g2v_broadcast32<1, 2>(0);
+        __tx_vec_vv_int32_cmp<0, 16, 0, 0b001>();
+    }
+    __tx_vec_lsu_s2u<0, 3>(uram + tile_offset(slice, ki & 1) + kTileMask);
+    __asm__ volatile("" ::: "memory");
+    __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
+    // Both softmax passes read the packed masks from URAM.
+    dayan_wait_vec();
+    __tx_vec_tcsr_write<kVecDim3>(0);
+    __tx_vec_tcsr_write<kVecV2Base + 3>(kVecBytes);
+    __tx_vec_tcsr_write<kVecV3Base + 4>(0);
     return true;
 }
 
 static void softmax(void * argument) {
     const State & s = *(State *) argument;
+    const long uram = (long) dayan_uram_base();
     uint64_t phases = 0;
     uint64_t state_phases = 0;
     initialize_vec();
@@ -543,9 +593,9 @@ static void softmax(void * argument) {
                 const uint64_t previous_state = ki == 0 ? 0 : DAYAN_RESOURCE_MASK(state_resource(slice, slot ^ 1));
                 // Publication phases also advance for the final state, which has no softmax reader.
                 check(dayan_resource_wait(state, score | previous_state, phases | (previous_state & ~state_phases), 0));
-                const bool masked = prepare_mask(s, block, slice, ki);
-                const long base = tile_offset(slice, slot);
-                const long previous = tile_offset(slice, slot ^ 1);
+                const bool masked = prepare_mask(s, uram, block, slice, ki);
+                const long base = uram + tile_offset(slice, slot);
+                const long previous = uram + tile_offset(slice, slot ^ 1);
                 const long rows = s.rows(block, slice);
                 if (ki == 0) {
                     if (masked) online_softmax<true, true>(base, previous, rows, s.scale);
@@ -605,28 +655,28 @@ template <bool First, bool Last> static inline void update_output(long base, lon
     using namespace ggml_dayan_vec_detail;
     constexpr long instructions = (First ? 2 : 6) + (Last ? 3 : 0);
     begin_vec_block(instructions);
-    __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTilePV));
+    __tx_vec_lsu_u2v<0, 0>(base + kTilePV);
     if constexpr (!First) {
-        __tx_vec_lsu_u2v<1, 0>(uram_addr(out));
-        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kTileAlpha));
+        __tx_vec_lsu_u2v<1, 0>(out);
+        __tx_vec_lsu_u2v_broadcast32<1, 2>(base + kTileAlpha);
         __tx_vec_vv_fp32_mul<1, 17, 16, 0>();
         __tx_vec_vv_fp32_add<0, 0, 16, 0>();
     }
     if constexpr (Last) {
-        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kTileL));
+        __tx_vec_lsu_u2v_broadcast32<1, 2>(base + kTileL);
         __tx_vec_v_fp32_eru<1, 16, 1>();
         __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
     }
-    __tx_vec_lsu_v2u<0, 0>(uram_addr(out));
+    __tx_vec_lsu_v2u<0, 0>(out);
     __asm__ volatile("" ::: "memory");
     __tx_vec_tcsr_write<kVecControl>(vec_control(instructions));
 }
 
-static void merge_decode(const State & s, long base, long rows) {
+static void merge_decode(const State & s, long uram, long base, long rows) {
     using namespace ggml_dayan_vec_detail;
     Cluster & cluster = *(Cluster *) shared;
     // The unused second Q slice holds peer state and merge weights.
-    const long peer = tile_offset(1, 0);
+    const long peer = uram + tile_offset(1, 0);
     const long alpha = peer + kTileAlpha;
     const long beta = peer + kTileMask;
     const long state_bytes = (rows + 7) / 8 * kVecBytes;
@@ -636,31 +686,31 @@ static void merge_decode(const State & s, long base, long rows) {
             const long slot = (s.keys(0, 0, core) - 1) & 1;
             const uint64_t source = cluster.uram[core];
             configure_lsu_rows<0>(state_bytes, state_bytes, state_bytes);
-            __tx_lsu_dma_d2u<0>(uram_addr(peer + kTileM), source + tile_offset(0, slot) + kTileM);
-            __tx_lsu_dma_d2u<0>(uram_addr(peer + kTileL), source + tile_offset(0, slot) + kTileL);
+            __tx_lsu_dma_d2u<0>(peer + kTileM, source + tile_offset(0, slot) + kTileM);
+            __tx_lsu_dma_d2u<0>(peer + kTileL, source + tile_offset(0, slot) + kTileL);
             configure_lsu_rows<0>(rows * s.cfg->head_dim * 4, 0, 0);
-            __tx_lsu_dma_d2u<0>(uram_addr(kContextBytes + kCtxO), source + kCtxO);
+            __tx_lsu_dma_d2u<0>(uram + kContextBytes + kCtxO, source + kCtxO);
             dayan_wait_lsu();
 
             configure_vec_grid((rows + 7) / 8);
             configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
             begin_vec_block(16);
-            __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileM));
-            __tx_vec_lsu_u2v<1, 0>(uram_addr(peer + kTileM));
+            __tx_vec_lsu_u2v<0, 0>(base + kTileM);
+            __tx_vec_lsu_u2v<1, 0>(peer + kTileM);
             __tx_vec_vv_fp32_max<0, 0, 16, 0>();
-            __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kTileM));
+            __tx_vec_lsu_v2u<0, 0>(base + kTileM);
             __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
             __tx_vec_v_fp32_eru<0, 0, 0>();
-            __tx_vec_lsu_v2u<0, 0>(uram_addr(alpha));
+            __tx_vec_lsu_v2u<0, 0>(alpha);
             __tx_vec_vv_fp32_sub<1, 16, 2, 0>();
             __tx_vec_v_fp32_eru<1, 16, 0>();
-            __tx_vec_lsu_v2u<16, 0>(uram_addr(beta));
-            __tx_vec_lsu_u2v<0, 0>(uram_addr(base + kTileL));
+            __tx_vec_lsu_v2u<16, 0>(beta);
+            __tx_vec_lsu_u2v<0, 0>(base + kTileL);
             __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-            __tx_vec_lsu_u2v<1, 0>(uram_addr(peer + kTileL));
+            __tx_vec_lsu_u2v<1, 0>(peer + kTileL);
             __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
             __tx_vec_vv_fp32_add<0, 0, 16, 0>();
-            __tx_vec_lsu_v2u<0, 0>(uram_addr(base + kTileL));
+            __tx_vec_lsu_v2u<0, 0>(base + kTileL);
             start_vec_block(16);
             dayan_wait_vec();
 
@@ -668,23 +718,23 @@ static void merge_decode(const State & s, long base, long rows) {
             configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
             configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
             begin_vec_block(8);
-            __tx_vec_lsu_u2v<0, 0>(uram_addr(kCtxO));
-            __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(alpha));
+            __tx_vec_lsu_u2v<0, 0>(uram + kCtxO);
+            __tx_vec_lsu_u2v_broadcast32<1, 2>(alpha);
             __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-            __tx_vec_lsu_u2v<1, 0>(uram_addr(kContextBytes + kCtxO));
-            __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(beta));
+            __tx_vec_lsu_u2v<1, 0>(uram + kContextBytes + kCtxO);
+            __tx_vec_lsu_u2v_broadcast32<1, 2>(beta);
             __tx_vec_vv_fp32_mul<1, 16, 17, 0>();
             __tx_vec_vv_fp32_add<0, 0, 16, 0>();
-            __tx_vec_lsu_v2u<0, 0>(uram_addr(kCtxO));
+            __tx_vec_lsu_v2u<0, 0>(uram + kCtxO);
             start_vec_block(8);
             dayan_wait_vec();
         }
         begin_vec_block(5);
-        __tx_vec_lsu_u2v<0, 0>(uram_addr(kCtxO));
-        __tx_vec_lsu_u2v_broadcast32<1, 2>(uram_addr(base + kTileL));
+        __tx_vec_lsu_u2v<0, 0>(uram + kCtxO);
+        __tx_vec_lsu_u2v_broadcast32<1, 2>(base + kTileL);
         __tx_vec_v_fp32_eru<1, 16, 1>();
         __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-        __tx_vec_lsu_v2u<0, 0>(uram_addr(kCtxO));
+        __tx_vec_lsu_v2u<0, 0>(uram + kCtxO);
         start_vec_block(5);
         dayan_wait_vec();
     }
@@ -695,6 +745,7 @@ static void merge_decode(const State & s, long base, long rows) {
 static void output(void * argument) {
     using namespace ggml_dayan_vec_detail;
     const State & s = *(State *) argument;
+    const long uram = (long) dayan_uram_base();
     uint64_t phases = 0;
     uint64_t o_phases = 0;
     for (uint64_t block = 0; block < s.blocks; ++block) {
@@ -718,8 +769,8 @@ static void output(void * argument) {
                 // Two version tokens serialize updates to the single O allocation.
                 check(dayan_resource_wait(current_o, inputs | previous_o, phases | (previous_o & ~o_phases), 0));
                 const long rows = s.rows(block, slice);
-                const long base = tile_offset(slice, slot);
-                const long out = slice * kContextBytes + kCtxO;
+                const long base = uram + tile_offset(slice, slot);
+                const long out = uram + slice * kContextBytes + kCtxO;
                 const bool last = ki + 1 == keys;
                 const bool normalize = last && !s.split_kv;
                 __tx_vec_tcsr_write<kVecDim2>(rows - 1);
@@ -737,12 +788,12 @@ static void output(void * argument) {
                 if (last) {
                     check(dayan_resource_wait_ready(o, (o_phases & current_o) ? 0 : 1));
                     if (s.split_kv) {
-                        merge_decode(s, base, rows);
+                        merge_decode(s, uram, base, rows);
                         configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4, s.cfg->head_dim * 4);
                     }
                     if (!s.split_kv || s.lane == 0) {
                         set_lsu_rows<0>(rows);
-                        __tx_lsu_dma_u2d<0>(s.output_address(block, slice), uram_addr(out));
+                        __tx_lsu_dma_u2d<0>(s.output_address(block, slice), out);
                     }
                     check(dayan_resource_consume_lsu(current_o | merge_state));
                     dayan_wait_lsu();
@@ -860,7 +911,8 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
         ranges_overlap(out_base_addr, out_bytes, v_base_addr, v_span)) {
         return FA_OUTPUT_ALIAS;
     }
-    DAYAN_PARAMS_IF(!dayan_uram_base() || dayan_uram_size() < kUramBytes) {
+    const long uram = (long) dayan_uram_base();
+    DAYAN_PARAMS_IF(!uram || dayan_uram_size() < kUramBytes) {
         return FA_INVALID_ARGUMENT;
     }
 
@@ -871,7 +923,7 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     s.k = k_base_addr;
     s.v = v_base_addr;
     s.out = out_base_addr;
-    s.uram = (uint64_t) dayan_uram_base() & (2 * 1024 * 1024 - 1);
+    s.uram = (uint64_t) uram & (2 * 1024 * 1024 - 1);
     if (s.uram + kUramBytes > 2 * 1024 * 1024) {
         return FA_INVALID_ARGUMENT;
     }
@@ -883,15 +935,18 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     s.groups = SplitKV ? (q_heads / kv_heads + kBr - 1) / kBr : q_groups;
     const uint64_t work = (uint64_t) batch * (SplitKV ? kv_heads : q_heads);
     s.blocks = (work > s.task ? (work - s.task + s.tasks - 1) / s.tasks : 0) * s.groups;
-    for (long i = 0; i < kVecBytes / 4; ++i) {
-        ((uint32_t *) uram_addr(kUramZero))[i] = 0;
+    for (long i = 0; i < kVecLanes; ++i) {
+        ((uint32_t *) (uram + kUramZero))[i] = 0;
+        ((int32_t *) (uram + kUramMaskRows))[i] = i / 8;
+        ((int32_t *) (uram + kUramMaskCols))[i] = i % 8;
+        ((int32_t *) (uram + kUramMaskDelta))[i] = i % 8 - i / 8;
     }
     if constexpr (Cores == 4) {
         if (!shared) {
             return FA_INVALID_ARGUMENT;
         }
         Cluster & cluster = *(Cluster *) shared;
-        cluster.uram[s.lane] = (uint64_t) dayan_uram_base();
+        cluster.uram[s.lane] = uram;
         check(dayan_cluster_barrier(4, &cluster.barrier));
     }
     dayan_thread_resources_t resources = {};

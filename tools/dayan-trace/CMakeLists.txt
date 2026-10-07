@@ -16,6 +16,13 @@ target_include_directories(llama-dayan-moe-bench PRIVATE "${CMAKE_SOURCE_DIR}/ve
 target_link_libraries(llama-dayan-moe-bench PRIVATE llama ggml)
 target_compile_features(llama-dayan-moe-bench PRIVATE cxx_std_17)
 
+add_executable(llama-dayan-layer-bench layer-bench.cpp)
+target_include_directories(llama-dayan-layer-bench PRIVATE
+    "${CMAKE_SOURCE_DIR}/vendor"
+    "${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan")
+target_link_libraries(llama-dayan-layer-bench PRIVATE llama ggml)
+target_compile_features(llama-dayan-layer-bench PRIVATE cxx_std_17)
+
 if(LLAMA_TOOLS_INSTALL)
-    install(TARGETS ${TARGET} llama-dayan-operator-bench llama-dayan-moe-bench RUNTIME)
+    install(TARGETS ${TARGET} llama-dayan-operator-bench llama-dayan-moe-bench llama-dayan-layer-bench RUNTIME)
 endif()

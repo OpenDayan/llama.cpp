@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -20,9 +21,27 @@
 #include <unordered_map>
 #include <vector>
 
-static constexpr uint32_t GGML_DAYAN_TIMEOUT_MS          = 3600000U;
+static constexpr uint32_t GGML_DAYAN_TIMEOUT_MS          = NPU_TIMEOUT_INFINITE;
 static constexpr size_t   GGML_DAYAN_MATMUL_BUFFER_BYTES = 16U * 1024U * 1024U;
 static constexpr uint64_t GGML_DAYAN_MATMUL_TILE_N       = 384U;
+
+static uint32_t ggml_backend_dayan_timeout_ms() {
+    static const uint32_t timeout_ms = []() {
+        const char * value = std::getenv("GGML_DAYAN_TIMEOUT_MS");
+        if (value == nullptr || value[0] == '\0') {
+            return GGML_DAYAN_TIMEOUT_MS;
+        }
+        char * end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(value, &end, 10);
+        if (errno != 0 || value[0] < '0' || value[0] > '9' || *end != '\0' || parsed == 0 || parsed > UINT32_MAX) {
+            GGML_LOG_WARN("%s: invalid GGML_DAYAN_TIMEOUT_MS=%s; using infinite wait\n", __func__, value);
+            return GGML_DAYAN_TIMEOUT_MS;
+        }
+        return (uint32_t) parsed;
+    }();
+    return timeout_ms;
+}
 
 struct ggml_backend_dayan_device_state {
     npu_runtime_t * runtime    = nullptr;
@@ -879,7 +898,9 @@ static int ggml_backend_dayan_device_acquire(ggml_backend_dayan_device_state ** 
         ggml_backend_dayan_device_state * device = new ggml_backend_dayan_device_state;
         npu_runtime_options_t             options;
         npu_runtime_options_init(&options);
-        options.default_timeout_ms = GGML_DAYAN_TIMEOUT_MS;
+        options.default_timeout_ms = ggml_backend_dayan_timeout_ms();
+        GGML_LOG_INFO("%s: wait timeout = %u ms%s\n", __func__, options.default_timeout_ms,
+                      options.default_timeout_ms == NPU_TIMEOUT_INFINITE ? " (infinite)" : "");
 
         const char * socket = std::getenv("DAYAN_SERVER_SOCKET");
         if (socket != nullptr && socket[0] != '\0') {
@@ -984,7 +1005,7 @@ static int ggml_backend_dayan_event_wait(npu_event_t * event) {
     }
 
     npu_event_info_t info;
-    const int        status         = npu_event_wait(event, GGML_DAYAN_TIMEOUT_MS, &info);
+    const int        status         = npu_event_wait(event, ggml_backend_dayan_timeout_ms(), &info);
     const int        destroy_status = npu_event_destroy(event);
 
     if (status < 0) {
@@ -1323,7 +1344,7 @@ static void ggml_backend_dayan_init_launch_attrs(ggml_backend_dayan_context * ct
     npu_kernel_launch_attrs_init(attrs, ctx->context, ctx->stream, name);
     attrs->config.task_dim  = NPUTaskDim3{ 1, 1, 1 };
     attrs->config.task_mode = NPUTaskMode::kSingleCore;
-    attrs->timeout_ms       = GGML_DAYAN_TIMEOUT_MS;
+    attrs->timeout_ms       = ggml_backend_dayan_timeout_ms();
 }
 
 static void ggml_backend_dayan_init_native_launch_attrs(ggml_backend_dayan_context * ctx,
@@ -3393,14 +3414,12 @@ static int ggml_backend_dayan_mega_launch(void * context,
     }
     if (status == 0) {
         npu_kernel_launch_attrs_t attrs;
-        const bool linear = graph == kDayanMegaQwen35DenseMxfp4Linear ||
-                            graph == kDayanMegaQwen35DenseBf16Linear || graph == kDayanMegaQwen35MoeLinear;
+        const auto kind = ggml_dayan_mega_detail::graph_kind(graph);
         const char * tag = std::getenv("GGML_DAYAN_MEGA_TAG");
         ggml_backend_dayan_init_launch_attrs(
-            ctx, tag && tag[0] ? tag : linear ? "q35-linear" : "q35-full-mega", &attrs);
+            ctx, tag && tag[0] ? tag : kind.linear ? "q35-linear" : "q35-full-mega", &attrs);
         attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
-        const bool moe = graph == kDayanMegaQwen35MoeLinear || graph == kDayanMegaQwen35MoeFull;
-        const auto launch = moe ? qwen35_moe_mega : qwen35_dense_mega;
+        const auto launch = kind.moe ? qwen35_moe_mega : qwen35_dense_mega;
         status = launch(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
             arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],

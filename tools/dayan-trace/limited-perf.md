@@ -1,5 +1,7 @@
 # Limited operator profiling
 
+For complete single-layer prefill/decode measurements and offline per-slot analysis, use [layer-perf.py](layer-perf.md). The operator presets below remain available for individual operator checks.
+
 `limited-perf.py` measures the key Dayan operators selected by `--model` and estimates their inference cost. Model groups, shapes, storage types, and prediction factors are recorded in [limited-perf-models.json](limited-perf-models.json). It connects to an existing `dayan_server` and reads the JSON output of an existing firmware `dyperf`. It does not start or stop TestCluster, cmodel, the server, or a profiler. No kernel contains custom performance instrumentation.
 
 Build the host client from the repository root:

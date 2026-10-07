@@ -2,6 +2,7 @@
 
 #include "ggml-dayan-matmul.h"
 #include "ggml-dayan-mxfp4-layout.h"
+#include "ggml-dayan-workers.h"
 
 #if defined(__DAYAN_DEVICE__)
 namespace ggml_dayan_mxfp4_detail {
@@ -146,22 +147,26 @@ static void store_quantized(uint64_t packed, uint64_t scales, uint64_t output, u
     store_matrix<0>(scale_bytes, columns / 128, padded, columns / 128, scales, output_scales);
 }
 
-static void convert(const DayanMxfp4Config * cfg, const void * input, void * output, void * scales) {
+static void convert(const DayanMxfp4Config * cfg, const void * input, void * output, void * scales, const NativeContext & context = {}) {
+    if (!cfg) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) cfg->m * cfg->n, ((cfg->m + 127) / 128) * ((cfg->n + 511) / 512), 320U * 1024U, 1}, [&](const NativeContext & worker) {
+            convert(cfg, input, output, scales, worker);
+        })) { return; }
     using namespace ggml_dayan_vec_detail;
-    const uint64_t base = (uintptr_t) dayan_uram_base();
+    const uint64_t base = native_uram(context);
     enum : int { Rows = 128, Columns = 512 };
     const uint64_t nt = (cfg->n + Columns - 1) / Columns;
     const int bytes = cfg->source_type == kDayanDataTypeF32 ? 4 : 2;
     const int value_stride = Columns * bytes;
     const uint64_t packed = base + Rows * value_stride, scale = packed + Rows * Columns / 2;
-    DAYAN_PARAMS_IF(!base || scale + Rows * Columns / 32 + 64 - base > dayan_uram_size()) {
+    DAYAN_PARAMS_IF(!base || scale + Rows * Columns / 32 + 64 - base > native_uram_size(context)) {
         DAYAN_PARAMS_ERROR();
     }
     DAYAN_PARAMS_IF((base | packed | scale) & 31) {
         DAYAN_PARAMS_ERROR();
     }
     long checksum = 0;
-    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((cfg->m + Rows - 1) / Rows) * nt; tile += dayan_task_dim(DAYAN_TASK_X)) {
+    for (uint64_t tile = context.task; tile < ((cfg->m + Rows - 1) / Rows) * nt; tile += context.tasks) {
         const uint64_t row = tile / nt * Rows, col = tile % nt * Columns;
         const int rows = extent(cfg->m - row, Rows), cols = extent(cfg->n - col, Columns);
         const int columns = (cols + 127) & ~127;

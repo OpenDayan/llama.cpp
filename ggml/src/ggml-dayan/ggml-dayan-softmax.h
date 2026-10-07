@@ -76,16 +76,16 @@ static inline void softmax_load_tile(const DayanSoftmaxConfig * config,
                                      uint32_t                   offset,
                                      uint32_t                   elements,
                                      uint64_t                   logits_uram,
-                                     uint64_t                   mask_f32_uram) {
+                                     uint64_t                   mask_f32_uram, const NativeContext & context = {}) {
     normalization_load_bits(
-        logits_uram, input + input_row * config->width + offset, elements, 0xff7fffffU);
+        logits_uram, input + input_row * config->width + offset, elements, 0xff7fffffU, context);
     if ((config->flags & kDayanSoftmaxHasMask) != 0U) {
         const uint32_t mask_bytes = memory_type_bytes(config->mask_type);
         memory_load_f32(mask_f32_uram,
                         (const char *) mask + (mask_row * config->width + offset) * mask_bytes,
                         elements,
-                        config->mask_type);
-        normalization_pad_tail_bits(mask_f32_uram, elements, 0U);
+                        config->mask_type, context);
+        normalization_pad_tail_bits(mask_f32_uram, elements, 0U, context);
     }
 }
 
@@ -114,39 +114,34 @@ static inline void softmax_max_accumulate(const DayanSoftmaxConfig * config,
                                           bool                       initialize) {
     const bool has_mask          = (config->flags & kDayanSoftmaxHasMask) != 0U;
     const bool has_sink          = (config->flags & kDayanSoftmaxHasSinks) != 0U;
-    const long chunks            = ggml_dayan_vec_detail::f32_chunks(elements);
-    const long chunk_instructions = has_mask ? 27 : 23;
-    const long instructions       = 2 + chunk_instructions * chunks;
+    const long loop_end = has_mask ? 10 : 6;
+    const long instructions = loop_end + 20;
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::begin_vec_block(instructions);
-    if (initialize) {
-        if (has_sink) {
-            __tx_vec_lsu_u2v_broadcast32<1, 1>((long) sink);
-        } else {
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(0xff7fffffU);
-        }
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
+    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, Constants::kVecBytes, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+    begin_vec_block(instructions);
+    if (initialize && !has_sink) {
+        __tx_vec_lsu_g2v_broadcast32<1, 2>(0xff7fffffU);
     } else {
-        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+        __tx_vec_lsu_u2v_broadcast32<1, 2>((long) (initialize ? sink : accumulator));
     }
-    for (long chunk = 0; chunk < chunks; ++chunk) {
-        const uint64_t chunk_offset = (uint64_t) chunk * Constants::kVecBytes;
-        emit_softmax_logits(config, input + chunk_offset, mask + chunk_offset, slope);
-        ggml_dayan_vec_detail::emit_f32_max_stages();
-        if (has_mask) {
-            __tx_vec_vv_fp32_cmp<0, 26, 0, 0b100>();
-            __tx_vec_vv_mux2<1, 0, 26, 0>();
-        } else {
-            __tx_vec_vv_fp32_cmp<0, 23, 0, 0b100>();
-            __tx_vec_vv_mux2<1, 0, 23, 0>();
-        }
+    // Q1 holds lane maxima across DIM1; mask evaluation adds four Q1 writes.
+    emit_softmax_logits(config, input, mask, slope);
+    if (has_mask) {
+        __tx_vec_vv_fp32_cmp<0, 20, 0, 0b100>();
+        __tx_vec_vv_mux2<1, 0, 20, 0>();
+    } else {
+        __tx_vec_vv_fp32_cmp<0, 17, 0, 0b100>();
+        __tx_vec_vv_mux2<1, 0, 17, 0>();
     }
-    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
-    ggml_dayan_vec_detail::start_vec_block(instructions);
+    __tx_vec_shuffle_xor<0, 16>(0);
+    ggml_dayan_vec_detail::emit_f32_max_stages();
+    __tx_vec_lsu_v2u<0, 3>((long) accumulator);
+    normalization_start_loop(1, loop_end, instructions);
     dayan_wait_vec();
 }
 
@@ -163,60 +158,43 @@ static inline void softmax_exp_sum_accumulate(const DayanSoftmaxConfig * config,
                                               bool                       finalize) {
     const bool has_mask                 = (config->flags & kDayanSoftmaxHasMask) != 0U;
     const bool has_sink                 = (config->flags & kDayanSoftmaxHasSinks) != 0U;
-    const long chunks                   = ggml_dayan_vec_detail::f32_chunks(elements);
-    const long initialize_instructions = initialize && has_sink ? 6 : 1;
-    const long chunk_instructions      = has_mask ? 26 : 22;
-    const long finalize_instructions   = finalize ? 1 + 3 * chunks : 0;
-    const long instructions = initialize_instructions + chunk_instructions * chunks + finalize_instructions + 1;
+    const long loop_end = has_mask ? 15 : 11;
+    const long instructions = loop_end + 14 + (initialize ? (has_sink ? 7 : 0) : 2) + (finalize ? 1 : 0);
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV0Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV1Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV2Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::configure_vec_iterator<ggml_dayan_vec_detail::kVecV3Base>(0, 0, 0, 0);
-    ggml_dayan_vec_detail::begin_vec_block(instructions);
-    if (initialize) {
-        if (has_sink) {
-            __tx_vec_lsu_u2v_broadcast32<1, 1>((long) sink);
-            __tx_vec_lsu_u2v_broadcast32<0, 0>((long) maximum);
-            __tx_vec_vv_fp32_sub<1, 16, 0, 0>();
-            __tx_vec_lsu_g2v_broadcast32<0, 0>(
-                (long) ggml_dayan_vec_detail::f32_bits(1.4426950408889634f));
-            __tx_vec_vv_fp32_mul<1, 16, 0, 0>();
-            __tx_vec_v_fp32_sfu<1, 16, 1>();
-        } else {
-            __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
-        }
-    } else {
-        __tx_vec_lsu_u2v_broadcast32<1, 1>((long) accumulator);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
+    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, Constants::kVecBytes, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+    begin_vec_block(instructions);
+    __tx_vec_lsu_g2v_broadcast32<1, 2>(0);
+    emit_softmax_logits(config, logits, mask, slope);
+    __tx_vec_lsu_u2v_broadcast32<0, 2>((long) maximum);
+    __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
+    __tx_vec_lsu_g2v_broadcast32<0, 2>((long) ggml_dayan_vec_detail::f32_bits(1.4426950408889634f));
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
+    __tx_vec_lsu_v2u<0, 0>((long) exponent);
+    if (has_mask) { __tx_vec_vv_fp32_add<1, 0, 20, 0>(); }
+    else { __tx_vec_vv_fp32_add<1, 0, 17, 0>(); }
+    __tx_vec_shuffle_xor<0, 16>(0);
+    ggml_dayan_vec_detail::emit_f32_sum_stages();
+    if (!initialize) {
+        __tx_vec_lsu_u2v_broadcast32<1, 2>((long) accumulator);
+        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+    } else if (has_sink) {
+        __tx_vec_lsu_u2v_broadcast32<1, 2>((long) sink);
+        __tx_vec_lsu_u2v_broadcast32<1, 2>((long) maximum);
+        __tx_vec_vv_fp32_sub<1, 17, 16, 0>();
+        __tx_vec_lsu_g2v_broadcast32<1, 2>((long) ggml_dayan_vec_detail::f32_bits(1.4426950408889634f));
+        __tx_vec_vv_fp32_mul<1, 17, 16, 0>();
+        __tx_vec_v_fp32_sfu<1, 16, 1>();
+        __tx_vec_vv_fp32_add<0, 0, 16, 0>();
     }
-    for (long chunk = 0; chunk < chunks; ++chunk) {
-        const uint64_t chunk_offset = (uint64_t) chunk * Constants::kVecBytes;
-        emit_softmax_logits(config, logits + chunk_offset, mask + chunk_offset, slope);
-        __tx_vec_lsu_u2v_broadcast32<0, 0>((long) maximum);
-        __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
-        __tx_vec_lsu_g2v_broadcast32<0, 0>((long) ggml_dayan_vec_detail::f32_bits(1.4426950408889634f));
-        __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-        __tx_vec_v_fp32_sfu<0, 0, 1>();
-        __tx_vec_lsu_v2u<0, 3>((long) (exponent + chunk_offset));
-        ggml_dayan_vec_detail::emit_f32_sum_stages();
-        if (has_mask) {
-            __tx_vec_vv_fp32_add<1, 0, 26, 0>();
-        } else {
-            __tx_vec_vv_fp32_add<1, 0, 23, 0>();
-        }
-    }
-    if (finalize) {
-        __tx_vec_v_fp32_sfu<1, 16, 5>();
-        for (long chunk = 0; chunk < chunks; ++chunk) {
-            const uint64_t chunk_offset = (uint64_t) chunk * Constants::kVecBytes;
-            __tx_vec_lsu_u2v<0, 0>((long) (exponent + chunk_offset));
-            __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
-            __tx_vec_lsu_v2u<0, 3>((long) (exponent + chunk_offset));
-        }
-    }
-    __tx_vec_lsu_v2u<16, 3>((long) accumulator);
-    ggml_dayan_vec_detail::start_vec_block(instructions);
+    if (finalize) { __tx_vec_v_fp32_sfu<0, 0, 5>(); }
+    __tx_vec_lsu_v2u<0, 3>((long) accumulator);
+    normalization_start_loop(1, loop_end, instructions);
     dayan_wait_vec();
 }
 
@@ -241,8 +219,13 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
                                    const float *              input,
                                    const void *               mask,
                                    const float *              sinks,
-                                   float *                    output) {
-    memory_validate(config);
+                                   float *                    output, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) config->width * config->rows * config->heads * config->batches, (uint64_t) config->rows * config->heads * config->batches, 256U * 1024U}, [&](const NativeContext & worker) {
+            run_softmax_f32(config, input, mask, sinks, output, worker);
+        })) { return; }
+
+    memory_validate(config, context);
     if (input == nullptr || output == nullptr || config->width == 0 || config->rows == 0 || config->heads == 0 ||
         config->batches == 0 || !softmax_positive_bits(config->scale_bits) ||
         (((config->flags & kDayanSoftmaxHasMask) != 0U) &&
@@ -255,7 +238,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
 
     configure_normalization_lsu();
     ggml_dayan_vec_detail::configure_f32_iterators();
-    const uint64_t uram          = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t uram          = native_uram(context);
     const uint64_t logits_uram   = uram + NormalizationLayout::kInput;
     const uint64_t sink_uram     = uram + NormalizationLayout::kAux;
     const uint64_t mask_f32_uram = uram + NormalizationLayout::kValue;
@@ -264,8 +247,8 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
     const uint64_t slope         = uram + NormalizationLayout::kScaled;
     const uint64_t accumulator   = uram + NormalizationLayout::kVectorScalar;
 
-    const uint32_t task       = dayan_native_task_id();
-    const uint32_t tasks      = dayan_native_task_count();
+    const uint32_t task       = dayan_native_task_id(context);
+    const uint32_t tasks      = dayan_native_task_count(context);
     const uint64_t work_items = (uint64_t) config->batches * config->heads * config->rows;
     for (uint64_t input_row = task; input_row < work_items; input_row += tasks) {
         uint64_t       work = input_row;
@@ -278,13 +261,13 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
             (config->flags & kDayanSoftmaxHasMask) != 0U ? softmax_mask_row(config, row, head, batch) : 0U;
 
         if ((config->flags & kDayanSoftmaxHasSinks) != 0U) {
-            normalization_load(sink_uram, sinks + head, 1);
+            normalization_load(sink_uram, sinks + head, 1, context);
         }
 
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             softmax_load_tile(
-                config, input, mask, input_row, mask_row, offset, elements, logits_uram, mask_f32_uram);
+                config, input, mask, input_row, mask_row, offset, elements, logits_uram, mask_f32_uram, context);
             softmax_max_accumulate(
                 config, maximum, logits_uram, mask_f32_uram, slope, sink_uram, elements, offset == 0);
         }
@@ -294,7 +277,7 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
             softmax_load_tile(
-                config, input, mask, input_row, mask_row, offset, elements, logits_uram, mask_f32_uram);
+                config, input, mask, input_row, mask_row, offset, elements, logits_uram, mask_f32_uram, context);
             softmax_exp_sum_accumulate(config,
                                        accumulator,
                                        maximum,
@@ -306,13 +289,14 @@ static inline void run_softmax_f32(const DayanSoftmaxConfig * config,
                                        elements,
                                        offset == 0,
                                        offset == final_offset);
+            if (offset == final_offset) { softmax_scale_output(exp_uram, exp_uram, accumulator, elements); }
             normalization_store_f32(output + input_row * config->width + offset, exp_uram, elements);
             dayan_wait_lsu();
         }
 
         for (uint32_t offset = 0; offset < final_offset; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
-            normalization_load(exp_uram, output + input_row * config->width + offset, elements);
+            normalization_load(exp_uram, output + input_row * config->width + offset, elements, context);
             softmax_scale_output(exp_uram, exp_uram, accumulator, elements);
             normalization_store_f32(output + input_row * config->width + offset, exp_uram, elements);
             dayan_wait_lsu();

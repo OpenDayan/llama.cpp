@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml-dayan-matmul.h"
+#include "ggml-dayan-workers.h"
 
 #if defined(__DAYAN_DEVICE__)
 
@@ -118,14 +119,19 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
                                 const float *              weight,
                                 float *                    output,
                                 const float *              qkv = nullptr,
-                                float *                    state_output = nullptr) {
+                                float *                    state_output = nullptr, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) config->channels * config->tokens * config->sequences, (uint64_t) ((config->channels + 63) / 64) * config->sequences * ((config->tokens + kDayanSSMConvTokenTile - 1) / kDayanSSMConvTokenTile), 256U * 1024U}, [&](const NativeContext & worker) {
+            run_ssm_conv(config, input, weight, output, qkv, state_output, worker);
+        })) { return; }
+
     DAYAN_PARAMS_IF(config == nullptr || input == nullptr || weight == nullptr || output == nullptr || config->input_length == 0 || config->channels == 0 || config->tokens == 0 ||
                     config->sequences == 0 || config->kernel_size == 0 ||
                     config->kernel_size > kDayanSSMConvMaxKernelSize ||
                     (uint64_t) config->input_length != (uint64_t) config->kernel_size - 1U + config->tokens ||
                     (config->flags & ~(kDayanSSMConvFlagSilu | kDayanSSMConvFlagNoStateCopy)) != 0 || !dayan_native_task_mode_valid() ||
-                    dayan_task_dim(DAYAN_TASK_X) == 0U ||
-                    dayan_task_id(DAYAN_TASK_X) >= dayan_task_dim(DAYAN_TASK_X) ||
+                    context.tasks == 0U ||
+                    context.task >= context.tasks ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         DAYAN_PARAMS_ERROR();
     }
@@ -135,14 +141,14 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
     }
     static_assert(kDayanSSMConvTokenTile >= kDayanSSMConvMaxKernelSize, "SSM token tiles must cover the history");
 
-    const uint64_t uram_address = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t uram_address = native_uram(context);
     DAYAN_PARAMS_IF(uram_address == 0) {
         DAYAN_PARAMS_ERROR();
     }
 
     const bool update_state = qkv != nullptr && (config->flags & kDayanSSMConvFlagNoStateCopy) == 0;
-    const uint32_t task = dayan_task_id(DAYAN_TASK_X);
-    const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
+    const uint32_t task = context.task;
+    const uint32_t tasks = context.tasks;
     const uint32_t token_tile = config->tokens < kDayanSSMConvTokenTile ? config->tokens : kDayanSSMConvTokenTile;
     const uint64_t channel_groups = ((uint64_t) config->channels + Constants::kVecLanes - 1U) / Constants::kVecLanes;
     const uint32_t channel_tasks = channel_groups < tasks ? (uint32_t) channel_groups : tasks;
@@ -154,7 +160,7 @@ static inline void run_ssm_conv(const DayanSSMConvConfig * config,
     const uint64_t channel_end = channel_limit < config->channels ? channel_limit : config->channels;
     const uint64_t shard_channels = channel_end - channel_begin;
     const uint64_t bytes_per_channel = ssm_conv_uram_layout(token_tile, config->kernel_size, Constants::kVecLanes).total / Constants::kVecLanes;
-    const uint64_t max_channel_tile = dayan_uram_size() / bytes_per_channel / Constants::kVecLanes * Constants::kVecLanes;
+    const uint64_t max_channel_tile = native_uram_size(context) / bytes_per_channel / Constants::kVecLanes * Constants::kVecLanes;
     DAYAN_PARAMS_IF(max_channel_tile == 0) {
         DAYAN_PARAMS_ERROR();
     }

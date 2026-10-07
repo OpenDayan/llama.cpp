@@ -352,7 +352,7 @@ int main(int argc, char ** argv) {
     ggml_backend_ptr backend(ggml_backend_init_by_name("DAYAN", nullptr));
     require(backend != nullptr, "initialize backend");
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
-        for (int width : {32, 160, 1024, 1056}) { get_rows_test(backend.get(), width, type, width == 1056); }
+        for (int width : {32, 160, 1024, 1056, 32768, 32800}) { get_rows_test(backend.get(), width, type, width == 1056 || width == 32800); }
     }
     get_rows_rewrite_test(backend.get(), GGML_TYPE_BF16);
     get_rows_rewrite_test(backend.get(), GGML_TYPE_F16);

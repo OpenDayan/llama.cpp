@@ -681,9 +681,7 @@ static int run_embedding_norm_case(ggml_backend_t dayan, enum ggml_type type, in
     return close ? 0 : fail("embedding RMSNorm numerical comparison failed");
 }
 
-static int run_elementwise_case(ggml_backend_t dayan) {
-    constexpr int64_t width      = 130;
-    constexpr int64_t rows       = 3;
+static int run_elementwise_case(ggml_backend_t dayan, int64_t width = 130, int64_t rows = 3) {
     constexpr float   l2_epsilon = 1.0e-6f;
     constexpr int     graph_size = 16;
 
@@ -1205,14 +1203,11 @@ static int run_strided_rms_case(ggml_backend_t dayan, int64_t width = 130) {
     return close ? 0 : fail("strided RMSNorm numerical comparison failed");
 }
 
-static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
-    constexpr int64_t width       = 130;
-    constexpr int64_t heads       = 2;
+static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode, int64_t heads = 2, int64_t width = 130, int64_t tokens = 8, int n_dims = 64, int64_t batches = 1, bool use_factors = false) {
     constexpr int32_t test_positions[] = { 0, 1, 6, 7, 359, -359, 32768, -32768 };
-    constexpr int64_t tokens      = sizeof(test_positions) / sizeof(test_positions[0]);
-    constexpr int     n_dims      = 64;
     constexpr int     graph_size  = 8;
-    int               sections[4] = { 11, 11, 10, 0 };
+    int               sections[4] = { n_dims / 6, n_dims / 6, n_dims / 2 - 2 * (n_dims / 6), 0 };
+    if (n_dims == 64) { sections[0] = 11; sections[1] = 11; sections[2] = 10; }
     const int         position_axes = (mode & GGML_ROPE_TYPE_MROPE) != 0 ? 4 : 1;
 
     ggml_init_params params = {
@@ -1225,9 +1220,10 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
         return fail("cannot create the RoPE context");
     }
 
-    ggml_tensor * input     = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, heads, tokens);
+    ggml_tensor * input     = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, width, heads, tokens, batches);
     ggml_tensor * positions = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, tokens * position_axes);
-    ggml_tensor * output = ggml_rope_multi(ctx.get(), input, positions, nullptr, n_dims, sections, mode, 262144,
+    ggml_tensor * factors = use_factors ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_dims / 2) : nullptr;
+    ggml_tensor * output = ggml_rope_multi(ctx.get(), input, positions, factors, n_dims, sections, mode, 262144,
                                            10000000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
     ggml_set_input(input);
     ggml_set_input(positions);
@@ -1239,18 +1235,23 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
         return fail("cannot allocate RoPE tensors");
     }
 
-    std::vector<float>   input_data((size_t) width * heads * tokens);
+    std::vector<float>   input_data((size_t) width * heads * tokens * batches);
     std::vector<int32_t> position_data((size_t) tokens * position_axes);
     for (size_t index = 0; index < input_data.size(); ++index) {
         input_data[index] = ((int) (index % 47) - 23) / 32.0f;
     }
     for (int axis = 0; axis < position_axes; ++axis) {
         for (int token = 0; token < tokens; ++token) {
-            position_data[(size_t) axis * tokens + token] = test_positions[token] + 3 * axis;
+            position_data[(size_t) axis * tokens + token] = test_positions[token % (sizeof(test_positions) / sizeof(test_positions[0]))] + 3 * axis;
         }
     }
     ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
     ggml_backend_tensor_set(positions, position_data.data(), 0, ggml_nbytes(positions));
+    if (factors) {
+        std::vector<float> factor_data((size_t) n_dims / 2);
+        for (size_t i = 0; i < factor_data.size(); ++i) { factor_data[i] = 1.0f + (i % 5) / 8.0f; }
+        ggml_backend_tensor_set(factors, factor_data.data(), 0, ggml_nbytes(factors));
+    }
 
     if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) {
         return fail("CPU RoPE reference failed");
@@ -1271,9 +1272,71 @@ static int run_rope_case(ggml_backend_t dayan, ggml_backend_t cpu, int mode) {
         max_abs           = std::max(max_abs, error);
         close             = close && error <= 0.002f + 0.002f * std::abs(reference[index]);
     }
-    std::printf("RoPE mode=%d width=%lld heads=%lld tokens=%lld n_dims=%d max_abs=%g\n", mode, (long long) width,
-                (long long) heads, (long long) tokens, n_dims, max_abs);
+    std::printf("RoPE mode=%d width=%lld heads=%lld tokens=%lld batches=%lld n_dims=%d factors=%d max_abs=%g\n", mode, (long long) width,
+                (long long) heads, (long long) tokens, (long long) batches, n_dims, use_factors, max_abs);
     return close ? 0 : fail("RoPE numerical comparison failed");
+}
+
+static int run_attention_layout_case(ggml_backend_t dayan, ggml_backend_t cpu, int64_t width, int64_t heads, int64_t tokens, int64_t batches) {
+    constexpr int graph_size = 16;
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) { return fail("cannot create attention layout context"); }
+    ggml_tensor * input = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, width, heads, tokens, batches);
+    ggml_tensor * weight = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, width);
+    ggml_tensor * scaled = ggml_mul(ctx.get(), input, weight);
+    ggml_tensor * permuted = ggml_permute(ctx.get(), scaled, 0, 2, 1, 3);
+    ggml_tensor * outputs[] = {
+        ggml_cpy(ctx.get(), permuted, ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, width, tokens, heads, batches)),
+        ggml_cpy(ctx.get(), permuted, ggml_new_tensor_4d(ctx.get(), GGML_TYPE_BF16, width, tokens, heads, batches)),
+    };
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    for (auto * output : outputs) { ggml_build_forward_expand(graph, output); }
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) { return fail("cannot allocate attention layout tensors"); }
+    std::vector<float> input_data((size_t) ggml_nelements(input)), weight_data((size_t) width);
+    for (size_t i = 0; i < input_data.size(); ++i) { input_data[i] = ((int) (i % 197) - 98) / 32.0f; }
+    for (size_t i = 0; i < weight_data.size(); ++i) { weight_data[i] = 0.5f + (i % 31) / 64.0f; }
+    std::vector<float> reference_scale(input_data.size());
+    std::vector<uint16_t> reference[2] = {std::vector<uint16_t>(input_data.size()), std::vector<uint16_t>(input_data.size())};
+    // Reuse the graph with new inputs to check resident weights and worker scratch.
+    for (int iteration = 0; iteration < 2; ++iteration) {
+        if (iteration != 0) {
+            for (float & value : input_data) { value = -value; }
+            for (float & value : weight_data) { value *= 0.5f; }
+        }
+        ggml_backend_tensor_set(input, input_data.data(), 0, ggml_nbytes(input));
+        ggml_backend_tensor_set(weight, weight_data.data(), 0, ggml_nbytes(weight));
+        if (ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS) { return fail("CPU attention layout reference failed"); }
+        std::memcpy(reference_scale.data(), scaled->data, ggml_nbytes(scaled));
+        for (int i = 0; i < 2; ++i) { std::memcpy(reference[i].data(), outputs[i]->data, ggml_nbytes(outputs[i])); }
+        if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) { return fail("DAYAN attention layout graph failed"); }
+        std::vector<float> observed_scale(input_data.size());
+        ggml_backend_tensor_get(scaled, observed_scale.data(), 0, ggml_nbytes(scaled));
+        if (observed_scale != reference_scale) { return fail("attention row scale comparison failed"); }
+        for (int i = 0; i < 2; ++i) {
+            std::vector<uint16_t> observed(input_data.size());
+            ggml_backend_tensor_get(outputs[i], observed.data(), 0, ggml_nbytes(outputs[i]));
+            if (observed != reference[i]) { return fail("attention permuted copy comparison failed"); }
+        }
+    }
+    std::printf("attention layout width=%lld heads=%lld tokens=%lld batches=%lld scale=PASS fp16=PASS bf16=PASS reuse=PASS\n",
+                (long long) width, (long long) heads, (long long) tokens, (long long) batches);
+    return 0;
+}
+
+static int run_attention_tile_cases(ggml_backend_t dayan, ggml_backend_t cpu) {
+    return run_attention_layout_case(dayan, cpu, 256, 8, 1024, 1) != 0 ||
+           run_attention_layout_case(dayan, cpu, 256, 3, 131, 2) != 0 ||
+           run_attention_layout_case(dayan, cpu, 65, 2, 7, 1) != 0 ||
+           run_rope_case(dayan, cpu, GGML_ROPE_TYPE_IMROPE, 8, 256, 1024) != 0 ||
+           run_rope_case(dayan, cpu, GGML_ROPE_TYPE_IMROPE, 2, 256, 1024) != 0 ||
+           run_rope_case(dayan, cpu, GGML_ROPE_TYPE_MROPE, 3, 386, 173, 384, 2, true) != 0 ||
+           run_rope_case(dayan, cpu, GGML_ROPE_TYPE_NORMAL, 3, 386, 173, 384, 2, true) != 0;
 }
 
 static int run_rope_cases(ggml_backend_t dayan, ggml_backend_t cpu) {
@@ -1663,6 +1726,92 @@ static int run_get_rows_fast_path_case(ggml_backend_t dayan) {
     }
 
     std::puts("get_rows f32-wide=PASS");
+    return 0;
+}
+
+static int run_get_rows_case(ggml_backend_t dayan, ggml_type type, int64_t width, int64_t rows, bool wide_indices, bool strided, bool same_type) {
+    constexpr int64_t source_rows = 97;
+    constexpr int graph_size = 8;
+    ggml_init_params params = { ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    if (!ctx) { return fail("cannot create GET_ROWS context"); }
+    auto * source = ggml_new_tensor_4d(ctx.get(), type, width, source_rows, 2, 2);
+    const int64_t index_step = strided ? 2 : 1;
+    const int64_t storage_rows = rows * index_step + (strided ? 3 : 0);
+    auto * storage = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I32, storage_rows, 2, 2);
+    auto * indices = ggml_view_3d(ctx.get(), storage, rows, 2, 2, storage->nb[1], storage->nb[2], strided ? sizeof(int32_t) : 0);
+    indices->nb[0] *= index_step;
+    auto * output = ggml_get_rows(ctx.get(), source, indices);
+    if (wide_indices) {
+        storage->type = indices->type = GGML_TYPE_I64;
+        indices->view_offs *= 2;
+        for (int i = 0; i < 4; ++i) { storage->nb[i] *= 2; indices->nb[i] *= 2; }
+    }
+    if (same_type) {
+        output->type = type;
+        output->nb[0] = ggml_type_size(type);
+        for (int i = 1; i < 4; ++i) { output->nb[i] = output->nb[i - 1] * output->ne[i - 1]; }
+    }
+    ggml_set_input(source);
+    ggml_set_input(storage);
+    ggml_set_output(output);
+    auto * graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) { return fail("cannot allocate GET_ROWS tensors"); }
+
+    std::vector<float> values((size_t) ggml_nelements(source));
+    std::vector<uint16_t> packed(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = float(int(i % 1021) - 510) / 128.0f;
+        if (type != GGML_TYPE_F32) { packed[i] = encode_lowp(type, values[i]); values[i] = decode_lowp(type, packed[i]); }
+    }
+    ggml_backend_tensor_set(source, type == GGML_TYPE_F32 ? (void *) values.data() : (void *) packed.data(), 0, ggml_nbytes(source));
+    for (int round = 0; round < 2; ++round) {
+        std::vector<int32_t> ids((size_t) storage_rows * 4, -1);
+        std::vector<int64_t> ids64(ids.size(), -1);
+        for (int64_t batch = 0; batch < 4; ++batch) {
+            for (int64_t row = 0; row < rows; ++row) {
+                const size_t offset = batch * storage_rows + row * index_step + (strided ? 1 : 0);
+                ids64[offset] = ids[offset] = (round == 0 ? row : row / 2 * 29 + 11) % source_rows;
+            }
+        }
+        ggml_backend_tensor_set(storage, wide_indices ? (void *) ids64.data() : (void *) ids.data(), 0, ggml_nbytes(storage));
+        ggml_backend_tensor_memset(output, 255, 0, ggml_nbytes(output));
+        if (ggml_backend_graph_compute(dayan, graph) != GGML_STATUS_SUCCESS) { return fail("GET_ROWS graph failed"); }
+        std::vector<uint8_t> actual(ggml_nbytes(output));
+        ggml_backend_tensor_get(output, actual.data(), 0, actual.size());
+        for (int64_t row = 0; row < rows * 4; ++row) {
+            const size_t selected = ids[(row / rows) * storage_rows + (row % rows) * index_step + (strided ? 1 : 0)];
+            for (int64_t column = 0; column < width; ++column) {
+                const size_t src = ((row / rows) * source_rows + selected) * width + column;
+                const size_t dst = row * width + column;
+                if (output->type == GGML_TYPE_F32) {
+                    float value;
+                    std::memcpy(&value, actual.data() + dst * sizeof(value), sizeof(value));
+                    if (value != values[src]) { return fail("GET_ROWS F32 values differ"); }
+                } else if (std::memcmp(actual.data() + dst * sizeof(uint16_t), &packed[src], sizeof(uint16_t)) != 0) {
+                    return fail("GET_ROWS lowp bytes differ");
+                }
+            }
+        }
+    }
+    std::printf("get_rows %s -> %s width=%lld rows=%lld batches=4 indices=%s strided=%d consecutive/random/repeated=PASS\n",
+                ggml_type_name(type), ggml_type_name(output->type), (long long) width, (long long) rows, wide_indices ? "i64" : "i32", strided);
+    return 0;
+}
+
+static int run_get_rows_cases(ggml_backend_t dayan) {
+    if (run_get_rows_fast_path_case(dayan) != 0) { return 1; }
+    for (ggml_type type : { GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (bool same_type : { false, true }) {
+            if (type == GGML_TYPE_F32 && same_type) { continue; }
+            if (run_get_rows_case(dayan, type, 1024, 256, false, false, same_type) ||
+                run_get_rows_case(dayan, type, 130, 67, true, true, same_type) ||
+                run_get_rows_case(dayan, type, 1, 3, false, true, same_type) ||
+                run_get_rows_case(dayan, type, 32769, 3, true, false, same_type)) { return 1; }
+        }
+    }
     return 0;
 }
 
@@ -2265,12 +2414,10 @@ static float softmax_slope_reference(int64_t head, int64_t heads, float max_bias
                               std::exp2(-0.5f * max_bias * (float) (2 * (head - head_log2) + 1) / (float) head_log2);
 }
 
-static int run_softmax_clamp_case(ggml_backend_t dayan) {
-    constexpr int64_t width      = 130;
-    constexpr int64_t rows       = 3;
+static int run_softmax_clamp_case(ggml_backend_t dayan, int64_t width = 130, int64_t rows = 3) {
     constexpr int64_t heads      = 3;
     constexpr int64_t batches    = 2;
-    constexpr int64_t mask_rows  = 4;
+    const int64_t mask_rows      = (rows + 3) / 4 * 4;
     constexpr float   scale      = 0.75f;
     constexpr float   max_bias   = 2.0f;
     constexpr float   clamp_min  = -0.75f;
@@ -2440,6 +2587,38 @@ static int run_norm_cached_cases(ggml_backend_t dayan) {
     return run_reduction_norm_case(dayan, 1024) != 0 || run_strided_rms_case(dayan, 1024) != 0 ? 1 : 0;
 }
 
+static int run_sort_workers_case(ggml_backend_t dayan, ggml_backend_t cpu) {
+    constexpr int width = 4096, rows = 129;
+    ggml_init_params params{ggml_tensor_overhead() * 8 + ggml_graph_overhead(), nullptr, true};
+    ggml_context_ptr ctx(ggml_init(params));
+    auto * input = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, width, rows);
+    auto * output = ggml_argsort(ctx.get(), input, GGML_SORT_ORDER_DESC);
+    auto * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), dayan));
+    if (!buffer) { return fail("cannot allocate worker sort tensors"); }
+    std::vector<float> data(width * rows);
+    for (int row = 0; row < rows; ++row) {
+        for (int column = 0; column < width; ++column) {
+            data[row * width + column] = ((column * 977 + row * 43) % width) - width / 2;
+        }
+    }
+    ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+    bool equal = true;
+    const auto compare = [](int, ggml_tensor * actual, ggml_tensor * expected, void * state) {
+        std::vector<int32_t> got(ggml_nelements(actual)), want(ggml_nelements(expected));
+        ggml_backend_tensor_get(actual, got.data(), 0, ggml_nbytes(actual));
+        ggml_backend_tensor_get(expected, want.data(), 0, ggml_nbytes(expected));
+        *(bool *) state = got == want;
+        return *(bool *) state;
+    };
+    if (!ggml_backend_compare_graph_backend(dayan, cpu, graph, compare, &equal, nullptr, 0) || !equal) {
+        return fail("worker sort differs from CPU");
+    }
+    std::printf("worker sort width=%d rows=%d CPU=exact\n", width, rows);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     ggml_backend_load_all();
 
@@ -2453,6 +2632,17 @@ int main(int argc, char ** argv) {
         return fail("cannot initialize the CPU backend");
     }
 
+    if (argc == 2 && std::strcmp(argv[1], "attention-tiles") == 0) {
+        return run_attention_tile_cases(dayan.get(), cpu.get());
+    }
+    if (argc == 2 && std::strcmp(argv[1], "workers") == 0) {
+        return run_sort_workers_case(dayan.get(), cpu.get()) != 0 ||
+               run_elementwise_case(dayan.get(), 8193, 65) != 0 ||
+               run_reduction_norm_case(dayan.get(), 16385) != 0 ||
+               run_softmax_clamp_case(dayan.get(), 2051, 33) != 0 ||
+               run_rope_case(dayan.get(), cpu.get(), GGML_ROPE_TYPE_MROPE, 1025) != 0 ||
+               run_norm_matmul_case(dayan.get(), GGML_TYPE_BF16, 1024, true, 257) != 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "rope") == 0) {
         return run_rope_cases(dayan.get(), cpu.get());
     }
@@ -2488,7 +2678,7 @@ int main(int argc, char ** argv) {
         return run_copy_fast_path_case(dayan.get());
     }
     if (argc == 2 && std::strcmp(argv[1], "get-rows") == 0) {
-        return run_get_rows_fast_path_case(dayan.get());
+        return run_get_rows_cases(dayan.get());
     }
     if (argc == 2 && std::strcmp(argv[1], "embedding-norm") == 0) {
         return run_embedding_norm_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
@@ -2509,7 +2699,7 @@ int main(int argc, char ** argv) {
                        run_empty_output_case(dayan.get(), GGML_TYPE_MXFP4) != 0 ? 1 : 0;
     }
     if (argc != 1) {
-        return fail("usage: test-dayan-graph [rope|ssm-conv|ssm-split|concat|gated-output|copy|get-rows|embedding-norm|norm|memory|empty]");
+        return fail("usage: test-dayan-graph [attention-tiles|workers|rope|ssm-conv|ssm-split|concat|gated-output|copy|get-rows|embedding-norm|norm|memory|empty]");
     }
 
     if (run_norm_cached_cases(dayan.get()) != 0 ||
@@ -2528,12 +2718,12 @@ int main(int argc, char ** argv) {
         run_empty_scale_case(dayan.get()) != 0 || run_offset_scale_case(dayan.get()) != 0 ||
         run_math_case(dayan.get()) != 0 || run_reduction_norm_case(dayan.get()) != 0 ||
         run_strided_rms_case(dayan.get()) != 0 || run_strided_rms_case(dayan.get(), 256) != 0 ||
-        run_rope_cases(dayan.get(), cpu.get()) != 0 ||
+        run_rope_cases(dayan.get(), cpu.get()) != 0 || run_attention_tile_cases(dayan.get(), cpu.get()) != 0 ||
         run_memory_case(dayan.get()) != 0 || run_empty_memory_case(dayan.get()) != 0 ||
         run_empty_output_case(dayan.get(), GGML_TYPE_BF16) != 0 ||
         run_empty_output_case(dayan.get(), GGML_TYPE_F16) != 0 ||
         run_empty_output_case(dayan.get(), GGML_TYPE_MXFP4) != 0 ||
-        run_copy_fast_path_case(dayan.get()) != 0 || run_get_rows_fast_path_case(dayan.get()) != 0 ||
+        run_copy_fast_path_case(dayan.get()) != 0 || run_get_rows_cases(dayan.get()) != 0 ||
         run_layout_case(dayan.get()) != 0 || run_indexed_layout_case(dayan.get(), cpu.get()) != 0 ||
         run_softmax_clamp_case(dayan.get()) != 0 ||
         run_fused_case(dayan.get(), GGML_TYPE_BF16, GGML_GLU_OP_SWIGLU, 1, 16, 256) != 0 ||

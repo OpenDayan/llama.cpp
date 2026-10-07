@@ -8,14 +8,19 @@
 
 namespace ggml_dayan_matmul_detail {
 
-static void run_router_f32(const DayanMatmulConfig * config, const float * activation, const float * weight, float * output) {
+static void run_router_f32(const DayanMatmulConfig * config, const float * activation, const float * weight, float * output, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) config->m * config->n * config->k, ((config->m + 31) / 32) * ((config->n + 63) / 64), 256U * 1024U, 1, 1, 0}, [&](const NativeContext & worker) {
+            run_router_f32(config, activation, weight, output, worker);
+        })) { return; }
+
     constexpr uint32_t rows = 32, columns = 64, inner_tile = 256;
     constexpr uint32_t input_stride = 1152, output_stride = 384;
-    const uint64_t base = (uintptr_t) dayan_uram_base();
+    const uint64_t base = native_uram(context);
     const uint64_t right = base + rows * input_stride;
     const uint64_t result = right + columns * input_stride;
     DAYAN_PARAMS_IF(!config || !activation || !weight || !output || !base ||
-                    !config->m || !config->n || !config->k || result + rows * output_stride - base > dayan_uram_size()) {
+                    !config->m || !config->n || !config->k || result + rows * output_stride - base > native_uram_size(context)) {
         DAYAN_PARAMS_ERROR();
     }
     const uint64_t local_mask = Constants::kUramWindowStride - 1;
@@ -29,7 +34,7 @@ static void run_router_f32(const DayanMatmulConfig * config, const float * activ
     __tx_mat_tcsr_write<MAT_PERSISTENTMODE>(0);
     __tx_mat_tcsr_write<MAT_DATATYPE>(MAT_DATATYPE_PAIR(BaseNPUInstBuilder::DT_MATIN_TF32, BaseNPUInstBuilder::DT_MATIN_TF32));
     long checksum = 0;
-    for (uint64_t tile = dayan_task_id(DAYAN_TASK_X); tile < ((config->m + rows - 1) / rows) * nt; tile += dayan_task_dim(DAYAN_TASK_X)) {
+    for (uint64_t tile = dayan_native_task_id(context); tile < ((config->m + rows - 1) / rows) * nt; tile += dayan_native_task_count(context)) {
         const uint64_t row = tile / nt * rows, column = tile % nt * columns;
         const uint32_t m = config->m - row < rows ? config->m - row : rows;
         const uint32_t n = config->n - column < columns ? config->n - column : columns;
@@ -59,6 +64,7 @@ static void run_router_f32(const DayanMatmulConfig * config, const float * activ
 }
 
 struct SortUramLayout {
+    // Two key/index pairs hold alternate radix passes.
     enum : uint64_t {
         kPlane = (uint64_t) kDayanSortMaxWidth * sizeof(uint32_t),
         kHistogram = 4 * kPlane,
@@ -80,9 +86,9 @@ static inline bool moe_allocation_fits(uint64_t element_size, uint64_t ne0, uint
     return true;
 }
 
-static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index) {
-    const uint64_t scratch = (uint64_t) (uintptr_t) dayan_uram_base();
-    DAYAN_PARAMS_IF(scratch == 0 || dayan_uram_size() < sizeof(int32_t)) {
+static inline int32_t moe_read_expert(const int32_t * ids, uint64_t index, const NativeContext & context = {}) {
+    const uint64_t scratch = native_uram(context);
+    DAYAN_PARAMS_IF(scratch == 0 || native_uram_size(context) < sizeof(int32_t)) {
         DAYAN_PARAMS_ERROR();
     }
     return (int32_t) memory_read_index(ids, (uint32_t) index, kDayanDataTypeI32, scratch);
@@ -208,6 +214,7 @@ static inline int run_router_indexer_f32(const DayanRouterIndexerConfig * config
     status = dayan_cluster_barrier(4, barrier);
     if (status < 0) { return status; }
     if (task == 0) {
+        // Convert per-core histograms to disjoint ranges within each expert.
         memory_load_bytes(uram, workspace, 4 * layout.count_stride);
         uint32_t * offsets = (uint32_t *) (uram + 4 * layout.count_stride);
         uint32_t running = 0;
@@ -459,7 +466,12 @@ static inline void run_add_id(const DayanAddIdConfig * config,
                               const float *            input,
                               const float *            bias,
                               const int32_t *          ids,
-                              float *                  output) {
+                              float *                  output, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) config->width * config->experts_used * config->tokens, (uint64_t) config->experts_used * config->tokens, 256U * 1024U}, [&](const NativeContext & worker) {
+            run_add_id(config, input, bias, ids, output, worker);
+        })) { return; }
+
     if (config == nullptr || input == nullptr || bias == nullptr || ids == nullptr || output == nullptr ||
         config->width == 0 || config->experts == 0 || config->experts > INT32_MAX || config->experts_used == 0 ||
         config->tokens == 0 || config->ids_row_stride < (uint64_t) config->experts_used * sizeof(int32_t) ||
@@ -468,30 +480,30 @@ static inline void run_add_id(const DayanAddIdConfig * config,
         !moe_allocation_fits(sizeof(int32_t), config->experts_used, config->tokens, 1)) {
         DAYAN_PARAMS_ERROR();
     }
-    elementwise_validate((uint64_t) config->width * config->experts_used * config->tokens, input, output);
+    elementwise_validate((uint64_t) config->width * config->experts_used * config->tokens, input, output, context);
     configure_normalization_lsu();
     ggml_dayan_vec_detail::configure_f32_iterators();
 
-    const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t uram       = native_uram(context);
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t bias_uram  = uram + NormalizationLayout::kAux;
     const uint64_t out_uram   = uram + NormalizationLayout::kValue;
-    const uint32_t task       = dayan_native_task_id();
-    const uint32_t tasks      = dayan_native_task_count();
+    const uint32_t task       = dayan_native_task_id(context);
+    const uint32_t tasks      = dayan_native_task_count(context);
     const uint64_t rows       = (uint64_t) config->tokens * config->experts_used;
     for (uint64_t row = task; row < rows; row += tasks) {
         const uint32_t used   = (uint32_t) (row % config->experts_used);
         const uint32_t token  = (uint32_t) (row / config->experts_used);
         const int32_t * token_ids =
             (const int32_t *) ((const char *) ids + (uint64_t) token * config->ids_row_stride);
-        const int32_t expert = moe_read_expert(token_ids, used);
+        const int32_t expert = moe_read_expert(token_ids, used, context);
         if (expert < 0 || expert >= (int32_t) config->experts) {
             DAYAN_PARAMS_ERROR();
         }
         for (uint32_t offset = 0; offset < config->width; offset += NormalizationLayout::kTileElements) {
             const uint32_t elements = min_int((int) (config->width - offset), (int) NormalizationLayout::kTileElements);
-            normalization_load(input_uram, input + row * config->width + offset, elements);
-            normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements);
+            normalization_load(input_uram, input + row * config->width + offset, elements, context);
+            normalization_load(bias_uram, bias + (uint64_t) expert * config->width + offset, elements, context);
             ggml_dayan_vec_detail::configure_vec_grid(ggml_dayan_vec_detail::f32_chunks(elements));
             constexpr long instructions = 4;
             ggml_dayan_vec_detail::begin_vec_block(instructions);
@@ -507,16 +519,21 @@ static inline void run_add_id(const DayanAddIdConfig * config,
     }
 }
 
-template <bool TopK> static void run_sort(const DayanSortConfig * config, const float * input, int32_t * output) {
-    memory_validate(config);
+template <bool TopK> static void run_sort(const DayanSortConfig * config, const float * input, int32_t * output, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) config->width * config->rows, config->rows, 256U * 1024U, 2, 0, 0}, [&](const NativeContext & worker) {
+            run_sort<TopK>(config, input, output, worker);
+        })) { return; }
+
+    memory_validate(config, context);
     DAYAN_PARAMS_IF(!input || !output || !config->width || !config->rows || !config->output_width ||
                     config->width > kDayanSortMaxWidth || config->output_width > config->width || config->order > 1 ||
                     config->output_stride < config->output_width || (TopK && config->order != kDayanSortOrderDesc) ||
-                    !dayan_uram_base() || dayan_uram_size() < SortUramLayout::kTotal) {
+                    !native_uram(context) || native_uram_size(context) < SortUramLayout::kTotal) {
         DAYAN_PARAMS_ERROR();
     }
-    const uint32_t task = dayan_native_task_id(), tasks = dayan_native_task_count();
-    const uint64_t uram = (uintptr_t) dayan_uram_base();
+    const uint32_t task = dayan_native_task_id(context), tasks = dayan_native_task_count(context);
+    const uint64_t uram = native_uram(context);
     uint32_t * histogram = (uint32_t *) (uram + SortUramLayout::kHistogram);
     for (uint32_t row = task; row < config->rows; row += tasks) {
         memory_load_bytes(uram, input + (uint64_t) row * config->width, config->width * sizeof(float));

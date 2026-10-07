@@ -4,24 +4,24 @@
 
 #include <stdint.h>
 
+#if defined(__DAYAN_DEVICE__)
+#    include <dayan_sys.h>
+#endif
+
 enum : uint16_t {
-    kDayanMegaQwen35DenseMxfp4Linear = 1,
-    kDayanMegaQwen35DenseMxfp4Full   = 2,
-    kDayanMegaQwen35DenseBf16Linear  = 3,
-    kDayanMegaQwen35DenseBf16Full    = 4,
-    kDayanMegaQwen35MoeLinear        = 5,
-    kDayanMegaQwen35MoeFull          = 6,
+    kDayanMegaInvalid = 0,
+#define MEGA_GRAPH_BEGIN(Name, Id, Moe, Linear) Id,
+#define MEGA_STEP(...)
+#define MEGA_GRAPH_END()
+#include "mega-graph/qwen35.inc"
+#undef MEGA_GRAPH_BEGIN
+#undef MEGA_STEP
+#undef MEGA_GRAPH_END
 };
 
 enum : uint32_t {
-    kDayanMegaMaxParameters                    = 256,
-    kDayanMegaRootCount                        = 16,
-    kDayanMegaQwen35DenseMxfp4LinearParameters = 161,
-    kDayanMegaQwen35DenseMxfp4FullParameters   = 137,
-    kDayanMegaQwen35DenseBf16LinearParameters  = 124,
-    kDayanMegaQwen35DenseBf16FullParameters    = 89,
-    kDayanMegaQwen35MoeLinearParameters       = 222,
-    kDayanMegaQwen35MoeFullParameters         = 187,
+    kDayanMegaMaxParameters = 256,
+    kDayanMegaRootCount     = 16,
 };
 
 struct DayanMegaConfig {
@@ -36,69 +36,138 @@ struct DayanMegaParameter {
     uint64_t offset;
 };
 
-#if defined(__DAYAN_DEVICE__)
-
 namespace ggml_dayan_mega_detail {
 
-using Function = int (*)(const uintptr_t *, const uint16_t *);
+struct GraphKind {
+    bool moe;
+    bool linear;
+};
+
+constexpr GraphKind graph_kind(uint16_t graph) {
+    switch (graph) {
+#define MEGA_GRAPH_BEGIN(Name, Id, Moe, Linear) case Id: return { Moe, Linear };
+#define MEGA_STEP(...)
+#define MEGA_GRAPH_END()
+#include "mega-graph/qwen35.inc"
+#undef MEGA_GRAPH_BEGIN
+#undef MEGA_STEP
+#undef MEGA_GRAPH_END
+        default: return { false, false };
+    }
+}
+
+int norm_pipeline(const DayanNormPipelineConfig * config, const void * input, const void * right, const float * scale, void * residual, float * rms, float * scaled, uint16_t * lowp);
+int residual_add(const DayanElementwiseConfig * config, const void * left, const void * right, void * output);
+int residual_add_bf16(const DayanElementwiseConfig * config, const void * left, const void * right, void * output);
+int rms_norm(const DayanNormConfig * config, const void * input, float * output);
+int scale(const DayanScaleConfig * config, const float * input, float * output);
+int get_rows(const DayanRowsConfig * config, const void * input, const void * indices, void * output);
+int quantize_mxfp4(const DayanMxfp4Config * config, const void * input, void * output, void * scales);
+int matmul_mxfp4(const DayanMxfp4Config * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, void * output, void * output_scales);
+int concat(const DayanConcatConfig * config, const void * left, const void * right, void * output);
+int copy(const DayanCopyConfig * config, const void * input, void * output);
+int ssm_conv(const DayanSSMConvConfig * config, const float * input, const float * weight, float * output);
+int ssm_conv_split(const DayanSSMConvConfig * config, const float * input, const float * weight, float * output, const float * current, float * state);
+int l2_norm(const DayanNormConfig * config, const float * input, float * output);
+int add(const DayanBinaryConfig * config, const float * left, const float * right, float * output);
+int multiply(const DayanBinaryConfig * config, const float * left, const float * right, float * output);
+int softplus(const DayanElementwiseConfig * config, const float * input, float * output);
+int sigmoid(const DayanElementwiseConfig * config, const float * input, float * output);
+int silu(const DayanElementwiseConfig * config, const float * input, float * output);
+int gated_delta_net(const DayanGatedDeltaNetConfig * config, const float * q, const float * k, const float * v, const float * g, const float * beta, const float * state, float * output);
+int rope(const DayanRopeConfig * config, const float * input, const int32_t * positions, const float * factors, float * output);
+int set_rows(const DayanRowsConfig * config, const float * input, const void * indices, void * output);
+int flash_attention_fp16(const DayanFlashAttentionConfig * config, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * output);
+int matmul_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, float * output);
+int matmul_pair_bf16(const DayanMatmulPairConfig * config, const uint16_t * input, const uint16_t * first, const uint16_t * second, float * first_output, float * second_output);
+int matmul_swiglu_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * gate, const uint16_t * up, uint16_t * output);
+int matmul_quantized_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, uint16_t * output);
+int gated_output_projection_bf16(const DayanGatedProjectionConfig * config, const float * input, const float * gate, const uint16_t * weight, float * output, uint16_t * scratch);
+int matmul_tf32(const DayanMatmulConfig * config, const float * input, const float * weight, float * output);
+int router_indexer(const DayanRouterIndexerConfig * config, const float * input, const float * weight, float * logits, int32_t * selected, void * workspace);
+int matmul_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, const int32_t * selected, void * output, void * output_scales, void * workspace);
+int softmax(const DayanSoftmaxConfig * config, const float * input, float * output);
+int sum_rows(const DayanReduceConfig * config, const float * input, float * output);
+int clamp(const DayanClampConfig * config, const float * input, float * output);
+int divide(const DayanBinaryConfig * config, const float * left, const float * right, float * output);
+int noop();
+
+template <typename Function> struct Signature;
+
+template <typename... Args>
+struct Signature<int (*)(Args...)> {
+    static constexpr uint16_t count = sizeof...(Args);
+};
+
+template <typename Config, typename... Args>
+struct Signature<int (*)(const Config *, Args...)> {
+    using config_type = Config;
+    static constexpr uint16_t count = 1 + sizeof...(Args);
+};
+
+template <unsigned Count>
+constexpr uint16_t parameter_count(const uint16_t (&counts)[Count]) {
+    uint16_t total = 0;
+    for (uint16_t count : counts) {
+        total += count;
+    }
+    return total;
+}
+
+#define MEGA_GRAPH_BEGIN(Name, Id, Moe, Linear) namespace Name { enum Step {
+#define MEGA_STEP(Name, Kind, Function, Barriers, Mode, ...) Name,
+#define MEGA_GRAPH_END() step_count }; }
+#include "mega-graph/qwen35.inc"
+#undef MEGA_GRAPH_BEGIN
+#undef MEGA_STEP
+#undef MEGA_GRAPH_END
+
+#define MEGA_GRAPH_BEGIN(Name, Id, Moe, Linear) namespace Name { static constexpr uint16_t counts[] = {
+#define MEGA_STEP(Name, Kind, Function, Barriers, Mode, ...) Signature<decltype(&ggml_dayan_mega_detail::Function)>::count,
+#define MEGA_GRAPH_END() \
+    }; \
+    static constexpr uint16_t parameter_count = ggml_dayan_mega_detail::parameter_count(counts); \
+    static_assert(parameter_count <= kDayanMegaMaxParameters, "Mega parameter table is too large"); \
+    }
+#include "mega-graph/qwen35.inc"
+#undef MEGA_GRAPH_BEGIN
+#undef MEGA_STEP
+#undef MEGA_GRAPH_END
+
+#if defined(__DAYAN_DEVICE__)
 
 struct Operation {
-    Function         function;
-    const uint16_t * arguments;
+    int (*function)(const uintptr_t *);
+    uint16_t argument_count;
+    uint16_t barriers;
+    char name[DAYAN_THREAD_NAME_SIZE];
 };
 
-template <uint16_t Base, uint16_t Count>
-struct NextParameter {
-    static constexpr uint16_t value = Base + Count;
+template <unsigned... Indices> struct Sequence {};
+template <unsigned Count, unsigned... Indices>
+struct MakeSequence : MakeSequence<Count - 1, Count - 1, Indices...> {};
+template <unsigned... Indices>
+struct MakeSequence<0, Indices...> { using type = Sequence<Indices...>; };
+
+template <typename Function, Function Entry> struct Binding;
+
+template <typename... Args, int (*Entry)(Args...)>
+struct Binding<int (*)(Args...), Entry> {
+    template <unsigned... Indices>
+    static int invoke(const uintptr_t * parameters, Sequence<Indices...>) {
+        return Entry(reinterpret_cast<Args>(parameters[Indices])...);
+    }
+
+    static int call(const uintptr_t * parameters) {
+        return invoke(parameters, typename MakeSequence<sizeof...(Args)>::type{});
+    }
 };
 
-template <uint16_t... Indices>
-struct Arguments {
-    static const uint16_t values[sizeof...(Indices)];
-};
-
-template <uint16_t... Indices>
-const uint16_t Arguments<Indices...>::values[sizeof...(Indices)] = { Indices... };
-
-int norm_pipeline(const uintptr_t *, const uint16_t *);
-int residual_add(const uintptr_t *, const uint16_t *);
-int residual_add_bf16(const uintptr_t *, const uint16_t *);
-int rms_norm(const uintptr_t *, const uint16_t *);
-int scale(const uintptr_t *, const uint16_t *);
-int get_rows(const uintptr_t *, const uint16_t *);
-int quantize_mxfp4(const uintptr_t *, const uint16_t *);
-int matmul_mxfp4(const uintptr_t *, const uint16_t *);
-int concat(const uintptr_t *, const uint16_t *);
-int copy(const uintptr_t *, const uint16_t *);
-int repeat(const uintptr_t *, const uint16_t *);
-int ssm_conv(const uintptr_t *, const uint16_t *);
-int ssm_conv_split(const uintptr_t *, const uint16_t *);
-int l2_norm(const uintptr_t *, const uint16_t *);
-int add(const uintptr_t *, const uint16_t *);
-int multiply(const uintptr_t *, const uint16_t *);
-int softplus(const uintptr_t *, const uint16_t *);
-int sigmoid(const uintptr_t *, const uint16_t *);
-int silu(const uintptr_t *, const uint16_t *);
-int gated_delta_net(const uintptr_t *, const uint16_t *);
-int rope(const uintptr_t *, const uint16_t *);
-int set_rows(const uintptr_t *, const uint16_t *);
-int flash_attention_fp16(const uintptr_t *, const uint16_t *);
-int matmul_bf16(const uintptr_t *, const uint16_t *);
-int matmul_pair_bf16(const uintptr_t *, const uint16_t *);
-int matmul_swiglu_bf16(const uintptr_t *, const uint16_t *);
-int matmul_quantized_bf16(const uintptr_t *, const uint16_t *);
-int gated_output_projection_bf16(const uintptr_t *, const uint16_t *);
-int matmul_tf32(const uintptr_t *, const uint16_t *);
-int router_indexer(const uintptr_t *, const uint16_t *);
-int matmul_id_mxfp4(const uintptr_t *, const uint16_t *);
-int softmax(const uintptr_t *, const uint16_t *);
-int sum_rows(const uintptr_t *, const uint16_t *);
-int clamp(const uintptr_t *, const uint16_t *);
-int divide(const uintptr_t *, const uint16_t *);
+#endif
 
 } // namespace ggml_dayan_mega_detail
 
-#else
+#if !defined(__DAYAN_DEVICE__)
 
 int qwen35_dense_mega(
     npu_buffer_t * config,
@@ -139,6 +208,5 @@ int qwen35_moe_mega(
     npu_buffer_t * root14,
     npu_buffer_t * root15,
     const npu_kernel_launch_attrs_t * attrs);
-
 
 #endif

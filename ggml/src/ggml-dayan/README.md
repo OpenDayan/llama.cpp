@@ -17,6 +17,7 @@ Set the SDK, Runtime socket, and model paths in each client terminal:
 ```sh
 export DAYAN_ROOT="$HOME/npu-firmware"
 export DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock
+export DAYAN_LAYER_CLIENT="$PWD/build-dayan/bin/llama-dayan-layer-bench"
 export DAYAN_MODEL_MXFP4=/share/models/Qwen3.5-0.8B-MXFP4/Qwen3.5-0.8B-MXFP4-Vocab-MXFP4.gguf
 export DAYAN_MODEL_BF16=/share/models/Qwen3.5-0.8B/Qwen3.5-0.8B-BF16.gguf
 export DAYAN_MODEL_MOE=/share/models/Qwen3.6-35B-A3B-MXFP4_MOE_BF16.gguf
@@ -47,7 +48,7 @@ Executables are written to `build-dayan/bin`. To rebuild the tools used below af
 ```sh
 cmake --build build-dayan -j6 --target \
     llama-cli llama-server llama-bench llama-dayan-trace \
-    llama-dayan-operator-bench llama-dayan-moe-bench \
+    llama-dayan-operator-bench llama-dayan-moe-bench llama-dayan-layer-bench \
     test-backend-ops test-dayan-topology test-dayan-matmul test-dayan-graph \
     test-dayan-mxfp4 test-dayan-moe test-dayan-qwen35-dense \
     test-dayan-attention-projection test-dayan-flash-attention
@@ -142,6 +143,19 @@ GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o TOP_K \
 
 `test-dayan-moe` uses BF16 expert weights. The MXFP4 expert products and TF32 routers are checked by the MoE operator preset in [Operator benchmarks](#operator-benchmarks-with-limited-perfpy); run that preset before the MoE mega test. Shared attention, recurrence, memory, and RoPE selectors are listed under [Dedicated tests](#dedicated-tests) and [Test a specific operator](#test-a-specific-operator).
 
+### Compare model operators against CPU
+
+After preparing layers with `layer-perf.py prepare`, run a separate correctness pass:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py cmp-ops \
+    --prepared build/dayan-layer/selected-mxfp4 --layer 0 3 \
+    --mode decode --input-len 4 --output-len 2 \
+    --output build/dayan-layer/operators-mxfp4
+```
+
+The command uses the external Dayan server and does not launch dyperf or PCU. It compares each executable Dayan slot with a CPU F32 graph from the slot's actual inputs, captured before execution. Required fusions, including SwiGLU, stay intact; their materialized outputs are compared, and the covered nodes are listed. `operators.json` records every output's shape, errors and first mismatch. The default condition is `abs(error) <= 1e-4 + 1e-3 * abs(CPU)`; override it with `--op-atol` and `--op-rtol`. Failed or incomplete checks return nonzero. This is separate from `run --cmp`, which compares final logits against a complete CPU replay. See [CPU operator comparison](../../../tools/dayan-trace/layer-perf.md#cpu-operator-comparison) for reference semantics and limitations.
+
 ### Check mega and decode graphs
 
 These commands use different references. Dense MXFP4 uses a trained-GGUF smoke run plus the standalone CPU checks above. Dense BF16 uses a random layer against CPU. MoE compares a random two-layer mega graph with standalone Dayan; its CPU operator checks remain separate.
@@ -205,7 +219,95 @@ The same client accepts a dense `qwen35` model or fixture through `DAYAN_MEGA_MO
 
 This checks an initial single token followed by two decode steps. Each step compares logits and requires two mega launches, including graphs where state SCALE nodes disappear. The client switches between standalone and mega internally. Use the MoE mega preset below to check both prefill and initial-single-token sequences. See [MoE validation](../../../tools/dayan-trace/qwen35-moe.md) for the full-model smoke result and quantization limits.
 
+### Single-layer inference and offline slot timing
+
+Use `layer-perf.py` to run a complete layer as one mega launch, then read its firmware perf trace with the independent `layer-perf-report.py`. Slot names and order come from the compiled mega flow declarations. No per-slot host callback or timer is installed.
+
+Extract a layer once, retaining the source weights, dimensions and quantization:
+
+```sh
+cmake --build build-dayan -j6 --target llama-dayan-layer-bench
+python3 tools/dayan-trace/layer-perf.py prepare \
+    --model "$DAYAN_MODEL_BF16" --layer 0 --output build-dayan/layer-bf16
+```
+
+The same command accepts `DAYAN_MODEL_MXFP4` or `DAYAN_MODEL_MOE`. `--layer` is zero-based; layer 0 is linear attention and layer 3 is full attention in the standard Qwen3.5-0.8B cycle. The script detects attention type from the tensors and keeps only that block plus embedding and output tensors. This measures a one-layer model fed from embeddings; it does not reproduce intermediate activations from the full source model. Split GGUF files must be merged before extraction.
+
+Prepare several independent single-layer models at once, for MXFP4 or BF16:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py prepare \
+    --model "$DAYAN_MODEL_MXFP4" --layer 0 3 --output build-dayan/layers-mxfp4
+
+python3 tools/dayan-trace/layer-perf.py prepare \
+    --model "$DAYAN_MODEL_BF16" --layer 0 3 --output build-dayan/layers-bf16
+```
+
+Each output directory contains `layer-0/` and `layer-3/`, each with its own `layer.gguf` and `layer.json`. A single index keeps the original layout with files directly under `--output`; the default index is 0.
+
+With an external four-core server ready, run both selected layers in one command. The same commands connect to TestCluster, hardware or cmodel through `DAYAN_SERVER_SOCKET`; simulator startup is managed externally. Prefill is the default mode:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layers-mxfp4 --layer 0 3 --input-len 1024 --cmp \
+    --output build-dayan/perf-mxfp4
+
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layers-bf16 --layer 0 3 --input-len 1024 --cmp \
+    --output build-dayan/perf-bf16
+
+python3 tools/dayan-trace/layer-perf-report.py --run build-dayan/perf-mxfp4
+python3 tools/dayan-trace/layer-perf-report.py --run build-dayan/perf-bf16
+```
+
+Omit `--layer` to run all layers in the prepared batch directory, or point `--prepared` directly at `layer-3` to run only full attention. Layers run sequentially with independent traces and CPU comparisons in `layer-N/` output directories. A failed layer is recorded in `batch.json`, and the command returns nonzero. CPU comparison failures allow remaining layers to run. Inference or profiler failures stop the batch and leave remaining layers marked `not-run`, since device work may still be active. The report accepts the batch directory and writes an index plus each layer's slot report.
+
+`run` enables mega for the layer body and requires exactly one mega launch per inference step. Server messages `[kernel] lp-prefill started`, `lp-setup` and `lp-d...` identify the layer mega for prefill, decode setup and decode steps. Embedding (`get-rows`) and the output norm/head still launch separate kernels before or after it; they are excluded from the offline layer timing. Four `proc-create` RPCs for one launch create its four core tasks. `cmp-ops` uses standalone slots with mega disabled so it can capture each slot's inputs and outputs.
+
+The client defaults to `DAYAN_LAYER_CLIENT`, or `build-dayan-public/bin/llama-dayan-layer-bench` when unset. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf`, with `DAYAN_ROOT` falling back to `~/npu-firmware`. Override it with `--dyperf /path/to/dyperf`; the script automatically launches `dyperf --follow`, runs the client, and waits for the trace to close. PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; it adds `--pcu-interval 0` to dyperf for continuous sampling. cmodel does not support PCU, so omit `--pcu` there. `--client` and `--socket` override their environment defaults. No `--simulator` argument is needed.
+
+With `--pcu`, open each `perf.json` in Perfetto to inspect per-core MAT utilization, VEC/Scalar IPC, LSU bandwidth and URAM read/write statistics. `PCU snapshot` events retain the 112 raw counters; metadata records `pcu_enabled: true` and `pcu_interval_ms: 0`. Offline slot timing uses proc-state events and works without PCU.
+
+The Dayan backend waits indefinitely by default for kernels and backend transfers. Startup logs show `wait timeout = 4294967295 ms (infinite)`. Set `GGML_DAYAN_TIMEOUT_MS` before starting the client to choose a positive finite timeout in milliseconds; `4294967295` explicitly selects unlimited waits. To remove a previous finite override and use the default:
+
+```sh
+unset GGML_DAYAN_TIMEOUT_MS
+```
+
+Status `-110` is a timeout, not a CPU comparison failure. Returning from a timed-out host wait does not prove the device task stopped. Check the external server and simulator, and finish or reset the outstanding task before retrying in a new output directory. A subsequent `-28` can indicate resources retained by the previous task. The runner does not reset the external server.
+
+With the four-core cmodel server ready, run prefill and compare against CPU:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layer-bf16 --mode prefill --input-len 4 --cmp \
+    --output build-dayan/layer-prefill-cmp
+python3 tools/dayan-trace/layer-perf-report.py --run build-dayan/layer-prefill-cmp
+```
+
+For consecutive decode, use `--mode decode --input-len 4 --output-len 2` and a new output directory:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layer-bf16 --mode decode \
+    --input-len 4 --output-len 2 --cmp \
+    --output build-dayan/layer-decode-cmp
+python3 tools/dayan-trace/layer-perf-report.py --run build-dayan/layer-decode-cmp
+```
+
+`input-len` is the prompt length. Decode first executes that prompt to build real KV/recurrent state, then measures `output-len` single-token calls; prompt setup is excluded from decode timing. Prefill defaults to zero output steps. Each call must launch mega exactly once; standalone fallback or microbatch splitting fails the run. No warmup is performed.
+
+`--cmp` uses an independent GGML CPU baseline after perf capture. Its separate process keeps only the CPU backend registered, with GPU layers, KV offload and operation offload disabled; zero GPU layers alone do not prevent ACCEL buffer selection. Both runs use the same stored weights and token sequence. It checks all vocabulary logits for the prompt's final token and each decode step, including the unmeasured decode setup. It does not compare intermediate slot outputs. The CPU reference retains CPU arithmetic and quantization; BF16/MXFP4 and MoE routing differences remain visible. Every value must satisfy `abs(Dayan - CPU) <= atol + rtol * abs(CPU)`, with defaults `--cmp-atol 0.03 --cmp-rtol 0.03`; nonfinite outputs fail. Thresholds are never relaxed automatically. Without `--cmp`, only execution and finite outputs are checked.
+
+The run directory contains `perf.json`, `run.json`, the command and log, and, with `--cmp`, `cpu-reference.json`, `cpu-reference.log` and saved Dayan logits. The report produces `report.md`, `report.json` and `slots.csv`, including complete Transformer layer cycles, each slot's cycles and percentage, and per-step CPU errors. Slot percentages divide each slot's summed cycles by summed layer cycles across measured steps; embedding and output norm/head are excluded. Overlapping slot spans can make percentages sum above 100%. Comparison failures return nonzero from both commands but keep the performance record for diagnosis. Each run needs an empty output directory.
+
+Report option `--include-outer` adds a separate kernel table and `kernels.csv` for embedding, the mega launch and output kernels. It shows the full inference span including gaps, with percentages relative to that separate span; layer statistics stay unchanged. Use `--output /path/to/reports` to leave the source run directory untouched. These are offline operations and never connect to the device; analyze a completed `layer-N` directory while other layers are still running. See [offline report](../../../tools/dayan-trace/layer-perf.md#offline-report) for timing boundaries.
+
+For actual performance measurement, use an existing hardware or TestCluster server and choose the intended lengths, such as `--mode decode --input-len 1024 --output-len 32`. The runner starts and stops its profiler/client only. CPU comparison runs after the trace is closed. Slot time is the earliest start to latest finish across four cores, including following barriers; concurrent cores are not summed. The layer span excludes embedding and output norm/projection, while host inference wall time includes them. Reports show raw counter ticks by default because the trace does not identify its simulator. For hardware/RTL, pass the actual frequency to the report, for example `--clock-hz 1000000000` for 1 GHz, to enable microsecond conversion. Cmodel counters validate execution and trace analysis only; do not convert them to hardware latency. See [single-layer profiling](../../../tools/dayan-trace/layer-perf.md) for detailed timing boundaries and formats.
+
 ### Operator benchmarks with limited-perf.py
+
+The presets below retain individual operator checks. Use the single-layer workflow above for complete inference and offline slot timing.
 
 `--model` selects operator shapes, not a GGUF file. These three presets use the same client and run CPU comparisons on stored BF16/MXFP4 inputs or TF32-rounded inputs. Each MoE expert case already executes all eight selected experts; its layer factor is 40, not 320.
 
@@ -329,7 +431,13 @@ Dense MXFP4 MatMul and FFN use `ggml-dayan-mxfp4.h`. MXFP4 weights must have one
 
 The GGUF representation remains the standard 17-byte block: one E8M0 scale followed by 32 FP4 values. Upload splits this into consecutive low-nibble-first FP4 payload and a separate scale view stored in `tensor->extra`. Readback restores the GGUF representation, including partial transfers. The arena allocation includes payload row padding and all scale planes, so the graph allocator owns both lifetimes.
 
-`GET_ROWS` accepts MXFP4 source weights and writes F32, BF16, or FP16 embeddings. It uses the same packed payload and Z-scale allocation as MatMul, so a tied embedding/LM head can remain one MXFP4 tensor. Each task loads up to 1024 selected-row elements plus aligned 32-byte scale packs. One VEC block expands FP4 nibbles and applies E8M0 scales; BF16/FP16 conversion and packing remain in registers. Dim2 covers 64-element groups, and LSU stores the complete output tile. The 8 KiB task scratch supports four resident Procs. I32/I64 indices, repeated selections, batched indices, and K32 tails are supported. Eligible residual/norm consumers retain the existing BF16/FP16 storage rewrite.
+`GET_ROWS` reserves 512 KiB of scratch per Proc, with up to four resident Procs. Large inputs run two child Threads using the same worker function on disjoint output regions. Each child requests two LSU TCSR groups and one VEC TCSR group through `dayan_thread_resources_t`. DAPI isolates these execution contexts; the worker arguments assign separate 256 KiB regions within the inherited URAM range. Each worker runs load, convert and store in order, allowing the scheduler to run its sibling during unit waits. There are no Named Resource tokens or inter-worker barriers. The root joins both children and propagates their errors before the next mega step.
+
+Workers cache up to 64 I32/I64 indices per load, including strided index views. BF16/FP16-to-F32 gathers up to 32768 output elements across selected rows, runs one VEC conversion block, and stores the complete tile. Consecutive source rows share one load; random rows use separate loads into the same conversion tile. Same-type F32/BF16/FP16 copies use D2D and merge consecutive selected rows. Child Threads are used when there are at least two full 32768-element tiles per Proc; same-type copies also require at least two selected rows per Proc. Smaller inputs run the same worker directly in the root, with adaptive tiles. For 1024 selected rows of width 1024, the widening path issues 32 VEC blocks instead of 4096; this is an issue-count reduction, not a measured latency ratio.
+
+MXFP4 `GET_ROWS` writes F32, BF16, or FP16 embeddings. It uses the same packed payload and Z-scale allocation as MatMul, so a tied embedding/LM head can remain one MXFP4 tensor. Each tile loads up to 32768 selected-row elements plus aligned 32-byte scale packs and uses the same index cache. One VEC block expands FP4 nibbles and applies E8M0 scales; BF16/FP16 conversion and packing remain in registers. Dim2 covers 64-element groups, and LSU stores the complete output tile. Repeated selections, batched indices, and K32 tails are supported. Eligible residual/norm consumers retain the existing BF16/FP16 storage rewrite.
+
+`ggml-dayan-workers.h` also dispatches independent regions of non-buffered norm, residual add, scale/clamp, division, broadcast fallback, reductions, format conversion, SET_ROWS, diagonal mask, Softmax, RoPE, ADD_ID, sorting, router and SSM convolution paths. Recurrent GDN partitions heads and sequences; token recurrence stays ordered. Most workers use 256 KiB each; standalone MXFP4 quantization needs 320 KiB each. Dispatch requires at least 32768 elements and one independent work unit per child, otherwise the root calls the same function directly. Generic tiles hold 8192 elements, and Softmax reductions use VEC DIM1 loops with constant instruction counts. Existing unary/binary/L2 ping-pong paths, matrix/attention/GDN chunk pipelines, and whole-tensor D2D copies retain their existing scheduling. Correctness and scheduling are checked with cmodel; hardware speedup still requires hardware or RTL measurements.
 
 For either operand, let `r` be the A row or B column and `g` the K32 group. The scale offset is `(g / 4) * scale_stride + r * 4 + g % 4`, with `scale_stride = align_up(rows_or_columns, 8) * 4`. Eight lanes occupy 32 bytes in each K128 plane. Scales are unswizzled; only matrix payload follows the selected MAT input swizzle. The load-a and load-b threads load both payload and scales before publishing their Resource. The paired gate/up products share A and release its Resource after both MAT reads.
 
@@ -347,7 +455,7 @@ The post thread submits one VEC block for the entire MAT slice. For MXFP4 output
 
 Two LSU URAM copies gather the entire MXFP4 slice into a compact payload buffer and a Z-packed scale buffer, removing the C swizzle. After those copies complete, one LSU instruction writes all payload rows and one writes all scale planes. A full 512 x 256 slice writes 64 KiB of payload and 4 KiB of scales; a 256 x 256 slice writes 32 KiB and 2 KiB. Tail stores include only allocated K128 payload padding and eight-row scale-owner padding. The C Resource remains held through LSU completion, and the shared packed buffers are reused only after the previous store completes. BF16/FP16 output stores the whole slice directly from C; a partial K32 column group uses one additional tail instruction.
 
-Standalone conversion uses 128 x 512 tiles, one VEC block per tile, and the same whole-tile payload/scale stores. FP16 widening and BF16 rounding also stay in registers before MXFP4 conversion. Each Proc reserves 296 KiB, allowing all four independent Procs to reside within 1536 KiB. URAM A scale planes use `align_up(M * 4, 64)` as their K128 stride so LSU's 64-byte tail zero-fill cannot overwrite the next plane; the external Z layout is unchanged.
+Standalone conversion uses 128 x 512 tiles, one VEC block per tile, and the same whole-tile payload/scale stores. FP16 widening and BF16 rounding also stay in registers before MXFP4 conversion. Each Proc reserves 640 KiB for two isolated 320 KiB workers; each tile needs about 290 KiB for F32 input. URAM A scale planes use `align_up(M * 4, 64)` as their K128 stride so LSU's 64-byte tail zero-fill cannot overwrite the next plane; the external Z layout is unchanged.
 
 All MXFP4 pipeline buffer bases are at least 32-byte aligned. The host arena and payload rows use 64-byte alignment, and external K128 scale planes use 32-byte alignment. URAM A/B/C buffers have 1024-byte-aligned bases and sizes; scale buffers, packed payload, and packed scales meet 32-byte alignment. Device entry points check the URAM buffer bases. Individual packed scale bytes keep their Z layout.
 
@@ -377,7 +485,7 @@ F32 matrix products, including the expert router and scalar shared gate, execute
 
 Graphs containing `MUL_MAT_ID` retain F32 residual storage. Rounding the residual stream to BF16 can change close router scores and select different experts in later layers.
 
-`ARGSORT` and `TOP_K` use a stable 32-bit FlexVec radix sort. VEC transforms float keys, computes prefix sums and bucket totals with Shuffle, and scatters keys and indices into SparseMem. Prefix carries stay in URAM and return directly to VEC; scalar code only controls loops. Signed zero is canonicalized and equal keys retain index order. Prefix consumers store only the requested indices with the original row stride. `GET_ROWS` accepts these strided I32/I64 views. Sorting uses independent Procs with no child Threads or Named Resources.
+`ARGSORT` and `TOP_K` use a stable radix sort in private URAM. Signed zero is canonicalized and equal keys retain index order. Prefix consumers store only the requested indices with the original row stride. `GET_ROWS` accepts these strided I32/I64 views. Large independent row sets use two workers per Proc, each with separate scratch and LSU groups; sorting does not request VEC or Named Resources.
 
 F32 binary operators read strided rows directly, including the expert output views used in MoE aggregation. Inputs with a noncontiguous first dimension still use Device copy staging. CLAMP accepts infinite bounds, including the lower-only clamp used to normalize selected routing weights.
 
@@ -423,7 +531,7 @@ Gated Delta Net assigns heads and sequences to independent single-core tasks, li
 
 Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The pipeline uses 758.5 KiB within a 768 KiB task reservation, with up to two resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation. Prepared Q becomes output storage after its last MAT read, and the prepared Resource stays held until the output DMA completes.
 
-Decode, short prefill, vector gates (KDA), and multiple state snapshots use the FP32 recurrent VEC path with a 96 KiB reservation and up to four resident tasks per core. It forms the gated key once per token and folds state decay into the state update, avoiding a separate full-state read/write pass. DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Both entries can distribute independent tasks across the available cores; they do not split one head across a cooperating four-core group.
+Decode, short prefill, vector gates (KDA), and multiple state snapshots use the FP32 recurrent VEC path with a 512 KiB reservation and up to two independent 256 KiB workers per Proc. It forms the gated key once per token and folds state decay into the state update, avoiding a separate full-state read/write pass. DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Both entries can distribute independent tasks across the available cores; they do not split one head across a cooperating four-core group.
 
 ## Profiling
 
@@ -504,7 +612,8 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-graph ro
 | `concat` | Contiguous and transposed inputs, all axes, F32/BF16/F16 |
 | `gated-output` | Gated attention output projection |
 | `copy` | Device copy paths |
-| `get-rows` | Indexed row reads |
+| `workers` | Large sort, elementwise, norm, reduction, masked Softmax and RoPE cases across two workers, including tails |
+| `get-rows` | F32/BF16/FP16 row reads, 1024 selected rows, consecutive/repeated/random indices, strided I32/I64 views, and tile tails |
 | `embedding-norm` | Embedding lookup and normalization |
 | `memory` | Memory and layout operators |
 | `empty` | Empty Scale, memory operators, and BF16/FP16/MXFP4 output MatMul |

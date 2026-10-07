@@ -317,11 +317,11 @@ static inline bool memory_issue_linear_copy(uint64_t destination,
 
 template <long ElementLog2>
 static inline void memory_transpose_copy(uint64_t destination, uint64_t source, const uint32_t ne[4],
-                                         const uint64_t input_nb[4], const uint64_t output_nb[4]) {
+                                         const uint64_t input_nb[4], const uint64_t output_nb[4], const NativeContext & context = {}) {
     constexpr uint32_t tile = 32;
     constexpr uint32_t bytes = 1U << ElementLog2;
     constexpr uint32_t stride = tile * bytes;
-    const uint64_t staging = (uint64_t) dayan_uram_base();
+    const uint64_t staging = native_uram(context);
     const uint64_t transposed = staging + tile * stride;
     static_assert(2 * tile * stride <= DAYAN_NATIVE_TASK_URAM_BYTES, "Transpose tile exceeds URAM");
     for (uint32_t i3 = 0; i3 < ne[3]; ++i3) {
@@ -358,7 +358,7 @@ static inline bool memory_issue_tensor_copy(uint64_t destination,
                                             const uint32_t ne[4],
                                             const uint64_t input_nb[4],
                                             const uint64_t output_nb[4],
-                                            uint32_t element_bytes) {
+                                            uint32_t element_bytes, const NativeContext & context = {}) {
     for (uint32_t dimension = 0; dimension < 4U; ++dimension) {
         if (ne[dimension] == 0U) {
             return false;
@@ -391,11 +391,11 @@ static inline bool memory_issue_tensor_copy(uint64_t destination,
         // Transpose aligned URAM tiles instead of issuing one DRAM request per element.
         dayan_wait_lsu();
         if (element_bytes == 4) {
-            memory_transpose_copy<2>(destination, source, ne, input_nb, output_nb);
+            memory_transpose_copy<2>(destination, source, ne, input_nb, output_nb, context);
             return true;
         }
         if (element_bytes == 2) {
-            memory_transpose_copy<1>(destination, source, ne, input_nb, output_nb);
+            memory_transpose_copy<1>(destination, source, ne, input_nb, output_nb, context);
             return true;
         }
     }
@@ -403,12 +403,12 @@ static inline bool memory_issue_tensor_copy(uint64_t destination,
     return true;
 }
 
-static inline void memory_validate(const void * config) {
+static inline void memory_validate(const void * config, const NativeContext & context = {}) {
     if (config == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
-    (void) dayan_native_task_id();
-    DAYAN_PARAMS_IF(dayan_uram_base() == nullptr || dayan_uram_size() < NormalizationLayout::kTotalBytes) {
+    (void) dayan_native_task_id(context);
+    DAYAN_PARAMS_IF(native_uram(context) == 0 || native_uram_size(context) < NormalizationLayout::kTotalBytes) {
         DAYAN_PARAMS_ERROR();
     }
 }
@@ -523,19 +523,19 @@ static inline uint64_t memory_read_index(const void * indices, uint32_t index, u
     return 0;
 }
 
-static inline uint64_t memory_lowp_staging() {
-    return (uint64_t) (uintptr_t) dayan_uram_base() + NormalizationLayout::kLowp;
+static inline uint64_t memory_lowp_staging(const NativeContext & context = {}) {
+    return native_uram(context) + NormalizationLayout::kLowp;
 }
 
 template <void (*Convert)()>
-static inline void memory_load_configured_lowp_to_f32(uint64_t output, const void * input, uint32_t elements) {
-    const uint64_t staging = memory_lowp_staging();
+static inline void memory_load_configured_lowp_to_f32(uint64_t output, const void * input, uint32_t elements, const NativeContext & context = {}) {
+    const uint64_t staging = memory_lowp_staging(context);
     memory_load_bytes(staging, input, (uint64_t) elements * sizeof(uint16_t));
     ggml_dayan_vec_detail::configure_f32_iterators();
     ggml_dayan_vec_detail::issue_lowp_to_f32<Convert>(output, staging, elements);
 }
 
-static inline void memory_load_f32(uint64_t output, const void * input, uint32_t elements, uint32_t type) {
+static inline void memory_load_f32(uint64_t output, const void * input, uint32_t elements, uint32_t type, const NativeContext & context = {}) {
     if (type == kDayanDataTypeF32) {
         memory_load(output, input, elements, type);
         return;
@@ -545,9 +545,9 @@ static inline void memory_load_f32(uint64_t output, const void * input, uint32_t
     }
 
     if (type == kDayanDataTypeBF16) {
-        memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(output, input, elements);
+        memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(output, input, elements, context);
     } else {
-        memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(output, input, elements);
+        memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(output, input, elements, context);
     }
 }
 
@@ -578,15 +578,15 @@ static inline uint64_t memory_convert_from_f32(uint64_t output, uint64_t input, 
 template <void (*Convert)()>
 static inline void memory_copy_lowp_to_f32(const DayanCopyConfig * config,
                                            const void *            source,
-                                           float *                 destination) {
+                                           float *                 destination, const NativeContext & context = {}) {
     configure_normalization_lsu();
     ggml_dayan_vec_detail::configure_f32_iterators();
 
-    const uint32_t task        = dayan_native_task_id();
-    const uint32_t tasks       = dayan_native_task_count();
-    const uint64_t uram        = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint32_t task        = dayan_native_task_id(context);
+    const uint32_t tasks       = dayan_native_task_count(context);
+    const uint64_t uram        = native_uram(context);
     const uint64_t value_uram  = uram + NormalizationLayout::kValue;
-    const uint64_t staging     = memory_lowp_staging();
+    const uint64_t staging     = memory_lowp_staging(context);
     const uint64_t source_rows = config->elements / config->source_ne[0];
     const uint64_t tiles       = memory_tile_count(config->source_ne[0]);
     const uint64_t work_items  = source_rows * tiles;
@@ -619,12 +619,73 @@ static inline void memory_copy_lowp_to_f32(const DayanCopyConfig * config,
     }
 }
 
-static inline void run_get_rows_mxfp4(const DayanRowsConfig * config, const void * source, const void * indices, void * output) {
+struct GetRowsLayout {
+    enum : uint32_t {
+        kWorkers = 2,
+        kWorkerBytes = 256U * 1024U,
+        kTileElements = 32768,
+        kIndexCount = 64,
+        kLowp = kTileElements * sizeof(float),
+        kIndices = kLowp + kTileElements * sizeof(uint16_t),
+    };
+};
+
+static_assert(GetRowsLayout::kIndices + GetRowsLayout::kIndexCount * sizeof(int64_t) <= GetRowsLayout::kWorkerBytes,
+              "GET_ROWS scratch exceeds URAM");
+static_assert(GetRowsLayout::kWorkers * GetRowsLayout::kWorkerBytes <= DAYAN_GET_ROWS_URAM_BYTES,
+              "GET_ROWS workers exceed URAM");
+
+struct GetRowsWorkerArgs {
+    const DayanRowsConfig * config;
+    const void * source;
+    const void * indices;
+    void * output;
+    uint64_t uram;
+    uint32_t task;
+    uint32_t tasks;
+};
+
+static inline uint64_t get_rows_source_row(const DayanRowsConfig * config, const void * indices, uint32_t row,
+                                           uint64_t scratch, uint32_t & first, uint32_t & count) {
+    const uint32_t column = row % config->index_ne[0];
+    const uint32_t index1 = row / config->index_ne[0] % config->index_ne[1];
+    const uint32_t index2 = row / config->index_ne[0] / config->index_ne[1];
+    const uint32_t bytes = memory_type_bytes(config->index_type);
+    if (row < first || row - first >= count) {
+        first = row;
+        count = min_int(config->index_ne[0] - column, GetRowsLayout::kIndexCount);
+        const char * address = (const char *) indices + column * config->index_nb[0] +
+                               index1 * config->index_nb[1] + index2 * config->index_nb[2];
+        if (config->index_nb[0] == bytes) {
+            memory_load_bytes(scratch, address, count * bytes);
+        } else {
+            if (!memory_stride_fits(config->index_nb[0])) { count = 1; }
+            configure_memory_lsu<1>(count, count == 1 ? 0 : config->index_nb[0], bytes, bytes, bytes);
+            __tx_lsu_dma_d2u<1>(scratch, (long) address);
+            dayan_wait_lsu();
+        }
+    }
+    const int64_t selected = config->index_type == kDayanDataTypeI32 ?
+                                 ((const int32_t *) (uintptr_t) scratch)[row - first] :
+                                 ((const int64_t *) (uintptr_t) scratch)[row - first];
+    const uint64_t source_row = selected + config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
+    if (selected < 0 || (uint64_t) selected >= config->source_ne[0] || source_row >= config->source_rows) {
+        DAYAN_PARAMS_ERROR();
+    }
+    return source_row;
+}
+
+static inline void run_get_rows_mxfp4(const DayanRowsConfig * config, const void * source, const void * indices, void * output,
+                                      uint64_t uram, uint32_t task, uint32_t tasks) {
     using namespace ggml_dayan_vec_detail;
-    constexpr uint32_t tile_elements = 1024;
-    constexpr uint64_t payload_offset = 4096, scales_offset = 4864, raw_scales_offset = 6912;
-    constexpr uint64_t shifts_offset = 7168, index_offset = 7424;
-    static_assert(index_offset + 64 <= DAYAN_NATIVE_TASK_URAM_BYTES, "MXFP4 rows scratch exceeds URAM");
+    constexpr uint32_t tile_elements = GetRowsLayout::kTileElements;
+    constexpr uint64_t payload_offset = tile_elements * sizeof(float);
+    constexpr uint64_t scales_offset = payload_offset + tile_elements / 2 + 256;
+    constexpr uint64_t raw_scales_offset = scales_offset + tile_elements * 2;
+    constexpr uint64_t shifts_offset = raw_scales_offset + tile_elements / 4;
+    constexpr uint64_t index_offset = shifts_offset + 256;
+    static_assert(index_offset + GetRowsLayout::kIndexCount * sizeof(int64_t) <= GetRowsLayout::kWorkerBytes,
+                  "MXFP4 rows scratch exceeds URAM");
     if (source == nullptr || indices == nullptr || output == nullptr || config->rows == 0 ||
         config->row_elements == 0 || config->row_elements % 32 != 0 ||
         (config->destination_type != kDayanDataTypeF32 && config->destination_type != kDayanDataTypeBF16 &&
@@ -632,20 +693,13 @@ static inline void run_get_rows_mxfp4(const DayanRowsConfig * config, const void
         config->source_scale_stride < config->source_rows * 4 || !memory_stride_fits(config->source_scale_stride)) {
         DAYAN_PARAMS_ERROR();
     }
-    const uint64_t uram = (uint64_t) (uintptr_t) dayan_uram_base();
-    const uint32_t task = dayan_native_task_id(), tasks = dayan_native_task_count();
     const uint64_t tiles = ((uint64_t) config->row_elements + tile_elements - 1) / tile_elements;
+    uint32_t first_index = 0, index_count = 0;
     for (uint32_t i = 0; i < 64; ++i) { ((uint32_t *) (uintptr_t) (uram + shifts_offset))[i] = (i % 8) * 4; }
     for (uint64_t work = task; work < config->rows * tiles; work += tasks) {
         const uint32_t row = work / tiles, offset = work % tiles * tile_elements;
         const uint32_t elements = min_int(config->row_elements - offset, tile_elements);
-        const uint32_t index1 = row / config->index_ne[0] % config->index_ne[1];
-        const uint32_t index2 = row / config->index_ne[0] / config->index_ne[1];
-        const char * index = (const char *) indices + (row % config->index_ne[0]) * config->index_nb[0] +
-                            index1 * config->index_nb[1] + index2 * config->index_nb[2];
-        const uint64_t selected = memory_read_index(index, 0, config->index_type, uram + index_offset);
-        const uint64_t source_row = selected + config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
-        if (selected >= config->source_ne[0] || source_row >= config->source_rows) { DAYAN_PARAMS_ERROR(); }
+        const uint64_t source_row = get_rows_source_row(config, indices, row, uram + index_offset, first_index, index_count);
         memory_load_bytes(uram + payload_offset, (const char *) source + source_row * config->source_row_stride + offset / 2,
                           (elements / 2 + 31U) & ~31U);
         const uint32_t planes = (elements + 127) / 128;
@@ -706,13 +760,20 @@ static inline void run_get_rows_mxfp4(const DayanRowsConfig * config, const void
     }
 }
 
-static inline void run_get_rows(const DayanRowsConfig * config,
-                                const void *            source,
-                                const void *            indices,
-                                void *                  output) {
-    memory_validate(config);
+static void get_rows_worker(void * argument) {
+    const auto & args = *(const GetRowsWorkerArgs *) argument;
+    const DayanRowsConfig * config = args.config;
+    const void * source = args.source;
+    const void * indices = args.indices;
+    void * output = args.output;
+    const uint64_t uram = args.uram;
+    const uint32_t task = args.task, tasks = args.tasks;
+    if (config->index_ne[0] == 0 || config->index_ne[1] == 0 ||
+        (config->index_type != kDayanDataTypeI32 && config->index_type != kDayanDataTypeI64)) {
+        DAYAN_PARAMS_ERROR();
+    }
     if (config->source_type == kDayanDataTypeMXFP4) {
-        run_get_rows_mxfp4(config, source, indices, output);
+        run_get_rows_mxfp4(config, source, indices, output, uram, task, tasks);
         return;
     }
     if (source == nullptr || indices == nullptr || output == nullptr || config->row_elements == 0 ||
@@ -725,32 +786,27 @@ static inline void run_get_rows(const DayanRowsConfig * config,
 
     const uint64_t source_row_bytes = (uint64_t) config->row_elements * memory_type_bytes(config->source_type);
     const uint64_t output_row_bytes = (uint64_t) config->row_elements * memory_type_bytes(config->destination_type);
-    const uint32_t task             = dayan_native_task_id();
-    const uint32_t tasks            = dayan_native_task_count();
     const uint64_t source_address = (uint64_t) (uintptr_t) source;
     const uint64_t output_address = (uint64_t) (uintptr_t) output;
     const uint64_t source_bytes   = config->source_rows * source_row_bytes;
     const uint64_t output_bytes   = (uint64_t) config->rows * output_row_bytes;
-    const uint64_t index_uram     = (uint64_t) (uintptr_t) dayan_uram_base() + NormalizationLayout::kScalar;
+    const uint64_t index_uram     = uram + GetRowsLayout::kIndices;
+    uint32_t first_index = 0, index_count = 0;
     const bool disjoint = source_address < output_address ? output_address - source_address >= source_bytes :
                                                               source_address - output_address >= output_bytes;
     if (config->source_type == config->destination_type && disjoint) {
         bool issued = false;
-        for (uint32_t row = task; row < config->rows; row += tasks) {
-            uint32_t       linear   = row / config->index_ne[0];
-            const uint32_t index1   = linear % config->index_ne[1];
-            const uint32_t index2   = linear / config->index_ne[1];
-            const char * index = (const char *) indices + (row % config->index_ne[0]) * config->index_nb[0] +
-                                 index1 * config->index_nb[1] + index2 * config->index_nb[2];
-            const uint64_t selected = memory_read_index(index, 0, config->index_type, index_uram);
-            const uint64_t source_index =
-                selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
-            if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
-                DAYAN_PARAMS_ERROR();
+        const uint64_t end = (uint64_t) config->rows * (task + 1) / tasks;
+        for (uint64_t row = (uint64_t) config->rows * task / tasks; row < end;) {
+            const uint64_t source_index = get_rows_source_row(config, indices, row, index_uram, first_index, index_count);
+            uint64_t rows = 1;
+            while (row + rows < end && get_rows_source_row(config, indices, row + rows, index_uram, first_index, index_count) == source_index + rows) {
+                ++rows;
             }
             issued = memory_issue_linear_copy(output_address + (uint64_t) row * output_row_bytes,
-                                              source_address + source_index * source_row_bytes, source_row_bytes) ||
+                                              source_address + source_index * source_row_bytes, rows * source_row_bytes) ||
                      issued;
+            row += rows;
         }
         if (issued) {
             dayan_wait_lsu();
@@ -761,51 +817,60 @@ static inline void run_get_rows(const DayanRowsConfig * config,
         DAYAN_PARAMS_ERROR();
     }
 
-    configure_normalization_lsu();
-    if (config->source_type != kDayanDataTypeF32) {
-        ggml_dayan_vec_detail::configure_f32_iterators();
-    }
-    const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
-    const uint64_t out_uram   = uram + NormalizationLayout::kValue;
-    const uint64_t tiles      = memory_tile_count(config->row_elements);
-    const uint64_t work_items = (uint64_t) config->rows * tiles;
-    for (uint64_t work = task; work < work_items; work += tasks) {
-        const uint32_t row      = (uint32_t) (work / tiles);
-        const uint32_t offset   = (uint32_t) (work % tiles) * NormalizationLayout::kTileElements;
-        const uint32_t elements = min_int((int) (config->row_elements - offset),
-                                          (int) NormalizationLayout::kTileElements);
-        uint32_t       linear   = row / config->index_ne[0];
-        const uint32_t index1   = linear % config->index_ne[1];
-        const uint32_t index2   = linear / config->index_ne[1];
-        const char * index = (const char *) indices + (row % config->index_ne[0]) * config->index_nb[0] +
-                             index1 * config->index_nb[1] + index2 * config->index_nb[2];
-        const uint64_t selected = memory_read_index(index, 0, config->index_type, index_uram);
-        const uint64_t source_index =
-            selected + (uint64_t) config->source_ne[0] * (index1 + (uint64_t) config->source_ne[1] * index2);
-        if (selected >= config->source_ne[0] || source_index >= config->source_rows) {
-            DAYAN_PARAMS_ERROR();
+    ggml_dayan_vec_detail::configure_f32_iterators();
+    const uint64_t total = (uint64_t) config->rows * config->row_elements;
+    const uint64_t per_task = align_up((total + tasks - 1) / tasks, 128);
+    const uint32_t tile = per_task < GetRowsLayout::kTileElements ? per_task : GetRowsLayout::kTileElements;
+    for (uint64_t first = (uint64_t) task * tile; first < total; first += (uint64_t) tasks * tile) {
+        const uint32_t elements = total - first < tile ? total - first : tile;
+        for (uint32_t loaded = 0; loaded < elements;) {
+            const uint64_t position = first + loaded;
+            const uint32_t row = position / config->row_elements, column = position % config->row_elements;
+            const uint64_t source_index = get_rows_source_row(config, indices, row, index_uram, first_index, index_count);
+            uint32_t span = min_int(config->row_elements - column, elements - loaded);
+            while (span < elements - loaded) {
+                const uint32_t next_row = (position + span) / config->row_elements;
+                const uint64_t next_source = get_rows_source_row(config, indices, next_row, index_uram, first_index, index_count);
+                if (next_source * config->row_elements != source_index * config->row_elements + column + span) { break; }
+                span += min_int(config->row_elements, elements - loaded - span);
+            }
+            memory_load_bytes(uram + GetRowsLayout::kLowp + (uint64_t) loaded * sizeof(uint16_t),
+                              (const char *) source + source_index * source_row_bytes + (uint64_t) column * sizeof(uint16_t),
+                              (uint64_t) span * sizeof(uint16_t));
+            loaded += span;
         }
-        const char * source_row = (const char *) source + source_index * source_row_bytes;
-        float *      output_row = (float *) output + (uint64_t) row * config->row_elements;
         if (config->source_type == kDayanDataTypeBF16) {
-            memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(
-                out_uram, source_row + (uint64_t) offset * sizeof(uint16_t), elements);
-        } else if (config->source_type == kDayanDataTypeF16) {
-            memory_load_configured_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(
-                out_uram, source_row + (uint64_t) offset * sizeof(uint16_t), elements);
+            ggml_dayan_vec_detail::issue_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(uram, uram + GetRowsLayout::kLowp, elements);
         } else {
-            memory_load(out_uram, source_row + (uint64_t) offset * sizeof(float), elements, config->source_type);
+            ggml_dayan_vec_detail::issue_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(uram, uram + GetRowsLayout::kLowp, elements);
         }
-        normalization_store_f32(output_row + offset, out_uram, elements);
-        dayan_wait_lsu();
+        memory_store_bytes((float *) output + first, uram, (uint64_t) elements * sizeof(float));
     }
+}
+
+static inline int run_get_rows(const DayanRowsConfig * config, const void * source, const void * indices, void * output, const NativeContext & context = {}) {
+    memory_validate(config);
+    const uint64_t total = (uint64_t) config->rows * config->row_elements;
+    const uint64_t units = config->source_type == config->destination_type ? config->rows :
+                           (total + GetRowsLayout::kTileElements - 1) / GetRowsLayout::kTileElements;
+    if (native_dispatch(context, {total, units, GetRowsLayout::kWorkerBytes}, [&](const NativeContext & worker) {
+            run_get_rows(config, source, indices, output, worker);
+        })) { return 0; }
+    GetRowsWorkerArgs args = {config, source, indices, output, context.uram, context.task, context.tasks};
+    get_rows_worker(&args);
+    return 0;
 }
 
 static inline void run_set_rows(const DayanRowsConfig * config,
                                 const float *           source,
                                 const void *            indices,
-                                void *                  destination) {
-    memory_validate(config);
+                                void *                  destination, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {(uint64_t) config->row_elements * config->rows, (uint64_t) config->rows * memory_tile_count(config->row_elements), 256U * 1024U}, [&](const NativeContext & worker) {
+            run_set_rows(config, source, indices, destination, worker);
+        })) { return; }
+
+    memory_validate(config, context);
     if (source == nullptr || indices == nullptr || destination == nullptr || config->row_elements == 0 ||
         config->rows == 0 || config->source_type != kDayanDataTypeF32 ||
         (config->destination_type != kDayanDataTypeF32 && config->destination_type != kDayanDataTypeBF16 &&
@@ -814,14 +879,14 @@ static inline void run_set_rows(const DayanRowsConfig * config,
     }
 
     configure_normalization_lsu();
-    const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t uram       = native_uram(context);
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t out_uram   = config->destination_type == kDayanDataTypeF32 ? uram + NormalizationLayout::kValue :
                                                                                 uram + NormalizationLayout::kLowp;
     const uint64_t index_uram = uram + NormalizationLayout::kScalar;
     const uint64_t row_bytes  = (uint64_t) config->row_elements * memory_type_bytes(config->destination_type);
-    const uint32_t task       = dayan_native_task_id();
-    const uint32_t tasks      = dayan_native_task_count();
+    const uint32_t task       = dayan_native_task_id(context);
+    const uint32_t tasks      = dayan_native_task_count(context);
     const uint64_t tiles      = memory_tile_count(config->row_elements);
     const uint64_t work_items = (uint64_t) config->rows * tiles;
     for (uint64_t work = task; work < work_items; work += tasks) {
@@ -845,15 +910,20 @@ static inline void run_set_rows(const DayanRowsConfig * config,
         }
         const float * source_row      = source + (uint64_t) row * config->row_elements;
         char *        destination_row = (char *) destination + destination_index * row_bytes;
-        normalization_load(input_uram, source_row + offset, elements);
+        normalization_load(input_uram, source_row + offset, elements, context);
         memory_convert_from_f32(out_uram, input_uram, elements, config->destination_type);
         memory_store(destination_row + (uint64_t) offset * memory_type_bytes(config->destination_type), out_uram,
                      elements, config->destination_type);
     }
 }
 
-static inline void run_copy(const DayanCopyConfig * config, const void * source, void * destination) {
-    memory_validate(config);
+static inline void run_copy(const DayanCopyConfig * config, const void * source, void * destination, const NativeContext & context = {}) {
+    if (!config) { DAYAN_PARAMS_ERROR(); }
+    if (native_dispatch(context, {config->elements, config->source_type == config->destination_type ? 1 : (config->elements + 8191) / 8192, 256U * 1024U}, [&](const NativeContext & worker) {
+            run_copy(config, source, destination, worker);
+        })) { return; }
+
+    memory_validate(config, context);
     if (source == nullptr || destination == nullptr || config->elements == 0 ||
         (config->source_type != kDayanDataTypeF32 && config->source_type != kDayanDataTypeBF16 &&
          config->source_type != kDayanDataTypeF16) ||
@@ -873,8 +943,8 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
     }
     const uint32_t source_bytes        = memory_type_bytes(config->source_type);
     const uint32_t destination_bytes   = memory_type_bytes(config->destination_type);
-    const uint32_t task                = dayan_native_task_id();
-    const uint32_t tasks               = dayan_native_task_count();
+    const uint32_t task                = dayan_native_task_id(context);
+    const uint32_t tasks               = dayan_native_task_count(context);
     const uint64_t total_bytes         = config->elements * source_bytes;
     const uint64_t source_address      = (uint64_t) (uintptr_t) source;
     const uint64_t destination_address = (uint64_t) (uintptr_t) destination;
@@ -895,7 +965,7 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
             (uint64_t) config->source_ne[0] * config->source_ne[1] * config->source_ne[2] * destination_bytes,
         };
         const bool issued = memory_issue_tensor_copy(destination_address, source_address, config->source_ne,
-                                                     config->source_nb, destination_nb, source_bytes);
+                                                     config->source_nb, destination_nb, source_bytes, context);
         if (issued) {
             dayan_wait_lsu();
         }
@@ -903,11 +973,37 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
     }
 
     if (config->destination_type == kDayanDataTypeF32 && config->source_type == kDayanDataTypeBF16) {
-        memory_copy_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(config, source, (float *) destination);
+        memory_copy_lowp_to_f32<__tx_vec_cvt_fp32_bf16<0, 0, 0>>(config, source, (float *) destination, context);
         return;
     }
     if (config->destination_type == kDayanDataTypeF32 && config->source_type == kDayanDataTypeF16) {
-        memory_copy_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(config, source, (float *) destination);
+        memory_copy_lowp_to_f32<__tx_vec_cvt_fp32_fp16<0, 0, 0>>(config, source, (float *) destination, context);
+        return;
+    }
+
+    if (disjoint && config->source_type == kDayanDataTypeF32 && config->destination_type != kDayanDataTypeF32 &&
+        config->source_nb[0] == sizeof(float) && config->source_ne[0] % Constants::kVecLanes == 0 &&
+        config->source_ne[0] <= GetRowsLayout::kTileElements && memory_stride_fits(config->source_nb[1])) {
+        const uint64_t width = config->source_ne[0];
+        const uint64_t row_bytes = width * sizeof(float);
+        const uint64_t tile_rows = GetRowsLayout::kTileElements / width;
+        const uint64_t row_tiles = (config->source_ne[1] + tile_rows - 1) / tile_rows;
+        const uint64_t work_items = row_tiles * config->source_ne[2] * config->source_ne[3];
+        const uint64_t uram = native_uram(context);
+        const uint64_t packed = uram + GetRowsLayout::kLowp;
+        for (uint64_t work = task; work < work_items; work += tasks) {
+            const uint64_t first_row = (work % row_tiles) * tile_rows;
+            const uint64_t index2 = (work / row_tiles) % config->source_ne[2];
+            const uint64_t index3 = work / (row_tiles * config->source_ne[2]);
+            const uint64_t rows = config->source_ne[1] - first_row < tile_rows ? config->source_ne[1] - first_row : tile_rows;
+            const uint64_t input = source_address + first_row * config->source_nb[1] + index2 * config->source_nb[2] + index3 * config->source_nb[3];
+            const uint64_t output = destination_address + (first_row + (index2 + index3 * config->source_ne[2]) * config->source_ne[1]) * width * destination_bytes;
+            configure_memory_lsu_3d<1>(row_bytes / 64, 64, 64, rows, config->source_nb[1], row_bytes, 1, 0, 0, 64, 64);
+            __tx_lsu_dma_d2u<1>(uram, input);
+            dayan_wait_lsu();
+            memory_convert_from_f32(packed, uram, rows * width, config->destination_type);
+            memory_store_bytes((void *) (uintptr_t) output, packed, rows * width * destination_bytes);
+        }
         return;
     }
 
@@ -915,7 +1011,7 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
     if (config->source_type != kDayanDataTypeF32) {
         ggml_dayan_vec_detail::configure_f32_iterators();
     }
-    const uint64_t uram       = (uint64_t) (uintptr_t) dayan_uram_base();
+    const uint64_t uram       = native_uram(context);
     const uint64_t input_uram = uram + NormalizationLayout::kInput;
     const uint64_t value_uram = uram + NormalizationLayout::kValue;
     const uint64_t out_uram =
@@ -953,10 +1049,10 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
         }
         if (config->source_nb[0] == source_bytes) {
             memory_load_f32(value_uram, source_row + (uint64_t) offset * source_bytes, elements,
-                            config->source_type);
+                            config->source_type, context);
         } else {
             const uint64_t staging = config->source_type == kDayanDataTypeF32 ? value_uram :
-                                                                                 memory_lowp_staging();
+                                                                                 memory_lowp_staging(context);
             configure_memory_lsu<1>(elements, config->source_nb[0], source_bytes, source_bytes, source_bytes);
             __tx_lsu_dma_d2u<1>((long) staging,
                                 (long) (source_row + (uint64_t) offset * config->source_nb[0]));
@@ -975,8 +1071,8 @@ static inline void run_copy(const DayanCopyConfig * config, const void * source,
     }
 }
 
-static inline void run_repeat(const DayanRepeatConfig * config, const void * source, void * output) {
-    memory_validate(config);
+static inline void run_repeat(const DayanRepeatConfig * config, const void * source, void * output, const NativeContext & context = {}) {
+    memory_validate(config, context);
     if (source == nullptr || output == nullptr ||
         (config->type != kDayanDataTypeF32 && config->type != kDayanDataTypeBF16 &&
          config->type != kDayanDataTypeF16)) {
@@ -989,7 +1085,7 @@ static inline void run_repeat(const DayanRepeatConfig * config, const void * sou
         }
     }
 
-    if (dayan_native_task_id() != 0U) {
+    if (dayan_native_task_id(context) != 0U) {
         return;
     }
 
@@ -1026,8 +1122,8 @@ static inline uint64_t memory_strided_offset(const uint64_t nb[4], const uint32_
            (uint64_t) indices[3] * nb[3];
 }
 
-static inline void run_concat(const DayanConcatConfig * config, const void * left, const void * right, void * output) {
-    memory_validate(config);
+static inline void run_concat(const DayanConcatConfig * config, const void * left, const void * right, void * output, const NativeContext & context = {}) {
+    memory_validate(config, context);
     if (left == nullptr || right == nullptr || output == nullptr || config->axis >= 4 ||
         (config->type != kDayanDataTypeF32 && config->type != kDayanDataTypeBF16 &&
          config->type != kDayanDataTypeF16)) {
@@ -1044,16 +1140,16 @@ static inline void run_concat(const DayanConcatConfig * config, const void * lef
     }
 
     const uint32_t element_bytes = memory_type_bytes(config->type);
-    const uint32_t task          = dayan_native_task_id();
+    const uint32_t task          = dayan_native_task_id(context);
     if (task != 0U) {
         return;
     }
     bool issued = memory_issue_tensor_copy(reinterpret_cast<uint64_t>(output), reinterpret_cast<uint64_t>(left),
-                                           config->left_ne, config->left_nb, config->output_nb, element_bytes);
+                                           config->left_ne, config->left_nb, config->output_nb, element_bytes, context);
     const uint64_t right_offset = (uint64_t) config->left_ne[config->axis] * config->output_nb[config->axis];
     issued = memory_issue_tensor_copy(reinterpret_cast<uint64_t>(output) + right_offset,
                                       reinterpret_cast<uint64_t>(right), config->right_ne, config->right_nb,
-                                      config->output_nb, element_bytes) ||
+                                      config->output_nb, element_bytes, context) ||
              issued;
     if (issued) {
         dayan_wait_lsu();

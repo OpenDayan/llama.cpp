@@ -16,15 +16,19 @@
 #endif
 
 #ifndef DAYAN_NATIVE_TASK_URAM_BYTES
-#    define DAYAN_NATIVE_TASK_URAM_BYTES (8U * 1024U)
+#    define DAYAN_NATIVE_TASK_URAM_BYTES (512U * 1024U)
 #endif
 
 #ifndef DAYAN_NORM_TASK_URAM_BYTES
-#    define DAYAN_NORM_TASK_URAM_BYTES (128U * 1024U)
+#    define DAYAN_NORM_TASK_URAM_BYTES (512U * 1024U)
+#endif
+
+#ifndef DAYAN_GET_ROWS_URAM_BYTES
+#    define DAYAN_GET_ROWS_URAM_BYTES (512U * 1024U)
 #endif
 
 enum : uint32_t {
-    kDayanNativeTaskTileElements = 256U,
+    kDayanNativeTaskTileElements = 8192U,
     kDayanNativeMaxTasks         = 4U,
     kDayanSSMConvMaxTasks         = 16U,
     kDayanSSMConvTokenTile        = 64U,
@@ -32,15 +36,15 @@ enum : uint32_t {
 };
 
 #ifndef DAYAN_SORT_TASK_URAM_BYTES
-#    define DAYAN_SORT_TASK_URAM_BYTES (96U * 1024U)
+#    define DAYAN_SORT_TASK_URAM_BYTES (512U * 1024U)
 #endif
 
 #ifndef DAYAN_SSM_CONV_TASK_URAM_BYTES
-#    define DAYAN_SSM_CONV_TASK_URAM_BYTES (256U * 1024U)
+#    define DAYAN_SSM_CONV_TASK_URAM_BYTES (512U * 1024U)
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES
-#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (96U * 1024U)
+#    define DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES (512U * 1024U)
 #endif
 
 #ifndef DAYAN_GATED_DELTA_NET_URAM_BYTES
