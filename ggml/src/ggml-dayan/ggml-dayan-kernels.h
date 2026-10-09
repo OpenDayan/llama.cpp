@@ -260,6 +260,7 @@ struct DayanMxfp4Config {
     uint64_t a_stride, b_stride, output_stride;
     uint64_t a_scale_stride, b_scale_stride, output_scale_stride;
     uint32_t source_type, weight_type, output_type, operation;
+    uint32_t share_inputs;
 };
 
 struct DayanRowsConfig {

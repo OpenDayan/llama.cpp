@@ -1457,6 +1457,8 @@ static int ggml_backend_dayan_mxfp4_matmul(ggml_backend_dayan_context * ctx, ggm
     config.output_type = out ? kDayanDataTypeMXFP4 : output->type == GGML_TYPE_F32 ? kDayanDataTypeF32 :
                          output->type == GGML_TYPE_BF16 ? kDayanDataTypeBF16 : kDayanDataTypeF16;
     config.operation = operation;
+    const char * share_inputs = std::getenv("GGML_DAYAN_MXFP4_SHARE_INPUTS");
+    config.share_inputs = share_inputs == nullptr || std::strcmp(share_inputs, "0") != 0;
     const bool moe = node->op == GGML_OP_MUL_MAT_ID;
     DayanMxfp4MoeConfig moe_config = {};
     if (moe) {

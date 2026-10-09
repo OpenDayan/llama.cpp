@@ -70,16 +70,16 @@ static void layout_test() {
     const auto mm = DayanMxfp4Tile::make(1024, 3584, 1024, true, 1, false);
     const auto converted = DayanMxfp4Tile::make(1024, 3584, 1024, true, 1, true);
     const auto ffn = DayanMxfp4Tile::make(1024, 3584, 1024, true, 2, true);
-    require(mm.m == 512 && mm.n == 512 && mm.k == 640, "FP4 demo MatMul tile");
-    require(converted.m == 512 && converted.n == 512 && converted.k == 512, "aligned converted MatMul tile");
-    require(ffn.m == 256 && ffn.n == 512 && ffn.k == 512, "large FFN tile");
-    require(mm.bytes() > DayanMxfp4Tile::uram_bytes * .99 && converted.bytes() > DayanMxfp4Tile::uram_bytes * .97 && ffn.bytes() > DayanMxfp4Tile::uram_bytes * .95, "URAM utilization");
+    require(mm.m == 512 && mm.n == 512 && mm.k == 640 && mm.c_buffers == 2, "prefill MatMul tile");
+    require(converted.m == 512 && converted.n == 512 && converted.k == 512 && converted.c_buffers == 2, "converted MatMul tile");
+    require(ffn.m == 256 && ffn.n == 512 && ffn.k == 640 && ffn.c_buffers == 2, "paired FFN tile");
     for (int rows : {1, 9, 127, 128, 257, 513, 1024}) {
         for (int columns : {16, 256, 544, 1024, 3584, 6144, 65536}) {
             for (bool mx : {false, true}) {
                 for (int products : {1, 2}) {
                     const auto tile = DayanMxfp4Tile::make(rows, columns, 3584, mx, products, true);
-                    require(tile.m > 0 && tile.m % 32 == 0 && tile.m <= (products == 2 ? 256 : 512) && tile.n % 256 == 0 && tile.k >= 512 && tile.k % 128 == 0, "tile alignment");
+                    require(tile.m > 0 && tile.m % 32 == 0 && tile.m <= 512 && tile.n % 256 == 0 && tile.k >= 128 && tile.k <= 640 && tile.k % 128 == 0, "tile alignment");
+                    require(tile.c_buffers >= 2 && tile.c_buffers <= 3, "accumulator buffer count");
                     require(tile.bytes() <= DayanMxfp4Tile::uram_bytes, "tile fits URAM");
                     require(tile.accumulator_offset() % 1024 == 0 && tile.scratch_offset() % 32 == 0 && tile.a_scale_stride() % 64 == 0 && tile.bytes() % 32 == 0, "buffer alignment");
                 }
@@ -278,6 +278,45 @@ static void matmul_test(ggml_backend_t backend, int m, int n, int k, bool ffn,
     }
 }
 
+static void moe_reuse_test(ggml_backend_t backend) {
+    constexpr int tokens = 4, experts = 3, used = 2, n = 1040, k = 1056;
+    auto ctx = context();
+    auto * a = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_MXFP4, k, 1, tokens);
+    auto * b = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_MXFP4, k, n, experts);
+    auto * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, used, tokens);
+    auto * output = ggml_mul_mat_id(ctx.get(), b, a, ids);
+    auto * graph = ggml_new_graph_custom(ctx.get(), 128, false);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    require(buffer != nullptr, "allocate expert reuse");
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        const auto input = quantize(values(tokens * k, repeat + 19));
+        const auto weight = quantize(values(experts * n * k, repeat + 23));
+        const auto decoded = decode(weight);
+        std::vector<int32_t> selected(tokens * used);
+        for (int i = 0; i < tokens * used; ++i) { selected[i] = (i + repeat) % experts; }
+        ggml_backend_tensor_set(a, input.data(), 0, input.size());
+        ggml_backend_tensor_set(b, weight.data(), 0, weight.size());
+        ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(int32_t));
+        const auto reference = matmul(decode(input), decoded, tokens, experts * n, k);
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "expert reuse execution");
+        std::vector<float> actual(tokens * used * n);
+        ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+        double error = 0, norm = 0;
+        for (int row = 0; row < tokens * used; ++row) {
+            for (int col = 0; col < n; ++col) {
+                const float expected = reference[((row / used) * experts + selected[row]) * n + col];
+                const float value = actual[row * n + col];
+                require(std::isfinite(value), "finite expert output");
+                error += std::pow(value - expected, 2);
+                norm += std::pow(expected, 2);
+            }
+        }
+        std::printf("MXFP4 expert Resource reuse repeat=%d relative L2=%g\n", repeat, std::sqrt(error / norm));
+        require(error <= norm * 1e-10, "expert reuse numerical reference");
+    }
+}
+
 static void get_rows_rewrite_test(ggml_backend_t backend, ggml_type type) {
     auto ctx = context();
     auto embedding = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_MXFP4, 160, 19);
@@ -351,6 +390,28 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     ggml_backend_ptr backend(ggml_backend_init_by_name("DAYAN", nullptr));
     require(backend != nullptr, "initialize backend");
+    if (argc > 1 && std::strcmp(argv[1], "--matmul-tiles") == 0) {
+        matmul_test(backend.get(), 1024, 4096, 1024, false);
+        matmul_test(backend.get(), 1024, 512, 1024, false);
+        matmul_test(backend.get(), 1024, 1024, 2048, false);
+        matmul_test(backend.get(), 1024, 3584, 1024, true);
+        matmul_test(backend.get(), 1024, 1024, 3584, false);
+        matmul_test(backend.get(), 513, 1040, 1056, false);
+        matmul_test(backend.get(), 385, 1056, 1056, true);
+        matmul_test(backend.get(), 1025, 1040, 672, false);
+        matmul_test(backend.get(), 513, 1056, 672, true);
+        matmul_test(backend.get(), 1024, 512, 672, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
+        matmul_test(backend.get(), 65, 16, 672, false);
+        matmul_test(backend.get(), 1, 512, 3584, false);
+        matmul_test(backend.get(), 9, 4096, 128, false);
+        matmul_test(backend.get(), 9, 8192, 128, false);
+        matmul_test(backend.get(), 257, 544, 544, false, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
+        matmul_test(backend.get(), 129, 544, 544, true, GGML_TYPE_BF16);
+        matmul_test(backend.get(), 129, 544, 544, true, GGML_TYPE_F16);
+        moe_reuse_test(backend.get());
+        std::puts("MXFP4 tile dispatch PASS");
+        return 0;
+    }
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16}) {
         for (int width : {32, 160, 1024, 1056, 32768, 32800}) { get_rows_test(backend.get(), width, type, width == 1056 || width == 32800); }
     }

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -355,6 +356,8 @@ static bool ggml_backend_dayan_mega_add_matmul(ggml_backend_dayan_mega_parameter
     config.weight_type         = kDayanDataTypeMXFP4;
     config.output_type         = output_mxfp4 ? kDayanDataTypeMXFP4 : kDayanDataTypeF32;
     config.operation           = operation;
+    const char * share_inputs = std::getenv("GGML_DAYAN_MXFP4_SHARE_INPUTS");
+    config.share_inputs = share_inputs == nullptr || std::strcmp(share_inputs, "0") != 0;
     const bool moe = node->op == GGML_OP_MUL_MAT_ID;
     if (moe && node->src[2] == nullptr) {
         return false;

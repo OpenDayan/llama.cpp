@@ -75,6 +75,16 @@ static int prepare_matmul_4c() {
     return 0;
 }
 
+static int prepare_mxfp4(bool share_inputs) {
+    reset_local_resources();
+    if (!share_inputs) { return 0; }
+    // A preceding slot can return before its peers leave the shared barrier.
+    auto * barrier = (dayan_cluster_barrier_t *) ((char *) shared + MATMUL_DAYAN_4C_ATOMIC_BYTES);
+    const int status = dayan_cluster_barrier(4, barrier);
+    if (status < 0) { return status; }
+    return clear_atomic_cache(MATMUL_DAYAN_4C_ATOMIC_BYTES);
+}
+
 int norm_pipeline(const DayanNormPipelineConfig * config, const void * input, const void * right, const float * scale, void * residual, float * rms, float * scaled, uint16_t * lowp) {
     using namespace ggml_dayan_matmul_detail;
     run_rms_norm_pipeline(config, input, right, scale, residual, rms, scaled, lowp);
@@ -115,7 +125,8 @@ int quantize_mxfp4(const DayanMxfp4Config * config, const void * input, void * o
 }
 
 int matmul_mxfp4(const DayanMxfp4Config * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, void * output, void * output_scales) {
-    reset_local_resources();
+    const int status = prepare_mxfp4(config->share_inputs);
+    if (status < 0) { return status; }
     return ggml_dayan_mxfp4_detail::run(config, input, input_scales, weight, weight_scales, up, up_scales, output, output_scales);
 }
 
@@ -267,7 +278,8 @@ int router_indexer(const DayanRouterIndexerConfig * config, const float * input,
 }
 
 int matmul_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, const int32_t * selected, void * output, void * output_scales, void * workspace) {
-    reset_local_resources();
+    const int status = prepare_mxfp4(config->matmul.share_inputs);
+    if (status < 0) { return status; }
     return ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(config, input, input_scales, weight, weight_scales, up, up_scales, selected, output, output_scales, workspace);
 }
 
