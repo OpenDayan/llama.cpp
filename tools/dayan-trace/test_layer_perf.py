@@ -347,6 +347,8 @@ class LayerBatchTests(unittest.TestCase):
                 calls = []
 
                 def execute(command, **kwargs):
+                    if command[0] == runner.sys.executable:
+                        return SimpleNamespace(returncode=report.main(command[2:]))
                     profiling = command[1] == "--socket"
                     case = Path(command[-2] if profiling else command[1])
                     spec = json.loads(case.read_text())
@@ -418,6 +420,124 @@ class LayerBatchTests(unittest.TestCase):
                 self.assertEqual(calls, [0] if outcome == "incomplete" else [0, 3])
                 self.assertFalse((path / "output/layer-0/perf.json").exists())
 
+    def test_multiple_modes_generate_independent_reports_and_filter_results(self):
+        for failure in (None, "comparison", "inference", "trace"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                self.prepare(path / "prepared")
+                output = path / "output"
+                calls = []
+
+                def execute(command, **kwargs):
+                    if command[0] == runner.sys.executable:
+                        calls.append(("report",))
+                        return SimpleNamespace(returncode=report.main(command[2:]))
+                    profiling = command[1] == "--socket"
+                    case = Path(command[-2] if profiling else command[1])
+                    spec = json.loads(case.read_text())
+                    layer, mode = spec["source_layer"], spec["mode"]
+                    calls.append(("perf" if profiling else "cpu", layer, mode))
+                    self.assertEqual(case.parent, output / f"layer-{layer}" / mode)
+                    self.assertEqual(spec["input_len"], 4)
+                    self.assertEqual(spec["output_len"], 0 if mode == "prefill" else 2)
+                    failing = (layer, mode) == (0, "decode")
+                    if profiling:
+                        if failing and failure == "inference":
+                            return SimpleNamespace(returncode=1)
+                        tags = ("lp-prefill",) if mode == "prefill" else ("lp-setup", "lp-d0000000001", "lp-d0000000002")
+                        run, trace = full_fixture(tags)
+                        run["case"] = spec
+                        if mode == "decode":
+                            run["samples"] = run["samples"][1:]
+                        runner.write_json(Path(command[-1]), run)
+                        if not (failing and failure == "trace"):
+                            runner.write_json(Path(command[command.index("-o") + 1]), trace)
+                    else:
+                        passed = not (failing and failure == "comparison")
+                        runner.write_json(Path(command[2]), dict(case=spec, backend="CPU", status="ok" if passed else "failed",
+                                                                 comparison=dict(reference="CPU", status="pass" if passed else "fail")))
+                    return SimpleNamespace(returncode=0)
+
+                with socket.socket(socket.AF_UNIX) as server:
+                    server.bind(str(path / "server.sock"))
+                    with patch.object(runner.subprocess, "run", side_effect=execute), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        status = runner.main(["run", "--prepared", str(path / "prepared"), "--layer", "0", "3",
+                                              "--mode", "prefill", "decode", "--input-len", "4", "--output-len", "2", "--cmp",
+                                              "--socket", str(path / "server.sock"), "--client", "/bin/true", "--dyperf", "/bin/true",
+                                              "--output", str(output)])
+                self.assertEqual(status, int(failure is not None))
+                expected = [(stage, layer, mode) for layer in (0, 3) for mode in ("prefill", "decode") for stage in ("perf", "cpu")]
+                self.assertEqual(calls, (expected[:3] if failure == "inference" else expected) + [("report",)])
+                batch = json.loads((output / "batch.json").read_text())
+                self.assertEqual(batch["schema"], 2)
+                summary = json.loads((output / "report.json").read_text())
+                self.assertEqual(summary["status"], "failed" if status else "ok")
+                self.assertEqual(len(summary["runs"]), 4)
+                self.assertEqual(summary["runs"][0]["total_layer_cycles"], 34)
+                if failure not in ("inference", "trace"):
+                    self.assertEqual(summary["runs"][1]["total_layer_cycles"], 68)
+                    self.assertEqual(summary["runs"][1]["median_layer_cycles"], 34)
+                if failure == "inference":
+                    self.assertEqual([entry["status"] for entry in batch["runs"]], ["ok", "failed", "not-run", "not-run"])
+                    self.assertFalse((output / "layer-3").exists())
+                else:
+                    before = {str(file): file.read_bytes() for file in output.rglob("*") if file.is_file()}
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(report.main(["--run", str(output), "--mode", "prefill", "--include-outer", "--output", str(path / "filtered")]), 0)
+                    filtered = json.loads((path / "filtered/report.json").read_text())
+                    self.assertEqual([entry["mode"] for entry in filtered["runs"]], ["prefill", "prefill"])
+                    self.assertEqual({str(file): file.read_bytes() for file in output.rglob("*") if file.is_file()}, before)
+                    self.assertTrue((path / "filtered/layer-3/prefill/kernels.csv").is_file())
+                self.assertIn("Median cycles/step", (output / "report.md").read_text())
+                self.assertEqual(len((output / "summary.csv").read_text().splitlines()), 5)
+
+    def test_single_prepared_layer_supports_mode_order_and_defaults(self):
+        for command in ("run", "cmp-ops"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                self.prepare(path / "prepared")
+                seen = []
+
+                def execute(args, metadata, output):
+                    seen.append((metadata["source_layer"], args.mode, args.output_len, output.relative_to(path / "output")))
+
+                with socket.socket(socket.AF_UNIX) as server:
+                    server.bind(str(path / "server.sock"))
+                    with patch.object(runner, "run_layer", side_effect=execute), patch.object(runner, "compare_operators", side_effect=execute), patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as process, contextlib.redirect_stdout(io.StringIO()):
+                        status = runner.main([command, "--prepared", str(path / "prepared/layer-3"), "--mode", "decode", "prefill",
+                                              "--client", "/bin/true", "--socket", str(path / "server.sock"), "--output", str(path / "output")] +
+                                             (["--dyperf", "/bin/true"] if command == "run" else []))
+                self.assertEqual(status, 0)
+                self.assertEqual(seen, [(3, "decode", 1, Path("layer-3/decode")), (3, "prefill", 0, Path("layer-3/prefill"))])
+                self.assertEqual(process.call_count, int(command == "run"))
+
+    def test_invalid_modes_and_lengths_fail_before_launch(self):
+        options = [("--mode", "prefill", "prefill"), ("--mode", "decode", "prefill", "--output-len", "0"),
+                   ("--mode", "prefill", "--output-len", "2"), ("--mode", "prefill", "decode", "--output-len", "-1")]
+        for args in options:
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+                path = Path(directory)
+                with patch.object(runner.subprocess, "run") as execute:
+                    self.assertEqual(runner.main(["run", "--prepared", str(path / "missing"), "--output", str(path / "output"), *args]), 1)
+                execute.assert_not_called()
+                self.assertFalse((path / "output").exists())
+
+    def test_report_mode_selection_preserves_legacy_runs(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            path = Path(directory)
+            self.prepare(path)
+            for layer in (0, 3):
+                run, trace = fixture()
+                runner.write_json(path / f"layer-{layer}/run.json", run)
+                runner.write_json(path / f"layer-{layer}/perf.json", trace)
+            runner.write_json(path / "batch.json", dict(schema=1, status="ok", layers=[
+                dict(source_layer=layer, directory=f"layer-{layer}", status="ok") for layer in (0, 3)]))
+            self.assertEqual(report.main(["--run", directory, "--mode", "prefill"]), 0)
+            self.assertEqual(report.main(["--run", directory, "--mode", "decode"]), 1)
+            self.assertEqual(report.main(["--run", directory, "--mode", "prefill", "prefill"]), 1)
+            self.assertEqual(report.main(["--run", str(path / "layer-0"), "--mode", "prefill"]), 0)
+            self.assertEqual(report.main(["--run", str(path / "layer-0"), "--mode", "prefill", "decode"]), 1)
+
     def test_inference_failure_stops_batch_without_cpu_comparison(self):
         for exit_code in (0, 1):
             with self.subTest(exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
@@ -425,6 +545,8 @@ class LayerBatchTests(unittest.TestCase):
                 self.prepare(path / "prepared")
 
                 def execute(command, **kwargs):
+                    if command[0] == runner.sys.executable:
+                        return SimpleNamespace(returncode=report.main(command[2:]))
                     runner.write_json(Path(command[-1]), dict(status="failed", error="model inference failed at step 0"))
                     return SimpleNamespace(returncode=exit_code)
 
@@ -435,7 +557,7 @@ class LayerBatchTests(unittest.TestCase):
                                               "--socket", str(path / "server.sock"), "--client", "/bin/true", "--dyperf", "/bin/true",
                                               "--output", str(path / "output")])
                     self.assertEqual(status, 1)
-                    self.assertEqual(process.call_count, 1)
+                    self.assertEqual(process.call_count, 2)
                     compare.assert_not_called()
                 batch = json.loads((path / "output/batch.json").read_text())
                 self.assertEqual(batch["status"], "failed")
@@ -444,7 +566,7 @@ class LayerBatchTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(report.main(["--run", str(path / "output")]), 1)
                 summary = json.loads((path / "output/report.json").read_text())
-                self.assertEqual(summary["layers"][1], dict(source_layer=3, status="not-run", report=None))
+                self.assertEqual(summary["layers"][1], dict(source_layer=3, mode="prefill", status="not-run", report=None))
 
 
 if __name__ == "__main__":

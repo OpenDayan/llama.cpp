@@ -206,13 +206,13 @@ def main(argv=None):
     common.add_argument("--prepared", type=Path, required=True, help="single-layer or batch directory produced by prepare")
     common.add_argument("--layer", type=int, nargs="+", help="source layer indices (default: all prepared layers)")
     common.add_argument("--output", type=Path, required=True)
-    common.add_argument("--mode", choices=("prefill", "decode"), default="prefill", help="inference mode (default: prefill)")
+    common.add_argument("--mode", choices=("prefill", "decode"), nargs="+", default=["prefill"], help="inference modes in execution order (default: prefill)")
     common.add_argument("--input-len", type=int, default=128, help="prompt length; executed before decode")
-    common.add_argument("--output-len", type=int, help="number of single-token decode calls (default: 1 for decode, 0 for prefill)")
+    common.add_argument("--output-len", type=int, help="number of single-token decode calls (default: 1); prefill always uses 0")
     common.add_argument("--seed", type=int, default=1)
     common.add_argument("--socket", default=os.environ.get("DAYAN_SERVER_SOCKET", "/tmp/dayan-server.sock"))
     common.add_argument("--client", type=Path, default=Path(os.environ.get("DAYAN_LAYER_CLIENT", ROOT / "build-dayan-public/bin/llama-dayan-layer-bench")), help="client executable (default: DAYAN_LAYER_CLIENT or build-dayan-public/bin/llama-dayan-layer-bench)")
-    run_parser = commands.add_parser("run", parents=[common], help="run inference and record dyperf")
+    run_parser = commands.add_parser("run", parents=[common], help="run inference, record dyperf and generate reports")
     run_parser.add_argument("--pcu", action="store_true", help="include continuous PCU sampling (off by default; unsupported by cmodel)")
     run_parser.add_argument("--cmp", action="store_true", help="compare every step's final-token logits with a CPU replay after profiling")
     run_parser.add_argument("--cmp-atol", type=float, default=0.03, help="absolute logit tolerance (default: 0.03)")
@@ -226,11 +226,13 @@ def main(argv=None):
         if args.command == "prepare":
             prepare(args.model, args.layer, args.output)
             return 0
+        if len(set(args.mode)) != len(args.mode):
+            raise ValueError("select unique inference modes")
         if args.output_len is None:
-            args.output_len = int(args.mode == "decode")
+            args.output_len = int("decode" in args.mode)
         if args.input_len < 1 or args.output_len < 0 or args.input_len + args.output_len > 2**31 - 257:
             raise ValueError("invalid input/output lengths")
-        if (args.mode == "prefill" and args.output_len != 0) or (args.mode == "decode" and args.output_len == 0):
+        if (args.mode == ["prefill"] and args.output_len != 0) or ("decode" in args.mode and args.output_len == 0):
             raise ValueError("prefill requires output-len=0; decode requires output-len>0")
         if not 0 <= args.seed < 2**32:
             raise ValueError("seed must fit uint32")
@@ -247,29 +249,38 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=True)
         if any(args.output.iterdir()):
             raise ValueError("run output directory must be empty")
-        status = 0
-        if batch:
-            manifest = dict(schema=1, status="running", layers=[dict(source_layer=model["source_layer"],
-                            directory=f"layer-{model['source_layer']}", status="not-run") for model in models])
+        multiple_modes = len(args.mode) > 1
+        entries = [dict(source_layer=model["source_layer"], mode=mode,
+                        directory=f"layer-{model['source_layer']}/{mode}" if multiple_modes else f"layer-{model['source_layer']}" if batch else ".",
+                        status="not-run") for model in models for mode in args.mode]
+        manifest = None
+        if batch or multiple_modes:
+            manifest = dict(schema=2, status="running", modes=args.mode, runs=entries) if multiple_modes else dict(schema=1, status="running", layers=entries)
             write_json(args.output / "batch.json", manifest)
-            for metadata, entry in zip(models, manifest["layers"]):
-                try:
-                    execute(args, metadata, args.output / entry["directory"])
-                    entry["status"] = "ok"
-                except (OSError, ValueError, KeyError) as error:
-                    entry.update(status="failed", error=str(error))
-                    print(f"layer-perf: layer {entry['source_layer']}: {error}", file=sys.stderr)
-                    status = 1
-                    if isinstance(error, InferenceError):
-                        print("layer-perf: batch stopped; check the external server before running another layer", file=sys.stderr)
-                        break
+        status = 0
+        for index, entry in enumerate(entries):
+            case_args = argparse.Namespace(**vars(args))
+            case_args.mode = entry["mode"]
+            case_args.output_len = args.output_len if entry["mode"] == "decode" else 0
+            try:
+                execute(case_args, models[index // len(args.mode)], args.output / entry["directory"])
+                entry["status"] = "ok"
+            except (OSError, ValueError, KeyError) as error:
+                entry.update(status="failed", error=str(error))
+                print(f"layer-perf: layer {entry['source_layer']} {entry['mode']}: {error}", file=sys.stderr)
+                status = 1
+                if isinstance(error, InferenceError):
+                    print("layer-perf: batch stopped; check the external server before running another case", file=sys.stderr)
+                    break
+            if manifest:
                 write_json(args.output / "batch.json", manifest)
+        if manifest:
             manifest["status"] = "failed" if status else "ok"
             write_json(args.output / "batch.json", manifest)
-        else:
-            execute(args, models[0], args.output)
         if args.command == "run":
-            print(f"Analyze: python3 tools/dayan-trace/layer-perf-report.py --run {args.output}")
+            command = [sys.executable, str(Path(__file__).with_name("layer-perf-report.py")), "--run", str(args.output)]
+            if subprocess.run(command, check=False).returncode:
+                status = 1
         return status
     except (OSError, ValueError, KeyError, StopIteration) as error:
         print(f"layer-perf: {error}", file=sys.stderr)

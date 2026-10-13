@@ -228,7 +228,11 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
 endif()
 
 if (LLAMA_BUILD_APP)
-    add_subdirectory(app)
+    if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+        add_subdirectory(app)
+    else()
+        message(STATUS "Skipping llama-app: requires native tools and server builds")
+    endif()
 endif()
 
 # Standalone libmtmd build without pulling in the rest of the tools/ tree.

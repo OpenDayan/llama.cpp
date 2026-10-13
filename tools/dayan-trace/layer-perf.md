@@ -4,7 +4,7 @@
 
 `prepare` copies the selected block from a GGUF, renames it to block 0, and retains its weights, dimensions and quantization. It also keeps the tokenizer, embedding and output head needed by `llama_decode`. It supports BF16/MXFP4 dense layers and MXFP4 MoE experts with BF16 attention. Merge split GGUFs before use. The resulting one-layer model receives embeddings directly; its hidden states and generated text do not reproduce the source model's intermediate layer inputs or language quality.
 
-`run` enables mega for the layer body and checks exactly one mega launch per inference step. Embedding and the output head still launch separate kernels. In the server log, `[kernel] lp-prefill started` is the layer mega; `lp-setup` is decode's prompt setup and `lp-d...` identifies decode steps. A preceding `get-rows` and following output normalization, row selection, conversion or matrix kernels are outside the layer mega. Four `proc-create` RPCs under one launch create its four core tasks. The offline layer timing covers only the mega body. `cmp-ops` explicitly disables mega for per-slot CPU comparison.
+`run` enables mega for the layer body and checks exactly one mega launch per inference step. Embedding and the output head still launch separate kernels. In the server log, `[kernel] lp-prefill started` is the layer mega; `lp-setup` is decode's prompt setup and `lp-d...` identifies decode steps. A preceding `get-rows` and following output normalization, row selection, conversion or matrix kernels are outside the layer mega. Four `proc-create` RPCs under one launch create its four core tasks. After capture and CPU comparison finish, `run` automatically invokes the independent report script. The offline layer timing covers only the mega body. `cmp-ops` explicitly disables mega for per-slot CPU comparison.
 
 Build the client and extract a layer once:
 
@@ -48,7 +48,36 @@ python3 tools/dayan-trace/layer-perf-report.py --run build/dayan-layer/batch-mxf
 python3 tools/dayan-trace/layer-perf-report.py --run build/dayan-layer/batch-bf16
 ```
 
-Prefill is the default mode. Omit `run --layer` to select every prepared layer in numeric order. Explicit indices run in the given order. All selections are checked before starting the profiler. Layers run sequentially, each with its own `layer-N/` output directory and CPU comparison. The batch records every layer's status in `batch.json` and returns nonzero if any layer failed. CPU comparison failures allow the next layer to run. Inference or profiler failures stop the batch with remaining layers marked `not-run`, since device work may still be active. The report accepts the batch directory, writes each layer's reports and a top-level index, and returns nonzero for failed or incomplete batches.
+Prefill is the default mode. Omit `run --layer` to select every prepared layer in numeric order. Explicit indices run in the given order. All selections are checked before starting the profiler. Layers run sequentially, each with its own `layer-N/` output directory and CPU comparison. The batch records every case's status in `batch.json` and returns nonzero if any case or report failed. CPU comparison failures allow the next case to run. Inference or profiler failures stop the batch with remaining cases marked `not-run`, since device work may still be active. Reports are generated after the batch finishes, including available timing for failed CPU comparisons. The report accepts the batch directory and returns nonzero for failed or incomplete batches.
+
+Measure both modes for every selected layer in one invocation:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layers-mxfp4 --layer 0 3 \
+    --mode prefill decode --input-len 1024 --output-len 32 \
+    --cmp --pcu --output build-dayan/perf-mxfp4-both
+```
+
+Each layer runs its selected modes in argument order, with independent client processes, traces and CPU comparisons. Decode rebuilds its prompt state; it does not reuse the measured prefill process. `--output-len` applies only to decode and defaults to one step; prefill always uses zero output steps. Omit `--pcu` for cmodel. The same command works with the BF16 prepared directory.
+
+Multiple modes use this layout, even when only one source layer is selected:
+
+```text
+perf-mxfp4-both/
+  batch.json
+  report.md
+  report.json
+  summary.csv
+  layer-0/
+    prefill/  # perf.json, run.json, report.md, report.json, slots.csv, ...
+    decode/
+  layer-3/
+    prefill/
+    decode/
+```
+
+The top-level report has one row per layer and mode, including step count, total layer cycles, median/min/max cycles per step and CPU comparison status. Detailed reports retain slot cycles and percentages for that mode. Decode totals exclude prompt setup. Single-mode runs retain their existing directory layout, and old records remain readable.
 
 `run` connects to the external server without a `--simulator` argument. The client defaults to `DAYAN_LAYER_CLIENT` or `build-dayan-public/bin/llama-dayan-layer-bench`; override it with `--client`. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf` (`DAYAN_ROOT` defaults to `~/npu-firmware`). Pass `--dyperf /path/to/dyperf` to choose another profiler; it is launched and stopped automatically. `--socket` overrides `DAYAN_SERVER_SOCKET`.
 
@@ -103,7 +132,7 @@ Comparison covers every vocabulary logit for the prompt's final token and every 
 
 ## CPU operator comparison
 
-`cmp-ops` runs a separate diagnostic pass over the prepared model. It supports the same `--prepared`, multi-layer selection, prefill/decode lengths, socket and client options as `run`. It does not use dyperf or PCU.
+`cmp-ops` runs a separate diagnostic pass over the prepared model. It supports the same `--prepared`, multi-layer selection, `--mode prefill decode`, lengths, socket and client options as `run`. It does not use dyperf or PCU and does not generate performance reports.
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py cmp-ops \
@@ -125,7 +154,20 @@ Dayan's current BF16-to-MXFP4 instruction uses fixed truncation and a scale that
 
 ## Offline report
 
-The independent report script needs no device or model. It reads the completed trace and the slot schema saved by the client, which is compiled directly from the mega flow declarations. Adding or removing a mega step requires no analyzer table changes.
+The independent report script needs no device or model. It reads the completed trace and the slot schema saved by the client, which is compiled directly from the mega flow declarations. Adding or removing a mega step requires no analyzer table changes. `run` calls it automatically after capture; invoke it again to change report options without running inference.
+
+All recorded modes are included by default. Use `--mode prefill decode` explicitly, or select only one mode:
+
+```sh
+python3 tools/dayan-trace/layer-perf-report.py \
+    --run build-dayan/perf-mxfp4-both --mode prefill decode
+
+python3 tools/dayan-trace/layer-perf-report.py \
+    --run build-dayan/perf-mxfp4-both --mode decode \
+    --output build-dayan/reports-mxfp4-decode
+```
+
+The filter applies to every source layer, and the return status reflects only the selected cases. A requested mode absent from the run is an error. To analyze one completed case while other cases are running, point `--run` at its `layer-N/prefill` or `layer-N/decode` directory and use a separate `--output`.
 
 When captured with `--pcu`, open `perf.json` in Perfetto to inspect each core's PCU tracks: MAT utilization, VEC group/total IPC, Scalar IPC, LSU read/write bandwidth, and URAM read/write mean, variance and standard deviation. `PCU snapshot` events also retain the 112 raw counters. The trace metadata records `pcu_enabled: true` and `pcu_interval_ms: 0`. Slot reports use proc-state events and do not require PCU counters.
 
@@ -139,7 +181,7 @@ The layer span covers the first named step through the final root's `WAIT_EXIT`,
 
 Add `--include-outer` to also list independent embedding/output kernels and the mega launch in execution order, with `kernels.csv` and per-step `kernels` entries in `report.json`. This optional section uses a separate full-inference span, from the first embedding root `RUNNING` to the last output projection root entering `WAIT_EXIT`, including inter-kernel gaps. It shows each kernel's cycles and percentage of that span, plus the total launch cycles and gap cycles/percentage. It does not change Transformer layer totals or slot percentages. Child threads are excluded using their enclosing root spans; the layer client's launches are serial. Four-core launch sequences and the embedding/output boundaries must match. Older traces containing only mega steps show full inference as unavailable. Decode setup is excluded from measured totals.
 
-Use `--output` to write reports outside the run directory, including `layer-N/` reports for a batch. This leaves the source run and any existing reports untouched. The script never connects to the device. For example, while another layer is still running, analyze only a completed layer:
+Use `--output` to write reports outside the run directory, preserving the batch's layer/mode subdirectories. This leaves the source run and any existing reports untouched. The script never connects to the device. For example, while another layer is still running, analyze only a completed layer:
 
 ```sh
 python3 tools/dayan-trace/layer-perf-report.py \

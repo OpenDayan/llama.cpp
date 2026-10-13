@@ -317,111 +317,161 @@ def analyze(run, trace, clock_hz=None, include_outer=False):
                 ])
 
 
-def report_batch(directory, clock_hz, output=None, include_outer=False):
+def report_layer(directory, clock_hz, output=None, include_outer=False, trace=None, modes=None):
+    run = json.loads((directory / "run.json").read_text())
+    if modes is not None and set(modes) != {run["case"]["mode"]}:
+        raise ValueError("requested modes do not match this single-mode run")
+    report = analyze(run, trace or directory / "perf.json", clock_hz, include_outer)
+    output = output or directory
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+    with (output / "slots.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["tag", "step", "context_before", "index", "name", "kind", "cycles", "device_us", "percent_of_layer"])
+        writer.writeheader()
+        for sample in report["samples"]:
+            for slot in sample["slots"]:
+                writer.writerow({key: (slot if key in slot else sample)[key] for key in writer.fieldnames})
+    lines = ["# Transformer layer timing", "", f"Mode: {report['case']['mode']}; input: {report['case']['input_len']}; output: {report['case']['output_len']}; counter source: {report['case'].get('simulator', 'external')}", "",
+             "Complete layer: first mega slot through final residual, including following barriers. Embedding and output norm/head are excluded. Host inference time includes them.", "",
+             f"Total measured layer cycles: {report['total_layer_cycles']:,}.", "",
+             "| Step | Context before | Layer cycles | Device us | Host inference s |",
+             "| --- | ---: | ---: | ---: | ---: |"]
+    for sample in report["samples"]:
+        time = "n/a" if sample["layer_device_us"] is None else f"{sample['layer_device_us']:.3f}"
+        lines.append(f"| {sample['tag']} | {sample['context_before']} | {sample['layer_cycles']:,} | {time} | {sample['host_inference_wall_s']:.6f} |")
+    lines += ["", "| Slot | Kind | Median cycles | Min | Max | Layer cycles (%) | Median device us |", "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+    for slot in report["slots"]:
+        time = "n/a" if slot["median_device_us"] is None else f"{slot['median_device_us']:.3f}"
+        lines.append(f"| {slot['name']} | {slot['kind']} | {slot['median_cycles']:,} | {slot['min_cycles']:,} | {slot['max_cycles']:,} | {slot['percent_of_layer']:.2f}% | {time} |")
+    if include_outer:
+        with (output / "kernels.csv").open("w", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["tag", "step", "context_before", "index", "name", "kind", "cycles", "device_us", "percent_of_inference"])
+            writer.writeheader()
+            for sample in report["samples"]:
+                for kernel in sample["kernels"]:
+                    writer.writerow({key: (kernel if key in kernel else sample)[key] for key in writer.fieldnames})
+        lines += ["", "Full inference (including embedding and output head; separate from layer totals):", "",
+                  "| Step | Full cycles | Kernel cycles | Between kernels | Gap (%) | Device us |",
+                  "| --- | ---: | ---: | ---: | ---: | ---: |"]
+        for sample in report["samples"]:
+            time = "n/a" if sample["inference_device_us"] is None else f"{sample['inference_device_us']:.3f}"
+            counts = [f"{sample[key]:,}" if sample[key] is not None else "n/a" for key in ("inference_cycles", "kernel_cycles", "inter_kernel_cycles")]
+            gap = f"{100 * sample['inter_kernel_cycles'] / sample['inference_cycles']:.2f}%" if sample["inference_cycles"] else "n/a"
+            lines.append(f"| {sample['tag']} | {' | '.join(counts)} | {gap} | {time} |")
+        lines += ["", "| Step | Index | Kernel | Cycles | Full inference cycles (%) | Device us |",
+                  "| --- | ---: | --- | ---: | ---: | ---: |"]
+        for sample in report["samples"]:
+            for kernel in sample["kernels"]:
+                time = "n/a" if kernel["device_us"] is None else f"{kernel['device_us']:.3f}"
+                lines.append(f"| {sample['tag']} | {kernel['index']} | {kernel['name']} | {kernel['cycles']:,} | {kernel['percent_of_inference']:.2f}% | {time} |")
+    if report["case"].get("cmp"):
+        cmp = report["comparison"]
+        lines += ["", f"CPU comparison: {cmp.get('status', 'not-run')}. Criterion: abs(Dayan - CPU) <= {cmp.get('atol', 'n/a')} + {cmp.get('rtol', 'n/a')} * abs(CPU).", "",
+                  "| Step | Phase | Status | Checked logits | Mismatches | Max abs | Max rel | Relative L2 |",
+                  "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+        for step in cmp.get("steps", []):
+            lines.append(f"| {step['step']} | {step['phase']} | {step['status']} | {step['checked_elements']} | {step['mismatched_elements']} | {step['max_abs_error']:.6g} | {step['max_rel_error']:.6g} | {step['relative_l2_error']:.6g} |")
+        if cmp.get("error"):
+            lines += ["", cmp["error"]]
+        lines += ["", "CPU replay runs after perf capture with GPU layers, KV offload and operation offload disabled. It uses the same stored weights and Dayan token sequence. Decode prompt logits are also checked. CPU and Dayan activation quantization can differ; these differences remain in the reported errors."]
+    lines += ["", *["- " + note for note in report["notes"]], ""]
+    (output / "report.md").write_text("\n".join(lines))
+    print("\n".join(lines))
+    return report
+
+
+def report_batch(directory, clock_hz, output=None, include_outer=False, modes=None):
     output = output or directory
     batch = json.loads((directory / "batch.json").read_text())
-    if batch.get("schema") != 1 or not batch.get("layers"):
+    key = "runs" if batch.get("schema") == 2 else "layers"
+    if batch.get("schema") not in (1, 2) or not batch.get(key):
         raise ValueError("invalid batch manifest")
-    layers = []
-    for entry in batch["layers"]:
+    entries = []
+    for original in batch[key]:
+        entry = dict(original)
         child = entry["directory"]
-        if child != f"layer-{entry['source_layer']}":
+        expected = f"layer-{entry['source_layer']}"
+        if key == "runs":
+            if entry.get("mode") not in ("prefill", "decode"):
+                raise ValueError("invalid batch mode")
+            expected += f"/{entry['mode']}"
+        if child != expected:
             raise ValueError("invalid batch layer directory")
+        if modes is not None and "mode" not in entry:
+            case = directory / child / "case.json"
+            run = directory / child / "run.json"
+            if case.is_file():
+                entry["mode"] = json.loads(case.read_text())["mode"]
+            elif run.is_file():
+                entry["mode"] = json.loads(run.read_text())["case"]["mode"]
+        entries.append(entry)
+    if modes is not None:
+        available = {entry.get("mode") for entry in entries}
+        if not set(modes) <= available:
+            raise ValueError("requested modes are not present in this batch")
+        entries = [entry for entry in entries if entry.get("mode") in modes or "mode" not in entry]
+    results = []
+    for entry in entries:
+        child = entry["directory"]
+        result = dict(source_layer=entry["source_layer"], status=entry["status"], report=None)
+        if "mode" in entry:
+            result["mode"] = entry["mode"]
+        results.append(result)
         if entry["status"] == "not-run":
-            layers.append(dict(source_layer=entry["source_layer"], status="not-run", report=None))
             continue
-        print(f"\nSource layer {entry['source_layer']}:")
-        argv = ["--run", str(directory / child), "--output", str(output / child)]
-        if clock_hz is not None:
-            argv += ["--clock-hz", str(clock_hz)]
-        if include_outer:
-            argv += ["--include-outer"]
-        status = main(argv)
-        layers.append(dict(source_layer=entry["source_layer"], status="ok" if status == 0 and entry["status"] == "ok" else "failed",
-                           report=f"{child}/report.md" if (output / child / "report.md").is_file() else None))
-    passed = batch["status"] == "ok" and all(layer["status"] == "ok" for layer in layers)
-    summary = dict(schema=1, status="ok" if passed else "failed", layers=layers)
+        print(f"\nSource layer {entry['source_layer']} {entry.get('mode', '')}:")
+        try:
+            measured = report_layer(directory / child, clock_hz, output / child, include_outer,
+                                    modes=[entry["mode"]] if "mode" in entry else None)
+            cycles = [sample["layer_cycles"] for sample in measured["samples"]]
+            result.update(status="ok" if measured["status"] == entry["status"] == "ok" else "failed",
+                          mode=measured["case"]["mode"], report=f"{child}/report.md", steps=len(cycles),
+                          total_layer_cycles=measured["total_layer_cycles"], median_layer_cycles=statistics.median(cycles),
+                          min_layer_cycles=min(cycles), max_layer_cycles=max(cycles),
+                          cpu_comparison=measured["comparison"].get("status", "not-run"))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result.update(status="failed", error=str(error))
+            print(f"layer-perf-report: layer {entry['source_layer']} {entry.get('mode', '')}: {error}", file=sys.stderr)
+    passed = (modes is not None or batch["status"] == "ok") and all(result["status"] == "ok" for result in results)
+    summary = dict(schema=batch["schema"], status="ok" if passed else "failed", **{key: results})
     output.mkdir(parents=True, exist_ok=True)
     (output / "report.json").write_text(json.dumps(summary, indent=2) + "\n")
-    lines = ["# Layer batch", "", f"Status: {summary['status']}", "", "| Source layer | Status | Report |", "| --- | --- | --- |"]
-    for layer in layers:
-        link = f"[Details]({layer['report']})" if layer["report"] else "-"
-        lines.append(f"| {layer['source_layer']} | {layer['status']} | {link} |")
+    fields = ["source_layer", "mode", "status", "steps", "total_layer_cycles", "median_layer_cycles", "min_layer_cycles", "max_layer_cycles", "cpu_comparison", "report"]
+    with (output / "summary.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(results)
+    lines = ["# Layer batch", "", f"Status: {summary['status']}", "",
+             "Prefill and decode are separate measurements. Decode totals exclude prompt setup; medians are per step. Cycles from different modes or source layers are not added together.", "",
+             "| Source layer | Mode | Status | Steps | Total layer cycles | Median cycles/step | Min | Max | CPU comparison | Report |",
+             "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"]
+    for result in results:
+        counts = [f"{result[field]:,}" if field in result else "-" for field in fields[3:8]]
+        link = f"[Details]({result['report']})" if result["report"] else "-"
+        lines.append(f"| {result['source_layer']} | {result.get('mode', '-')} | {result['status']} | {' | '.join(counts)} | {result.get('cpu_comparison', '-')} | {link} |")
     (output / "report.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
     return 0 if passed else 1
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True, help="completed single-layer or batch run directory")
+    parser.add_argument("--mode", nargs="+", choices=("prefill", "decode"), help="report only these modes (default: all recorded modes)")
     parser.add_argument("--trace", type=Path, help="override perf.json location")
     parser.add_argument("--output", type=Path, help="report destination (default: run directory); leaves source files untouched when separate")
     parser.add_argument("--include-outer", action="store_true", help="also report embedding/output kernels and the full inference span, separately from Transformer layer timing")
     parser.add_argument("--clock-hz", type=float, help="enable time conversion at this frequency for hardware or cycle-accurate simulation")
     args = parser.parse_args(argv)
     try:
+        if args.mode is not None and len(set(args.mode)) != len(args.mode):
+            raise ValueError("select unique report modes")
         if (args.run / "batch.json").is_file():
             if args.trace:
                 raise ValueError("--trace requires a single-layer run directory")
-            return report_batch(args.run, args.clock_hz, args.output, args.include_outer)
-        run = json.loads((args.run / "run.json").read_text())
-        report = analyze(run, args.trace or args.run / "perf.json", args.clock_hz, args.include_outer)
-        output = args.output or args.run
-        output.mkdir(parents=True, exist_ok=True)
-        (output / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-        with (output / "slots.csv").open("w", newline="") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["tag", "step", "context_before", "index", "name", "kind", "cycles", "device_us", "percent_of_layer"])
-            writer.writeheader()
-            for sample in report["samples"]:
-                for slot in sample["slots"]:
-                    writer.writerow({key: (slot if key in slot else sample)[key] for key in writer.fieldnames})
-        lines = ["# Transformer layer timing", "", f"Mode: {report['case']['mode']}; input: {report['case']['input_len']}; output: {report['case']['output_len']}; counter source: {report['case'].get('simulator', 'external')}", "",
-                 "Complete layer: first mega slot through final residual, including following barriers. Embedding and output norm/head are excluded. Host inference time includes them.", "",
-                 f"Total measured layer cycles: {report['total_layer_cycles']:,}.", "",
-                 "| Step | Context before | Layer cycles | Device us | Host inference s |",
-                 "| --- | ---: | ---: | ---: | ---: |"]
-        for sample in report["samples"]:
-            time = "n/a" if sample["layer_device_us"] is None else f"{sample['layer_device_us']:.3f}"
-            lines.append(f"| {sample['tag']} | {sample['context_before']} | {sample['layer_cycles']:,} | {time} | {sample['host_inference_wall_s']:.6f} |")
-        lines += ["", "| Slot | Kind | Median cycles | Min | Max | Layer cycles (%) | Median device us |", "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
-        for slot in report["slots"]:
-            time = "n/a" if slot["median_device_us"] is None else f"{slot['median_device_us']:.3f}"
-            lines.append(f"| {slot['name']} | {slot['kind']} | {slot['median_cycles']:,} | {slot['min_cycles']:,} | {slot['max_cycles']:,} | {slot['percent_of_layer']:.2f}% | {time} |")
-        if args.include_outer:
-            with (output / "kernels.csv").open("w", newline="") as stream:
-                writer = csv.DictWriter(stream, fieldnames=["tag", "step", "context_before", "index", "name", "kind", "cycles", "device_us", "percent_of_inference"])
-                writer.writeheader()
-                for sample in report["samples"]:
-                    for kernel in sample["kernels"]:
-                        writer.writerow({key: (kernel if key in kernel else sample)[key] for key in writer.fieldnames})
-            lines += ["", "Full inference (including embedding and output head; separate from layer totals):", "",
-                      "| Step | Full cycles | Kernel cycles | Between kernels | Gap (%) | Device us |",
-                      "| --- | ---: | ---: | ---: | ---: | ---: |"]
-            for sample in report["samples"]:
-                time = "n/a" if sample["inference_device_us"] is None else f"{sample['inference_device_us']:.3f}"
-                counts = [f"{sample[key]:,}" if sample[key] is not None else "n/a" for key in ("inference_cycles", "kernel_cycles", "inter_kernel_cycles")]
-                gap = f"{100 * sample['inter_kernel_cycles'] / sample['inference_cycles']:.2f}%" if sample["inference_cycles"] else "n/a"
-                lines.append(f"| {sample['tag']} | {' | '.join(counts)} | {gap} | {time} |")
-            lines += ["", "| Step | Index | Kernel | Cycles | Full inference cycles (%) | Device us |",
-                      "| --- | ---: | --- | ---: | ---: | ---: |"]
-            for sample in report["samples"]:
-                for kernel in sample["kernels"]:
-                    time = "n/a" if kernel["device_us"] is None else f"{kernel['device_us']:.3f}"
-                    lines.append(f"| {sample['tag']} | {kernel['index']} | {kernel['name']} | {kernel['cycles']:,} | {kernel['percent_of_inference']:.2f}% | {time} |")
-        if report["case"].get("cmp"):
-            cmp = report["comparison"]
-            lines += ["", f"CPU comparison: {cmp.get('status', 'not-run')}. Criterion: abs(Dayan - CPU) <= {cmp.get('atol', 'n/a')} + {cmp.get('rtol', 'n/a')} * abs(CPU).", "",
-                      "| Step | Phase | Status | Checked logits | Mismatches | Max abs | Max rel | Relative L2 |",
-                      "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"]
-            for step in cmp.get("steps", []):
-                lines.append(f"| {step['step']} | {step['phase']} | {step['status']} | {step['checked_elements']} | {step['mismatched_elements']} | {step['max_abs_error']:.6g} | {step['max_rel_error']:.6g} | {step['relative_l2_error']:.6g} |")
-            if cmp.get("error"):
-                lines += ["", cmp["error"]]
-            lines += ["", "CPU replay runs after perf capture with GPU layers, KV offload and operation offload disabled. It uses the same stored weights and Dayan token sequence. Decode prompt logits are also checked. CPU and Dayan activation quantization can differ; these differences remain in the reported errors."]
-        lines += ["", *["- " + note for note in report["notes"]], ""]
-        (output / "report.md").write_text("\n".join(lines))
-        print("\n".join(lines))
-        return 0 if report["status"] == "ok" else 1
+            return report_batch(args.run, args.clock_hz, args.output, args.include_outer, args.mode)
+        result = report_layer(args.run, args.clock_hz, args.output, args.include_outer, args.trace, args.mode)
+        return 0 if result["status"] == "ok" else 1
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"layer-perf-report: {error}", file=sys.stderr)
         return 1
