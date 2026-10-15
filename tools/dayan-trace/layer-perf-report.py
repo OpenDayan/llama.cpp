@@ -331,7 +331,11 @@ def report_layer(directory, clock_hz, output=None, include_outer=False, trace=No
         for sample in report["samples"]:
             for slot in sample["slots"]:
                 writer.writerow({key: (slot if key in slot else sample)[key] for key in writer.fieldnames})
-    lines = ["# Transformer layer timing", "", f"Mode: {report['case']['mode']}; input: {report['case']['input_len']}; output: {report['case']['output_len']}; counter source: {report['case'].get('simulator', 'external')}", "",
+    spec = report["case"]
+    model = f"Graph: {spec.get('graph', 'unknown')}; weights: {spec.get('dtype', 'unspecified')}"
+    if "expert_count" in spec:
+        model += f"; experts: {spec['expert_count']}; selected per token: {spec['expert_used_count']}"
+    lines = ["# Transformer layer timing", "", model, "", f"Mode: {spec['mode']}; input: {spec['input_len']}; output: {spec['output_len']}; counter source: {spec.get('simulator', 'external')}", "",
              "Complete layer: first mega slot through final residual, including following barriers. Embedding and output norm/head are excluded. Host inference time includes them.", "",
              f"Total measured layer cycles: {report['total_layer_cycles']:,}.", "",
              "| Step | Context before | Layer cycles | Device us | Host inference s |",
@@ -366,11 +370,17 @@ def report_layer(directory, clock_hz, output=None, include_outer=False, trace=No
                 lines.append(f"| {sample['tag']} | {kernel['index']} | {kernel['name']} | {kernel['cycles']:,} | {kernel['percent_of_inference']:.2f}% | {time} |")
     if report["case"].get("cmp"):
         cmp = report["comparison"]
-        lines += ["", f"CPU comparison: {cmp.get('status', 'not-run')}. Criterion: abs(Dayan - CPU) <= {cmp.get('atol', 'n/a')} + {cmp.get('rtol', 'n/a')} * abs(CPU).", "",
-                  "| Step | Phase | Status | Checked logits | Mismatches | Max abs | Max rel | Relative L2 |",
-                  "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |"]
+        criterion = f"abs(Dayan - CPU) <= {cmp.get('atol', 'n/a')} + {cmp.get('rtol', 'n/a')} * abs(CPU) for every logit"
+        if cmp.get("profile") == "mxfp4":
+            criterion = f"relative L2 <= {cmp['max_relative_l2_error']} and cosine >= {cmp['min_cosine_similarity']} for every step, including decode setup"
+        lines += ["", f"CPU comparison: {cmp.get('status', 'not-run')}; profile: {cmp.get('profile', 'strict')}. Criterion: {criterion}."]
+        if cmp.get("profile") == "mxfp4":
+            lines += [f"Elementwise mismatches use {cmp['atol']} + {cmp['rtol']} * abs(CPU) for diagnostics and do not determine this profile's status. Nonfinite logits always fail."]
+        lines += ["", "| Step | Phase | Status | Checked logits | Mismatches | Max abs | Max rel | Relative L2 | Cosine |",
+                  "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for step in cmp.get("steps", []):
-            lines.append(f"| {step['step']} | {step['phase']} | {step['status']} | {step['checked_elements']} | {step['mismatched_elements']} | {step['max_abs_error']:.6g} | {step['max_rel_error']:.6g} | {step['relative_l2_error']:.6g} |")
+            cosine = f"{step['cosine_similarity']:.6g}" if "cosine_similarity" in step else "n/a"
+            lines.append(f"| {step['step']} | {step['phase']} | {step['status']} | {step['checked_elements']} | {step['mismatched_elements']} | {step['max_abs_error']:.6g} | {step['max_rel_error']:.6g} | {step['relative_l2_error']:.6g} | {cosine} |")
         if cmp.get("error"):
             lines += ["", cmp["error"]]
         lines += ["", "CPU replay runs after perf capture with GPU layers, KV offload and operation offload disabled. It uses the same stored weights and Dayan token sequence. Decode prompt logits are also checked. CPU and Dayan activation quantization can differ; these differences remain in the reported errors."]

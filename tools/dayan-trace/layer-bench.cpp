@@ -56,11 +56,15 @@ int main(int argc, char ** argv) {
         const std::string mode = spec.at("mode");
         const bool compare = spec.value("cmp", false) && !compare_ops;
         const double atol = spec.value("cmp_atol", 0.03), rtol = spec.value("cmp_rtol", 0.03);
+        const std::string profile = spec.value("cmp_profile", "strict");
+        const double max_rel_l2 = spec.value("cmp_max_rel_l2", 0.35), min_cosine = spec.value("cmp_min_cosine", 0.93);
         if (input_len < 1 || output_len < 0 || int64_t(input_len) + output_len > INT32_MAX - 256 ||
             (mode != "prefill" && mode != "decode") || (mode == "prefill" ? output_len != 0 : output_len == 0)) {
             throw std::runtime_error("invalid mode or input/output lengths");
         }
-        if (!std::isfinite(atol) || !std::isfinite(rtol) || atol < 0 || rtol < 0 || (cpu_reference && !compare)) {
+        if (!std::isfinite(atol) || !std::isfinite(rtol) || atol < 0 || rtol < 0 || (cpu_reference && !compare) ||
+            (profile != "strict" && profile != "mxfp4") || !std::isfinite(max_rel_l2) || max_rel_l2 < 0 ||
+            !std::isfinite(min_cosine) || min_cosine < -1 || min_cosine > 1) {
             throw std::runtime_error("invalid CPU comparison options");
         }
         json actual;
@@ -143,8 +147,8 @@ int main(int argc, char ** argv) {
         }
         std::vector<float> observed(cpu_reference ? vocab : 0);
         json comparisons = json::array();
-        double max_abs = 0, max_rel = 0, squared_error = 0, squared_reference = 0;
-        size_t checked = 0, mismatches = 0;
+        layer_logit_compare total;
+        size_t failures = 0;
         std::vector<llama_token> tokens(input_len);
         for (int i = 0; i < input_len; ++i) { tokens[i] = 3 + (uint64_t(i) + spec.value("seed", 1U)) % (vocab - 3); }
         for (int step = 0; step <= output_len; ++step) {
@@ -175,32 +179,21 @@ int main(int argc, char ** argv) {
             if (cpu_reference) {
                 actual_logits.read(reinterpret_cast<char *>(observed.data()), vocab * sizeof(float));
                 if (!actual_logits) { throw std::runtime_error("truncated Dayan logits file"); }
-                double step_abs = 0, step_rel = 0, step_error = 0, step_reference = 0;
-                size_t step_mismatches = 0;
+                layer_logit_compare measured_logits;
                 for (int i = 0; i < vocab; ++i) {
-                    if (!std::isfinite(observed[i])) { throw std::runtime_error("nonfinite saved Dayan logits"); }
-                    const double expected = logits[i], error = std::abs(double(observed[i]) - expected);
-                    step_abs = std::max(step_abs, error);
-                    step_rel = std::max(step_rel, error / std::max(std::abs(expected), 1e-12));
-                    step_error += error * error;
-                    step_reference += expected * expected;
-                    step_mismatches += error > atol + rtol * std::abs(expected);
+                    measured_logits.add(observed[i], logits[i], atol, rtol);
+                    total.add(observed[i], logits[i], atol, rtol);
                 }
                 const json & sample = measured ? actual.at("samples").at(mode == "decode" ? step - 1 : 0) : actual.at("setup");
                 if (sample.at("step").get<int>() != step) { throw std::runtime_error("Dayan token sequence has a missing step"); }
                 next = sample.at("next_token").get<llama_token>();
                 if (next < 0 || next >= vocab) { throw std::runtime_error("invalid Dayan continuation token"); }
-                comparisons.push_back({{"step", step}, {"phase", step == 0 ? "prefill" : "decode"}, {"measured", measured},
-                                       {"status", step_mismatches ? "fail" : "pass"}, {"checked_elements", vocab},
-                                       {"mismatched_elements", step_mismatches}, {"max_abs_error", step_abs}, {"max_rel_error", step_rel},
-                                       {"relative_l2_error", std::sqrt(step_error / std::max(step_reference, 1e-30))},
-                                       {"cpu_greedy_token", greedy}, {"dayan_greedy_token", next}});
-                max_abs = std::max(max_abs, step_abs);
-                max_rel = std::max(max_rel, step_rel);
-                squared_error += step_error;
-                squared_reference += step_reference;
-                checked += vocab;
-                mismatches += step_mismatches;
+                const bool passed = measured_logits.passes(profile == "mxfp4", max_rel_l2, min_cosine);
+                json comparison = measured_logits.report();
+                comparison.update({{"step", step}, {"phase", step == 0 ? "prefill" : "decode"}, {"measured", measured},
+                                   {"status", passed ? "pass" : "fail"}, {"cpu_greedy_token", greedy}, {"dayan_greedy_token", next}});
+                comparisons.push_back(comparison);
+                failures += !passed;
             } else if (compare) {
                 saved_logits.write(reinterpret_cast<const char *>(logits), vocab * sizeof(float));
                 if (!saved_logits) { throw std::runtime_error("cannot save Dayan logits"); }
@@ -215,18 +208,18 @@ int main(int argc, char ** argv) {
         }
         if (cpu_reference) {
             if (actual_logits.peek() != std::char_traits<char>::eof()) { throw std::runtime_error("extra data in Dayan logits file"); }
-            result["comparison"] = {{"reference", "CPU"}, {"status", mismatches ? "fail" : "pass"},
-                                    {"atol", atol}, {"rtol", rtol}, {"checked_elements", checked}, {"mismatched_elements", mismatches},
-                                    {"max_abs_error", max_abs}, {"max_rel_error", max_rel},
-                                    {"relative_l2_error", std::sqrt(squared_error / std::max(squared_reference, 1e-30))}, {"steps", comparisons}};
+            result["comparison"] = total.report();
+            result["comparison"].update({{"reference", "CPU"}, {"status", failures ? "fail" : "pass"}, {"profile", profile},
+                                         {"atol", atol}, {"rtol", rtol}, {"max_relative_l2_error", max_rel_l2}, {"min_cosine_similarity", min_cosine},
+                                         {"failed_steps", failures}, {"steps", comparisons}});
         } else if (compare) {
             saved_logits.close();
             if (!saved_logits) { throw std::runtime_error("cannot finish Dayan logits file"); }
         }
-        if (operators) { mismatches += operators->failures + operators->nodes.empty(); }
+        if (operators) { failures += operators->failures + operators->nodes.empty(); }
         result["inference_status"] = "ok";
-        result["status"] = mismatches ? "failed" : "ok";
-        status = mismatches ? 1 : 0;
+        result["status"] = failures ? "failed" : "ok";
+        status = failures ? 1 : 0;
     } catch (const std::exception & error) {
         result["error"] = error.what();
         std::fprintf(stderr, "%s\n", error.what());

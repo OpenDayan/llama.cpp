@@ -136,7 +136,10 @@ public:
         if (next_ != count_ || data_.size() > UINT32_MAX) {
             return false;
         }
-        const DayanMegaConfig header = { (uint32_t) data_.size(), graph_, count_ };
+        const size_t workspace_offset = (data_.size() + 63) & ~size_t(63);
+        if (workspace_offset > UINT32_MAX - sizeof(DayanClusterState)) { return false; }
+        data_.resize(workspace_offset + sizeof(DayanClusterState));
+        const DayanMegaConfig header = { (uint32_t) data_.size(), graph_, count_, (uint32_t) workspace_offset };
         std::memcpy(data_.data(), &header, sizeof(header));
         return true;
     }
@@ -806,27 +809,26 @@ static bool ggml_backend_dayan_mega_add_tf32(ggml_backend_dayan_mega_parameters 
     return parameters->add<mega::matmul_tf32>(config, output->src[1], output->src[0], output);
 }
 
-static bool ggml_backend_dayan_mega_add_router_indexer(ggml_backend_dayan_mega_parameters * parameters,
+static bool ggml_backend_dayan_mega_add_moe_sort(ggml_backend_dayan_mega_parameters * parameters,
                                                         const ggml_backend_dayan_graph_slot & slot,
                                                         const ggml_tensor *                  selected,
                                                         npu_buffer_t *                       workspace,
                                                         uint64_t                             workspace_bytes) {
-    const ggml_tensor * logits = slot.nodes[0];
-    if (logits == nullptr || logits->src[0] == nullptr || logits->src[1] == nullptr || selected == nullptr ||
-        logits->type != GGML_TYPE_F32 || logits->src[0]->type != GGML_TYPE_F32 ||
-        logits->src[1]->type != GGML_TYPE_F32 || selected->type != GGML_TYPE_I32 || selected->nb[0] != sizeof(int32_t) ||
-        selected->ne[0] == 0 ||
-        selected->ne[1] != logits->ne[1]) {
+    const ggml_tensor * output = slot.nodes[0];
+    if (output == nullptr || output->src[0] == nullptr || selected == nullptr || output->op != GGML_OP_ARGSORT ||
+        output->src[0]->type != GGML_TYPE_F32 || output->type != GGML_TYPE_I32 || selected->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(output->src[0]) || !ggml_is_contiguous(output) || selected->nb[0] != sizeof(int32_t) ||
+        selected->ne[0] <= 0 || selected->ne[0] > slot.sort_k || selected->view_src != output || selected->view_offs != 0 ||
+        selected->ne[1] != output->ne[1] || selected->nb[1] != output->nb[1] ||
+        ggml_get_op_params_i32(output, 0) != GGML_SORT_ORDER_DESC) {
         return false;
     }
-    DayanRouterIndexerConfig config = {};
-    config.matmul = ggml_backend_dayan_mega_matmul_config(logits->src[0], logits->src[1], logits);
-    config.matmul.a_stride = config.matmul.k * sizeof(float);
+    DayanMoeSortConfig config = {};
+    config.sort = {(uint32_t) output->src[0]->ne[0], (uint32_t) ggml_nrows(output->src[0]), slot.sort_k,
+                   kDayanSortOrderDesc, (uint32_t) output->ne[0]};
     config.experts_used = (uint32_t) selected->ne[0];
-    config.selected_stride = (uint32_t) selected->nb[1];
-    config.grouped = config.matmul.m > 1;
     config.workspace_bytes = workspace_bytes;
-    return parameters->add<mega::router_indexer>(config, logits->src[1], logits->src[0], logits, selected, workspace);
+    return parameters->add<mega::moe_sort>(config, output->src[0], output, workspace);
 }
 
 static bool ggml_backend_dayan_mega_add_routing(ggml_backend_dayan_mega_parameters * parameters,

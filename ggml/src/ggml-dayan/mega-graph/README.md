@@ -18,7 +18,9 @@ The slot modes are:
 - `reuse`: use the preceding matched slot without advancing. MXFP4 K/V projections use two device calls for one paired slot.
 - `borrow`: match the current slot without consuming it. The final residual uses the next layer's norm slot, which must remain available after mega finishes.
 
-Keep synchronization explicit. A zero barrier count is valid only when the following operation can run independently on each core or the graph ends. MoE's sort is already performed by the router; its step only validates the sort direction and keeps the existing synchronization.
+The parameter packet ends with a cache-line-aligned `DayanClusterState` in ordinary DRAM. `Binding` supplies this address to matrix and attention configs without adding graph parameters. Per-core records and explicit cache maintenance keep peer metadata separate from the outer mega barrier. Internal rendezvous uses Shared Resources 20..23; each call completes two generations to return those tokens to phase zero. Only the outer step barrier uses Atomic Cache (16 bytes before Runtime alignment).
+
+Keep synchronization explicit. A zero barrier count is valid only when the following operation can run independently on each core or the graph ends. MoE's `sort` step runs VEC TopK on the softmax probabilities and prepares grouped dispatch tables. Its final barrier publishes the selections and tables to following steps; the router step only computes logits.
 
 Each device step calls `dayan_set_proc_name` with its declared name before execution. The following barriers stay in that trace segment. Names must fit in `DAYAN_THREAD_NAME_SIZE` including NUL; the operation table's fixed name array enforces this at compile time.
 

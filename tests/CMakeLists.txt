@@ -291,6 +291,20 @@ if (GGML_DAYAN)
         "${DAYAN_ROOT}/host/include")
     llama_build(test-dayan-qwen35-dense.cpp)
     llama_build(test-dayan-moe.cpp)
+    set(DAYAN_DISPATCH_TEST "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/test-dayan-moe-dispatch")
+    add_custom_command(
+        OUTPUT "${DAYAN_DISPATCH_TEST}"
+        COMMAND "${DAYAN_DYCC}" -O2
+            "-I${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan"
+            -Xdevice "-I${CMAKE_SOURCE_DIR}/ggml/src/ggml-dayan/device_include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test-dayan-moe-dispatch.cpp" -o "${DAYAN_DISPATCH_TEST}"
+        DEPENDS test-dayan-moe-dispatch.cpp ggml-dayan
+        VERBATIM)
+    add_custom_target(test-dayan-moe-dispatch DEPENDS "${DAYAN_DISPATCH_TEST}")
+    llama_build(test-dayan-sort.cpp)
+    target_include_directories(test-dayan-sort PRIVATE "${CMAKE_SOURCE_DIR}/tools/dayan-trace" "${CMAKE_SOURCE_DIR}/vendor")
+    llama_build_and_test(test-dayan-layer-compare.cpp)
+    target_include_directories(test-dayan-layer-compare PRIVATE "${CMAKE_SOURCE_DIR}/tools/dayan-trace" "${CMAKE_SOURCE_DIR}/vendor")
     llama_build(test-dayan-hotspots.cpp)
 endif()
 

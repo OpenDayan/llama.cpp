@@ -1,11 +1,11 @@
 MEGA_STEP(ffn_norm, norm_pipeline, norm_pipeline, 1, required,
           pack(norm, at(ffn_norm), true))
-MEGA_STEP(router, mul_mat, router_indexer, 1, required,
-          pack(router_indexer, at(router), at(experts).nodes[0]->src[2], ctx.workspace, ctx.workspace_bytes))
+MEGA_STEP(router, mul_mat, matmul_tf32, 1, required,
+          pack(tf32, at(router)))
 MEGA_STEP(probs, softmax, softmax, 1, required,
           pack(routing, at(probs)))
-MEGA_STEP(sort, argsort, noop, 2, required,
-          at(sort).nodes[0] != nullptr && ggml_get_op_params_i32(at(sort).nodes[0], 0) == GGML_SORT_ORDER_DESC)
+MEGA_STEP(sort, argsort, moe_sort, 1, required,
+          pack(moe_sort, at(sort), at(experts).nodes[0]->src[2], ctx.workspace, ctx.workspace_bytes))
 MEGA_STEP(weights, get_rows, get_rows, 1, required,
           pack(rows, at(weights), false))
 MEGA_STEP(sum, sum_rows, sum_rows, 1, required,

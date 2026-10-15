@@ -16,6 +16,40 @@
 #include <stdexcept>
 #include <vector>
 
+struct layer_logit_compare {
+    double max_abs = 0, max_rel = 0, squared_error = 0, squared_reference = 0, squared_observed = 0, dot = 0;
+    size_t checked = 0, mismatches = 0;
+
+    void add(double observed, double reference, double atol, double rtol) {
+        if (!std::isfinite(observed) || !std::isfinite(reference)) { throw std::runtime_error("nonfinite comparison logits"); }
+        const double error = std::abs(observed - reference);
+        max_abs = std::max(max_abs, error);
+        max_rel = std::max(max_rel, error / std::max(std::abs(reference), 1e-12));
+        squared_error += error * error;
+        squared_reference += reference * reference;
+        squared_observed += observed * observed;
+        dot += observed * reference;
+        ++checked;
+        mismatches += error > atol + rtol * std::abs(reference);
+    }
+
+    double relative_l2() const { return std::sqrt(squared_error / std::max(squared_reference, 1e-30)); }
+
+    double cosine() const {
+        if (squared_reference == 0 || squared_observed == 0) { return squared_reference == squared_observed ? 1 : 0; }
+        return std::max(-1.0, std::min(1.0, dot / std::sqrt(squared_reference * squared_observed)));
+    }
+
+    bool passes(bool mxfp4, double max_rel_l2, double min_cosine) const {
+        return checked && (mxfp4 ? relative_l2() <= max_rel_l2 && cosine() >= min_cosine : mismatches == 0);
+    }
+
+    nlohmann::json report() const {
+        return {{"checked_elements", checked}, {"mismatched_elements", mismatches}, {"max_abs_error", max_abs},
+                {"max_rel_error", max_rel}, {"relative_l2_error", relative_l2()}, {"cosine_similarity", cosine()}};
+    }
+};
+
 struct layer_operator_compare {
     using json = nlohmann::json;
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu{ggml_backend_cpu_init(), ggml_backend_free};
@@ -28,6 +62,7 @@ struct layer_operator_compare {
     std::unordered_map<const ggml_tensor *, ggml_tensor *> copies;
     std::unordered_map<const ggml_tensor *, std::vector<float>> references;
     std::unordered_map<const ggml_tensor *, std::vector<int64_t>> integer_references;
+    std::unordered_map<const ggml_tensor *, std::vector<float>> sort_scores;
     ggml_backend_dayan_set_slot_filter_callback_t set_filter = nullptr;
     ggml_backend_dayan_set_slot_trace_callback_t set_trace = nullptr;
     size_t failures = 0;
@@ -159,7 +194,7 @@ struct layer_operator_compare {
     }
 
     void reference(const ggml_backend_dayan_slot_trace_event * event) {
-        computed.clear(); copies.clear(); references.clear(); integer_references.clear();
+        computed.clear(); copies.clear(); references.clear(); integer_references.clear(); sort_scores.clear();
         for (size_t i = 0; i < GGML_DAYAN_SLOT_TRACE_MAX_NODES; ++i) {
             if (event->nodes[i] && !(std::strcmp(event->kind, "gated_output_projection") == 0 && i == 3)) {
                 computed.insert(event->nodes[i]);
@@ -195,6 +230,9 @@ struct layer_operator_compare {
             const auto * tensor = event->outputs[i];
             if (ggml_is_empty(tensor)) { continue; }
             if (integer(tensor->type)) { integer_references[tensor] = values<int64_t>(copies.at(tensor)); }
+            if (tensor->op == GGML_OP_ARGSORT || tensor->op == GGML_OP_TOP_K) {
+                sort_scores[tensor] = values(copies.at(tensor->src[0]));
+            }
             expected = values(copies.at(tensor));
             round_output(tensor);
             references[tensor] = std::move(expected);
@@ -211,6 +249,53 @@ struct layer_operator_compare {
             ggml_quantize_chunk(tensor->type, expected.data(), bytes.data(), 0, ggml_nrows(tensor), tensor->ne[0], nullptr);
             ggml_get_type_traits(tensor->type)->to_float(bytes.data(), expected.data(), expected.size());
         }
+    }
+
+    void compare_sort(const ggml_tensor * tensor, uint32_t sort_k) {
+        const bool unordered = tensor->op == GGML_OP_TOP_K;
+        const size_t width = tensor->src[0]->ne[0], stride = tensor->ne[0], rows = ggml_nrows(tensor);
+        const size_t count = unordered || !sort_k ? stride : sort_k;
+        if (count > stride || stride > width) { throw std::runtime_error("invalid sort comparison prefix"); }
+        const auto actual = values<int64_t>(tensor);
+        const auto & reference = integer_references.at(tensor);
+        const auto & scores = sort_scores.at(tensor);
+        size_t mismatches = 0;
+        json first = nullptr;
+        for (size_t row = 0; row < rows; ++row) {
+            std::vector<int64_t> selected(actual.begin() + row * stride, actual.begin() + row * stride + count);
+            std::vector<int64_t> expected_ids(reference.begin() + row * stride, reference.begin() + row * stride + count);
+            std::vector<bool> seen(width, false);
+            auto valid = [width](int64_t id) { return id >= 0 && (uint64_t) id < width; };
+            auto descending = [&](int64_t a, int64_t b) {
+                if (!valid(a) || !valid(b)) { return a < b; }
+                const float left = scores[row * width + a], right = scores[row * width + b];
+                return left == right ? a < b : left > right;
+            };
+            for (size_t i = 0; i < width; ++i) {
+                if (std::isnan(scores[row * width + i])) { throw std::runtime_error("sort comparison does not support NaN scores"); }
+            }
+            if (unordered) {
+                std::sort(selected.begin(), selected.end(), descending);
+                std::sort(expected_ids.begin(), expected_ids.end(), descending);
+            }
+            for (size_t i = 0; i < count; ++i) {
+                const int64_t id = selected[i], expected_id = expected_ids[i];
+                const bool match = valid(id) && !seen[id] && scores[row * width + id] == scores[row * width + expected_id];
+                if (valid(id)) { seen[id] = true; }
+                if (!match) {
+                    ++mismatches;
+                    if (first.is_null()) { first = {{"row", row}, {"rank", i}, {"actual", id}, {"expected", expected_id}}; }
+                }
+            }
+        }
+        pending.update({{"status", mismatches ? "fail" : "pass"}, {"checked_elements", rows * count},
+                        {"ignored_elements", rows * (stride - count)}, {"mismatched_elements", mismatches},
+                        {"comparison", unordered ? "top-k score multiset and unique indices" : "sorted prefix scores and unique indices"},
+                        {"first_mismatch", first}});
+        failures += mismatches != 0;
+        std::fprintf(stderr, "CPU op step=%d %s %s: %s mismatches=%zu/%zu ignored=%zu\n", step,
+                     ggml_op_name(tensor->op), tensor->name, mismatches ? "FAIL" : "PASS", mismatches, rows * count, rows * (stride - count));
+        nodes.push_back(pending);
     }
 
     void compare(const ggml_tensor * tensor) {
@@ -291,7 +376,8 @@ struct layer_operator_compare {
             self.pending.update({{"name", t->name}, {"op", ggml_op_name(t->op)}, {"type", ggml_type_name(t->type)},
                                  {"shape", {t->ne[0], t->ne[1], t->ne[2], t->ne[3]}}});
             self.expected = std::move(self.references.at(t));
-            self.compare(t);
+            if (t->op == GGML_OP_ARGSORT || t->op == GGML_OP_TOP_K) { self.compare_sort(t, event->sort_k); }
+            else { self.compare(t); }
         }
     }
 

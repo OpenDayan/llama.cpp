@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ggml-dayan-cluster.h"
+
 #include <dayan_kernel.h>
 #include <stdint.h>
 
@@ -114,6 +116,7 @@ struct DayanMatmulConfig {
     uint64_t bt_batch_stride3     = 0;
     uint64_t output_batch_stride2 = 0;
     uint64_t output_batch_stride3 = 0;
+    uint64_t cluster_workspace = 0;
 };
 
 struct DayanMatmulPairConfig {
@@ -140,6 +143,7 @@ struct DayanFlashAttentionConfig {
     uint64_t v_row_stride;
     uint64_t v_head_stride;
     uint64_t v_batch_stride;
+    uint64_t cluster_workspace = 0;
 };
 
 static inline bool dayan_flash_attention_use_split_kv(uint32_t q_len, uint32_t kv_len) {
@@ -261,6 +265,7 @@ struct DayanMxfp4Config {
     uint64_t a_scale_stride, b_scale_stride, output_scale_stride;
     uint32_t source_type, weight_type, output_type, operation;
     uint32_t share_inputs;
+    uint64_t cluster_workspace = 0;
 };
 
 struct DayanRowsConfig {
@@ -339,26 +344,18 @@ struct DayanMxfp4MoeConfig {
     uint64_t workspace_bytes;
 };
 
-struct DayanRouterIndexerConfig {
-    DayanMatmulConfig matmul;
-    uint32_t experts_used;
-    uint32_t selected_stride;
-    uint32_t grouped;
-    uint32_t reserved;
-    uint64_t workspace_bytes;
-};
-
 struct DayanMoeDispatchLayout {
     uint64_t count_stride;
     uint64_t position_stride;
+    // Per-core maps from local token/rank order to global grouped rows.
     uint64_t positions_offset;
     uint64_t offsets_offset;
     uint64_t bytes;
 
     static DayanMoeDispatchLayout make(uint32_t tokens, uint32_t experts, uint32_t used) {
-        const uint64_t counts = ((uint64_t) experts * sizeof(uint32_t) + 63U) & ~63ULL;
+        const uint64_t counts = ((uint64_t) experts * sizeof(uint32_t) + 255U) & ~255ULL;
         const uint64_t positions = ((((uint64_t) tokens + 3U) / 4U) * used * sizeof(uint32_t) + 63U) & ~63ULL;
-        const uint64_t offsets = (((uint64_t) experts + 1U) * sizeof(uint32_t) + 63U) & ~63ULL;
+        const uint64_t offsets = (((uint64_t) experts + 1U) * sizeof(uint32_t) + 255U) & ~255ULL;
         return {counts, positions, 4U * counts, 4U * (counts + positions), 4U * (counts + positions) + offsets};
     }
 };
@@ -377,6 +374,12 @@ struct DayanSortConfig {
     uint32_t output_width;
     uint32_t order;
     uint32_t output_stride;
+};
+
+struct DayanMoeSortConfig {
+    DayanSortConfig sort;
+    uint32_t experts_used;
+    uint64_t workspace_bytes;
 };
 
 enum : uint32_t {

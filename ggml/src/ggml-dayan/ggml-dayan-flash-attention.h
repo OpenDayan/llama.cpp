@@ -18,7 +18,7 @@ constexpr long kVecBytes = 256;
 constexpr long kLocalResources = kSlices + 5 * kSlices * kSlots + 4;
 constexpr long kSharedResources = 4;
 constexpr long kMatQK = 1;
-constexpr long kAtomicBytes = 128;
+constexpr long kAtomicBytes = sizeof(DayanClusterState);
 constexpr long kUramBytes = 1536 * 1024;
 constexpr long kQBytes = kBr * kMaxHeadDim * sizeof(uint16_t);
 constexpr long kOBytes = kBr * kMaxHeadDim * sizeof(float);
@@ -206,16 +206,9 @@ static inline bool ranges_overlap(uint64_t a, uint64_t a_bytes, uint64_t b, uint
 
 
 
-struct Cluster {
-    dayan_cluster_barrier_t barrier;
-    uint64_t uram[4];
-    uint32_t owner[4];
-};
-static_assert(sizeof(Cluster) <= kAtomicBytes, "Attention shared metadata exceeds allocation");
-
 struct State {
     const DayanFlashAttentionConfig * cfg;
-    uint64_t q, k, v, out, uram;
+    uint64_t q, k, v, out, uram, peer_uram[4];
     uint64_t blocks;
     uint32_t task, tasks, cores, lane, scale;
     long groups;
@@ -355,7 +348,10 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
                 }
             } else if (role == DAYAN_RESOURCE_ROLE_PRODUCER) {
                 if constexpr (Cores == 4) {
-                    ((Cluster *) shared)->owner[2 * Value + slot] = s.lane;
+                    const int index = 2 * Value + slot;
+                    dayan_cluster_invalidate(s.cfg->cluster_workspace, index);
+                    dayan_cluster_state(s.cfg->cluster_workspace).core[index].owner = s.lane;
+                    dayan_cluster_flush(s.cfg->cluster_workspace, index);
                 }
                 if constexpr (Value) {
                     const long end = (cols + 31) / 32 * 64;
@@ -375,11 +371,12 @@ template <int Cores, bool Value> static void load_kv(void * argument) {
                     check(dayan_resource_produce_lsu(ready, Cores - 1, 0));
                 }
             } else if (role == DAYAN_RESOURCE_ROLE_CONSUMER) {
-                const Cluster & cluster = *(Cluster *) shared;
-                const long owner = cluster.owner[2 * Value + slot];
+                const int index = 2 * Value + slot;
+                dayan_cluster_invalidate(s.cfg->cluster_workspace, index);
+                const long owner = dayan_cluster_state(s.cfg->cluster_workspace).core[index].owner;
                 const long bytes = Value ? s.cfg->head_dim * kBc * 2 : cols * s.cfg->head_dim * 2;
                 configure_lsu_rows<1>(bytes, bytes, bytes);
-                __tx_lsu_dma_d2u<1>(uram + offset, cluster.uram[owner] + offset);
+                __tx_lsu_dma_d2u<1>(uram + offset, s.peer_uram[owner] + offset);
                 check(dayan_resource_produce_lsu(local, users, shared_mask));
             } else {
                 DAYAN_PARAMS_ERROR();
@@ -674,17 +671,16 @@ template <bool First, bool Last> static inline void update_output(long base, lon
 
 static void merge_decode(const State & s, long uram, long base, long rows) {
     using namespace ggml_dayan_vec_detail;
-    Cluster & cluster = *(Cluster *) shared;
     // The unused second Q slice holds peer state and merge weights.
     const long peer = uram + tile_offset(1, 0);
     const long alpha = peer + kTileAlpha;
     const long beta = peer + kTileMask;
     const long state_bytes = (rows + 7) / 8 * kVecBytes;
-    check(dayan_cluster_barrier(4, &cluster.barrier));
+    check(dayan_cluster_sync());
     if (s.lane == 0) {
         for (long core = 1; core < 4; ++core) {
             const long slot = (s.keys(0, 0, core) - 1) & 1;
-            const uint64_t source = cluster.uram[core];
+            const uint64_t source = s.peer_uram[core];
             configure_lsu_rows<0>(state_bytes, state_bytes, state_bytes);
             __tx_lsu_dma_d2u<0>(peer + kTileM, source + tile_offset(0, slot) + kTileM);
             __tx_lsu_dma_d2u<0>(peer + kTileL, source + tile_offset(0, slot) + kTileL);
@@ -739,7 +735,7 @@ static void merge_decode(const State & s, long uram, long base, long rows) {
         dayan_wait_vec();
     }
     // Peer O and softmax state stay live until all remote reads finish.
-    check(dayan_cluster_barrier(4, &cluster.barrier));
+    check(dayan_cluster_sync());
 }
 
 static void output(void * argument) {
@@ -942,12 +938,18 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
         ((int32_t *) (uram + kUramMaskDelta))[i] = i % 8 - i / 8;
     }
     if constexpr (Cores == 4) {
-        if (!shared) {
+        if (!cfg->cluster_workspace && !shared) {
             return FA_INVALID_ARGUMENT;
         }
-        Cluster & cluster = *(Cluster *) shared;
-        cluster.uram[s.lane] = uram;
-        check(dayan_cluster_barrier(4, &cluster.barrier));
+        auto & cluster = dayan_cluster_state(cfg->cluster_workspace);
+        cluster.core[s.lane].uram = uram;
+        dayan_cluster_flush(cfg->cluster_workspace, s.lane);
+        check(dayan_cluster_sync());
+        for (int peer = 0; peer < 4; ++peer) {
+            if (peer != (int) s.lane) { dayan_cluster_invalidate(cfg->cluster_workspace, peer); }
+            s.peer_uram[peer] = cluster.core[peer].uram;
+        }
+        check(dayan_cluster_sync());
     }
     dayan_thread_resources_t resources = {};
     resources.local_resource_count = kLocalResources;
@@ -966,11 +968,12 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     resources.mat_tcsr_count = 0;
     resources.vec_tcsr_count = 1;
     resources.lsu_tcsr_count = 1;
+    if constexpr (Cores == 4 && SplitKV) { resources.shared_resource_count = kDayanClusterResources; }
     check(dayan_create_thread("attn-output", output, &s, &resources));
     calculate_qk<Format>(s);
     check(dayan_thread_join_all());
     if constexpr (Cores == 4) {
-        check(dayan_cluster_barrier(4, &((Cluster *) shared)->barrier));
+        check(dayan_cluster_sync());
     }
     return 0;
 }

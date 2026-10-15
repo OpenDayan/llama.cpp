@@ -194,12 +194,6 @@ struct Phases {
     uint64_t post = 0;
 };
 
-struct Cluster {
-    dayan_cluster_barrier_t barrier;
-    uint64_t uram[4];
-};
-static_assert(sizeof(Cluster) <= MATMUL_DAYAN_4C_ATOMIC_BYTES, "MXFP4 shared state exceeds its allocation");
-
 // Shared 0..11 belong to the other matrix and attention pipelines.
 static constexpr int shared_resource_begin = 12;
 
@@ -208,7 +202,7 @@ struct State {
     Phases * phases;
     DayanMxfp4Tile shape;
     uint64_t input[3], scales[3], output, output_scales;
-    uint64_t physical, local, packed, packed_scales;
+    uint64_t physical, local, packed, packed_scales, peer_uram[4];
     uint64_t a[2], as[2], b[2], bs[2], c[DayanMxfp4Tile::max_c_buffers];
     int kt, nt, grid_rows, grid_cols;
     uint64_t tiles, task, tasks, load_phases[2];
@@ -298,19 +292,18 @@ static void load(void * arg) {
                     matmul_check(dayan_resource_produce_lsu(resource, users, 0));
                     if (share) { matmul_check(dayan_resource_produce_lsu(ready, broadcast ? 3 : 1, 0)); }
                 } else {
-                    const auto & cluster = *(const Cluster *) shared;
                     for (int product = 0; product < (B ? shape.products : 1); ++product) {
                         const uint64_t destination = (B ? s.b[slot] : s.a[slot]) + product * capacity * shape.input_stride;
                         const uint64_t bytes = capacity * shape.input_stride;
                         // Copy the full allocation: the 320B swizzle can move tail data between rows.
                         set_lsu_matrix<0>(checksum, 1, bytes, bytes, bytes);
-                        load_matrix<0>(bytes, 1, bytes, 1, destination, cluster.uram[peer] + destination - s.local);
+                        load_matrix<0>(bytes, 1, bytes, 1, destination, s.peer_uram[peer] + destination - s.local);
                         if (shape.scales) {
                             const uint64_t stride = B ? capacity * 4 : shape.a_scale_stride();
                             const uint64_t scale_bytes = (shape.k / 128) * stride;
                             const uint64_t target = (B ? s.bs[slot] : s.as[slot]) + product * scale_bytes;
                             set_lsu_matrix<0>(checksum, 1, scale_bytes, scale_bytes, scale_bytes);
-                            load_matrix<0>(scale_bytes, 1, scale_bytes, 1, target, cluster.uram[peer] + target - s.local);
+                            load_matrix<0>(scale_bytes, 1, scale_bytes, 1, target, s.peer_uram[peer] + target - s.local);
                         }
                     }
                     matmul_check(dayan_resource_produce_lsu(resource, users, ready_mask));
@@ -482,9 +475,15 @@ static int run_tiled(State & s) {
         DAYAN_PARAMS_IF(s.c[i] & 1023) { return -22; }
     }
     if (s.share) {
-        auto & cluster = *(Cluster *) shared;
-        cluster.uram[s.task] = s.physical;
-        matmul_check(dayan_cluster_barrier(4, &cluster.barrier));
+        auto & cluster = dayan_cluster_state(cfg->cluster_workspace);
+        cluster.core[s.task].uram = s.physical;
+        dayan_cluster_flush(cfg->cluster_workspace, s.task);
+        matmul_check(dayan_cluster_sync());
+        for (int peer = 0; peer < 4; ++peer) {
+            if (peer != (int) s.task) { dayan_cluster_invalidate(cfg->cluster_workspace, peer); }
+            s.peer_uram[peer] = cluster.core[peer].uram;
+        }
+        matmul_check(dayan_cluster_sync());
     }
     dayan_thread_resources_t resources = {};
     resources.lsu_tcsr_count = 1;
@@ -497,8 +496,7 @@ static int run_tiled(State & s) {
     calculate<M, N>(s);
     matmul_check(dayan_thread_join_all());
     if (s.share) {
-        auto & cluster = *(Cluster *) shared;
-        matmul_check(dayan_cluster_barrier(4, &cluster.barrier));
+        matmul_check(dayan_cluster_sync());
         // Return the dedicated Shared tokens to phase zero for the next mega slot or expert.
         for (int operand = 0; operand < 2; ++operand) {
             const bool owner = operand ? s.grid_rows == 2 && s.task < 2 : s.grid_rows == 1 ? s.task == 0 : (s.task & 1) == 0;
@@ -515,7 +513,7 @@ static int run_tiled(State & s) {
             }
         }
         dayan_wait_lsu();
-        return dayan_cluster_barrier(4, &cluster.barrier);
+        return dayan_cluster_sync();
     }
     return 0;
 }
@@ -534,7 +532,8 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
     DAYAN_PARAMS_IF(!s.tasks || dayan_task_dim(DAYAN_TASK_Z) != 1) { return -22; }
     s.grid_rows = s.tasks == 4 && cfg->m >= 64 ? 2 : 1;
     s.grid_cols = s.tasks / s.grid_rows;
-    s.share = cfg->share_inputs && s.tasks == 4 && dayan_task_mode() == 4;
+    const bool decode = cfg->m == 1 && cfg->weight_type == kDayanDataTypeMXFP4;
+    s.share = cfg->share_inputs && !decode && s.tasks == 4 && dayan_task_mode() == 4;
     s.shape = DayanMxfp4Tile::make(cfg->m, cfg->n, cfg->k, cfg->weight_type == kDayanDataTypeMXFP4,
                                  cfg->operation >= 2 ? 2 : 1, cfg->operation != 0 || cfg->output_type != kDayanDataTypeF32, s.tasks);
     switch (s.shape.m) {
@@ -547,8 +546,17 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
                 case 128: return run_tiled<32, 128>(s);
                 case 256: return run_tiled<32, 256>(s);
                 case 512: return run_tiled<32, 512>(s);
+                case 768: return run_tiled<32, 768>(s);
                 case 1024: return run_tiled<32, 1024>(s);
-                default: return run_tiled<32, 2048>(s);
+                case 1280: return run_tiled<32, 1280>(s);
+                case 1536: return run_tiled<32, 1536>(s);
+                case 1792: return run_tiled<32, 1792>(s);
+                case 2048: return run_tiled<32, 2048>(s);
+                case 2304: return run_tiled<32, 2304>(s);
+                case 2560: return run_tiled<32, 2560>(s);
+                case 2816: return run_tiled<32, 2816>(s);
+                case 3072: return run_tiled<32, 3072>(s);
+                default: return -22;
             }
     }
 }

@@ -25,7 +25,7 @@ enum : int {
 struct State {
     const DayanMatmulConfig * config;
     uint64_t input[3], output, physical, uram, tiles, col_begin, col_end;
-    uint64_t packed, load_phases;
+    uint64_t packed, load_phases, shared_phases;
     int lane, tile_m, slice_m, tile_n, slice_n, nt, kt;
     int accumulator_stride, output_stride;
     bool buffer_a;
@@ -53,12 +53,10 @@ static inline Tile tile(const State & s, uint64_t index, int slice) {
 template <int Cores>
 static void load_a(void * argument) {
     State & s = *(State *) argument;
-    MatmulCluster * cluster = (MatmulCluster *) shared;
+    MatmulCluster * cluster = Cores == 4 ? &dayan_cluster_state(s.config->cluster_workspace) : nullptr;
     uint64_t phases = 0;
     if constexpr (Cores == 4) {
-        for (int i = 0; i < kSlices; ++i) {
-            phases |= (uint64_t) cluster->shared_phase[i] << DAYAN_SHARED_RESOURCE(i);
-        }
+        phases = s.shared_phases;
     }
     long checksum = 0;
     for (uint64_t out = 0; out < s.tiles; ++out) {
@@ -91,7 +89,7 @@ static void load_a(void * argument) {
                     matmul_check(dayan_resource_wait(local, mask, phases, 0));
                     if (n.cols) {
                         set_lsu_matrix<0>(checksum, n.rows, kInputStride, kInputStride, kInputStride);
-                        __tx_lsu_dma_d2u<0>(a.uram, cluster->uram_base[0] + a.uram - s.uram);
+                        __tx_lsu_dma_d2u<0>(a.uram, cluster->core[0].uram + a.uram - s.uram);
                         matmul_check(dayan_resource_produce_lsu(a.resource, users, mask));
                     } else {
                         matmul_check(dayan_resource_consume_lsu(mask));
@@ -226,7 +224,7 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
     if (!ggml_dayan_matmul_detail::matmul_config_valid<sizeof(uint16_t)>(config) || !a || !gate || !up || !output ||
         dayan_task_mode() != Cores || (Cores == 4 && dayan_task_dim(DAYAN_TASK_X) != 4) || lane >= Cores ||
         !groups || group >= groups || (Cores == 1 && dayan_task_dim(DAYAN_TASK_Y) != 1) ||
-        dayan_task_dim(DAYAN_TASK_Z) != 1 || (Cores == 4 && !shared) ||
+        dayan_task_dim(DAYAN_TASK_Z) != 1 || (Cores == 4 && !config->cluster_workspace && !shared) ||
         (Inference && config->m > 512)) {
         return -22;
     }
@@ -240,7 +238,7 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
     output += begin;
     config = &shard;
     MatmulPhases local_phases;
-    MatmulCluster * cluster = (MatmulCluster *) shared;
+    MatmulCluster * cluster = Cores == 4 ? &dayan_cluster_state(config->cluster_workspace) : nullptr;
     State s = {};
     s.config = config;
     s.lane = lane;
@@ -260,7 +258,11 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
     if (s.tiles > UINT64_MAX / s.kt) {
         return -22;
     }
-    s.phases = Cores == 4 ? &cluster->phases[lane] : phases ? phases : &local_phases;
+    if constexpr (Cores == 4) {
+        local_phases = cluster->core[lane].phases;
+        s.shared_phases = cluster->core[lane].shared_phases;
+    }
+    s.phases = phases ? phases : &local_phases;
     s.physical = (uintptr_t) dayan_uram_base();
     s.uram = s.physical & (ggml_dayan_matmul_detail::Constants::kUramWindowStride - 1);
     uint64_t address = s.uram;
@@ -282,8 +284,10 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
         return -12;
     }
     if constexpr (Cores == 4) {
-        cluster->uram_base[lane] = s.physical;
-        matmul_check(dayan_cluster_barrier(4, &cluster->barrier));
+        cluster->core[lane].uram = s.physical;
+        dayan_cluster_flush(config->cluster_workspace, lane);
+        matmul_check(dayan_cluster_sync());
+        if (lane != 0) { dayan_cluster_invalidate(config->cluster_workspace, 0); }
     }
     const uint64_t ne2 = config->batch_ne2 ? config->batch_ne2 : 1;
     const uint64_t ne3 = config->batch_ne3 ? config->batch_ne3 : 1;
@@ -307,15 +311,15 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
             calculate<Format>(s);
             matmul_check(dayan_thread_join_all());
             if constexpr (Cores == 4) {
-                matmul_check(dayan_cluster_barrier(4, &cluster->barrier));
-                if (lane == 0) {
-                    for (int i = 0; i < kSlices; ++i) {
-                        cluster->shared_phase[i] = (s.load_phases >> DAYAN_SHARED_RESOURCE(i)) & 1;
-                    }
-                }
-                matmul_check(dayan_cluster_barrier(4, &cluster->barrier));
+                s.shared_phases = s.load_phases;
+                matmul_check(dayan_cluster_sync());
             }
         }
+    }
+    if constexpr (Cores == 4) {
+        cluster->core[lane].phases = *s.phases;
+        cluster->core[lane].shared_phases = s.shared_phases;
+        dayan_cluster_flush(config->cluster_workspace, lane);
     }
     return 0;
 }

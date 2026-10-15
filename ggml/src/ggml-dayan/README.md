@@ -133,8 +133,9 @@ GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-mxfp4
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-matmul 3 481 513
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-graph
 
-# MXFP4 MoE: routing regression and exact URAM radix-sort indices
+# MXFP4 MoE: routing regression and VEC sorting against CPU
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-dayan-moe
+./build-dayan/bin/test-dayan-sort
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o ARGSORT \
     -p 'ne=\[(63|64|65|256|4096),3,1,1\]'
 GGML_DAYAN_MEGA=0 ./build-dayan/bin/test-backend-ops test -b DAYAN -o TOP_K \
@@ -160,7 +161,7 @@ The command uses the external Dayan server and does not launch dyperf or PCU. It
 
 These commands use different references. Dense MXFP4 uses a trained-GGUF smoke run plus the standalone CPU checks above. Dense BF16 uses a random layer against CPU. MoE compares a random two-layer mega graph with standalone Dayan; its CPU operator checks remain separate.
 
-Dense and MoE graphs launch separate kernels, `qwen35_dense_mega` and `qwen35_moe_mega`. Each reserves 272 bytes of Atomic Cache for matrix synchronization and the cluster barrier; the Runtime aligns initialization to 320 bytes. Sorting uses private URAM and reserves no Atomic Cache. MoE routing builds per-core counts and positions in URAM, then stores them in a reusable device workspace sized for the graph. Single-token decode does not use this dispatch workspace.
+Dense and MoE graphs launch separate kernels, `qwen35_dense_mega` and `qwen35_moe_mega`. Both reserve only the 16-byte outer cluster barrier in Atomic Cache, aligned to 64 bytes by the Runtime. Matrix, FFN, attention and MoE routing synchronize through Shared Resources 20..23. Their 256-byte metadata workspace is appended to the ordinary DRAM mega parameter buffer; each core owns a separate 64-byte cache line, with explicit flush/invalidate when publishing or reading peer state. Matrix worker phases stay in private CPU state during execution. Standalone four-core matrix and attention entries retain an Atomic Cache metadata allocation for compatibility; their internal synchronization also uses Resources. VEC SparseMem is a separate, core-local SRAM; it does not address Runtime `shared` memory. Standalone sorting uses private URAM and reserves no Atomic Cache. MoE routing builds counts, prefix sums and grouped row maps with VEC, then exchanges results through a reusable ordinary DRAM workspace. Single-token decode skips dispatch-table construction.
 
 MoE mega reuses the BF16 attention segment and includes routing, MXFP4 experts, shared experts, and the F32 residual in one launch per layer. Parameter offsets are 64-bit for weights beyond 4 GiB. Benchmark clients can set `GGML_DAYAN_MEGA_TAG` to override the profiler name.
 
@@ -233,7 +234,7 @@ python3 tools/dayan-trace/layer-perf.py prepare \
 
 The same command accepts `DAYAN_MODEL_MXFP4` or `DAYAN_MODEL_MOE`. `--layer` is zero-based; layer 0 is linear attention and layer 3 is full attention in the standard Qwen3.5-0.8B cycle. The script detects attention type from the tensors and keeps only that block plus embedding and output tensors. This measures a one-layer model fed from embeddings; it does not reproduce intermediate activations from the full source model. Split GGUF files must be merged before extraction.
 
-Prepare several independent single-layer models at once, for MXFP4 or BF16:
+Prepare several independent single-layer models at once, for MXFP4 dense, BF16 dense or MXFP4 MoE:
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py prepare \
@@ -241,6 +242,9 @@ python3 tools/dayan-trace/layer-perf.py prepare \
 
 python3 tools/dayan-trace/layer-perf.py prepare \
     --model "$DAYAN_MODEL_BF16" --layer 0 3 --output build-dayan/layers-bf16
+
+python3 tools/dayan-trace/layer-perf.py prepare \
+    --model "$DAYAN_MODEL_MOE" --layer 0 3 --output build-dayan/layers-moe
 ```
 
 Each output directory contains `layer-0/` and `layer-3/`, each with its own `layer.gguf` and `layer.json`. A single index keeps the original layout with files directly under `--output`; the default index is 0.
@@ -274,9 +278,16 @@ python3 tools/dayan-trace/layer-perf.py run \
     --prepared build-dayan/layers-bf16 --layer 0 3 \
     --mode prefill decode --input-len 1024 --output-len 32 \
     --cmp --pcu --output build-dayan/perf-bf16-both
+
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layers-moe --layer 0 3 \
+    --mode prefill decode --input-len 1024 --output-len 32 \
+    --cmp --pcu --output build-dayan/perf-moe-both
 ```
 
 Omit `--pcu` for cmodel. Each layer runs the requested modes in argument order. `--output-len` sets the measured decode steps, defaulting to one; prefill always uses zero output steps. Each mode has its own client process, prompt state, trace and CPU comparison. Decode rebuilds the prefix rather than reusing the measured prefill process.
+
+MoE runs use the `Qwen35MoeLinear` and `Qwen35MoeFull` mega graphs. Reports include routing, TopK, routed experts, shared experts and the final residual, with cycles and percentages for each slot. `layer.json` records MXFP4 precision and expert counts. The prepared model retains the original expert weights, F32 routers and BF16 attention/shared experts. For a small cmodel check, use `--input-len 4 --output-len 2`; the random MoE fixture uses source layers `0 1`. See [MoE layer tests](../../../tools/dayan-trace/layer-perf.md#moe-layers).
 
 With multiple modes, results are stored in `layer-N/prefill/` and `layer-N/decode/`, even for a single selected layer. The top-level `report.md`, `report.json` and `summary.csv` contain one row per layer and mode: step count, total layer cycles, median/min/max cycles per step and CPU comparison status. Each mode's detailed report includes slot cycles and percentages. Decode statistics exclude prompt setup. Single-mode directory layouts and old report inputs remain supported.
 
@@ -292,6 +303,8 @@ python3 tools/dayan-trace/layer-perf-report.py \
 ```
 
 `run` enables mega for the layer body and requires exactly one mega launch per inference step. Server messages `[kernel] lp-prefill started`, `lp-setup` and `lp-d...` identify the layer mega for prefill, decode setup and decode steps. Embedding (`get-rows`) and the output norm/head still launch separate kernels before or after it; they are excluded from the offline layer timing. Four `proc-create` RPCs for one launch create its four core tasks. `cmp-ops` uses standalone slots with mega disabled so it can capture each slot's inputs and outputs.
+
+For sorting, `cmp-ops` checks only the ARGSORT prefix consumed by the graph. It checks score order and unique, valid indices, allowing equal-score ties to use different index orders. Native `TOP_K` is unordered, so its comparison checks the selected score multiset and index uniqueness. Unwritten ARGSORT suffixes are reported as `ignored_elements`.
 
 The client defaults to `DAYAN_LAYER_CLIENT`, or `build-dayan-public/bin/llama-dayan-layer-bench` when unset. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf`, with `DAYAN_ROOT` falling back to `~/npu-firmware`. Override it with `--dyperf /path/to/dyperf`; the script automatically launches `dyperf --follow`, runs the client, and waits for the trace to close. PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; it adds `--pcu-interval 0` to dyperf for continuous sampling. cmodel does not support PCU, so omit `--pcu` there. `--client` and `--socket` override their environment defaults. No `--simulator` argument is needed.
 
@@ -326,7 +339,9 @@ python3 tools/dayan-trace/layer-perf-report.py --run build-dayan/layer-decode-cm
 
 `input-len` is the prompt length. Decode first executes that prompt to build real KV/recurrent state, then measures `output-len` single-token calls; prompt setup is excluded from decode timing. Prefill defaults to zero output steps. Each call must launch mega exactly once; standalone fallback or microbatch splitting fails the run. No warmup is performed.
 
-`--cmp` uses an independent GGML CPU baseline after perf capture. Its separate process keeps only the CPU backend registered, with GPU layers, KV offload and operation offload disabled; zero GPU layers alone do not prevent ACCEL buffer selection. Both runs use the same stored weights and token sequence. It checks all vocabulary logits for the prompt's final token and each decode step, including the unmeasured decode setup. It does not compare intermediate slot outputs. The CPU reference retains CPU arithmetic and quantization; BF16/MXFP4 and MoE routing differences remain visible. Every value must satisfy `abs(Dayan - CPU) <= atol + rtol * abs(CPU)`, with defaults `--cmp-atol 0.03 --cmp-rtol 0.03`; nonfinite outputs fail. Thresholds are never relaxed automatically. Without `--cmp`, only execution and finite outputs are checked.
+`--cmp` uses an independent GGML CPU baseline after perf capture. Its separate process keeps only the CPU backend registered, with GPU layers, KV offload and operation offload disabled; zero GPU layers alone do not prevent ACCEL buffer selection. Both runs use the same stored weights and token sequence. It checks all vocabulary logits for the prompt's final token and each decode step, including the unmeasured decode setup. It does not compare intermediate slot outputs. The CPU reference retains CPU arithmetic and quantization; BF16/MXFP4 and MoE routing differences remain visible. Without `--cmp`, only execution and finite outputs are checked.
+
+`--cmp-profile auto` uses strict elementwise checks for BF16: `abs(Dayan - CPU) <= 0.03 + 0.03 * abs(CPU)`. For MXFP4 dense and MoE, it allows relative L2 error <= 0.35 and cosine similarity >= 0.93 at every step. Both limits must pass, including decode setup; nonfinite outputs always fail. The report retains elementwise mismatch counts and errors as diagnostics. Override these MXFP4 limits with `--cmp-max-rel-l2` and `--cmp-min-cosine`, or use `--cmp-profile strict --cmp-atol 0.03 --cmp-rtol 0.03` for strict checks. This relaxation applies only to whole-layer `run --cmp`; BF16 and `cmp-ops` defaults remain unchanged. Profiles and thresholds are recorded in each case and report.
 
 The run directory contains `perf.json`, `run.json`, the command and log, and, with `--cmp`, `cpu-reference.json`, `cpu-reference.log` and saved Dayan logits. The report produces `report.md`, `report.json` and `slots.csv`, including complete Transformer layer cycles, each slot's cycles and percentage, and per-step CPU errors. Slot percentages divide each slot's summed cycles by summed layer cycles across measured steps; embedding and output norm/head are excluded. Overlapping slot spans can make percentages sum above 100%. Comparison failures return nonzero from both commands but keep the performance record for diagnosis. Each run needs an empty output directory.
 
@@ -478,11 +493,13 @@ MXFP4 uses `run_tiled<M, N>` specializations selected at entry from the matrix s
 | MXFP4 MatMul with output conversion | 512 x 512 x 512 | 512 x 256 x 512 | 2 | 1500.06 KiB |
 | MXFP4 gate/up + activation + conversion | 256 x 512 x 640 | 256 x 256 x 640, twice | 2 | 1534.06 KiB |
 
-K capacity is a multiple of 128, capped at 640 for MXFP4 and 512 for BF16/FP16 inputs, and reduced when packing scratch needs more space. The paired FFN reuses the up accumulator for packing after activation. Three C buffers for a 512 x 512 macro tile would occupy all 1536 KiB before inputs and scales, so that tile requires two C buffers.
+Prefill K capacity is a multiple of 128, capped at 640 for MXFP4 and 512 for BF16/FP16 inputs, and reduced when packing scratch needs more space. The paired FFN reuses the up accumulator for packing after activation. Three C buffers for a 512 x 512 macro tile would occupy all 1536 KiB before inputs and scales, so that tile requires two C buffers.
 
 Four-core prefill uses a 2 x 2 grid, covering up to 1024 x 1024 outputs per group for ordinary MatMul. Full groups run first; the final group divides its remaining rows and columns among the same cores, with 32-row and 16-column alignment (128 columns for MXFP4 output). For M=1024, QG (N=4096), K/V (N=512), output/down (N=1024), and FFN (N=3584) give all four cores equal output work. K/V assigns 512 x 256 outputs per core, retaining all four cores even though N is smaller than the full group width.
 
 The entry selects M=32/64/128/256/512 and N=512 for larger M. With M=32, N=128/256/512/1024/2048 minimizes padded work, preferring wider tiles on ties; post-processing requires N>=256. M<64 uses a 1 x 4 grid. Actual MAT instructions use valid M/N/K, including single rows and K32 tails. C rotation and Resource phases follow each buffer's actual uses, including skipped N slices and repeated expert calls.
+
+Single-row MXFP4 decode uses two C buffers and a separate tile policy. N is the per-core column count rounded to 256, capped at 3072; K grows to 1024, 2048 or 4096 when URAM permits. For Qwen3.5-0.8B, QKV uses N=1536/K=1024, output uses N=256/K=2048, and down uses N=256/K=4096. This path loads inputs independently and skips input-sharing barriers, even when `GGML_DAYAN_MXFP4_SHARE_INPUTS=1`. The CPU-reference regression is `test-dayan-mxfp4 --decode-matmul`.
 
 `GGML_DAYAN_MXFP4_SHARE_INPUTS=1` is the default for standalone and mega execution. In the 2 x 2 grid, horizontal peers share A and vertical peers share B, including scale planes and both gate/up weights. A Resource election selects the DRAM loader; its peer copies from the producer's URAM into its own buffer. In the 1 x 4 grid, core 0 broadcasts A to the other three cores and B remains private. Full groups halve A/B DRAM input loads in 2 x 2 mode; sharing adds peer LSU transfers and Resource synchronization. Each core computes and stores its own C, with no split-K reduction. One-core and native multi-task launches do not share inputs.
 
@@ -529,7 +546,15 @@ F32 matrix products, including the expert router and scalar shared gate, execute
 
 Graphs containing `MUL_MAT_ID` retain F32 residual storage. Rounding the residual stream to BF16 can change close router scores and select different experts in later layers.
 
-`ARGSORT` and `TOP_K` use a stable radix sort in private URAM. Signed zero is canonicalized and equal keys retain index order. Prefix consumers store only the requested indices with the original row stride. `GET_ROWS` accepts these strided I32/I64 views. Large independent row sets use two workers per Proc, each with separate scratch and LSU groups; sorting does not request VEC or Named Resources.
+`ARGSORT` and `TOP_K` use VEC compare/shuffle networks with index tie-breaking. Signed zero is canonicalized. For K<=32, each 64-lane group keeps a power-of-two candidate count covering K, with a minimum of eight for 32-byte URAM channel alignment, then repeats on the reduced candidate set. Full ARGSORT and larger K use a complete bitonic merge. Keys and indices stay in VEC registers through each local network; URAM holds data between candidate or merge stages. Prefix consumers store only the requested indices with the original row stride. `GET_ROWS` accepts these strided I32/I64 views.
+
+Prefill partitions contiguous row ranges across cores and batches rows in 256 KiB of scratch per worker. At 256 experts and Top-8, a full worker batch loads 102 rows (102 KiB of scores). Large row sets use two workers per Proc with separate scratch, LSU and VEC groups. Single-row decode sorts on one core. No Atomic Cache or Named Resources are needed for sorting. The DAPI header must provide the full four-bit LUT encoding for `__tx_vec_s_bitwise`.
+
+MoE mega runs matrix multiplication in `router`, softmax in `probs`, and VEC sorting plus dispatch-table preparation in `sort`. The sort step has one final cluster barrier; grouped prefill also synchronizes before reading peer selections, before combining per-core histograms, and before loading the combined expert bases. Single-token decode skips dispatch-table preparation. Slot reports therefore attribute the actual selection work to `sort`.
+
+Dispatch uses local SparseMem offsets: a 4 KiB histogram and a 256-byte reorder table fit within the 8 KiB SRAM. It processes up to 1024 experts per window and preserves partial row maps in DRAM between windows. VEC sorts assignments in 64-lane groups and updates each expert counter from one lane, without atomic instructions. Sequential DIM1 loops order counter updates. Mega reserves all Proc slots on each core, and sorting workers finish before dispatch uses this local SRAM.
+
+Grouped MXFP4 expert products use VEC-generated 64-bit address tables and LSU gather/scatter to move payload rows and scale planes in batches. They reuse the final row map for both expert products. Decode and standalone expert kernels invalidate the ID span once and read cached DRAM metadata, without a 4-byte DMA and scalar URAM read per expert. Non-power-of-two Top-K or offsets beyond the vector address builder's 32-bit range use cached DRAM maps and row copies.
 
 F32 binary operators read strided rows directly, including the expert output views used in MoE aggregation. Inputs with a noncontiguous first dimension still use Device copy staging. CLAMP accepts infinite bounds, including the lower-only clamp used to normalize selected routing weights.
 
@@ -547,7 +572,7 @@ The attention operator package provides dedicated BF16 and FP16 QG, K, and V pro
 
 Flash-Attention uses 128-query tiles and 128-key tiles. Each core owns two Q slices; Q remains resident across the KV traversal. K and transposed V each have two buffers. Four-core mode splits Q tiles between cores and elects one active core to load each K or V tile, then copies its URAM tile to the other active cores. Every core retires its Shared Resource credit, including cores with no query rows. Single-core mode uses private KV loaders. The graph executor selects four-core mode for more than 64 query rows when a complete Cluster is enabled, and single-core tasks otherwise.
 
-The root issues QK MAT; six child Threads load Q, load K, load V, compute online softmax, issue PV MAT, and update/store O. Each Q slice has two Score/P, PV, and softmax-state buffers, allowing the compute stages to overlap across KV tiles as well as slices. Score and P share FP32 storage in each buffer; both Resource tokens must be free before QK can overwrite it. P is read directly as TF32 by the mixed TF32/BF16 or TF32/FP16 PV product. Each state generation has an O-update reader and, except for the last tile, a reader in the next softmax. Two alternating O version tokens serialize updates to one O allocation. There are 26 Local Resources and, in four-core mode, four Shared Resources plus 128 bytes of shared metadata.
+The root issues QK MAT; six child Threads load Q, load K, load V, compute online softmax, issue PV MAT, and update/store O. Each Q slice has two Score/P, PV, and softmax-state buffers, allowing the compute stages to overlap across KV tiles as well as slices. Score and P share FP32 storage in each buffer; both Resource tokens must be free before QK can overwrite it. P is read directly as TF32 by the mixed TF32/BF16 or TF32/FP16 PV product. Each state generation has an O-update reader and, except for the last tile, a reader in the next softmax. Two alternating O version tokens serialize updates to one O allocation. There are 26 Local Resources. Four-core mode uses Shared Resources 0..3 for KV exchange and 20..23 for rendezvous, so its descriptor exposes a 24-entry Shared window. The 256-byte metadata block stores peer URAM bases and elected loader IDs; mega supplies it from ordinary DRAM.
 
 Q becomes reusable after its last QK MAT read. K becomes reusable after all active slices finish their QK MAT reads and all peer copies finish. Neither waits for softmax or O update. PV MAT releases P and V when its reads complete; O update releases PV and its state credit when VEC completes. The final O token is released by the LSU store. Resource phases persist across query groups and batches, including slices with different causal tile counts.
 
@@ -699,6 +724,13 @@ The Qwen3.5 dense test includes the BF16 single-token linear regression with see
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-qwen35-dense
+```
+
+The grouped routing regression checks exact CPU row maps, repeated experts, tails, repeated launches, 1024-expert window boundaries, empty windows, cross-batch counters, MXFP4 payload/scale permutations, F32 output restoration, and 64-bit address carry. Its 128 KiB scratch forces multiple batches in the large case. cmodel validation must enforce the 8 KiB local SparseMem capacity; an unbounded address map can hide invalid addresses and aliasing:
+
+```sh
+cmake --build build-dayan --target test-dayan-moe-dispatch
+DAYAN_SERVER_SOCKET=/tmp/dayan-moe.sock build-dayan/bin/test-dayan-moe-dispatch
 ```
 
 The BF16 MoE routing regression covers 512 experts, a narrow `ARGSORT` view, `TOP_K`, fused SWIGLU expert projections, the down expert projection, `ADD_ID`, and expert-weighted aggregation. For MXFP4 expert and TF32 router CPU comparisons, use the [MoE operator preset](#operator-benchmarks-with-limited-perfpy); for the random hybrid graph, use [MXFP4 MoE mega checks](#mxfp4-moe).

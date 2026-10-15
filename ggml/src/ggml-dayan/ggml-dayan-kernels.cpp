@@ -1820,7 +1820,7 @@ __kernel__ void rms_norm_pipeline_1c(const DayanNormPipelineConfig * config,
 #define DAYAN_MATMUL_1C_DESC(kernel) \
     DAYAN_KERNEL_NAMED_RESOURCE_DESC(kernel, 3, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES), 6, 1, 2, 0, 12, 0)
 #define DAYAN_MATMUL_4C_DESC(kernel) \
-    DAYAN_KERNEL_NAMED_RESOURCE_DESC(kernel, 3, MATMUL_DAYAN_4C_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 7, 1, 2, 0, 12, 12)
+    DAYAN_KERNEL_NAMED_RESOURCE_DESC(kernel, 3, MATMUL_DAYAN_4C_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 7, 1, 2, 0, 12, kDayanClusterResources)
 
 DAYAN_MATMUL_1C_DESC(matmul_bf16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_inference_bf16_1c);
@@ -1829,7 +1829,7 @@ DAYAN_MATMUL_1C_DESC(matmul_inference_fp16_1c);
 DAYAN_MATMUL_4C_DESC(matmul_bf16_4c);
 DAYAN_MATMUL_1C_DESC(matmul_mxfp4_1c);
 DAYAN_MATMUL_1C_DESC(mul_mat_id_mxfp4);
-DAYAN_KERNEL_NAMED_RESOURCE_DESC(matmul_mxfp4_4c, 3, MATMUL_DAYAN_4C_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 7, 1, 2, 0, 12, 20);
+DAYAN_KERNEL_NAMED_RESOURCE_DESC(matmul_mxfp4_4c, 3, MATMUL_DAYAN_4C_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 7, 1, 2, 0, 12, kDayanClusterResources);
 DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 2, 0, DAYAN_DESC_URAM_BYTES(640U * 1024U), 2, 0, 2, 0);
 DAYAN_KERNEL_TASK_DESC(router_f32, 4, 2, 0, DAYAN_DESC_URAM_BYTES(512U * 1024U), 2, 2, 0, 0);
 DAYAN_MATMUL_4C_DESC(matmul_inference_bf16_4c);
@@ -1891,14 +1891,14 @@ DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 6, DAYAN_KERNEL_RESOU
                               6, 2, 2, 0, 26, 0);
 DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
                               6, 2, 2, 0, 26, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
-                              6, 2, 2, 0, 26, 4);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
-                              6, 2, 2, 0, 26, 4);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_bf16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
-                              6, 2, 2, 0, 26, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_fp16_4c, 1U, 6, 0, 128, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
-                              6, 2, 2, 0, 26, 0);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, sizeof(DayanClusterState), DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, kDayanClusterResources);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_4c, 1U, 6, 0, sizeof(DayanClusterState), DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, kDayanClusterResources);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_bf16_4c, 1U, 6, 0, sizeof(DayanClusterState), DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, kDayanClusterResources);
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_decode_fp16_4c, 1U, 6, 0, sizeof(DayanClusterState), DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+                              6, 2, 2, 0, 26, kDayanClusterResources);
 DAYAN_KERNEL_TASK_DESC(gated_delta_net_f32_1c, 4, 2, 0,
                        DAYAN_DESC_URAM_BYTES(DAYAN_GATED_DELTA_NET_URAM_BYTES), 2, 0, 2, 0);
 DAYAN_KERNEL_NAMED_RESOURCE_TASK_DESC(gated_delta_net_chunk_f32_1c, 2, 2, 0,
@@ -1992,8 +1992,8 @@ DAYAN_KERNEL_TASK_DESC(rms_norm_pipeline_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYA
 #undef DAYAN_NATIVE_KERNEL_DESC
 #undef DAYAN_NATIVE_WORKER_DESC
 
-DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 4, 0, 0, 0);
-DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 4, 0, 0, 0);
+DAYAN_KERNEL_TASK_DESC(argsort_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 4, 0, 2, 0);
+DAYAN_KERNEL_TASK_DESC(top_k_f32_1c, 4, 2, 0, DAYAN_DESC_URAM_BYTES(DAYAN_SORT_TASK_URAM_BYTES), 4, 0, 2, 0);
 
 #undef DAYAN_MATMUL_4C_DESC
 #undef DAYAN_MATMUL_1C_DESC

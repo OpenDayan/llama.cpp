@@ -24,10 +24,11 @@ enum : uint32_t {
     kDayanMegaRootCount     = 16,
 };
 
-struct DayanMegaConfig {
+struct alignas(8) DayanMegaConfig {
     uint32_t total_bytes;
     uint16_t graph;
     uint16_t parameter_count;
+    uint32_t workspace_offset = 0;
 };
 
 struct DayanMegaParameter {
@@ -84,7 +85,7 @@ int matmul_swiglu_bf16(const DayanMatmulConfig * config, const uint16_t * input,
 int matmul_quantized_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, uint16_t * output);
 int gated_output_projection_bf16(const DayanGatedProjectionConfig * config, const float * input, const float * gate, const uint16_t * weight, float * output, uint16_t * scratch);
 int matmul_tf32(const DayanMatmulConfig * config, const float * input, const float * weight, float * output);
-int router_indexer(const DayanRouterIndexerConfig * config, const float * input, const float * weight, float * logits, int32_t * selected, void * workspace);
+int moe_sort(const DayanMoeSortConfig * config, const float * probabilities, int32_t * selected, void * workspace);
 int matmul_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * input, const void * input_scales, const void * weight, const void * weight_scales, const void * up, const void * up_scales, const int32_t * selected, void * output, void * output_scales, void * workspace);
 int softmax(const DayanSoftmaxConfig * config, const float * input, float * output);
 int sum_rows(const DayanReduceConfig * config, const float * input, float * output);
@@ -137,7 +138,7 @@ constexpr uint16_t parameter_count(const uint16_t (&counts)[Count]) {
 #if defined(__DAYAN_DEVICE__)
 
 struct Operation {
-    int (*function)(const uintptr_t *);
+    int (*function)(const uintptr_t *, uint64_t);
     uint16_t argument_count;
     uint16_t barriers;
     char name[DAYAN_THREAD_NAME_SIZE];
@@ -158,8 +159,63 @@ struct Binding<int (*)(Args...), Entry> {
         return Entry(reinterpret_cast<Args>(parameters[Indices])...);
     }
 
-    static int call(const uintptr_t * parameters) {
+    static int call(const uintptr_t * parameters, uint64_t) {
         return invoke(parameters, typename MakeSequence<sizeof...(Args)>::type{});
+    }
+};
+
+template <typename Config> struct ClusterConfig {
+    static constexpr bool enabled = false;
+};
+
+template <> struct ClusterConfig<DayanMatmulConfig> {
+    static constexpr bool enabled = true;
+    static void bind(DayanMatmulConfig & config, uint64_t workspace) { config.cluster_workspace = workspace; }
+};
+
+template <> struct ClusterConfig<DayanMxfp4Config> {
+    static constexpr bool enabled = true;
+    static void bind(DayanMxfp4Config & config, uint64_t workspace) { config.cluster_workspace = workspace; }
+};
+
+template <> struct ClusterConfig<DayanFlashAttentionConfig> {
+    static constexpr bool enabled = true;
+    static void bind(DayanFlashAttentionConfig & config, uint64_t workspace) { config.cluster_workspace = workspace; }
+};
+
+template <> struct ClusterConfig<DayanMatmulPairConfig> {
+    static constexpr bool enabled = true;
+    static void bind(DayanMatmulPairConfig & config, uint64_t workspace) {
+        config.first.cluster_workspace = config.second.cluster_workspace = workspace;
+    }
+};
+
+template <> struct ClusterConfig<DayanGatedProjectionConfig> {
+    static constexpr bool enabled = true;
+    static void bind(DayanGatedProjectionConfig & config, uint64_t workspace) { config.matmul.cluster_workspace = workspace; }
+};
+
+template <> struct ClusterConfig<DayanMxfp4MoeConfig> {
+    static constexpr bool enabled = true;
+    static void bind(DayanMxfp4MoeConfig & config, uint64_t workspace) { config.matmul.cluster_workspace = workspace; }
+};
+
+template <typename Config, typename... Args, int (*Entry)(const Config *, Args...)>
+struct Binding<int (*)(const Config *, Args...), Entry> {
+    template <unsigned... Indices>
+    static int invoke(const uintptr_t * parameters, uint64_t workspace, Sequence<Indices...>) {
+        const auto * original = reinterpret_cast<const Config *>(parameters[0]);
+        if constexpr (ClusterConfig<Config>::enabled) {
+            Config config = *original;
+            ClusterConfig<Config>::bind(config, workspace);
+            return Entry(&config, reinterpret_cast<Args>(parameters[Indices + 1])...);
+        } else {
+            return Entry(original, reinterpret_cast<Args>(parameters[Indices + 1])...);
+        }
+    }
+
+    static int call(const uintptr_t * parameters, uint64_t workspace) {
+        return invoke(parameters, workspace, typename MakeSequence<sizeof...(Args)>::type{});
     }
 };
 

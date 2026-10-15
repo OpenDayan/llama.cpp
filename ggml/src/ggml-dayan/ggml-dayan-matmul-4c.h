@@ -15,31 +15,20 @@ struct Constants {
 };
 
 using ggml_dayan_matmul_detail::min_int;
-using ClusterShared = ggml_dayan_matmul_detail::MatmulCluster;
-
-static inline ClusterShared & cluster_shared() {
-    return *(ClusterShared *) shared;
-}
-
-static inline void initialize_resources() {
+static inline void initialize_resources(uint64_t workspace = 0) {
     const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
-    DAYAN_PARAMS_IF(!shared || lane >= 4) {
+    DAYAN_PARAMS_IF((!workspace && !shared) || lane >= 4) {
         DAYAN_PARAMS_ERROR();
     }
-    cluster_shared().phases[lane] = {};
-    if (lane == 0) {
-        for (int i = 0; i < 12; ++i) {
-            cluster_shared().shared_phase[i] = 0;
-        }
-    }
-    ggml_dayan_matmul_detail::matmul_check(dayan_cluster_barrier(4, &cluster_shared().barrier));
+    dayan_cluster_state(workspace).core[lane] = {};
+    dayan_cluster_flush(workspace, lane);
+    ggml_dayan_matmul_detail::matmul_check(dayan_cluster_sync());
 }
 
 static inline int finish_epilogue_4c()
 {
     if (dayan_task_mode() == 1) { return 0; }
-    return dayan_cluster_barrier(Constants::kClusterCores,
-                                 &cluster_shared().barrier);
+    return dayan_cluster_sync();
 }
 
 static inline bool moe_allocation_fits_4c(uint64_t element_size,
@@ -91,34 +80,12 @@ static int read_selected_expert_4c(const DayanMulMatIdConfig *config,
                                    const int32_t *ids, uint64_t index,
                                    int32_t *expert)
 {
-    const uint32_t lane = dayan_task_id(DAYAN_TASK_X);
-    ClusterShared &cluster = cluster_shared();
-
-    if (lane == 0U) {
-        cluster.selected_status = 0;
-        const uint64_t scratch = (uint64_t)(uintptr_t)dayan_uram_base();
-        DAYAN_PARAMS_IF(!scratch || dayan_uram_size() < sizeof(int32_t)) {
-            cluster.selected_status = -12;
-        } else {
-            long checksum = 0;
-            set_lsu_matrix<0>(checksum, 1, 64, 64, 64);
-            ggml_dayan_matmul_detail::load_matrix<0>(
-                sizeof(int32_t), 1, 64, 1, scratch,
-                (uint64_t)(uintptr_t)ids + (index / config->experts_used) * config->ids_row_stride +
-                    (index % config->experts_used) * sizeof(int32_t));
-            dayan_wait_lsu();
-            cluster.selected_expert = *(const int32_t *)(uintptr_t)scratch;
-            if (cluster.selected_expert < 0 ||
-                (uint32_t)cluster.selected_expert >= config->experts)
-                cluster.selected_status = -22;
-        }
-    }
-    const int status = dayan_cluster_barrier(Constants::kClusterCores,
-                                             &cluster.barrier);
-    if (status < 0)
-        return status;
-    *expert = cluster.selected_expert;
-    return cluster.selected_status;
+    const auto * selected = (const int32_t *) ((const char *) ids +
+        (index / config->experts_used) * config->ids_row_stride +
+        (index % config->experts_used) * sizeof(int32_t));
+    dayan_cache_invalidate(selected, sizeof(*selected));
+    *expert = *selected;
+    return *expert < 0 || (uint32_t) *expert >= config->experts ? -22 : 0;
 }
 
 static inline DayanMatmulConfig moe_matmul_config_4c(

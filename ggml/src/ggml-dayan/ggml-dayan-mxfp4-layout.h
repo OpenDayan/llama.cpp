@@ -23,6 +23,21 @@ struct DayanMxfp4Tile {
     }
 
     static DayanMxfp4Tile make(uint64_t rows, uint64_t columns, uint64_t inner, bool scales, int products, bool post, uint64_t tasks = 4) {
+        if (rows == 1 && scales) {
+            const uint64_t local_columns = (columns + tasks - 1) / tasks;
+            DayanMxfp4Tile tile = {32, local_columns > 3072 ? 3072 : (int) ((local_columns + 255) & ~255ULL),
+                                  post ? 512 : 640, 0, products, 2, scales, post};
+            tile.input_stride = tile.k / 2;
+            while (tile.n > 256 && tile.bytes() > uram_bytes) { tile.n -= 256; }
+            for (int k = 1024; k <= 4096 && inner > (uint64_t) tile.k; k *= 2) {
+                DayanMxfp4Tile wider = tile;
+                wider.k = k;
+                wider.input_stride = k / 2;
+                if (wider.bytes() > uram_bytes) { break; }
+                tile = wider;
+            }
+            return tile;
+        }
         const uint64_t grid_rows = tasks == 4 && rows >= 64 ? 2 : 1;
         const uint64_t grid_cols = tasks / grid_rows;
         const uint64_t local_rows = (rows + grid_rows - 1) / grid_rows;

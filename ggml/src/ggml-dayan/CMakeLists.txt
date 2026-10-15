@@ -74,6 +74,7 @@ add_custom_command(
         ggml-dayan-kernels.h
         ggml-dayan-activation.h
         ggml-dayan-common.h
+        ggml-dayan-cluster.h
         ggml-dayan-attention.h
         ggml-dayan-conv.h
         ggml-dayan-elementwise.h
@@ -121,6 +122,7 @@ add_custom_command(
         ggml-dayan-activation.h
         ggml-dayan-attention.h
         ggml-dayan-common.h
+        ggml-dayan-cluster.h
         ggml-dayan-conv.h
         ggml-dayan-elementwise.h
         ggml-dayan-flash-attention.h
@@ -162,6 +164,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-kernels.h
     ggml-dayan-activation.h
     ggml-dayan-common.h
+    ggml-dayan-cluster.h
     ggml-dayan-attention.h
     ggml-dayan-conv.h
     ggml-dayan-elementwise.h

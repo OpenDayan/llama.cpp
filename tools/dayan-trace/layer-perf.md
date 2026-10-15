@@ -19,6 +19,30 @@ python3 tools/dayan-trace/layer-perf.py prepare \
 
 `--layer` is a zero-based source layer index. Select a full-attention block, such as layer 3 for the standard Qwen3.5-0.8B cycle, to profile FlashAttention instead of gated delta net. The extractor detects the layer type from its tensors. MoE uses the same commands with its source GGUF. Extraction uses the local `gguf-py` package and NumPy; reporting uses only Python's standard library.
 
+## MoE layers
+
+Qwen3.5/3.6 MoE GGUFs use architecture `qwen35moe`. Prepare and run their linear and full-attention layers together:
+
+```sh
+python3 tools/dayan-trace/layer-perf.py prepare \
+    --model /share/models/Qwen3.6-35B-A3B-MXFP4_MOE_BF16.gguf \
+    --layer 0 3 --output build-dayan/layers-moe
+
+python3 tools/dayan-trace/layer-perf.py run \
+    --prepared build-dayan/layers-moe --mode prefill decode \
+    --input-len 1024 --output-len 32 --cmp \
+    --output build-dayan/perf-moe
+
+python3 tools/dayan-trace/layer-perf-report.py \
+    --run build-dayan/perf-moe --mode prefill decode
+```
+
+The MoE mega graph includes attention, router, softmax, TopK, routed experts, shared experts and the final residual. Each slot has its own cycles and layer percentage in the report. The report also identifies the graph, weight precision, expert count and experts selected per token. Weights and expert metadata are retained during extraction, including the F32 routers, BF16 attention/shared experts and MXFP4 routed experts. This path requires MXFP4 expert weights; it does not select the dense FFN graph. `run --cmp` uses the CPU baseline, not standalone Dayan.
+
+For a cmodel check, use `--input-len 4 --output-len 2` and omit `--pcu`. The random two-layer MoE fixture in [MoE validation](qwen35-moe.md#cmodel-and-fixture) can be used with `--layer 0 1`. It exercises both attention kinds with a 512-token vocabulary; it does not measure trained-model quality. The server remains externally managed. Do not start cmodel while another test owns its device endpoints.
+
+## Dense layers and batch modes
+
 Pass multiple indices to prepare independent single-layer models in one command, for MXFP4 or BF16:
 
 ```sh
@@ -126,7 +150,16 @@ python3 tools/dayan-trace/layer-perf.py run \
 python3 tools/dayan-trace/layer-perf-report.py --run build/dayan-layer/decode-cmp
 ```
 
-Comparison covers every vocabulary logit for the prompt's final token and every decode step. Decode prompt setup is checked even though it is outside the timing summary. It does not download or compare intermediate slots. The pass condition is `abs(Dayan - CPU) <= cmp_atol + cmp_rtol * abs(CPU)` for every value; both tolerances default to `0.03`, and nonfinite values fail. `--cmp-atol` and `--cmp-rtol` override these explicit thresholds. BF16 rounding, MXFP4 activation conversion and MoE routing can produce differences from CPU; they are reported without changing the reference or automatically relaxing the thresholds.
+Comparison covers every vocabulary logit for the prompt's final token and every decode step. Decode prompt setup is checked even though it is outside the timing summary. It does not download or compare intermediate slots. `--cmp-profile auto` selects the following defaults:
+
+| Weights | Profile | Required for each step |
+| --- | --- | --- |
+| BF16 | `strict` | Every logit satisfies `abs(Dayan - CPU) <= 0.03 + 0.03 * abs(CPU)` |
+| MXFP4 dense or MoE | `mxfp4` | Relative L2 error <= 0.35 and cosine similarity >= 0.93 |
+
+Relative L2 is `norm(Dayan - CPU) / norm(CPU)`. The MXFP4 profile allows activation quantization error while retaining every elementwise mismatch, maximum error and greedy token in the report. Its mismatch count is diagnostic; pass/fail uses both aggregate limits separately for every step, including decode setup. Nonfinite logits fail in either profile. This is an end-to-end quantization check, not a replacement for operator correctness or language-quality evaluation. Large deviations can still fail the relaxed profile.
+
+Override the MXFP4 limits with `--cmp-max-rel-l2` and `--cmp-min-cosine`. Use `--cmp-profile strict` to require elementwise agreement, with `--cmp-atol` and `--cmp-rtol` overriding the default 0.03 tolerances. Those two tolerances only control diagnostic mismatch counts under the `mxfp4` profile. Resolved profiles and thresholds are saved in `case.json` and the CPU report. Existing prepared MoE/MXFP4 graph metadata also selects the MXFP4 profile, without preparing again. Older run results retain their recorded criteria when reported offline. BF16 defaults and `cmp-ops` thresholds are unchanged.
 
 `cpu-reference.json` and `cpu-reference.log` store the CPU result. `run.json` and the offline report include per-step and overall maximum absolute/relative error, relative L2 error, checked logit count and mismatch count. `run.json.logits.f32` stores the Dayan outputs as native float32 rows for this local comparison. The CPU process and comparisons run after capture; output saving occurs outside each inference timer. A failed comparison returns nonzero from both `run` and the report command, while preserving the trace and slot timings for diagnosis. Without `--cmp`, the run is an execution/finite-output check only.
 

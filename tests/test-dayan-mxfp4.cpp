@@ -73,12 +73,26 @@ static void layout_test() {
     require(mm.m == 512 && mm.n == 512 && mm.k == 640 && mm.c_buffers == 2, "prefill MatMul tile");
     require(converted.m == 512 && converted.n == 512 && converted.k == 512 && converted.c_buffers == 2, "converted MatMul tile");
     require(ffn.m == 256 && ffn.n == 512 && ffn.k == 640 && ffn.c_buffers == 2, "paired FFN tile");
+    const int decode_tiles[][5] = {
+        {6144, 1024, 1, 1536, 1024},
+        {4096, 1024, 1, 1024, 1024},
+        {512, 1024, 1, 256, 1024},
+        {16, 1024, 1, 256, 1024},
+        {1024, 2048, 1, 256, 2048},
+        {3584, 1024, 2, 1024, 1024},
+        {1024, 3584, 1, 256, 4096},
+    };
+    for (const auto & shape : decode_tiles) {
+        const auto tile = DayanMxfp4Tile::make(1, shape[0], shape[1], true, shape[2], shape[2] == 2);
+        require(tile.m == 32 && tile.n == shape[3] && tile.k == shape[4] && tile.c_buffers == 2, "decode MatMul tile");
+    }
     for (int rows : {1, 9, 127, 128, 257, 513, 1024}) {
         for (int columns : {16, 256, 544, 1024, 3584, 6144, 65536}) {
             for (bool mx : {false, true}) {
                 for (int products : {1, 2}) {
                     const auto tile = DayanMxfp4Tile::make(rows, columns, 3584, mx, products, true);
-                    require(tile.m > 0 && tile.m % 32 == 0 && tile.m <= 512 && tile.n % 256 == 0 && tile.k >= 128 && tile.k <= 640 && tile.k % 128 == 0, "tile alignment");
+                    const int max_k = rows == 1 && mx ? 4096 : 640;
+                    require(tile.m > 0 && tile.m % 32 == 0 && tile.m <= 512 && tile.n % 256 == 0 && tile.k >= 128 && tile.k <= max_k && tile.k % 128 == 0, "tile alignment");
                     require(tile.c_buffers >= 2 && tile.c_buffers <= 3, "accumulator buffer count");
                     require(tile.bytes() <= DayanMxfp4Tile::uram_bytes, "tile fits URAM");
                     require(tile.accumulator_offset() % 1024 == 0 && tile.scratch_offset() % 32 == 0 && tile.a_scale_stride() % 64 == 0 && tile.bytes() % 32 == 0, "buffer alignment");
@@ -390,6 +404,20 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all();
     ggml_backend_ptr backend(ggml_backend_init_by_name("DAYAN", nullptr));
     require(backend != nullptr, "initialize backend");
+    if (argc > 1 && std::strcmp(argv[1], "--decode-matmul") == 0) {
+        matmul_test(backend.get(), 1, 6144, 1024, false);
+        matmul_test(backend.get(), 1, 4096, 1024, false);
+        matmul_test(backend.get(), 1, 512, 1024, false);
+        matmul_test(backend.get(), 1, 16, 1024, false);
+        matmul_test(backend.get(), 1, 1024, 2048, false);
+        matmul_test(backend.get(), 1, 3584, 1024, true);
+        matmul_test(backend.get(), 1, 1024, 3584, false);
+        matmul_test(backend.get(), 1, 1040, 1056, false);
+        matmul_test(backend.get(), 1, 3072, 1056, true);
+        moe_reuse_test(backend.get());
+        std::puts("MXFP4 decode MatMul PASS");
+        return 0;
+    }
     if (argc > 1 && std::strcmp(argv[1], "--matmul-tiles") == 0) {
         matmul_test(backend.get(), 1024, 4096, 1024, false);
         matmul_test(backend.get(), 1024, 512, 1024, false);

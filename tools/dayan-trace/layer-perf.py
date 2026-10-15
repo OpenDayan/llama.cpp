@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare Qwen3.5 layers for single-layer inference with firmware dyperf."""
+"""Profile Qwen3.5/3.6 dense and MoE layers with firmware dyperf and CPU comparison."""
 
 import argparse
 import json
@@ -105,6 +105,7 @@ def prepare_layer(model, reader, layer, output):
     writer.add_full_attention_interval(2 if linear else 1)
     writer.add_nextn_predict_layers(0)
     kept = []
+    mxfp4 = False
     for tensor in reader.tensors:
         if tensor.name.startswith(prefix):
             name = "blk.0." + tensor.name[len(prefix):]
@@ -114,6 +115,7 @@ def prepare_layer(model, reader, layer, output):
             continue
         writer.add_tensor(name, tensor.data, raw_dtype=tensor.tensor_type, tensor_endianess=reader.endianess)
         kept.append(name)
+        mxfp4 |= tensor.tensor_type == gguf.GGMLQuantizationType.MXFP4
     try:
         writer.write_header_to_file()
         writer.write_kv_data_to_file()
@@ -122,7 +124,11 @@ def prepare_layer(model, reader, layer, output):
         writer.close()
     temporary.replace(target)
     metadata = dict(schema=1, model=str(target.resolve()), source_model=str(model.resolve()), source_layer=layer,
-                    architecture=arch, attention="linear" if linear else "full", graph=graph, tensors=kept)
+                    architecture=arch, attention="linear" if linear else "full", graph=graph,
+                    dtype="mxfp4" if mxfp4 else "bf16", tensors=kept)
+    if arch == "qwen35moe":
+        metadata.update(expert_count=reader.get_field(arch + ".expert_count").contents(),
+                        expert_used_count=reader.get_field(arch + ".expert_used_count").contents())
     write_json(output / "layer.json", metadata)
     print(f"Prepared {graph}, source layer {layer}: {target}")
 
@@ -149,10 +155,20 @@ def selected_models(prepared, layers):
     return batch, models
 
 
+def comparison_options(args, metadata):
+    profile = args.cmp_profile
+    if profile == "auto":
+        graph = metadata.get("graph", "")
+        mxfp4 = metadata.get("dtype") == "mxfp4" or "Mxfp4" in graph or graph.startswith("Qwen35Moe")
+        profile = "mxfp4" if mxfp4 else "strict"
+    return dict(cmp_profile=profile, cmp_atol=args.cmp_atol, cmp_rtol=args.cmp_rtol,
+                cmp_max_rel_l2=args.cmp_max_rel_l2, cmp_min_cosine=args.cmp_min_cosine)
+
+
 def run_layer(args, metadata, output):
     output.mkdir(parents=True, exist_ok=True)
     spec = dict(metadata, mode=args.mode, input_len=args.input_len, output_len=args.output_len,
-                seed=args.seed, cmp=args.cmp, cmp_atol=args.cmp_atol, cmp_rtol=args.cmp_rtol)
+                seed=args.seed, cmp=args.cmp, **comparison_options(args, metadata))
     case = output.resolve() / "case.json"
     result = output.resolve() / "run.json"
     trace = output.resolve() / "perf.json"
@@ -215,8 +231,11 @@ def main(argv=None):
     run_parser = commands.add_parser("run", parents=[common], help="run inference, record dyperf and generate reports")
     run_parser.add_argument("--pcu", action="store_true", help="include continuous PCU sampling (off by default; unsupported by cmodel)")
     run_parser.add_argument("--cmp", action="store_true", help="compare every step's final-token logits with a CPU replay after profiling")
-    run_parser.add_argument("--cmp-atol", type=float, default=0.03, help="absolute logit tolerance (default: 0.03)")
-    run_parser.add_argument("--cmp-rtol", type=float, default=0.03, help="relative logit tolerance (default: 0.03)")
+    run_parser.add_argument("--cmp-profile", choices=("auto", "strict", "mxfp4"), default="auto", help="auto selects aggregate MXFP4 checks for dense/MoE MXFP4 and strict elementwise checks for BF16")
+    run_parser.add_argument("--cmp-atol", type=float, default=0.03, help="absolute logit tolerance; diagnostic only with the mxfp4 profile (default: 0.03)")
+    run_parser.add_argument("--cmp-rtol", type=float, default=0.03, help="relative logit tolerance; diagnostic only with the mxfp4 profile (default: 0.03)")
+    run_parser.add_argument("--cmp-max-rel-l2", type=float, default=0.35, help="maximum relative L2 error per step with the mxfp4 profile (default: 0.35)")
+    run_parser.add_argument("--cmp-min-cosine", type=float, default=0.93, help="minimum cosine similarity per step with the mxfp4 profile (default: 0.93)")
     run_parser.add_argument("--dyperf", type=Path, default=Path(os.environ.get("DAYAN_ROOT", Path.home() / "npu-firmware")) / "build/host/dyperf/dyperf", help="profiler executable; launched automatically (default: $DAYAN_ROOT/build/host/dyperf/dyperf)")
     compare_parser = commands.add_parser("cmp-ops", parents=[common], help="compare each inference operator against CPU using its actual inputs")
     compare_parser.add_argument("--op-atol", type=float, default=1e-4)
@@ -236,9 +255,11 @@ def main(argv=None):
             raise ValueError("prefill requires output-len=0; decode requires output-len>0")
         if not 0 <= args.seed < 2**32:
             raise ValueError("seed must fit uint32")
-        tolerances = (args.cmp_atol, args.cmp_rtol) if args.command == "run" else (args.op_atol, args.op_rtol)
+        tolerances = (args.cmp_atol, args.cmp_rtol, args.cmp_max_rel_l2) if args.command == "run" else (args.op_atol, args.op_rtol)
         if any(not math.isfinite(value) or value < 0 for value in tolerances):
             raise ValueError("comparison tolerances must be finite and nonnegative")
+        if args.command == "run" and (not math.isfinite(args.cmp_min_cosine) or not -1 <= args.cmp_min_cosine <= 1):
+            raise ValueError("minimum cosine must be finite and between -1 and 1")
         batch, models = selected_models(args.prepared, args.layer)
         execute = run_layer if args.command == "run" else compare_operators
         for path in ([args.client, args.dyperf] if args.command == "run" else [args.client]):

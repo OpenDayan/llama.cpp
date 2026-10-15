@@ -5,6 +5,7 @@ import io
 import json
 from pathlib import Path
 import socket
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -281,12 +282,16 @@ class LayerPerfTests(unittest.TestCase):
 
 
 class LayerBatchTests(unittest.TestCase):
-    def prepare(self, directory):
+    def prepare(self, directory, moe=False):
         for layer in (0, 3):
             path = directory / f"layer-{layer}"
             path.mkdir(parents=True)
             (path / "layer.gguf").touch()
-            runner.write_json(path / "layer.json", dict(schema=1, source_layer=layer, model=str(path / "layer.gguf")))
+            metadata = dict(schema=1, source_layer=layer, model=str(path / "layer.gguf"))
+            if moe:
+                metadata.update(architecture="qwen35moe", graph="Qwen35Moe" + ("Linear" if layer == 0 else "Full"),
+                                dtype="mxfp4", expert_count=256, expert_used_count=8)
+            runner.write_json(path / "layer.json", metadata)
 
     def test_selection_and_single_layer_compatibility(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -421,10 +426,10 @@ class LayerBatchTests(unittest.TestCase):
                 self.assertFalse((path / "output/layer-0/perf.json").exists())
 
     def test_multiple_modes_generate_independent_reports_and_filter_results(self):
-        for failure in (None, "comparison", "inference", "trace"):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+        for failure, moe in [(None, True)] + [(failure, False) for failure in (None, "comparison", "inference", "trace")]:
+            with self.subTest(failure=failure, moe=moe), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)
-                self.prepare(path / "prepared")
+                self.prepare(path / "prepared", moe=moe)
                 output = path / "output"
                 calls = []
 
@@ -440,6 +445,7 @@ class LayerBatchTests(unittest.TestCase):
                     self.assertEqual(case.parent, output / f"layer-{layer}" / mode)
                     self.assertEqual(spec["input_len"], 4)
                     self.assertEqual(spec["output_len"], 0 if mode == "prefill" else 2)
+                    self.assertEqual(spec["cmp_profile"], "mxfp4" if moe else "strict")
                     failing = (layer, mode) == (0, "decode")
                     if profiling:
                         if failing and failure == "inference":
@@ -490,6 +496,48 @@ class LayerBatchTests(unittest.TestCase):
                     self.assertTrue((path / "filtered/layer-3/prefill/kernels.csv").is_file())
                 self.assertIn("Median cycles/step", (output / "report.md").read_text())
                 self.assertEqual(len((output / "summary.csv").read_text().splitlines()), 5)
+                if moe:
+                    text = (output / "layer-0/prefill/report.md").read_text()
+                    self.assertIn("Qwen35MoeLinear", text)
+                    self.assertIn("experts: 256; selected per token: 8", text)
+
+    def test_comparison_profiles_and_overrides(self):
+        args = SimpleNamespace(cmp_profile="auto", cmp_atol=0.03, cmp_rtol=0.03, cmp_max_rel_l2=0.35, cmp_min_cosine=0.93)
+        for graph, expected in (("Qwen35DenseBf16Linear", "strict"), ("Qwen35DenseMxfp4Full", "mxfp4"),
+                                ("Qwen35MoeLinear", "mxfp4"), ("Qwen35MoeFull", "mxfp4")):
+            self.assertEqual(runner.comparison_options(args, dict(graph=graph))["cmp_profile"], expected)
+        self.assertEqual(runner.comparison_options(args, dict(dtype="mxfp4", graph="Qwen35DenseBf16Full"))["cmp_profile"], "mxfp4")
+        args.cmp_profile, args.cmp_atol, args.cmp_rtol = "strict", 0.1, 0.2
+        options = runner.comparison_options(args, dict(graph="Qwen35MoeFull"))
+        self.assertEqual((options["cmp_profile"], options["cmp_atol"], options["cmp_rtol"]), ("strict", 0.1, 0.2))
+        args.cmp_profile, args.cmp_max_rel_l2, args.cmp_min_cosine = "mxfp4", 0.4, 0.9
+        options = runner.comparison_options(args, dict(dtype="bf16"))
+        self.assertEqual((options["cmp_profile"], options["cmp_max_rel_l2"], options["cmp_min_cosine"]), ("mxfp4", 0.4, 0.9))
+
+    def test_invalid_comparison_limits_fail_before_launch(self):
+        for option, value in (("--cmp-max-rel-l2", "-1"), ("--cmp-max-rel-l2", "nan"),
+                              ("--cmp-min-cosine", "1.1"), ("--cmp-min-cosine", "-1.1"), ("--cmp-min-cosine", "inf")):
+            with self.subTest(option=option, value=value), tempfile.TemporaryDirectory() as directory, contextlib.redirect_stderr(io.StringIO()):
+                path = Path(directory)
+                with patch.object(runner.subprocess, "run") as execute:
+                    self.assertEqual(runner.main(["run", "--prepared", str(path / "missing"), "--output", str(path / "output"), option, value]), 1)
+                execute.assert_not_called()
+
+    def test_mxfp4_report_displays_aggregate_criterion_and_diagnostic_mismatches(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(directory)
+            run, trace = fixture()
+            run["case"].update(cmp=True, graph="Qwen35MoeLinear", dtype="mxfp4", expert_count=256, expert_used_count=8)
+            run["comparison"] = dict(reference="CPU", status="pass", profile="mxfp4", max_relative_l2_error=0.35, min_cosine_similarity=0.93,
+                                     atol=0.03, rtol=0.03, steps=[dict(step=0, phase="prefill", status="pass", checked_elements=512,
+                                     mismatched_elements=80, max_abs_error=0.2, max_rel_error=3, relative_l2_error=0.1, cosine_similarity=0.99)])
+            runner.write_json(path / "run.json", run)
+            runner.write_json(path / "perf.json", trace)
+            self.assertEqual(report.main(["--run", str(path)]), 0)
+            text = (path / "report.md").read_text()
+            self.assertIn("relative L2 <= 0.35 and cosine >= 0.93 for every step", text)
+            self.assertIn("do not determine this profile's status", text)
+            self.assertIn("| 512 | 80 | 0.2 | 3 | 0.1 | 0.99 |", text)
 
     def test_single_prepared_layer_supports_mode_order_and_defaults(self):
         for command in ("run", "cmp-ops"):
@@ -567,6 +615,92 @@ class LayerBatchTests(unittest.TestCase):
                     self.assertEqual(report.main(["--run", str(path / "output")]), 1)
                 summary = json.loads((path / "output/report.json").read_text())
                 self.assertEqual(summary["layers"][1], dict(source_layer=3, mode="prefill", status="not-run", report=None))
+
+
+class LayerMoePrepareTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(runner.ROOT / "gguf-py"))
+        try:
+            import gguf
+            import numpy
+        except ImportError as error:
+            raise unittest.SkipTest(f"GGUF extraction needs NumPy and gguf-py: {error}")
+        cls.gguf, cls.np = gguf, numpy
+
+    def write_model(self, path, expert_type):
+        gguf, np = self.gguf, self.np
+        writer = gguf.GGUFWriter(path, "qwen35moe")
+        writer.add_block_count(5)
+        writer.add_nextn_predict_layers(1)
+        writer.add_full_attention_interval(4)
+        writer.add_expert_count(256)
+        writer.add_expert_used_count(8)
+        writer.add_head_count([8, 8, 8, 16, 8])
+        writer.add_head_count_kv([2, 2, 2, 4, 2])
+        writer.add_feed_forward_length([256, 256, 256, 512, 256])
+        writer.add_tokenizer_model("llama")
+        writer.add_token_list(["one", "two", "three", "four"])
+
+        def tensor(name, shape, dtype):
+            data = np.ones(shape, dtype=np.float32)
+            if dtype != gguf.GGMLQuantizationType.F32:
+                data = gguf.quants.quantize(data, dtype)
+            writer.add_tensor(name, data, raw_dtype=dtype)
+
+        f32, bf16 = gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.BF16
+        tensor("token_embd.weight", (4, 32), bf16)
+        tensor("output.weight", (4, 32), bf16)
+        tensor("output_norm.weight", (32,), f32)
+        for layer in (0, 3, 4):
+            prefix = f"blk.{layer}."
+            tensor(prefix + ("ssm_conv1d.weight" if layer == 0 else "attn_q.weight"), (32, 32), bf16)
+            tensor(prefix + "ffn_gate_inp.weight", (256, 32), f32)
+            for part in ("gate", "up", "down"):
+                tensor(prefix + f"ffn_{part}_exps.weight", (256, 32, 32), expert_type)
+                tensor(prefix + f"ffn_{part}_shexp.weight", (32, 32), bf16)
+            tensor(prefix + "ffn_gate_inp_shexp.weight", (32,), f32)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def test_extract_moe_layers_preserves_weights_and_routing_metadata(self):
+        gguf = self.gguf
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(directory)
+            source = path / "moe.gguf"
+            self.write_model(source, gguf.GGMLQuantizationType.MXFP4)
+            runner.prepare(source, [0, 3], path / "prepared")
+            original = {t.name: t for t in gguf.GGUFReader(source).tensors}
+            for layer, graph, interval in ((0, "Qwen35MoeLinear", 2), (3, "Qwen35MoeFull", 1)):
+                target = path / "prepared" / f"layer-{layer}"
+                metadata = json.loads((target / "layer.json").read_text())
+                self.assertEqual((metadata["graph"], metadata["dtype"], metadata["expert_count"], metadata["expert_used_count"]), (graph, "mxfp4", 256, 8))
+                reader = gguf.GGUFReader(target / "layer.gguf")
+                for key, value in (("block_count", 1), ("nextn_predict_layers", 0), ("full_attention_interval", interval),
+                                   ("expert_count", 256), ("expert_used_count", 8)):
+                    self.assertEqual(reader.get_field("qwen35moe." + key).contents(), value)
+                self.assertEqual(reader.get_field("qwen35moe.attention.head_count").contents(), [8 if layer == 0 else 16])
+                self.assertEqual(reader.get_field("tokenizer.ggml.tokens").contents(), ["one", "two", "three", "four"])
+                self.assertEqual({t.name for t in reader.tensors}, set(metadata["tensors"]))
+                for tensor in reader.tensors:
+                    source_name = tensor.name.replace("blk.0.", f"blk.{layer}.")
+                    expected = original[source_name]
+                    self.assertEqual(tensor.tensor_type, expected.tensor_type)
+                    self.assertEqual(tensor.data.tobytes(), expected.data.tobytes())
+
+    def test_moe_bf16_experts_and_mtp_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(directory)
+            source = path / "moe.gguf"
+            self.write_model(source, self.gguf.GGMLQuantizationType.BF16)
+            with self.assertRaisesRegex(ValueError, "MXFP4 expert weights"):
+                runner.prepare(source, [0], path / "bf16")
+            with self.assertRaisesRegex(ValueError, "excluding MTP"):
+                runner.prepare(source, [4], path / "mtp")
+            self.assertFalse((path / "bf16").exists())
+            self.assertFalse((path / "mtp").exists())
 
 
 if __name__ == "__main__":
