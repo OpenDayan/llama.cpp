@@ -390,8 +390,8 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
 
             sort_chunks(keys, ids, keys, ids, uram, 64, blocks, 256, 256, 64);
             configure_vec_grid(1);
-            __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(blocks - 1);
-            configure_vec_iterator<kVecV0Base>(0, 256, 0, 0);
+            __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(blocks - 1);
+            configure_vec_iterator<kVecV0Base>(256, 0, 0, 0);
             configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
             begin_vec_block(62);
             __tx_vec_lsu_g2v_broadcast32<0, 2>(UINT32_MAX);
@@ -429,7 +429,7 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
             __tx_vec_lsu_g2v_broadcast32<1, 2>(0);
             __tx_vec_vv_int32_cmp<0, 16, 3, 0b011>();
             __tx_vec_lsu_v2u_mask<0, 0, 3>(positions);
-            // DIM1 keeps histogram updates ordered across blocks.
+            // DIM0 keeps histogram updates ordered across blocks.
             normalization_start_loop(0, 62, 62);
             dayan_wait_vec();
             memory_store_bytes(mapping, positions, (uint64_t) rows * row_bytes);
@@ -450,8 +450,8 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
         const uint64_t offsets = keys + 4 * layout.count_stride, carry = offsets + layout.count_stride;
         memory_load_bytes(keys, workspace, 4 * layout.count_stride);
         configure_vec_grid(1);
-        __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(layout.count_stride / 256 - 1);
-        configure_vec_iterator<kVecV0Base>(0, 256, 0, 0);
+        __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(layout.count_stride / 256 - 1);
+        configure_vec_iterator<kVecV0Base>(256, 0, 0, 0);
         configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
         begin_vec_block(56);
         __tx_vec_lsu_g2v_broadcast32<1, 2>(0);

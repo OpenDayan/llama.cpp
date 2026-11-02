@@ -118,9 +118,9 @@ static inline void softmax_max_accumulate(const DayanSoftmaxConfig * config,
     const long instructions = loop_end + 20;
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
-    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
-    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, Constants::kVecBytes, 0, 0);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
+    configure_vec_iterator<kVecV0Base>(Constants::kVecBytes, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(Constants::kVecBytes, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
@@ -129,7 +129,7 @@ static inline void softmax_max_accumulate(const DayanSoftmaxConfig * config,
     } else {
         __tx_vec_lsu_u2v_broadcast32<1, 2>((long) (initialize ? sink : accumulator));
     }
-    // Q1 holds lane maxima across DIM1; mask evaluation adds four Q1 writes.
+    // Q1 holds lane maxima across DIM0; mask evaluation adds four Q1 writes.
     emit_softmax_logits(config, input, mask, slope);
     if (has_mask) {
         __tx_vec_vv_fp32_cmp<0, 20, 0, 0b100>();
@@ -162,9 +162,9 @@ static inline void softmax_exp_sum_accumulate(const DayanSoftmaxConfig * config,
     const long instructions = loop_end + 14 + (initialize ? (has_sink ? 7 : 0) : 2) + (finalize ? 1 : 0);
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
-    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
-    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, Constants::kVecBytes, 0, 0);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
+    configure_vec_iterator<kVecV0Base>(Constants::kVecBytes, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(Constants::kVecBytes, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);

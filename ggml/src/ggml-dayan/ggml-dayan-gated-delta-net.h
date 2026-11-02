@@ -79,20 +79,20 @@ static inline void configure_vec_iterator(long dim0_stride, long dim1_stride, lo
 
 static inline void configure_vec_recurrence() {
     // Each outer context updates eight state rows and packs eight outputs.
-    __tx_vec_tcsr_write<kVecDim0>(0);
-    __tx_vec_tcsr_write<kVecDim1>(kRowsPerThread - 1);
+    __tx_vec_tcsr_write<kVecDim0>(kRowsPerThread - 1);
+    __tx_vec_tcsr_write<kVecDim1>(0);
     __tx_vec_tcsr_write<kVecDim2>(kRowsPerGroup / kRowsPerThread - 1);
     __tx_vec_tcsr_write<kVecDim3>(kRowGroups - 1);
     __tx_vec_tcsr_write<kVecDim4>(0);
     __tx_vec_tcsr_write<kVecDim5>(0);
 
-    configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
+    configure_vec_iterator<kVecS0Base>(1, 0, 0, 0);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, kHeadDim * sizeof(float),
+    configure_vec_iterator<kVecV1Base>(kHeadDim * sizeof(float), 0,
                                        kRowsPerThread * kHeadDim * sizeof(float),
                                        kRowsPerGroup * kHeadDim * sizeof(float));
     configure_vec_iterator<kVecV2Base>(0, 0, kRowsPerThread * sizeof(float), kVecBytes);
-    configure_vec_iterator<kVecV3Base>(0, kScalarStride, 0, 0);
+    configure_vec_iterator<kVecV3Base>(kScalarStride, 0, 0, 0);
 }
 
 static inline long vec_control(long prologue0, long prologue1, long loop, long epilogue1, long epilogue0) {
@@ -512,9 +512,9 @@ static inline void issue_chunk_inverse(const GdnChunk & chunk, long output) {
         return;
     }
     configure_vec_outer(kChunkTokens);
-    __tx_vec_tcsr_write<kVecDim1>(chunk.rows - 2);
-    configure_vec_iterator<kVecS0Base>(0, 1, 0, 0);
-    configure_vec_iterator<kVecV0Base>(0, kChunkStride, 0, 0);
+    __tx_vec_tcsr_write<kVecDim0>(chunk.rows - 2);
+    configure_vec_iterator<kVecS0Base>(1, 0, 0, 0);
+    configure_vec_iterator<kVecV0Base>(kChunkStride, 0, 0, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, kChunkStride, 0);
     begin_vec_block(7);
     __tx_vec_lsu_u2v<1, 1>(uram_address(output));

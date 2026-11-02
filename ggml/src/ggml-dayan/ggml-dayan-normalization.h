@@ -186,13 +186,13 @@ static inline void normalization_accumulate(uint64_t accumulator, uint64_t input
     const long instructions = loop_end + 14 + (initialize ? 0 : 2);
 
     ggml_dayan_vec_detail::configure_vec_grid(1);
-    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
-    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, 0, 0);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(ggml_dayan_vec_detail::f32_chunks(elements) - 1);
+    configure_vec_iterator<kVecV0Base>(Constants::kVecBytes, 0, 0, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
     configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
     begin_vec_block(instructions);
-    // Q1 holds lane sums across DIM1; Q0 holds the current input.
+    // Q1 holds lane sums across DIM0; Q0 holds the current input.
     __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
     __tx_vec_lsu_u2v<0, 0>((long) input);
     if constexpr (Centered) {
@@ -327,10 +327,10 @@ static inline void normalization_cached_reduce(uint64_t values, uint64_t right, 
     const long instructions = loop_end + 16 + (square ? 3 : 0);
     const long row_bytes = (long) width * sizeof(float);
     ggml_dayan_vec_detail::configure_vec_grid(rows);
-    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(width / Constants::kVecLanes - 1);
-    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, row_bytes, 0);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(width / Constants::kVecLanes - 1);
+    configure_vec_iterator<kVecV0Base>(Constants::kVecBytes, 0, row_bytes, 0);
     configure_vec_iterator<kVecV1Base>(0, 0, Constants::kVecBytes, 0);
-    configure_vec_iterator<kVecV2Base>(0, Constants::kVecBytes, row_bytes, 0);
+    configure_vec_iterator<kVecV2Base>(Constants::kVecBytes, 0, row_bytes, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_g2v_broadcast32<1, 1>(0);
     __tx_vec_lsu_u2v<0, 0>((long) values);
@@ -424,10 +424,10 @@ static inline void normalization_cached_apply(uint64_t values, uint64_t output, 
                                               uint32_t width, uint32_t rows, bool write_rms, bool pack) {
     const long instructions = 4 + (scale != 0 ? 2 : 0) + (write_rms ? 1 : 0) + (pack ? 2 : 0);
     ggml_dayan_vec_detail::configure_vec_grid(rows);
-    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim1>(width / Constants::kVecLanes - 1);
-    configure_vec_iterator<kVecV0Base>(0, Constants::kVecBytes, (long) width * sizeof(float), 0);
+    __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(width / Constants::kVecLanes - 1);
+    configure_vec_iterator<kVecV0Base>(Constants::kVecBytes, 0, (long) width * sizeof(float), 0);
     configure_vec_iterator<kVecV1Base>(0, 0, Constants::kVecBytes, 0);
-    configure_vec_iterator<kVecV2Base>(0, Constants::kVecBytes, 0, 0);
+    configure_vec_iterator<kVecV2Base>(Constants::kVecBytes, 0, 0, 0);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v_broadcast32<1, 1>((long) inverse);
     __tx_vec_lsu_u2v<0, 0>((long) values);
