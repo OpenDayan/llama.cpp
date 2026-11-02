@@ -92,20 +92,13 @@ static inline void load_matrix(uint64_t major_left,
                                uint64_t minor_tile,
                                uint64_t uram_base,
                                uint64_t dram_base) {
-    if (minor_left == 0 || major_left == 0) {
+    if (minor_left == 0 || major_left == 0 || minor_tile == 0 || major_tile == 0) {
         return;
     }
 
+    major_left = major_left < major_tile ? major_left : major_tile;
     const uint64_t real_minor = minor_left < minor_tile ? minor_left : minor_tile;
     __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM1>(real_minor - 1U);
-
-    if (major_left >= major_tile) {
-        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(major_tile / 64U - 1U);
-        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
-        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
-        __tx_lsu_dma_d2u<TcsrId>((long) uram_base, (long) dram_base);
-        return;
-    }
 
     while (major_left) {
         uint64_t       handled_bytes   = major_left & ~0x3fULL;
@@ -114,6 +107,7 @@ static inline void load_matrix(uint64_t major_left,
         if (handled_bytes == 0 && remaining_bytes > 0) {
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(0);
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(remaining_bytes - 1U);
+            // Callers reserve a full 64-byte URAM beat for the padded tail.
             __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
             handled_bytes = remaining_bytes;
         } else {
@@ -135,20 +129,13 @@ static inline void store_matrix(uint64_t major_left,
                                 uint64_t minor_tile,
                                 uint64_t uram_base,
                                 uint64_t dram_base) {
-    if (minor_left == 0 || major_left == 0) {
+    if (minor_left == 0 || major_left == 0 || minor_tile == 0 || major_tile == 0) {
         return;
     }
 
+    major_left = major_left < major_tile ? major_left : major_tile;
     const uint64_t real_minor = minor_left < minor_tile ? minor_left : minor_tile;
     __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM1>(real_minor - 1U);
-
-    if (major_left >= major_tile) {
-        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_DIM0>(major_tile / 64U - 1U);
-        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(63);
-        __tx_lsu_tcsr_write<TcsrId * LSU_GROUPSZ + LSU_REQUESTWRITESIZE>(63);
-        __tx_lsu_dma_u2d<TcsrId>((long) dram_base, (long) uram_base);
-        return;
-    }
 
     while (major_left) {
         uint64_t       handled_bytes   = major_left & ~0x3fULL;

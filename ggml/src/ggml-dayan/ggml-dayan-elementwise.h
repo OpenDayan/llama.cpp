@@ -358,10 +358,13 @@ static void run_div_f32(const DayanBinaryConfig * config,
                                                                          NormalizationLayout::kTileElements;
     const uint64_t units_per_row = (row_elements + unit - 1) / unit;
     const uint64_t right_copies  = right_full || right_scalar ? 1 : Constants::kVecLanes / right_row;
-    ggml_dayan_vec_detail::configure_f32_tile(NormalizationLayout::kTileElements,
-                                              right_full ? (long) Constants::kVecBytes : 0);
-
     const bool reusable_right = binary_reusable_right(config);
+    const bool packed_scalars = right_scalar && !config->right_nb[0] &&
+                                config->right_ne[1] == config->ne[1] &&
+                                config->right_ne[2] == config->ne[2] &&
+                                config->right_ne[3] == config->ne[3] && !reusable_right;
+    uint64_t scalar_first = rows;
+    uint64_t scalar_count = 0;
     if (reusable_right && task < rows * units_per_row) {
         binary_preload_right(config, right, right_uram);
     }
@@ -386,7 +389,17 @@ static void run_div_f32(const DayanBinaryConfig * config,
 
         load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, left_uram,
                        (uint64_t) (uintptr_t) (left + left_base + column));
-        if (!reusable_right) {
+        uint64_t scalar_uram = right_uram;
+        if (packed_scalars) {
+            if (row < scalar_first || row >= scalar_first + scalar_count) {
+                scalar_first = row;
+                scalar_count = rows - row < NormalizationLayout::kTileElements ? rows - row : NormalizationLayout::kTileElements;
+                // Keep consecutive per-token divisors in URAM across row iterations.
+                load_matrix<0>(scalar_count * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1,
+                               right_uram, (uint64_t) (uintptr_t) (right + row));
+            }
+            scalar_uram += (row - scalar_first) * sizeof(float);
+        } else if (!reusable_right) {
             if (right_full) {
                 load_matrix<0>((uint64_t) length * sizeof(float), 1, NormalizationLayout::kFloatBytes, 1, right_uram,
                                (uint64_t) (uintptr_t) (right + right_base + column));
@@ -400,10 +413,14 @@ static void run_div_f32(const DayanBinaryConfig * config,
             }
         }
         dayan_wait_lsu();
+        ggml_dayan_vec_detail::configure_f32_tile(length, right_full ? (long) Constants::kVecBytes : 0);
         constexpr long instructions = 5;
         ggml_dayan_vec_detail::begin_vec_block(instructions);
         __tx_vec_lsu_u2v<0, 0>((long) left_uram);
-        if (right_scalar) {
+        if (packed_scalars) {
+            // Read packed words through the scalar port before broadcasting.
+            __tx_vec_lsu_g2v_broadcast32<1, 1>((long) *(const volatile uint32_t *) (uintptr_t) scalar_uram);
+        } else if (right_scalar) {
             __tx_vec_lsu_u2v_broadcast32<1, 1>((long) right_uram);
         } else {
             __tx_vec_lsu_u2v<1, 1>((long) right_uram);

@@ -50,7 +50,7 @@ cmake --build build-dayan -j6 --target \
     llama-cli llama-server llama-bench llama-dayan-trace \
     llama-dayan-operator-bench llama-dayan-moe-bench llama-dayan-layer-bench \
     test-backend-ops test-dayan-topology test-dayan-matmul test-dayan-graph \
-    test-dayan-mxfp4 test-dayan-moe test-dayan-qwen35-dense \
+    test-dayan-mxfp4 test-dayan-moe test-dayan-dma test-dayan-qwen35-dense \
     test-dayan-attention-projection test-dayan-flash-attention
 ```
 
@@ -731,6 +731,13 @@ The grouped routing regression checks exact CPU row maps, repeated experts, tail
 ```sh
 cmake --build build-dayan --target test-dayan-moe-dispatch
 DAYAN_SERVER_SOCKET=/tmp/dayan-moe.sock build-dayan/bin/test-dayan-moe-dispatch
+```
+
+The DMA regression checks short loads/stores, 64-byte boundaries, tile clipping, zero dimensions, URAM padding, and guard bytes. It also compares scalar division against a CPU reference, including top-8 decode, consecutive per-token divisors, cache rollover, strided/repeated divisors, and repeated launches on one or four cores:
+
+```sh
+cmake --build build-dayan --target test-dayan-dma
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock build-dayan/bin/test-dayan-dma
 ```
 
 The BF16 MoE routing regression covers 512 experts, a narrow `ARGSORT` view, `TOP_K`, fused SWIGLU expert projections, the down expert projection, `ADD_ID`, and expert-weighted aggregation. For MXFP4 expert and TF32 router CPU comparisons, use the [MoE operator preset](#operator-benchmarks-with-limited-perfpy); for the random hybrid graph, use [MXFP4 MoE mega checks](#mxfp4-moe).

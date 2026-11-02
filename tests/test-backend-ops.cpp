@@ -8707,6 +8707,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t row : {4, 8, 16, 32, 64}) {
         add_test_bin_bcast(GGML_TYPE_F32, {row, 1, 1, 1}, {(int) (128 / row), 4, 1, 1});
     }
+    for (int64_t tokens : {1, 17, 1024, 8193}) {
+        test_cases.emplace_back(new test_bin_bcast(ggml_div, GGML_TYPE_F32, {1, tokens, 1, 1}, {8, 1, 1, 1}));
+    }
 
     // single inplace tests, especially important for WebGPU backend since kernels for inplace vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
