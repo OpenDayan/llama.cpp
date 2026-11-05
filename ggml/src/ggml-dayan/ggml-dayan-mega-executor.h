@@ -76,6 +76,13 @@ int softplus(const DayanElementwiseConfig * config, const float * input, float *
 int sigmoid(const DayanElementwiseConfig * config, const float * input, float * output);
 int silu(const DayanElementwiseConfig * config, const float * input, float * output);
 int gated_delta_net(const DayanGatedDeltaNetConfig * config, const float * q, const float * k, const float * v, const float * g, const float * beta, const float * state, float * output);
+int gated_delta_net_z_bf16(const DayanGdnZGateConfig * config,
+                           const float * q, const float * k, const float * v, const float * g,
+                           const float * beta, const float * state, float * gdn_output,
+                           const float * state_source, float * state_destination,
+                           const float * norm_scale, float * norm_rms, float * norm_scaled,
+                           uint16_t * norm_lowp, const uint16_t * z_input, const uint16_t * z_weight,
+                           float * z_output, float * z_silu, float * gate_output);
 int rope(const DayanRopeConfig * config, const float * input, const int32_t * positions, const float * factors, float * output);
 int set_rows(const DayanRowsConfig * config, const float * input, const void * indices, void * output);
 int flash_attention_fp16(const DayanFlashAttentionConfig * config, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * output);
@@ -190,6 +197,13 @@ template <> struct ClusterConfig<DayanMatmulPairConfig> {
     static constexpr bool enabled = true;
     static void bind(DayanMatmulPairConfig & config, uint64_t workspace) {
         config.first.cluster_workspace = config.second.cluster_workspace = workspace;
+    }
+};
+
+template <> struct ClusterConfig<DayanGdnZGateConfig> {
+    static constexpr bool enabled = true;
+    static void bind(DayanGdnZGateConfig & config, uint64_t workspace) {
+        config.z_bf16.cluster_workspace = workspace;
     }
 };
 

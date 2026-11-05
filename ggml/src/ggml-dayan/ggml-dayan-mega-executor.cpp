@@ -154,6 +154,134 @@ int gated_delta_net(const DayanGatedDeltaNetConfig * config, const float * q, co
     return (int) ggml_dayan_gdn_detail::run_gated_delta_net(config, q, k, v, g, beta, state, output);
 }
 
+struct GdnZWorker {
+    const DayanGatedDeltaNetConfig * config;
+    const float * q;
+    const float * k;
+    const float * v;
+    const float * g;
+    const float * beta;
+    const float * state;
+    float * output;
+    ggml_dayan_matmul_detail::NativeContext context;
+
+    static void entry(void * argument) {
+        const auto & worker = *(const GdnZWorker *) argument;
+        const long status = ggml_dayan_gdn_detail::run_gated_delta_net_task<0>(
+            worker.config, worker.q, worker.k, worker.v, worker.g, worker.beta, worker.state, worker.output,
+            worker.context);
+        if (status < 0) { dayan_thread_exit(status); }
+    }
+};
+
+int gated_delta_net_z_bf16(const DayanGdnZGateConfig * config,
+                           const float * q, const float * k, const float * v, const float * g,
+                           const float * beta, const float * state, float * gdn_output,
+                           const float * state_source, float * state_destination,
+                           const float * norm_scale, float * norm_rms, float * norm_scaled,
+                           uint16_t * norm_lowp, const uint16_t * z_input, const uint16_t * z_weight,
+                           float * z_output, float * z_silu, float * gate_output) {
+    if (config == nullptr || q == nullptr || k == nullptr || v == nullptr || g == nullptr || beta == nullptr ||
+        state == nullptr || gdn_output == nullptr || state_source == nullptr || state_destination == nullptr ||
+        z_input == nullptr || z_weight == nullptr || z_output == nullptr || z_silu == nullptr || gate_output == nullptr ||
+        (config->norm_pipeline.flags & kDayanNormWriteScaled && norm_scaled == nullptr) ||
+        (config->norm_pipeline.flags & kDayanNormWriteRms && norm_rms == nullptr)) {
+        return -22;
+    }
+
+    using namespace ggml_dayan_matmul_detail;
+    reset_local_resources();
+    if (dayan_task_mode() == 4) {
+        ggml_dayan_matmul_4c_detail::initialize_resources(config->z_bf16.cluster_workspace);
+    }
+
+    const uint32_t task = dayan_task_id(DAYAN_TASK_X);
+    const uint32_t tasks = dayan_task_dim(DAYAN_TASK_X);
+    const uint64_t elements = (uint64_t) config->gdn.sequences * config->gdn.heads * config->gdn.tokens * 128U * 128U;
+    const uint64_t units = (uint64_t) config->gdn.sequences * config->gdn.heads;
+    const uint32_t worker_bytes = 128U * 1024U;
+    const bool parallel = tasks != 0 && task < tasks && elements >= (uint64_t) tasks * 2U * 32768U &&
+                          units >= (uint64_t) tasks * 2U && 2ULL * worker_bytes <= dayan_uram_size();
+    int threads[2] = {};
+    GdnZWorker workers[2] = {};
+    dayan_thread_resources_t resources = {};
+    resources.lsu_tcsr_count = 1;
+    resources.vec_tcsr_count = 1;
+    int created = 0;
+    int gdn_status = 0;
+    if (parallel) {
+        const uint64_t uram = (uintptr_t) dayan_uram_base();
+        for (int index = 0; index < 2; ++index) {
+            workers[index] = {config ? &config->gdn : nullptr, q, k, v, g, beta, state, gdn_output,
+                              {uram + (uint64_t) index * worker_bytes, worker_bytes,
+                               task * 2U + (uint32_t) index, tasks * 2U}};
+            const int thread = dayan_create_thread(index == 0 ? "gdn-z-0" : "gdn-z-1", GdnZWorker::entry,
+                                                    &workers[index], &resources);
+            if (thread < 0) { break; }
+            threads[created++] = thread;
+        }
+        if (created != 2) {
+            for (int index = 0; index < created; ++index) {
+                int64_t result = 0;
+                const int status = dayan_thread_join(threads[index], &result);
+                if (gdn_status == 0 && status < 0) { gdn_status = status; }
+                if (gdn_status == 0 && result < 0) { gdn_status = (int) result; }
+            }
+            const uint64_t uram = (uintptr_t) dayan_uram_base();
+            for (int index = created; index < 2; ++index) {
+                const NativeContext context = {uram + (uint64_t) index * worker_bytes, worker_bytes,
+                                               task * 2U + (uint32_t) index, tasks * 2U};
+                const long status = ggml_dayan_gdn_detail::run_gated_delta_net_task<0>(
+                    &config->gdn, q, k, v, g, beta, state, gdn_output, context);
+                if (gdn_status == 0 && status < 0) { gdn_status = (int) status; }
+            }
+        }
+    } else {
+        const NativeContext context = {(uintptr_t) dayan_uram_base(), worker_bytes, task, tasks};
+        gdn_status = (int) ggml_dayan_gdn_detail::run_gated_delta_net_task<0>(
+            &config->gdn, q, k, v, g, beta, state, gdn_output, context);
+    }
+
+    int matmul_status = 0;
+    if (dayan_task_mode() == 1) {
+        matmul_status = run_matmul<Bf16Format, 1, 1, sizeof(float), false, epilogue_identity,
+                                   nullptr, 0, true>(&config->z_bf16, z_input, z_weight, nullptr, z_output,
+                                                    nullptr, nullptr, 64);
+    } else if (dayan_task_mode() == 4) {
+        matmul_status = ggml_dayan_matmul_4c_detail::run_matmul_4c<Bf16Format, true>(
+            &config->z_bf16, z_input, z_weight, z_output);
+    } else {
+        matmul_status = -22;
+    }
+
+    if (parallel && created == 2) {
+        for (int index = 0; index < created; ++index) {
+            int64_t result = 0;
+            const int status = dayan_thread_join(threads[index], &result);
+            if (gdn_status == 0 && status < 0) { gdn_status = status; }
+            if (gdn_status == 0 && result < 0) { gdn_status = (int) result; }
+        }
+    }
+    if (matmul_status < 0) { return matmul_status; }
+    if (gdn_status < 0) { return gdn_status; }
+    if (dayan_task_mode() == 4) {
+        const int status = dayan_cluster_barrier(4, (dayan_cluster_barrier_t *) shared);
+        if (status < 0) { return status; }
+    }
+
+    run_copy(&config->state_copy, state_source, state_destination);
+    run_rms_norm_pipeline(&config->norm_pipeline, gdn_output, nullptr, norm_scale, nullptr,
+                          norm_rms, norm_scaled, norm_lowp);
+    run_unary_f32<silu_tile>(&config->z_silu, z_output, z_silu);
+    if (dayan_task_mode() == 4) {
+        const int status = dayan_cluster_barrier(4, (dayan_cluster_barrier_t *) shared);
+        if (status < 0) { return status; }
+    }
+    run_binary_f32<__tx_vec_vv_fp32_mul<0, 0, 16, 0>>(
+        &config->gate_mul, norm_scaled, z_silu, gate_output);
+    return 0;
+}
+
 int rope(const DayanRopeConfig * config, const float * input, const int32_t * positions, const float * factors, float * output) {
     ggml_dayan_matmul_detail::run_rope_f32(config, input, positions, factors, output);
     return 0;

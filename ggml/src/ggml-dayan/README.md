@@ -163,6 +163,8 @@ These commands use different references. Dense MXFP4 uses a trained-GGUF smoke r
 
 Dense and MoE graphs launch separate kernels, `qwen35_dense_mega` and `qwen35_moe_mega`. Both reserve only the 16-byte outer cluster barrier in Atomic Cache, aligned to 64 bytes by the Runtime. Matrix, FFN, attention and MoE routing synchronize through Shared Resources 20..23. Their 256-byte metadata workspace is appended to the ordinary DRAM mega parameter buffer; each core owns a separate 64-byte cache line, with explicit flush/invalidate when publishing or reading peer state. Matrix worker phases stay in private CPU state during execution. Standalone four-core matrix and attention entries retain an Atomic Cache metadata allocation for compatibility; their internal synchronization also uses Resources. VEC SparseMem is a separate, core-local SRAM; it does not address Runtime `shared` memory. Standalone sorting uses private URAM and reserves no Atomic Cache. MoE routing builds counts, prefix sums and grouped row maps with VEC, then exchanges results through a reusable ordinary DRAM workspace. Single-token decode skips dispatch-table construction.
 
+Single-token Qwen3.5 Dense BF16 and MoE linear graphs can fuse GDN with the BF16 z projection, then run state copy, RMSNorm, SiLU and the gate multiply in the same mega slot. GDN and z MAT execute concurrently. Prefill, MXFP4 z weights, and unsupported tensor layouts keep the separate slots. `roofline.csv` records a component-based fused estimate; it is not a measurement of the fused slot.
+
 MoE mega reuses the BF16 attention segment and includes routing, MXFP4 experts, shared experts, and the F32 residual in one launch per layer. Parameter offsets are 64-bit for weights beyond 4 GiB. Benchmark clients can set `GGML_DAYAN_MEGA_TAG` to override the profiler name.
 
 Single-token FFNs can use `moe_ffn_decode` from `ggml-dayan-moe-ffn.h`. This kernel keeps Gate/Up, SwiGLU, the existing hidden quantization boundary, Down, routing multiplication and expert reduction in URAM. One persistent weight loader serves all selected experts; only the final output goes to DRAM. Dense MXFP4 and BF16 FFNs and the MoE shared expert use the same path with one expert. Routing and normalization remain separate slots.
@@ -328,6 +330,8 @@ unset GGML_DAYAN_TIMEOUT_MS
 
 Status `-110` is a timeout, not a CPU comparison failure. Returning from a timed-out host wait does not prove the device task stopped. Check the external server and simulator, and finish or reset the outstanding task before retrying in a new output directory. A subsequent `-28` can indicate resources retained by the previous task. The runner does not reset the external server.
 
+For an intermittent inference stall, first run without dyperf, set `GGML_DAYAN_TIMEOUT_MS=60000 GGML_DAYAN_MEGA_DEBUG=1`, and retain both client stderr and server logs. The mega debug output identifies submitted graphs and completed launches; it does not identify the last active device slot. Start the server with `DAYAN_RPC_DEBUG=1` to record RPC begin/end and core IDs. A timeout bounds a host wait and does not prove a Resource deadlock. After the outstanding task finishes or is reset, repeat with `GGML_DAYAN_MEGA=0` to compare standalone scheduling. Completion in that mode alone is not a synchronization fix. With `--single-turn -n 16`, reaching the 16-token budget normally exits even if the answer is unfinished.
+
 With the four-core cmodel server ready, run prefill and compare against CPU:
 
 ```sh
@@ -477,6 +481,10 @@ A cooperative kernel requires all four cores of an enabled Cluster. `TaskDim.x` 
 
 MatMul, fused SiLU, paired projections, SWIGLU/GEGLU FFN, MoE, MXFP4, and gated output projections have non-cooperative fallbacks. FlashAttention uses its general 1c entry when four-core prefill or split-KV decode is unavailable. Standalone GLU support still requires the existing graph fusion pattern; topology selection does not add a generic standalone SWIGLU kernel.
 
+FlashAttention uses separate tile policies for the two sequence regimes. Prefill uses 128 query rows when 1536 KiB URAM is available; single-token Decode uses the `run_decode` entry with 32 query rows on every URAM size. The 768 KiB configuration also uses 32 rows for Prefill. This avoids reserving a large query/output tile for Decode while keeping the KV traversal and split-KV path unchanged.
+
+Single-core Decode groups Query heads that share one KV head into the MAT row dimension. Each group loads K/V once, uses the same causal key limit for all its heads, and stores contiguous output heads. Groups larger than 32 heads use multiple tiles. Prefill keeps its sequence-row traversal, and four-core split-KV keeps its existing key partition and merge.
+
 Independent workers and cooperative groups partition output columns; attention projections keep whole heads within each partition. MXFP4 partitions output tiles, and FlashAttention partitions heads and batches. Gated output projections reserve separate staging storage for each worker or group. Native operators use the enabled core count, with Gated Delta Net and SSM convolution also limiting tasks to available work.
 
 ## Backend behavior
@@ -620,9 +628,11 @@ Gated Delta Net assigns heads and sequences to independent single-core tasks, li
 
 Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The pipeline uses 758.5 KiB within a 768 KiB task reservation, with up to two resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation. Prepared Q becomes output storage after its last MAT read, and the prepared Resource stays held until the output DMA completes.
 
-Decode, short prefill, vector gates (KDA), and multiple state snapshots use the FP32 recurrent VEC path with a 512 KiB reservation and up to two independent 256 KiB workers per Proc. It forms the gated key once per token and folds state decay into the state update, avoiding a separate full-state read/write pass. DIM2/DIM3 provide 16 independent contexts per head, each processing eight state rows. Both entries can distribute independent tasks across the available cores; they do not split one head across a cooperating four-core group.
+Decode, short prefill, vector gates (KDA), and multiple state snapshots use the FP32 recurrent VEC path with a 512 KiB reservation and up to two independent 128 KiB workers per Proc. It forms the gated key once per token and folds state decay into the state update, avoiding a separate full-state read/write pass. Both entries distribute independent heads and sequences across available cores. Recurrent state rows use a 576-byte internal stride; LSU loads and stores retain the external 512-byte row stride.
 
-Each recurrent dot adds its two 64-lane partial products before one reduction. The 63-instruction row keeps the copy-queue positions and state buffers unchanged.
+Single-token scalar-gate Decode assigns one state row to each eight-lane channel, so a context processes eight rows in parallel. Queue 1 retains the last eight state/key tile pairs. The first updated pair frees two queue entries for gate and delta; the remaining cached updates read both constants without queue copies or repeated broadcasts. The first state half is then reloaded for an eight-iteration DIM0 loop. This adds 1 MiB of URAM state reads for H=32, while logical DRAM traffic stays unchanged. A 154-instruction program executes 217 instructions per eight rows. The scalar gate multiplies the reduced state-key dot, so Decode skips the separate gated-key preparation block. Three XOR reductions replace each six-stage full-vector reduction. Compress gathers the eight output values, and a low-eight-lane mask limits the store. State and arithmetic remain FP32, with a different reduction order checked against the original recurrent tolerances. Iterator bases and invariant LSU fields are initialized once per worker; each transfer changes only its dimensions, row strides and read width. Independent state and vector loads share one completion wait, as do output and state stores. Decode skips the unused row-mask table.
+
+Other recurrent cases keep the row-wise path. Each dot adds its two 64-lane partial products before one reduction. Queue 1 retains both state halves through their updates and caches the scalar gate or two vector-gate halves across eight rows. The row uses 59 instructions with a scalar gate and 60 with vector gates; queue rotations restore V, gate and packed-output positions at every row boundary.
 
 ## Profiling
 
@@ -740,6 +750,14 @@ The direct attention pipeline test covers both launch modes, BF16/FP16, all supp
 
 ```sh
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-pipeline
+```
+
+The following opt-in cases each run 64 launches without profiling, advance the causal offset across a KV tile boundary, and use a different input seed per launch. Each launch prints a start record to stderr before submitting device work. The four-core cases require a complete four-core Cluster:
+
+```sh
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-pipeline decode-repeat-fp16-1c
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-pipeline decode-repeat-fp16-4c
+DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-attention-pipeline decode-repeat-split-fp16-4c
 ```
 
 The Qwen3.5 dense test includes the BF16 single-token linear regression with seed 35, then four-layer BF16/FP16 hybrid cycles with three gated DeltaNet layers and one full-attention layer. Every layer also contains RMSNorm, dense SWIGLU FFN, and residual paths. It compares Dayan outputs and final logits against a CPU reference. Gated Delta Net uses a 128-element head so the test exercises the device kernel instead of CPU fallback. For the single-case JSON command, see [BF16 dense mega checks](#bf16-dense).

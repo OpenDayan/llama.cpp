@@ -124,11 +124,11 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
                                       int64_t        effective_kv_len,
                                       uint32_t       seed,
                                       ggml_type      type = GGML_TYPE_BF16,
-                                      bool           causal = true) {
+                                      bool           causal = true,
+                                      int64_t        q_heads = 8,
+                                      int64_t        kv_heads = 2,
+                                      int64_t        batch = 1) {
     constexpr int64_t head_dim = 256;
-    constexpr int64_t q_heads  = 8;
-    constexpr int64_t kv_heads = 2;
-    constexpr int64_t batch    = 1;
 
     // Keep reference accumulation in F32 for long decode sequences.
     attention_graph reference = build_graph(GGML_TYPE_F32, GGML_TYPE_F32, head_dim, q_len, physical_kv_len, q_heads,
@@ -203,9 +203,10 @@ static int test_permuted_cache_layout(ggml_backend_t dayan,
     const bool close = compare_outputs(reference.output, actual.output, &max_abs, &max_rel);
 
     std::printf(
-        "permuted type=%s q_len=%lld physical_kv_len=%lld effective_kv_len=%lld head_dim=%lld causal=%d "
+        "permuted type=%s q_len=%lld physical_kv_len=%lld effective_kv_len=%lld head_dim=%lld causal=%d q_heads=%lld kv_heads=%lld batch=%lld "
         "max_abs=%g max_rel=%g\n",
-        ggml_type_name(type), (long long) q_len, (long long) physical_kv_len, (long long) effective_kv_len, (long long) head_dim, causal, max_abs,
+        ggml_type_name(type), (long long) q_len, (long long) physical_kv_len, (long long) effective_kv_len, (long long) head_dim, causal,
+        (long long) q_heads, (long long) kv_heads, (long long) batch, max_abs,
         max_rel);
     return close ? 0 : fail("permuted numerical comparison failed");
 }
@@ -313,6 +314,8 @@ int main() {
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 512, 129, 0x35f25U, GGML_TYPE_F16) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 512, 0x35f22U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 1024, 511, 0x35f23U) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 256, 129, 0x35f31U, GGML_TYPE_F16, true, 66, 2, 2) != 0 ||
+        test_permuted_cache_layout(dayan.get(), cpu.get(), 1, 151, 151, 0x35f32U, GGML_TYPE_BF16, false, 6, 2) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 65, 256, 151, 0x35f19U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 1024, 1024, 1024, 0x35f29U) != 0 ||
         test_permuted_cache_layout(dayan.get(), cpu.get(), 129, 151, 151, 0x35f30U, GGML_TYPE_F16, false) != 0) {

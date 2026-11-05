@@ -215,20 +215,21 @@ struct State {
     uint32_t task, tasks, cores, lane, scale;
     long groups;
     bool split_kv;
+    bool grouped_q;
 
     uint64_t work(uint64_t block) const { return task + block / groups * tasks; }
-    uint32_t batch(uint64_t block) const { return (uint32_t) (work(block) / (split_kv ? cfg->kv_heads : cfg->q_heads)); }
+    uint32_t batch(uint64_t block) const { return (uint32_t) (work(block) / (grouped_q ? cfg->kv_heads : cfg->q_heads)); }
     uint32_t head(uint64_t block) const {
-        return split_kv ? (work(block) % cfg->kv_heads) * (cfg->q_heads / cfg->kv_heads) + block % groups * kBr : work(block) % cfg->q_heads;
+        return grouped_q ? (work(block) % cfg->kv_heads) * (cfg->q_heads / cfg->kv_heads) + block % groups * kBr : work(block) % cfg->q_heads;
     }
     long row(uint64_t block, long slice, long core) const {
-        if (split_kv) {
+        if (grouped_q) {
             return 0;
         }
         return ((block % groups * kSlices + slice) * cores + core) * kBr;
     }
     long rows(uint64_t block, long slice) const {
-        if (split_kv) {
+        if (grouped_q) {
             return slice ? 0 : extent(cfg->q_heads / cfg->kv_heads - block % groups * kBr, kBr);
         }
         return extent((long) cfg->q_len - row(block, slice, lane), kBr);
@@ -237,10 +238,13 @@ struct State {
         const long visible = (cfg->flags & kFlagCausal) ? cfg->causal_offset + 1L : cfg->kv_len;
         return split_kv ? visible * core / 4 : 0;
     }
-    long key_count(long core) const { return split_kv ? key_begin(core + 1) - key_begin(core) : cfg->kv_len; }
+    long key_count(long core) const {
+        return split_kv ? key_begin(core + 1) - key_begin(core) :
+               grouped_q && (cfg->flags & kFlagCausal) ? cfg->causal_offset + 1L : cfg->kv_len;
+    }
     long cols(long ki) const { return extent(key_count(lane) - ki * kBc, kBc); }
     long keys(uint64_t block, long slice, long core) const {
-        if (split_kv) {
+        if (grouped_q) {
             return slice ? 0 : (key_count(core) + kBc - 1) / kBc;
         }
         const long first = row(block, slice, core);
@@ -252,7 +256,7 @@ struct State {
         return (end + kBc - 1) / kBc;
     }
     long shared_keys(uint64_t block) const {
-        if (split_kv) {
+        if (grouped_q) {
             return keys(block, 0, lane);
         }
         long count = 0;
@@ -296,7 +300,7 @@ static constexpr long kVSwizzle = MAT_BATCH_SWIZZLE(5, 1, 5);
 static void load_q(void * argument) {
     const State & s = *(State *) argument;
     const long uram = (long) dayan_uram_base();
-    configure_lsu_rows<0>(s.cfg->head_dim * 2, s.split_kv ? s.cfg->q_head_stride : s.cfg->q_row_stride, s.cfg->head_dim * 2);
+    configure_lsu_rows<0>(s.cfg->head_dim * 2, s.grouped_q ? s.cfg->q_head_stride : s.cfg->q_row_stride, s.cfg->head_dim * 2);
     __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(qk_swizzle(s.cfg->head_dim));
     for (uint64_t block = 0; block < s.blocks; ++block) {
         for (long slice = 0; slice < kSlices; ++slice) {
@@ -514,7 +518,7 @@ static bool prepare_mask(const State & s, long uram, uint64_t block, long slice,
     using namespace ggml_dayan_vec_detail;
     const long rows = s.rows(block, slice);
     const long cols = s.cols(ki);
-    const bool causal = !s.split_kv && (s.cfg->flags & kFlagCausal);
+    const bool causal = !s.grouped_q && (s.cfg->flags & kFlagCausal);
     const long first = s.row(block, slice, s.lane) + s.cfg->causal_offset - ki * kBc;
     if (rows % 8 == 0 && cols == kBc && (!causal || first >= kBc - 1)) {
         return false;
@@ -752,7 +756,8 @@ static void output(void * argument) {
             configure_vec_grid(1, s.cfg->head_dim / 64);
             configure_vec_iterator<kVecV0Base>(0, 0, s.cfg->head_dim * 4, kVecBytes);
             configure_vec_iterator<kVecV2Base>(0, 0, 32, 0);
-            configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4, s.cfg->q_heads * s.cfg->head_dim * 4);
+            configure_lsu_rows<0>(s.cfg->head_dim * 4, s.cfg->head_dim * 4,
+                                  (s.grouped_q ? 1 : s.cfg->q_heads) * s.cfg->head_dim * 4);
         }
         for (long ki = 0; ki < s.shared_keys(block); ++ki) {
             for (long slice = 0; slice < kSlices; ++slice) {
@@ -918,6 +923,7 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     State s = {};
     s.cfg = cfg;
     s.split_kv = SplitKV;
+    s.grouped_q = SplitKV || (Cores == 1 && q_len == 1);
     s.q = q_base_addr;
     s.k = k_base_addr;
     s.v = v_base_addr;
@@ -931,8 +937,8 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     s.task = Cores == 4 ? dayan_task_id(DAYAN_TASK_Y) : task;
     s.tasks = Cores == 4 ? dayan_task_dim(DAYAN_TASK_Y) : tasks;
     s.scale = float_as_u32(scale_log2e);
-    s.groups = SplitKV ? (q_heads / kv_heads + kBr - 1) / kBr : q_groups;
-    const uint64_t work = (uint64_t) batch * (SplitKV ? kv_heads : q_heads);
+    s.groups = s.grouped_q ? (q_heads / kv_heads + kBr - 1) / kBr : q_groups;
+    const uint64_t work = (uint64_t) batch * (s.grouped_q ? kv_heads : q_heads);
     s.blocks = (work > s.task ? (work - s.task + s.tasks - 1) / s.tasks : 0) * s.groups;
     for (long i = 0; i < kVecLanes; ++i) {
         ((uint32_t *) (uram + kUramZero))[i] = 0;
@@ -985,7 +991,16 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
 };
 
 template <typename Format, int Cores, bool SplitKV = false>
+static int run_decode(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const uint16_t * k,
+                      const uint16_t * v, float * out) {
+    return Pipeline<32>::template run<Format, Cores, SplitKV>(cfg, q, k, v, out);
+}
+
+template <typename Format, int Cores, bool SplitKV = false>
 static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * out) {
+    if (cfg->q_len == 1) {
+        return run_decode<Format, Cores, SplitKV>(cfg, q, k, v, out);
+    }
     return dayan_uram_size() < 1536U * 1024U ? Pipeline<32>::template run<Format, Cores, SplitKV>(cfg, q, k, v, out) :
                                              Pipeline<128>::template run<Format, Cores, SplitKV>(cfg, q, k, v, out);
 }

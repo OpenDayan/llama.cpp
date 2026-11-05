@@ -11,6 +11,12 @@ MEGA_GRAPH_BEGIN(Qwen35DenseMxfp4FullFfn, kDayanMegaQwen35DenseMxfp4FullFfn, fal
 MEGA_GRAPH_END()
 #undef MEGA_MXFP4
 
+#define MEGA_GDN_Z_GATE
+MEGA_GRAPH_BEGIN(Qwen35DenseBf16LinearGdnFfn, kDayanMegaQwen35DenseBf16LinearGdnFfn, false, true)
+#include "linear.inc"
+#include "dense-ffn.inc"
+MEGA_GRAPH_END()
+#undef MEGA_GDN_Z_GATE
 MEGA_GRAPH_BEGIN(Qwen35DenseBf16LinearFfn, kDayanMegaQwen35DenseBf16LinearFfn, false, true)
 #include "linear.inc"
 #include "dense-ffn.inc"
@@ -19,6 +25,12 @@ MEGA_GRAPH_BEGIN(Qwen35DenseBf16FullFfn, kDayanMegaQwen35DenseBf16FullFfn, false
 #include "full.inc"
 #include "dense-ffn.inc"
 MEGA_GRAPH_END()
+#define MEGA_GDN_Z_GATE
+MEGA_GRAPH_BEGIN(Qwen35MoeLinearGdnFfn, kDayanMegaQwen35MoeLinearGdnFfn, true, true)
+#include "linear.inc"
+#include "moe-ffn.inc"
+MEGA_GRAPH_END()
+#undef MEGA_GDN_Z_GATE
 MEGA_GRAPH_BEGIN(Qwen35MoeLinearFfn, kDayanMegaQwen35MoeLinearFfn, true, true)
 #include "linear.inc"
 #include "moe-ffn.inc"

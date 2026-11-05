@@ -117,6 +117,8 @@ struct DayanMatmulConfig {
     uint64_t output_batch_stride2 = 0;
     uint64_t output_batch_stride3 = 0;
     uint64_t cluster_workspace = 0;
+    uint64_t uram_offset = 0;
+    uint64_t uram_size = 0;
 };
 
 struct DayanMatmulPairConfig {
@@ -473,6 +475,15 @@ struct DayanNormPipelineConfig {
     DayanNormConfig norm;
     uint32_t        flags;
     uint32_t        output_type;
+};
+
+struct DayanGdnZGateConfig {
+    DayanGatedDeltaNetConfig gdn;
+    DayanCopyConfig          state_copy;
+    DayanNormPipelineConfig  norm_pipeline;
+    DayanMatmulConfig        z_bf16;
+    DayanElementwiseConfig   z_silu;
+    DayanBinaryConfig        gate_mul;
 };
 
 struct DayanGroupNormConfig {

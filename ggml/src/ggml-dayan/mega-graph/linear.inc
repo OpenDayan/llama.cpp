@@ -50,6 +50,10 @@ MEGA_STEP(beta, mul_mat, matmul_bf16, 1, required,
 #endif
 MEGA_STEP(beta_sigmoid, sigmoid, sigmoid, 1, required,
           pack(unary, at(beta_sigmoid)))
+#if defined(MEGA_GDN_Z_GATE)
+MEGA_STEP(gdn_z_gate, gated_delta_net, gated_delta_net_z_bf16, 1, fused,
+          pack(gdn_z_gate, ctx.slots, ctx.indices[gdn_z_gate]))
+#else
 MEGA_STEP(gdn, gated_delta_net, gated_delta_net, 1, required,
           pack(gdn, at(gdn)))
 MEGA_STEP(state_copy, copy, copy, 1, required,
@@ -67,6 +71,7 @@ MEGA_STEP(z_silu, silu, silu, 1, required,
           pack(unary, at(z_silu)))
 MEGA_STEP(gate_mul, elementwise_mul, multiply, 1, required,
           pack(binary, at(gate_mul)))
+#endif
 #if defined(MEGA_MXFP4)
 MEGA_STEP(output_copy, copy, quantize_mxfp4, 1, required,
           pack(quantize, at(output_copy)))

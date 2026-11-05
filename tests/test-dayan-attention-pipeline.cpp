@@ -170,6 +170,7 @@ static void reference_attention(const attention_case &        test,
 }
 
 static int run_case(runtime_context * runtime, const attention_case & test, uint32_t seed) {
+    std::fprintf(stderr, "case=%s seed=%u q_len=%u kv_len=%u causal_offset=%u starting\n", test.name, seed, test.q_len, test.kv_len, test.causal_offset);
     const size_t          q_elements  = static_cast<size_t>(test.batch) * test.q_heads * test.q_len * test.head_dim;
     const size_t          kv_elements = static_cast<size_t>(test.batch) * test.kv_heads * test.kv_len * test.head_dim;
     const size_t          output_elements = static_cast<size_t>(test.batch) * test.q_len * test.q_heads * test.head_dim;
@@ -351,6 +352,9 @@ int main(int argc, char ** argv) {
     }
 
     const attention_case cases[] = {
+        { "decode-repeat-fp16-1c", GGML_TYPE_F16, 1, 16, 2, 1, 512, 256, 120, true, true },
+        { "decode-repeat-fp16-4c", GGML_TYPE_F16, 1, 16, 2, 1, 512, 256, 120, true, true, 1, true },
+        { "decode-repeat-split-fp16-4c", GGML_TYPE_F16, 1, 16, 2, 1, 1280, 256, 1023, true, true, 1, true, 2.0f, true },
         { "groups-prefill-bf16", GGML_TYPE_BF16, 2, 6, 2, 65, 151, 64, 86, true, true, 2, true },
         { "groups-decode-fp16", GGML_TYPE_F16, 2, 6, 2, 1, 769, 128, 0, false, false, 8, true, 2.0f, true },
         { "tasks-prefill-fp16", GGML_TYPE_F16, 2, 6, 2, 65, 151, 64, 86, true, true, 8 },
@@ -384,19 +388,22 @@ int main(int argc, char ** argv) {
     uint32_t seed   = 0x35a128U;
     bool     ran    = false;
     for (const attention_case & test : cases) {
-        if (argc > 1 && std::strcmp(argv[1], test.name) != 0) {
+        const bool repeated = std::strncmp(test.name, "decode-repeat-", 14) == 0;
+        if ((argc == 1 && repeated) || (argc > 1 && std::strcmp(argv[1], test.name) != 0)) {
             ++seed;
             continue;
         }
         ran = true;
-        if (run_case(&runtime, test, seed++) != 0) {
-            result = 1;
-            break;
+        const int repeats = repeated ? 64 : test.split_kv ? 2 : 1;
+        for (int repeat = 0; repeat < repeats; ++repeat) {
+            attention_case current = test;
+            if (repeated) { current.causal_offset += repeat; }
+            if (run_case(&runtime, current, seed++) != 0) {
+                result = 1;
+                break;
+            }
         }
-        if (test.split_kv && run_case(&runtime, test, seed++) != 0) {
-            result = 1;
-            break;
-        }
+        if (result != 0) { break; }
     }
     free_runtime(&runtime);
     if (!ran) {

@@ -12,6 +12,7 @@ using ggml_dayan_matmul_detail::NativeContext;
 constexpr uint32_t kHeadDim     = 128;
 constexpr long     kLanes       = 64;
 constexpr long     kVecBytes    = kLanes * sizeof(float);
+constexpr long     kStateStride = kHeadDim * sizeof(float) + 64;
 constexpr long     kScalarStride = 32;
 constexpr long     kRowsPerGroup = kLanes;
 constexpr long     kRowGroups    = kHeadDim / kRowsPerGroup;
@@ -19,19 +20,20 @@ constexpr long     kRowsPerThread = 8;
 constexpr long     kMaskGroupBytes = kRowsPerGroup * kScalarStride;
 
 constexpr long kUramState       = 0x00000;
-constexpr long kUramQ           = 0x10000;
-constexpr long kUramK           = 0x10200;
-constexpr long kUramV           = 0x10400;
-constexpr long kUramG           = 0x10600;
-constexpr long kUramGate        = 0x10800;
-constexpr long kUramGatedK      = 0x10a00;
-constexpr long kUramMaskTable   = 0x10c00;
+constexpr long kUramQ           = kHeadDim * kStateStride;
+constexpr long kUramK           = kUramQ + 0x200;
+constexpr long kUramV           = kUramQ + 0x400;
+constexpr long kUramG           = kUramQ + 0x600;
+constexpr long kUramGate        = kUramQ + 0x800;
+constexpr long kUramGatedK      = kUramQ + 0xa00;
+constexpr long kUramMaskTable   = kUramQ + 0xc00;
 constexpr long kUramOutputPacked = kUramMaskTable + kRowGroups * kMaskGroupBytes;
 constexpr long kUramBeta        = kUramOutputPacked + kMaskGroupBytes + kVecBytes;
 constexpr long kUramLog2E       = kUramBeta + 64;
 constexpr long kUramEnd         = kUramLog2E + 64;
 
 static_assert(kUramEnd <= DAYAN_GATED_DELTA_NET_TASK_URAM_BYTES, "Gated Delta Net URAM layout is too large");
+static_assert(kUramEnd <= 128U * 1024U, "Gated Delta Net worker exceeds URAM budget");
 
 enum VecTcsr {
     kVecControl = 0,
@@ -88,9 +90,7 @@ static inline void configure_vec_recurrence() {
 
     configure_vec_iterator<kVecS0Base>(1, 0, 0, 0);
     configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(kHeadDim * sizeof(float), 0,
-                                       kRowsPerThread * kHeadDim * sizeof(float),
-                                       kRowsPerGroup * kHeadDim * sizeof(float));
+    configure_vec_iterator<kVecV1Base>(kStateStride, 0, kRowsPerThread * kStateStride, kRowsPerGroup * kStateStride);
     configure_vec_iterator<kVecV2Base>(0, 0, kRowsPerThread * sizeof(float), kVecBytes);
     configure_vec_iterator<kVecV3Base>(kScalarStride, 0, 0, 0);
 }
@@ -159,15 +159,13 @@ static inline void emit_sum_64() {
 
 static inline void emit_dot_half(uint64_t input, uint64_t state) {
     __tx_vec_lsu_u2v<0, 0>(input);
-    __tx_vec_lsu_u2v<0, 1>(state);
-    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_lsu_u2v<1, 1>(state);
+    __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
 }
 
-template <long Delta>
-static inline void emit_update_half(uint64_t state, uint64_t key, uint64_t query, uint64_t gate) {
-    __tx_vec_lsu_u2v<0, 1>(state);
-    __tx_vec_lsu_u2v<0, 0>(gate);
-    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+template <long Delta, long Gate>
+static inline void emit_update_half(uint64_t state, uint64_t key, uint64_t query) {
+    __tx_vec_vv_fp32_mul<0, 18, Gate, 0>();
     __tx_vec_lsu_u2v<0, 0>(key);
     __tx_vec_vv_fp32_mul<0, Delta, 0, 0>();
     __tx_vec_vv_fp32_add<0, 0, 2, 0>();
@@ -188,10 +186,7 @@ static inline void configure_vec_outer(long rows, long halves = 1) {
 static inline void issue_scalar_gate(uint64_t input, const NativeContext & context = {}) {
     constexpr long instructions = 5;
     configure_vec_outer(1);
-    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
+    __tx_vec_tcsr_write<VEC_V3_URAM_CHANNEL_STRIDE>(32);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v_broadcast32<0, 0>(input);
     __tx_vec_lsu_u2v_broadcast32<1, 1>(uram_address(kUramLog2E, context));
@@ -223,10 +218,11 @@ template <long GateHalfStride>
 static inline void issue_gated_key(const NativeContext & context = {}) {
     constexpr long instructions = 4;
     configure_vec_outer(kRowGroups);
-    configure_vec_iterator<kVecV0Base>(0, 0, kVecBytes, 0);
-    configure_vec_iterator<kVecV1Base>(0, 0, GateHalfStride, 0);
-    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
-    configure_vec_iterator<kVecV3Base>(0, 0, kVecBytes, 0);
+    __tx_vec_tcsr_write<kVecV0Base + 3>(kVecBytes);
+    __tx_vec_tcsr_write<kVecV1Base + 3>(GateHalfStride);
+    __tx_vec_tcsr_write<kVecV3Base + 3>(kVecBytes);
+    __tx_vec_tcsr_write<VEC_V0_URAM_CHANNEL_STRIDE>(32);
+    __tx_vec_tcsr_write<VEC_V1_URAM_CHANNEL_STRIDE>(32);
     begin_vec_block(instructions);
     __tx_vec_lsu_u2v<0, 0>(uram_address(kUramK, context));
     __tx_vec_lsu_u2v<1, 1>(uram_address(kUramGate, context));
@@ -238,36 +234,44 @@ static inline void issue_gated_key(const NativeContext & context = {}) {
 
 template <long GateHalfStride>
 static inline void emit_recurrence_row(uint32_t scale_bits, const NativeContext & context = {}) {
+    // Queue 1 keeps both state halves until their updates finish.
     emit_dot_half(uram_address(kUramGatedK, context), uram_address(kUramState, context));
-    __tx_vec_shuffle_xor<1, 0>(0);
     emit_dot_half(uram_address(kUramGatedK + kVecBytes, context), uram_address(kUramState + kVecBytes, context));
-    __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 2, 0>();
     emit_sum_64();
     __tx_vec_s_iter_gets<0, 0, 0, 0>();
-    __tx_vec_shuffle_broadcast_dyn<0, 17, 0>();
+    __tx_vec_shuffle_broadcast_dyn<0, 18, 0>();
     __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
     __tx_vec_lsu_u2v_broadcast32<0, 0>(uram_address(kUramBeta, context));
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_shuffle_xor<1, 0>(0);
 
-    emit_update_half<16>(uram_address(kUramState, context), uram_address(kUramK, context), uram_address(kUramQ, context), uram_address(kUramGate, context));
+    emit_update_half<16, GateHalfStride == 0 ? 20 : 21>(uram_address(kUramState, context), uram_address(kUramK, context), uram_address(kUramQ, context));
     __tx_vec_shuffle_xor<1, 0>(0);
-    emit_update_half<17>(uram_address(kUramState + kVecBytes, context), uram_address(kUramK + kVecBytes, context),
-                         uram_address(kUramQ + kVecBytes, context), uram_address(kUramGate + GateHalfStride, context));
+    emit_update_half<17, 21>(uram_address(kUramState + kVecBytes, context), uram_address(kUramK + kVecBytes, context),
+                            uram_address(kUramQ + kVecBytes, context));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
     emit_sum_64();
     __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_lsu_u2s<0, 3>(uram_address(kUramMaskTable, context));
-    __tx_vec_vv_mux2<1, 20, 0, 0>();
-    __tx_vec_shuffle_xor<1, 20>(0);
+    __tx_vec_vv_mux2<1, GateHalfStride == 0 ? 22 : 23, 0, 0>();
+    // Restore V, gate halves and packed output for the next row.
+    if constexpr (GateHalfStride == 0) {
+        __tx_vec_shuffle_xor<1, 22>(0);
+        __tx_vec_shuffle_xor<1, 22>(0);
+    } else {
+        __tx_vec_shuffle_xor<1, 23>(0);
+        __tx_vec_shuffle_xor<1, 23>(0);
+        __tx_vec_shuffle_xor<1, 23>(0);
+    }
 }
 
 template <long GateHalfStride>
 static inline void issue_recurrence(uint32_t scale_bits, const NativeContext & context = {}) {
     constexpr long prologue0 = 0;
-    constexpr long group_prologue = 2;
-    constexpr long row_instructions = 63;
+    constexpr long group_prologue = GateHalfStride == 0 ? 3 : 4;
+    constexpr long row_instructions = GateHalfStride == 0 ? 59 : 60;
     constexpr long group_epilogue = 2;
     const long prologue1 = prologue0 + group_prologue;
     const long loop = prologue1 + row_instructions;
@@ -275,16 +279,128 @@ static inline void issue_recurrence(uint32_t scale_bits, const NativeContext & c
 
     begin_vec_block(epilogue1);
     __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
+    __tx_vec_lsu_u2v<1, 0>(uram_address(kUramGate, context));
+    if constexpr (GateHalfStride != 0) {
+        __tx_vec_lsu_u2v<1, 0>(uram_address(kUramGate + GateHalfStride, context));
+    }
     __tx_vec_lsu_u2v<1, 2>(uram_address(kUramV, context));
     emit_recurrence_row<GateHalfStride>(scale_bits, context);
     __tx_vec_lsu_g2s<0>((1U << kRowsPerThread) - 1);
-    __tx_vec_lsu_v2u_mask<17, 2, 0>(uram_address(kUramOutputPacked, context));
+    __tx_vec_lsu_v2u_mask<GateHalfStride == 0 ? 18 : 19, 2, 0>(uram_address(kUramOutputPacked, context));
     start_vec_block(prologue0, prologue1, loop, epilogue1, epilogue1);
+}
+
+template <long Column>
+static inline void emit_decode_cached_update(const NativeContext & context) {
+    // Q1 entries 0/1 hold delta/gate; the remaining state/key pairs stay live.
+    __tx_vec_vv_fp32_mul<0, 48 - 2 * Column, 17, 0>();
+    __tx_vec_vv_fp32_mul<0, 16, 49 - 2 * Column, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_lsu_v2u<0, 1>(uram_address(kUramState + Column * kScalarStride, context));
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramQ + Column * kScalarStride, context));
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 5, 0>();
+}
+
+static inline void issue_decode(uint32_t scale_bits, const NativeContext & context = {}) {
+    configure_vec_outer(kHeadDim / 8);
+    __tx_vec_tcsr_write<kVecDim0>(kHeadDim / 16 - 1);
+    configure_vec_iterator<kVecV0Base>(kScalarStride, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(kScalarStride, 0, 8 * kStateStride, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, kScalarStride, 0);
+    __tx_vec_tcsr_write<VEC_V0_URAM_CHANNEL_STRIDE>(0);
+    __tx_vec_tcsr_write<VEC_V1_URAM_CHANNEL_STRIDE>(kStateStride);
+    __tx_vec_tcsr_write<VEC_V3_URAM_CHANNEL_STRIDE>(0);
+    const uint32_t gate_bits = *uram_pointer<uint32_t>(kUramGate, context);
+    const uint32_t beta_bits = *uram_pointer<uint32_t>(kUramBeta, context);
+
+    begin_vec_block(154);
+    for (long column = 0; column < kHeadDim / 16; ++column) {
+        const long offset = column * kScalarStride;
+        __tx_vec_lsu_u2v<0, 0>(uram_address(kUramK + offset, context));
+        __tx_vec_lsu_u2v<1, 1>(uram_address(kUramState + offset, context));
+        __tx_vec_vv_fp32_mul<0, 0, 16, 0>();
+        if (column != 0) {
+            __tx_vec_vv_fp32_add<0, 0, 2, 0>();
+        }
+    }
+    // Queue 1 keeps the last eight state and key tiles.
+    for (long column = kHeadDim / 16; column < kHeadDim / 8; ++column) {
+        const long offset = column * kScalarStride;
+        __tx_vec_lsu_u2v<1, 0>(uram_address(kUramK + offset, context));
+        __tx_vec_lsu_u2v<1, 1>(uram_address(kUramState + offset, context));
+        __tx_vec_vv_fp32_mul<0, 16, 17, 0>();
+        __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    }
+    __tx_vec_shuffle_xor<0, 0>(4);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(2);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(1);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_lsu_g2v_broadcast32<0, 0>(gate_bits);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_lsu_u2v<0, 3>(uram_address(kUramV, context));
+    __tx_vec_shuffle_compress<0, 0>(0x22);
+    __tx_vec_vv_fp32_sub<0, 0, 2, 0>();
+    __tx_vec_lsu_g2v_broadcast32<0, 0>(beta_bits);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+
+    __tx_vec_lsu_g2v_broadcast32<0, 0>(gate_bits);
+    __tx_vec_vv_fp32_mul<0, 30, 0, 0>();
+    __tx_vec_vv_fp32_mul<0, 2, 31, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    // The first cached state/key pair is dead before gate and delta replace it.
+    __tx_vec_shuffle_xor<1, 3>(0);
+    __tx_vec_shuffle_xor<1, 4>(0);
+    __tx_vec_lsu_v2u<0, 1>(uram_address(kUramState + 8 * kScalarStride, context));
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramQ + 8 * kScalarStride, context));
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+
+    emit_decode_cached_update<9>(context);
+    emit_decode_cached_update<10>(context);
+    emit_decode_cached_update<11>(context);
+    emit_decode_cached_update<12>(context);
+    emit_decode_cached_update<13>(context);
+    emit_decode_cached_update<14>(context);
+    emit_decode_cached_update<15>(context);
+
+    __tx_vec_lsu_u2v<0, 1>(uram_address(kUramState, context));
+    __tx_vec_vv_fp32_mul<0, 0, 17, 0>();
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramK, context));
+    __tx_vec_vv_fp32_mul<0, 16, 0, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 2, 0>();
+    __tx_vec_lsu_v2u<0, 1>(uram_address(kUramState, context));
+    __tx_vec_lsu_u2v<0, 0>(uram_address(kUramQ, context));
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_vv_fp32_add<0, 0, 7, 0>();
+
+    __tx_vec_shuffle_xor<0, 0>(4);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(2);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_shuffle_xor<0, 0>(1);
+    __tx_vec_vv_fp32_add<0, 0, 1, 0>();
+    __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
+    __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
+    __tx_vec_shuffle_compress<0, 0>(0x02);
+    __tx_vec_lsu_g2s<0>(0xff);
+    __tx_vec_lsu_v2u_mask<0, 3, 0>(uram_address(kUramOutputPacked, context));
+    start_vec_block(0, 134, 143, 154, 154);
 }
 
 template <long Group> static inline void configure_lsu_scalar() {
     configure_lsu_rows<Group>(1, 64, 64, 64);
     __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(sizeof(float) - 1);
+}
+
+template <long Group>
+static inline void configure_lsu_recurrent_rows(long rows, long row_bytes, long input_stride, long output_stride, long read_bytes = 64) {
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM0>(row_bytes / 64 - 1);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_DIM1>(rows - 1);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_INDIM1STRIDE>(input_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_OUTDIM1STRIDE>(output_stride);
+    __tx_lsu_tcsr_write<Group * LSU_GROUPSZ + LSU_REQUESTREADSIZE>(read_bytes - 1);
 }
 
 static inline const float * gdn_row(const float *  base,
@@ -779,7 +895,7 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
 
     if (ggml_dayan_matmul_detail::native_dispatch(context,
             {(uint64_t) config->sequences * config->heads * config->tokens * kHeadDim * kHeadDim,
-             (uint64_t) config->sequences * config->heads, 256U * 1024U, 1, 0, 1}, [&](const NativeContext & worker) {
+             (uint64_t) config->sequences * config->heads, 128U * 1024U, 1, 0, 1}, [&](const NativeContext & worker) {
                 const long status = run_gated_delta_net_task<LsuGroup>(config, q, k, v, g, beta, state, output, worker);
                 if (status < 0) { dayan_thread_exit(status); }
             })) { return 0; }
@@ -790,16 +906,23 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
     const uint64_t state_slot_count = state_count;
 
     *uram_pointer<float>(kUramLog2E, context) = 1.4426950408889634f;
+    // All recurrent paths keep iterator bases at zero.
+    configure_vec_iterator<kVecV0Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV1Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
+    configure_vec_iterator<kVecV3Base>(0, 0, 0, 0);
 
-    for (long group = 0; group < kRowGroups; ++group) {
-        for (long lane = 0; lane < kRowsPerGroup; ++lane) {
-            *uram_pointer<uint64_t>(kUramMaskTable + group * kMaskGroupBytes + lane * kScalarStride, context) =
-                uint64_t{ 1 } << lane;
+    if (config->tokens != 1 || config->gate_width != 1) {
+        for (long group = 0; group < kRowGroups; ++group) {
+            for (long lane = 0; lane < kRowsPerGroup; ++lane) {
+                *uram_pointer<uint64_t>(kUramMaskTable + group * kMaskGroupBytes + lane * kScalarStride, context) =
+                    uint64_t{ 1 } << lane;
+            }
         }
     }
 
-    configure_lsu_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
-                                 kHeadDim * sizeof(float));
+    configure_lsu_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
+
     const uint32_t task       = context.task;
     const uint32_t tasks      = context.tasks;
     const uint64_t work_items = (uint64_t) config->sequences * config->heads;
@@ -807,8 +930,8 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
         const uint32_t sequence    = (uint32_t) (work / config->heads);
         const uint32_t head        = (uint32_t) (work % config->heads);
         const uint64_t state_index = ((uint64_t) sequence * config->heads + head) * kHeadDim * kHeadDim;
+        configure_lsu_recurrent_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kStateStride);
         __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramState, context), reinterpret_cast<uint64_t>(state + state_index));
-        dayan_wait_lsu();
 
         for (uint32_t token = 0; token < config->tokens; ++token) {
             const uint64_t vector_index = ((uint64_t) sequence * config->tokens + token) * config->heads + head;
@@ -820,7 +943,7 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
             const float *  v_row        = gdn_row(v, config->v_nb, head, token, sequence);
             const float *  g_row        = gdn_row(g, config->g_nb, head, token, sequence);
             const float *  beta_row     = gdn_row(beta, config->beta_nb, head, token, sequence);
-            configure_lsu_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
+            configure_lsu_recurrent_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
                                          kHeadDim * sizeof(float));
             __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramQ, context), reinterpret_cast<uint64_t>(q_row));
             __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramK, context), reinterpret_cast<uint64_t>(k_row));
@@ -828,7 +951,7 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
             if (config->gate_width == kHeadDim) {
                 __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramG, context), reinterpret_cast<uint64_t>(g_row));
             }
-            configure_lsu_scalar<LsuGroup>();
+            configure_lsu_recurrent_rows<LsuGroup>(1, 64, 64, 64, sizeof(float));
             if (config->gate_width == 1) {
                 __tx_lsu_dma_d2u<LsuGroup>(uram_address(kUramG, context), reinterpret_cast<uint64_t>(g_row));
             }
@@ -838,9 +961,13 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
             float * attn_output = output + value_index;
             if (config->gate_width == 1) {
                 issue_scalar_gate(uram_address(kUramG, context), context);
-                issue_gated_key<0>(context);
-                configure_vec_recurrence();
-                issue_recurrence<0>(config->scale_bits, context);
+                if (config->tokens == 1) {
+                    issue_decode(config->scale_bits, context);
+                } else {
+                    issue_gated_key<0>(context);
+                    configure_vec_recurrence();
+                    issue_recurrence<0>(config->scale_bits, context);
+                }
             } else {
                 issue_vector_gate(uram_address(kUramG, context), context);
                 issue_gated_key<kVecBytes>(context);
@@ -848,20 +975,19 @@ static inline long run_gated_delta_net_task(const DayanGatedDeltaNetConfig * con
                 issue_recurrence<kVecBytes>(config->scale_bits, context);
             }
             dayan_wait_vec();
-            configure_lsu_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
+            configure_lsu_recurrent_rows<LsuGroup>(1, kHeadDim * sizeof(float), kHeadDim * sizeof(float), kHeadDim * sizeof(float));
             __tx_lsu_dma_u2d<LsuGroup>(reinterpret_cast<uint64_t>(attn_output), uram_address(kUramOutputPacked, context));
-            dayan_wait_lsu();
 
             const int64_t target_slot = (int64_t) config->tokens - 1 - token;
             if (target_slot >= 0 && target_slot < config->snapshots) {
                 const uint64_t output_state_index =
                     attn_count + (uint64_t) target_slot * state_slot_count + state_index;
-                configure_lsu_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kHeadDim * sizeof(float),
+                configure_lsu_recurrent_rows<LsuGroup>(kHeadDim, kHeadDim * sizeof(float), kStateStride,
                                              kHeadDim * sizeof(float));
                 __tx_lsu_dma_u2d<LsuGroup>(reinterpret_cast<uint64_t>(output + output_state_index),
                                            uram_address(kUramState, context));
-                dayan_wait_lsu();
             }
+            dayan_wait_lsu();
         }
     }
 

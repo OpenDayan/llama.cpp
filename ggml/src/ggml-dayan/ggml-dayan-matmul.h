@@ -227,7 +227,7 @@ struct MatmulBuffer {
 
 struct MatmulState {
     const DayanMatmulConfig * config;
-    uint64_t input[3], output, physical, uram, generations;
+    uint64_t input[3], output, physical, uram, uram_bytes, generations;
     uint64_t accumulator_bytes, output_bytes, output_start, scratch, a_cache;
     uint64_t a_swizzle, b_swizzle, c_swizzle, load_phases[2], shared_phases;
     int cores, lane, tile_m, tile_n, tile_k, b_stride, nt, kt, slice_m, slice_n, c_columns;
@@ -513,6 +513,10 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
                          config->output_batch_stride2 == config->m * config->output_stride;
     const bool packed3 = packed2 && config->weight_ne2 == 1 && config->a_batch_stride3 == ne2 * config->a_batch_stride2 &&
                          config->output_batch_stride3 == ne2 * config->output_batch_stride2;
+    if (config->uram_offset > dayan_uram_size() ||
+        (config->uram_size && config->uram_size > dayan_uram_size() - config->uram_offset)) { return -12; }
+    const uint64_t available_uram = config->uram_size ? config->uram_size : dayan_uram_size() - config->uram_offset;
+    if (!available_uram) { return -12; }
     uint64_t group2 = packed2 ? ratio2 : 1;
     uint64_t group3 = packed3 ? ratio3 : 1;
     if (config->m > 0x7ffff000ULL / group2) {
@@ -533,6 +537,8 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     MatmulPhases local_phases;
     MatmulCluster * cluster = Cores == 4 ? &dayan_cluster_state(config->cluster_workspace) : nullptr;
     MatmulState s = {};
+    s.physical = (uintptr_t) dayan_uram_base() + config->uram_offset;
+    s.uram_bytes = available_uram;
     s.config = &matrix;
     s.cores = Cores;
     s.lane = lane;
@@ -555,11 +561,14 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
         s.tile_n = 64;
         s.tile_k = 4096;
     }
+    if (decode && s.uram_bytes < 768U * 1024U) {
+        s.tile_n = full_k ? 32 : 256;
+    }
     s.b_stride = s.tile_k * 2;
     if (full_k) {
-        s.b_stride += dayan_uram_size() < 1536U * 1024U ? 64 : 128;
+        s.b_stride += s.uram_bytes < 1536U * 1024U ? 64 : 128;
     }
-    if (dayan_uram_size() < 1536U * 1024U && matrix.m >= 32) { s.tile_m = 64; }
+    if (s.uram_bytes < 1536U * 1024U && matrix.m >= 32) { s.tile_m = 64; }
     s.slice_m = s.buffer_a ? s.tile_m : s.tile_m / kMatmulSlices;
     s.slice_n = s.buffer_a ? s.tile_n / kMatmulSlices : s.tile_n;
     // Pad complete VEC chunks and rotate the linear row start across Banks.
@@ -568,10 +577,9 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     s.b_swizzle = kMatSwizzle;
     if (decode) {
         s.a_swizzle = 0;
-        s.b_swizzle = full_k ? 0 : dayan_uram_size() < 1536U * 1024U ? MAT_BATCH_SWIZZLE(6, 3, 4) : MAT_BATCH_SWIZZLE(7, 3, 3);
+        s.b_swizzle = full_k ? 0 : s.uram_bytes < 1536U * 1024U ? MAT_BATCH_SWIZZLE(6, 3, 4) : MAT_BATCH_SWIZZLE(7, 3, 3);
     }
     s.c_swizzle = HasEpilogue || s.buffer_a ? 0 : kMatSwizzle;
-    s.physical = (uintptr_t) dayan_uram_base();
     s.uram = s.physical & (Constants::kUramWindowStride - 1);
     s.input_context = input_context;
     if constexpr (Cores == 4) {
@@ -602,7 +610,7 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
         address += align_up(matrix.k * sizeof(uint16_t), 64);
     }
     s.scratch = s.physical + address - s.uram;
-    DAYAN_PARAMS_IF(!s.physical || address - s.uram + InputScratchBytes > dayan_uram_size() || address + InputScratchBytes > Constants::kUramWindowStride) {
+    DAYAN_PARAMS_IF(!s.physical || address - s.uram + InputScratchBytes > s.uram_bytes || address + InputScratchBytes > Constants::kUramWindowStride) {
         return -12;
     }
     if constexpr (Cores == 4) {

@@ -704,6 +704,133 @@ static bool ggml_backend_dayan_mega_add_gdn(ggml_backend_dayan_mega_parameters *
     return parameters->add<mega::gated_delta_net>(config, q, k, v, g, beta, state, output);
 }
 
+static bool ggml_backend_dayan_mega_add_gdn_z_gate(ggml_backend_dayan_mega_parameters * parameters,
+                                                    const std::vector<ggml_backend_dayan_graph_slot> & slots,
+                                                    size_t first) {
+    if (first > slots.size() || slots.size() - first < 6) { return false; }
+    const auto & gdn_slot = slots[first];
+    const auto & copy_slot = slots[first + 1];
+    const auto & norm_slot = slots[first + 2];
+    const auto & z_slot = slots[first + 3];
+    const auto & silu_slot = slots[first + 4];
+    const auto & gate_slot = slots[first + 5];
+    ggml_tensor * gdn_output = gdn_slot.nodes[0];
+    ggml_tensor * state_copy = copy_slot.nodes[0];
+    ggml_tensor * rms = norm_slot.nodes[1];
+    ggml_tensor * scaled = norm_slot.nodes[2];
+    ggml_tensor * lowp = norm_slot.nodes[3];
+    const ggml_tensor * state_source = state_copy != nullptr ? state_copy->src[0] : nullptr;
+    ggml_tensor * z = z_slot.nodes[0];
+    ggml_tensor * z_silu = silu_slot.nodes[0];
+    ggml_tensor * gate = gate_slot.nodes[0];
+    if (gdn_slot.kind != ggml_backend_dayan_slot_kind::gated_delta_net ||
+        copy_slot.kind != ggml_backend_dayan_slot_kind::copy ||
+        norm_slot.kind != ggml_backend_dayan_slot_kind::norm_pipeline || norm_slot.nodes[0] != nullptr ||
+        z_slot.kind != ggml_backend_dayan_slot_kind::mul_mat || silu_slot.kind != ggml_backend_dayan_slot_kind::silu ||
+        gate_slot.kind != ggml_backend_dayan_slot_kind::elementwise_mul || gdn_output == nullptr || state_copy == nullptr ||
+        rms == nullptr || scaled == nullptr || z == nullptr || z_silu == nullptr || gate == nullptr ||
+        state_source == nullptr || z->src[0] == nullptr || z->src[1] == nullptr || z_silu->src[0] == nullptr ||
+        (z_silu->src[0] != z && (z_silu->src[0]->view_src != z || z_silu->src[0]->view_offs != 0)) ||
+        (gate->src[0] != scaled && gate->src[1] != scaled) ||
+        (gate->src[0] != z_silu && gate->src[1] != z_silu) ||
+        ggml_get_op_params_i32(gdn_output, 0) != 1 ||
+        (uint64_t) ggml_nelements(state_source) != (uint64_t) ggml_nelements(state_copy) ||
+        state_source->view_src != gdn_output || z->src[1]->type != GGML_TYPE_BF16 ||
+        z->src[0]->type != GGML_TYPE_BF16 || z->type != GGML_TYPE_F32 || z_silu->type != GGML_TYPE_F32 ||
+        gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(z_silu) || !ggml_is_contiguous(gate) ||
+        !ggml_are_same_shape(z, z_silu) || !ggml_are_same_shape(gate, scaled) ||
+        !ggml_are_same_shape(gate, z_silu) || (z->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        return false;
+    }
+
+    const ggml_tensor * q = gdn_output->src[0];
+    const ggml_tensor * k = gdn_output->src[1];
+    const ggml_tensor * v = gdn_output->src[2];
+    const ggml_tensor * g = gdn_output->src[3];
+    const ggml_tensor * beta = gdn_output->src[4];
+    const ggml_tensor * state = gdn_output->src[5];
+    if (q == nullptr || k == nullptr || v == nullptr || g == nullptr || beta == nullptr || state == nullptr ||
+        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
+        g->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+        v->ne[2] != 1 || v->ne[3] != 1 || gdn_output->ne[2] != 1 || gdn_output->ne[3] != 1 || rms->src[0] == nullptr ||
+        rms->src[0]->view_src != gdn_output || rms->src[0]->view_offs != 0 ||
+        !ggml_backend_dayan_supports_rms_norm_scale(scaled) || z->src[1]->ne[0] != z->src[0]->ne[0] ||
+        z->src[1]->ne[1] != 1 || z->src[1]->ne[2] != 1 || z->src[1]->ne[3] != 1 ||
+        z->ne[0] != z->src[0]->ne[1] || z->ne[1] != z->src[1]->ne[1] || z->ne[2] != 1 || z->ne[3] != 1) {
+        return false;
+    }
+
+    DayanGdnZGateConfig config = {};
+    config.gdn.head_dim = (uint32_t) v->ne[0];
+    config.gdn.heads = (uint32_t) v->ne[1];
+    config.gdn.tokens = (uint32_t) v->ne[2];
+    config.gdn.sequences = (uint32_t) v->ne[3];
+    if (config.gdn.tokens != 1 || config.gdn.sequences != 1) { return false; }
+    config.gdn.snapshots = (uint32_t) ggml_get_op_params_i32(gdn_output, 0);
+    config.gdn.gate_width = (uint32_t) g->ne[0];
+    config.gdn.q_heads = (uint32_t) q->ne[1];
+    config.gdn.k_heads = (uint32_t) k->ne[1];
+    config.gdn.q_sequences = (uint32_t) q->ne[3];
+    config.gdn.k_sequences = (uint32_t) k->ne[3];
+    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+        config.gdn.q_nb[dimension] = q->nb[dimension];
+        config.gdn.k_nb[dimension] = k->nb[dimension];
+        config.gdn.v_nb[dimension] = v->nb[dimension];
+        config.gdn.g_nb[dimension] = g->nb[dimension];
+        config.gdn.beta_nb[dimension] = beta->nb[dimension];
+    }
+    const float gdn_scale = 1.0f / std::sqrt((float) config.gdn.head_dim);
+    std::memcpy(&config.gdn.scale_bits, &gdn_scale, sizeof(gdn_scale));
+
+    if (state_source->view_offs != (size_t) config.gdn.tokens * config.gdn.sequences * config.gdn.heads *
+                                      config.gdn.head_dim * sizeof(float) ||
+        state_copy->type != GGML_TYPE_F32 || !ggml_is_contiguous(state_copy) || state_source->type != GGML_TYPE_F32 ||
+        rms->src[0]->type != GGML_TYPE_F32 || scaled->type != GGML_TYPE_F32 ||
+        (lowp != nullptr && lowp->type != GGML_TYPE_BF16)) {
+        return false;
+    }
+    config.state_copy.elements = (uint64_t) ggml_nelements(state_copy);
+    config.state_copy.source_type = kDayanDataTypeF32;
+    config.state_copy.destination_type = kDayanDataTypeF32;
+    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+        config.state_copy.source_ne[dimension] = (uint32_t) state_source->ne[dimension];
+        config.state_copy.source_nb[dimension] = state_source->nb[dimension];
+    }
+
+    const ggml_tensor * norm_scale = ggml_backend_dayan_mega_norm_scale(scaled, rms);
+    if (norm_scale == nullptr || norm_scale->type != GGML_TYPE_F32) {
+        return false;
+    }
+    config.norm_pipeline.norm = ggml_backend_dayan_mega_norm_config(rms);
+    config.norm_pipeline.flags = 0;
+    if (norm_slot.output_mask & kDayanNormSlotOutputRms) { config.norm_pipeline.flags |= kDayanNormWriteRms; }
+    if (norm_slot.output_mask & kDayanNormSlotOutputScaled) { config.norm_pipeline.flags |= kDayanNormWriteScaled; }
+    if (norm_slot.output_mask & kDayanNormSlotOutputLowp) {
+        if (lowp == nullptr || !ggml_backend_dayan_mega_type_code(lowp->type, &config.norm_pipeline.output_type)) {
+            return false;
+        }
+        config.norm_pipeline.flags |= kDayanNormWriteLowp;
+    }
+    if ((config.norm_pipeline.flags & kDayanNormWriteScaled) == 0 ||
+        ((config.norm_pipeline.flags & kDayanNormWriteLowp) != 0 && config.norm_pipeline.output_type != kDayanDataTypeBF16)) {
+        return false;
+    }
+
+    config.z_bf16 = ggml_backend_dayan_mega_matmul_config(z->src[0], z->src[1], z);
+    if (config.z_bf16.m > 512) { return false; }
+    config.z_bf16.uram_offset = 256U * 1024U;
+    config.z_silu.elements = (uint64_t) ggml_nelements(z_silu);
+    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+        config.gate_mul.ne[dimension] = (uint32_t) gate->ne[dimension];
+        config.gate_mul.right_ne[dimension] = (uint32_t) z_silu->ne[dimension];
+    }
+    config.gate_mul.elements = (uint64_t) ggml_nelements(gate);
+
+    return parameters->add<mega::gated_delta_net_z_bf16>(config, q, k, v, g, beta, state, gdn_output,
+        state_source, state_copy, norm_scale, rms, scaled, lowp != nullptr ? lowp : scaled,
+        z->src[1], z->src[0], z, z_silu, gate);
+}
+
 static bool ggml_backend_dayan_mega_add_rms_norm(ggml_backend_dayan_mega_parameters * parameters,
                                                   const ggml_backend_dayan_graph_slot & slot) {
     ggml_tensor * output = slot.nodes[0];
@@ -936,7 +1063,7 @@ static bool ggml_backend_dayan_mega_add_routing(ggml_backend_dayan_mega_paramete
     }
 }
 
-enum class ggml_backend_dayan_mega_slot_mode { required, optional, reuse, borrow };
+enum class ggml_backend_dayan_mega_slot_mode { required, optional, reuse, borrow, fused };
 
 struct ggml_backend_dayan_mega_context {
     const std::vector<ggml_backend_dayan_graph_slot> & slots;
@@ -1018,7 +1145,11 @@ static bool ggml_backend_dayan_mega_match(const ggml_backend_dayan_mega_graph & 
             return false;
         }
         ctx.indices[index] = position;
-        cursor += !reuse && step.mode != ggml_backend_dayan_mega_slot_mode::borrow;
+        if (step.mode == ggml_backend_dayan_mega_slot_mode::fused) {
+            cursor += 6;
+        } else {
+            cursor += !reuse && step.mode != ggml_backend_dayan_mega_slot_mode::borrow;
+        }
     }
     *end = cursor;
     return true;
