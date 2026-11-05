@@ -345,7 +345,21 @@ static void matmul_load(void * argument) {
                         const uint64_t src = s.input[b ? 1 + product : 0] + (b ? n.col : n.row) * stride + (uint64_t) n.step * s.tile_k * 2;
                         set_lsu_matrix<0>(checksum, rows, s.tile_k * 2, stride, row_stride);
                         __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(b ? s.b_swizzle : s.a_swizzle);
-                        load_matrix<0>(n.inner * 2, rows, s.tile_k * 2, rows, dst.uram, src);
+                        if (b && s.a_cache) {
+                            // Interleave rows and 4 KiB halves without changing the MAT layout.
+                            __tx_lsu_tcsr_write<LSU_DIM0>(rows - 1);
+                            __tx_lsu_tcsr_write<LSU_DIM1>(1);
+                            __tx_lsu_tcsr_write<LSU_DIM2>(63);
+                            __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(stride);
+                            __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(4096);
+                            __tx_lsu_tcsr_write<LSU_INDIM2STRIDE>(64);
+                            __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(row_stride);
+                            __tx_lsu_tcsr_write<LSU_OUTDIM1STRIDE>(4096);
+                            __tx_lsu_tcsr_write<LSU_OUTDIM2STRIDE>(64);
+                            __tx_lsu_dma_d2u<0>((long) dst.uram, (long) src);
+                        } else {
+                            load_matrix<0>(n.inner * 2, rows, s.tile_k * 2, rows, dst.uram, src);
+                        }
                     }
                     if (active) {
                         matmul_check(dayan_resource_produce_lsu(dst.resource, users, 0));
@@ -587,7 +601,7 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
         s.shared_phases = cluster->core[lane].shared_phases;
     }
     s.phases = phases ? phases : &local_phases;
-    const int counts[] = {s.buffer_a ? 2 : kMatmulSlices, s.buffer_a ? kMatmulSlices : 2};
+    const int counts[] = {full_k ? 0 : s.buffer_a ? 2 : kMatmulSlices, s.buffer_a ? kMatmulSlices : 2};
     const uint64_t bytes[] = {(uint64_t) s.slice_m * s.tile_k * 2, (uint64_t) s.slice_n * s.b_stride};
     uint64_t address = s.uram;
     for (int operand = 0; operand < 2; ++operand) {

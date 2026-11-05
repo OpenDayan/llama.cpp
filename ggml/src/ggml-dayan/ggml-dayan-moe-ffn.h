@@ -63,26 +63,36 @@ static void load_weights(void * argument) {
             for (uint64_t col = 0; col < cfg.n; col += l.columns) {
                 const int columns = extent(cfg.n - col, l.columns);
                 for (uint64_t step = 0; step < cfg.k; step += l.inner) {
-                    const int slot = sequence++ & 1;
+                    // Gate/Up owns a pair of halves; Down reuses each half independently.
+                    const int slot = sequence++ & (stage ? 3 : 1);
+                    const int buffer = stage ? slot / 2 : slot;
+                    const int first = stage ? slot % 2 : 0;
                     const int inner = extent(cfg.k - step, l.inner);
-                    const auto resource = DAYAN_LOCAL_RESOURCE(slot);
-                    matmul_check(dayan_resource_wait_free(resource));
+                    const auto resource = DAYAN_LOCAL_RESOURCE(stage ? slot : slot * 2);
+                    const auto mask = DAYAN_RESOURCE_MASK(resource) | (stage ? 0 : DAYAN_RESOURCE_MASK(resource + 1));
+                    matmul_check(dayan_resource_wait(mask, 0, 0, 0));
                     for (int product = 0; product < (stage ? 1 : 2); ++product) {
                         const int operand = stage ? 2 : product;
                         const uint64_t row = (uint64_t) s.ids[expert] * cfg.n + col;
-                        const uint64_t target = s.local + l.b[slot] + product * l.columns * l.b_stride;
+                        const uint64_t target = s.local + l.b[buffer] + (first + product) * l.columns * l.b_stride;
                         set_lsu_matrix<0>(checksum, columns, l.b_stride, cfg.b_stride, l.b_stride);
                         __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(kWeightSwizzle);
-                        load_matrix<0>(mx ? inner / 2 : inner * 2, columns, l.b_stride, columns, target,
-                                       s.weight[operand] + row * cfg.b_stride + (mx ? step / 2 : step * 2));
+                        __tx_lsu_tcsr_write<LSU_DIM0>(columns - 1);
+                        __tx_lsu_tcsr_write<LSU_DIM1>((mx ? inner / 2 : inner * 2) / 64 - 1);
+                        __tx_lsu_tcsr_write<LSU_INDIM0STRIDE>(cfg.b_stride);
+                        __tx_lsu_tcsr_write<LSU_INDIM1STRIDE>(64);
+                        __tx_lsu_tcsr_write<LSU_OUTDIM0STRIDE>(l.b_stride);
+                        __tx_lsu_tcsr_write<LSU_OUTDIM1STRIDE>(64);
+                        __tx_lsu_dma_d2u<0>((long) target, (long) (s.weight[operand] + row * cfg.b_stride + (mx ? step / 2 : step * 2)));
                         if (mx) {
-                            const uint64_t scales = s.local + l.bs[slot] + product * l.columns * l.inner / 32;
+                            const uint64_t scales = s.local + l.bs[buffer] + (first + product) * l.columns * l.inner / 32;
                             set_lsu_matrix<0>(checksum, inner / 128, columns * 4, cfg.b_scale_stride, l.columns * 4);
                             load_matrix<0>(columns * 4, inner / 128, columns * 4, inner / 128, scales,
                                            s.scales[operand] + step / 128 * cfg.b_scale_stride + row * 4);
                         }
                     }
                     matmul_check(dayan_resource_produce_lsu(resource, 1, 0));
+                    if (!stage) { matmul_check(dayan_resource_produce_lsu(resource + 1, 1, 0)); }
                 }
             }
         }
@@ -130,7 +140,7 @@ static int run(const DayanFfnConfig * config, const void * input, const void * i
     dayan_wait_lsu();
     dayan_thread_resources_t resources = {};
     resources.lsu_tcsr_count = 1;
-    resources.local_resource_count = 2;
+    resources.local_resource_count = 4;
     matmul_check(dayan_create_thread("ffn-load", load_weights, &s, &resources));
     uint64_t sequence = 0, phases = 0;
     for (uint32_t expert = 0; expert < config->experts_used; ++expert) {
@@ -151,16 +161,19 @@ static int run(const DayanFfnConfig * config, const void * input, const void * i
                 const int columns = extent(cfg.n - col, l.columns);
                 __tx_mat_tcsr_write<MAT_N>(columns - 1);
                 for (uint64_t step = 0; step < cfg.k; step += l.inner) {
-                    const int slot = sequence++ & 1;
-                    const auto mask = DAYAN_RESOURCE_MASK(DAYAN_LOCAL_RESOURCE(slot));
+                    const int slot = sequence++ & (stage ? 3 : 1);
+                    const int buffer = stage ? slot / 2 : slot;
+                    const int first = stage ? slot % 2 : 0;
+                    const auto resource = DAYAN_LOCAL_RESOURCE(stage ? slot : slot * 2);
+                    const auto mask = DAYAN_RESOURCE_MASK(resource) | (stage ? 0 : DAYAN_RESOURCE_MASK(resource + 1));
                     matmul_check(dayan_resource_wait(0, mask, phases, 0));
                     __tx_mat_tcsr_write<MAT_K>(extent(cfg.k - step, l.inner) - 1);
                     const uint64_t a = s.local + (stage ? l.hidden : l.a) + (mx ? step / 2 : step * 2);
                     const uint64_t as = s.local + (stage ? l.hidden_scales : l.as) + step / 128 * 64;
                     for (int product = 0; product < (stage ? 1 : 2); ++product) {
-                        const uint64_t b = s.local + l.b[slot] + product * l.columns * l.b_stride;
+                        const uint64_t b = s.local + l.b[buffer] + (first + product) * l.columns * l.b_stride;
                         const uint64_t c = s.local + l.c[product];
-                        __tx_mat_setptr<0>(0, as, s.local + l.bs[slot] + product * l.columns * l.inner / 32);
+                        __tx_mat_setptr<0>(0, as, s.local + l.bs[buffer] + (first + product) * l.columns * l.inner / 32);
                         if (!step) { __tx_mat_mm<0>(c, a, b); }
                         else { __tx_mat_mma<0>(c, a, b); }
                     }
