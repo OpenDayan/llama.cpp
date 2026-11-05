@@ -22,18 +22,22 @@ struct DayanMxfp4Tile {
         return scratch_offset() + (post && products == 1 ? (uint64_t) m * n * 17 / 64 : 0) + 64;
     }
 
-    static DayanMxfp4Tile make(uint64_t rows, uint64_t columns, uint64_t inner, bool scales, int products, bool post, uint64_t tasks = 4) {
+    static DayanMxfp4Tile make(uint64_t rows, uint64_t columns, uint64_t inner, bool scales, int products, bool post, uint64_t tasks = 4, uint64_t capacity = uram_bytes) {
         if (rows == 1 && scales) {
+            if (columns == 2048 && inner == 512 && products == 1 && !post && tasks == 1) {
+                const DayanMxfp4Tile compact = {8, 2048, 512, 256, 1, 2, true, false};
+                if (compact.bytes() <= capacity) { return compact; }
+            }
             const uint64_t local_columns = (columns + tasks - 1) / tasks;
             DayanMxfp4Tile tile = {32, local_columns > 3072 ? 3072 : (int) ((local_columns + 255) & ~255ULL),
                                   post ? 512 : 640, 0, products, 2, scales, post};
             tile.input_stride = tile.k / 2;
-            while (tile.n > 256 && tile.bytes() > uram_bytes) { tile.n -= 256; }
+            while (tile.n > 256 && tile.bytes() > capacity) { tile.n -= 256; }
             for (int k = 1024; k <= 4096 && inner > (uint64_t) tile.k; k *= 2) {
                 DayanMxfp4Tile wider = tile;
                 wider.k = k;
                 wider.input_stride = k / 2;
-                if (wider.bytes() > uram_bytes) { break; }
+                if (wider.bytes() > capacity) { break; }
                 tile = wider;
             }
             return tile;
@@ -48,17 +52,18 @@ struct DayanMxfp4Tile {
             for (int n = post ? 256 : 128; n <= 2048; n *= 2) {
                 DayanMxfp4Tile candidate = tile;
                 candidate.n = n;
-                if (candidate.bytes() > uram_bytes) { continue; }
+                if (candidate.bytes() > capacity) { continue; }
                 const uint64_t work = (columns + grid_cols * n - 1) / (grid_cols * n) * n;
                 if (work <= best) { best = work; tile.n = n; }
             }
         }
-        if (tile.bytes() > uram_bytes) { tile.c_buffers = 2; }
+        if (tile.bytes() > capacity) { tile.c_buffers = 2; }
+        while (tile.m > m_alignment && tile.bytes() > capacity) { tile.m /= 2; }
         const int limit = scales ? 640 : 512;
         tile.k = inner >= (uint64_t) limit ? limit : (inner + 127) / 128 * 128;
         for (;;) {
             tile.input_stride = scales ? tile.k / 2 : tile.k * 2;
-            if (tile.bytes() <= uram_bytes || tile.k == 128) { break; }
+            if (tile.bytes() <= capacity || tile.k == 128) { break; }
             tile.k -= 128;
         }
         return tile;

@@ -63,7 +63,9 @@ def relative(counter, anchor):
     return (counter - anchor + PERIOD // 2) % PERIOD - PERIOD // 2
 
 
-def read_segments(path, samples, slots, include_outer=False):
+def read_segments(path, samples, slots, include_outer=False, core_count=4):
+    if type(core_count) is not int or core_count not in (1, 4):
+        raise ValueError("expected core_count of one or four")
     tags = {sample["tag"] for sample in samples}
     if len(tags) != len(samples):
         raise ValueError("sample tags must be unique")
@@ -151,8 +153,8 @@ def read_segments(path, samples, slots, include_outer=False):
     for tag, group in groups.items():
         if not group and tag not in tags:
             continue
-        if len(group) != 4:
-            raise ValueError(f"{tag}: expected four cores, found {len(group)}")
+        if len(group) != core_count:
+            raise ValueError(f"{tag}: expected {core_count} cores, found {len(group)}")
         for pid, core in group.items():
             segments = core["segments"]
             if core["launch_start"] is None or len(segments) != len(names) or not segments[-1]["exited"]:
@@ -239,7 +241,7 @@ def analyze(run, trace, clock_hz=None, include_outer=False):
     expected = 1 if spec["mode"] == "prefill" else spec["output_len"]
     if len(samples) != expected or any(sample.get("mega_launches") != 1 for sample in samples):
         raise ValueError("sample count or mega launch count does not match the run")
-    groups, cores, metadata, threads = read_segments(trace, samples, run["slots"], include_outer)
+    groups, cores, metadata, threads = read_segments(trace, samples, run["slots"], include_outer, run.get("core_count", 4))
     inference = inference_kernels(kernel_spans(groups, cores, threads)) if include_outer else {}
     timed = spec.get("simulator") in ("hardware", "testcluster") or clock_hz is not None
     frequency = clock_hz if clock_hz is not None else metadata.get("clock_hz") if timed else None
@@ -293,8 +295,8 @@ def analyze(run, trace, clock_hz=None, include_outer=False):
                               max_cycles=max(cycles), median_device_us=microseconds(median),
                               percent_of_layer=100 * sum(cycles) / total if total else 0))
     full_total = sum(sample["inference_cycles"] for sample in measured) if all(sample["kernels"] for sample in measured) else None
-    return dict(schema=1, status="ok" if comparison_ok else "failed", case=spec, perf_trace=str(trace), trace_metadata=metadata, clock_hz=frequency,
-                comparison=comparison, performance_valid=timed and not functional and comparison_ok, samples=measured, slots=aggregate,
+    return dict(schema=1, core_count=run.get("core_count", 4), status="ok" if comparison_ok else "failed", case=spec, perf_trace=str(trace), trace_metadata=metadata, clock_hz=frequency,
+                comparison=comparison, initial_state=run.get("initial_state"), performance_valid=timed and not functional and comparison_ok, samples=measured, slots=aggregate,
                 total_layer_cycles=total, total_layer_device_us=microseconds(total), include_outer=include_outer,
                 total_inference_cycles=full_total, total_inference_device_us=microseconds(full_total) if full_total is not None else None,
                 notes=[
@@ -308,9 +310,10 @@ def analyze(run, trace, clock_hz=None, include_outer=False):
                     *([
                         "Full inference spans the first embedding root RUNNING to the last output projection root WAIT_EXIT entry, including gaps between launches. Host preparation before that first root and output readback after that last root are excluded.",
                         "Kernel percentages use that full inference span, separately from layer slot percentages. Child threads are excluded; mega slots are a breakdown, not additional launches. kernel_cycles sums launches; inter_kernel_cycles records the intervening gaps.",
-                        "Full inference is unavailable for older traces containing only mega steps. Trace boundaries require embedding and output projection on all four cores; decode setup is excluded from measured totals.",
+                        "Full inference is unavailable for older traces containing only mega steps. Trace boundaries require embedding and output projection on all participating cores; decode setup is excluded from measured totals.",
                     ] if include_outer else []),
-                    "Decode prompt setup is executed but excluded. Every decode step has its own context length and slot timings.",
+                    "Decode loads the shared CPU prompt checkpoint without executing prefill. Every decode step has its own context length and slot timings." if run.get("initial_state") else
+                    "Legacy decode prompt setup, when present, is excluded. Every decode step has its own context length and slot timings.",
                     "cmodel counters validate trace analysis only; device microseconds are suppressed." if functional else
                     "Device microseconds use the selected clock frequency and require hardware or a cycle-accurate simulator. Host wall time is not hardware latency." if timed else
                     "Counter source is controlled externally. Raw counter ticks are reported; use --clock-hz for time conversion only with hardware or a cycle-accurate simulator.",
@@ -332,7 +335,7 @@ def report_layer(directory, clock_hz, output=None, include_outer=False, trace=No
             for slot in sample["slots"]:
                 writer.writerow({key: (slot if key in slot else sample)[key] for key in writer.fieldnames})
     spec = report["case"]
-    model = f"Graph: {spec.get('graph', 'unknown')}; weights: {spec.get('dtype', 'unspecified')}"
+    model = f"Graph: {spec.get('graph', 'unknown')}; weights: {spec.get('dtype', 'unspecified')}; cores: {report.get('core_count', 4)}"
     if "expert_count" in spec:
         model += f"; experts: {spec['expert_count']}; selected per token: {spec['expert_used_count']}"
     lines = ["# Transformer layer timing", "", model, "", f"Mode: {spec['mode']}; input: {spec['input_len']}; output: {spec['output_len']}; counter source: {spec.get('simulator', 'external')}", "",
@@ -372,7 +375,9 @@ def report_layer(directory, clock_hz, output=None, include_outer=False, trace=No
         cmp = report["comparison"]
         criterion = f"abs(Dayan - CPU) <= {cmp.get('atol', 'n/a')} + {cmp.get('rtol', 'n/a')} * abs(CPU) for every logit"
         if cmp.get("profile") == "mxfp4":
-            criterion = f"relative L2 <= {cmp['max_relative_l2_error']} and cosine >= {cmp['min_cosine_similarity']} for every step, including decode setup"
+            criterion = f"relative L2 <= {cmp['max_relative_l2_error']} and cosine >= {cmp['min_cosine_similarity']} for every step"
+            if any(not step.get("measured", True) for step in cmp.get("steps", [])):
+                criterion += ", including legacy decode setup"
         lines += ["", f"CPU comparison: {cmp.get('status', 'not-run')}; profile: {cmp.get('profile', 'strict')}. Criterion: {criterion}."]
         if cmp.get("profile") == "mxfp4":
             lines += [f"Elementwise mismatches use {cmp['atol']} + {cmp['rtol']} * abs(CPU) for diagnostics and do not determine this profile's status. Nonfinite logits always fail."]
@@ -383,7 +388,7 @@ def report_layer(directory, clock_hz, output=None, include_outer=False, trace=No
             lines.append(f"| {step['step']} | {step['phase']} | {step['status']} | {step['checked_elements']} | {step['mismatched_elements']} | {step['max_abs_error']:.6g} | {step['max_rel_error']:.6g} | {step['relative_l2_error']:.6g} | {cosine} |")
         if cmp.get("error"):
             lines += ["", cmp["error"]]
-        lines += ["", "CPU replay runs after perf capture with GPU layers, KV offload and operation offload disabled. It uses the same stored weights and Dayan token sequence. Decode prompt logits are also checked. CPU and Dayan activation quantization can differ; these differences remain in the reported errors."]
+        lines += ["", "CPU comparison runs after perf capture with GPU layers, KV offload and operation offload disabled. It uses the same stored weights and Dayan token sequence. Runs with a CPU prompt checkpoint reuse its state and logits without recomputing prefill. CPU and Dayan activation quantization can differ; these differences remain in the reported errors."]
     lines += ["", *["- " + note for note in report["notes"]], ""]
     (output / "report.md").write_text("\n".join(lines))
     print("\n".join(lines))

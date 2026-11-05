@@ -1,4 +1,5 @@
 #include "ggml-dayan-mega.h"
+#include "ggml-dayan-moe-ffn.h"
 
 #include "ggml-dayan-kernels.h"
 #include "ggml-dayan-mxfp4-layout.h"
@@ -478,6 +479,82 @@ static bool ggml_backend_dayan_mega_add_bf16_quantized(ggml_backend_dayan_mega_p
     return parameters->add<mega::matmul_quantized_bf16>(config, input, weight, output);
 }
 
+static bool ggml_backend_dayan_mega_add_noop(ggml_backend_dayan_mega_parameters *, int) { return true; }
+
+static bool ggml_backend_dayan_mega_add_ffn(ggml_backend_dayan_mega_parameters * parameters,
+                                           const ggml_backend_dayan_graph_slot & gate_slot,
+                                           const ggml_backend_dayan_graph_slot & down_slot,
+                                           const ggml_backend_dayan_graph_slot * weighted_slot,
+                                           const ggml_backend_dayan_graph_slot * sum_slot) {
+    const char * enabled = std::getenv("GGML_DAYAN_FUSED_FFN");
+    if (enabled && std::strcmp(enabled, "0") == 0) { return false; }
+    const auto * gate = gate_slot.nodes[0];
+    const auto * up = gate_slot.nodes[1];
+    const auto * hidden = gate_slot.nodes[3];
+    const auto * down = down_slot.nodes[0];
+    const bool moe = weighted_slot != nullptr;
+    const auto * weighted = moe ? weighted_slot->nodes[0] : nullptr;
+    auto * output = moe ? (sum_slot ? sum_slot->nodes[0] : nullptr) :
+        down_slot.kind == ggml_backend_dayan_slot_kind::mul_mat_quantized ? down_slot.nodes[1] : down_slot.nodes[0];
+    if (!gate || !up || !hidden || !down || !output || !gate->src[0] || !gate->src[1] || !up->src[0] ||
+        !down->src[0] || down->src[1] != hidden || up->src[1] != gate->src[1] || ggml_nrows(gate->src[1]) != 1 ||
+        (gate->src[0]->type != GGML_TYPE_MXFP4 && gate->src[0]->type != GGML_TYPE_BF16) ||
+        up->src[0]->type != gate->src[0]->type || down->src[0]->type != gate->src[0]->type ||
+        gate->src[1]->type != gate->src[0]->type || hidden->type != gate->src[0]->type ||
+        (output->type != GGML_TYPE_F32 && output->type != GGML_TYPE_BF16) || ggml_nrows(output) != 1 ||
+        gate->src[0]->ne[0] % 128 || gate->src[0]->ne[1] % 128 || down->src[0]->ne[1] % 64 ||
+        down->src[0]->ne[0] != gate->src[0]->ne[1] || output->ne[0] != down->src[0]->ne[1] ||
+        !ggml_is_contiguous(output) || (hidden->flags & GGML_TENSOR_FLAG_OUTPUT)) { return false; }
+    const auto * input = gate->src[1];
+    const auto * gw = gate->src[0];
+    const auto * uw = up->src[0];
+    const auto * dw = down->src[0];
+    if (!ggml_is_contiguous(input) || !ggml_is_contiguous(gw) || !ggml_is_contiguous(uw) || !ggml_is_contiguous(dw) ||
+        gw->ne[0] > 65536 || gw->ne[1] > 65536 || dw->ne[1] > 65536 ||
+        gw->ne[0] != uw->ne[0] || gw->ne[1] != uw->ne[1] || gw->ne[2] != uw->ne[2] ||
+        dw->ne[2] != gw->ne[2] || gw->ne[3] != 1 || uw->ne[3] != 1 || dw->ne[3] != 1) { return false; }
+    const auto * selected = moe ? gate->src[2] : input;
+    const auto * weights = moe && weighted ? weighted->src[1] : input;
+    const uint32_t used = moe && selected ? selected->ne[0] : 1;
+    if (moe) {
+        if (!weighted || !selected || !weights || selected->type != GGML_TYPE_I32 || selected->ne[1] != 1 ||
+            selected->nb[0] != sizeof(int32_t) || !used || used > 32 || used > gw->ne[2] || up->src[2] != selected || down->src[2] != selected ||
+            weighted->src[0] != down || weights->type != GGML_TYPE_F32 || ggml_nelements(weights) != used ||
+            !ggml_is_contiguous(weights) || output->type != GGML_TYPE_F32 ||
+            (down->flags & GGML_TENSOR_FLAG_OUTPUT) || (weighted->flags & GGML_TENSOR_FLAG_OUTPUT)) { return false; }
+        const ggml_tensor * accumulator = output;
+        for (uint32_t e = used - 1; e > 0; --e) {
+            if (accumulator->op != GGML_OP_ADD || !accumulator->src[0] || !accumulator->src[1] ||
+                accumulator->src[1]->view_src != weighted || accumulator->src[1]->view_offs != e * weighted->nb[1]) { return false; }
+            accumulator = accumulator->src[0];
+        }
+        if (accumulator->view_src != weighted || accumulator->view_offs != 0) { return false; }
+    } else if (gw->ne[2] != 1) { return false; }
+    const bool mx = gw->type == GGML_TYPE_MXFP4;
+    const auto a = DayanMxfp4Layout::make(ggml_nrows(input), input->ne[0]);
+    const auto g = DayanMxfp4Layout::make(ggml_nrows(gw), gw->ne[0]);
+    const auto u = DayanMxfp4Layout::make(ggml_nrows(uw), uw->ne[0]);
+    const auto d = DayanMxfp4Layout::make(ggml_nrows(dw), dw->ne[0]);
+    DayanFfnConfig config = {};
+    config.gate.m = config.down.m = 1;
+    config.gate.k = gw->ne[0]; config.gate.n = gw->ne[1];
+    config.down.k = dw->ne[0]; config.down.n = dw->ne[1];
+    config.gate.a_stride = mx ? a.row_stride : input->nb[1];
+    config.gate.a_scale_stride = a.scale_stride;
+    config.gate.b_stride = mx ? g.row_stride : gw->nb[1];
+    config.gate.b_scale_stride = g.scale_stride;
+    config.down.b_stride = mx ? d.row_stride : dw->nb[1];
+    config.down.b_scale_stride = d.scale_stride;
+    config.gate.weight_type = config.down.weight_type = mx ? kDayanDataTypeMXFP4 : kDayanDataTypeBF16;
+    config.down.output_type = output->type == GGML_TYPE_F32 ? kDayanDataTypeF32 : kDayanDataTypeBF16;
+    config.experts = gw->ne[2]; config.experts_used = used;
+    if (DayanFfnLayout::make(config).bytes > MATMUL_DAYAN_1C_URAM_BYTES) { return false; }
+    using tensor_ref = ggml_backend_dayan_mega_parameters::tensor_ref;
+    return parameters->add<mega::ffn_decode>(config, input, tensor_ref{input, mx ? a.scale_offset : 0},
+        gw, tensor_ref{gw, mx ? g.scale_offset : 0}, uw, tensor_ref{uw, mx ? u.scale_offset : 0},
+        dw, tensor_ref{dw, mx ? d.scale_offset : 0}, selected, weights, output);
+}
+
 static bool ggml_backend_dayan_mega_add_copy(ggml_backend_dayan_mega_parameters * parameters,
                                               const ggml_backend_dayan_graph_slot & slot) {
     ggml_tensor *       output = slot.nodes[0];
@@ -764,7 +841,8 @@ static bool ggml_backend_dayan_mega_add_flash_attention(ggml_backend_dayan_mega_
 static bool ggml_backend_dayan_mega_add_bf16_gated_projection(
     ggml_backend_dayan_mega_parameters * parameters,
     const ggml_backend_dayan_graph_slot & slot,
-    const ggml_tensor *                   scratch) {
+    npu_buffer_t *                       scratch,
+    uint64_t                             scratch_bytes) {
     const ggml_tensor * sigmoid   = slot.nodes[0];
     const ggml_tensor * gated     = slot.nodes[1];
     ggml_tensor *       output    = slot.nodes[2];
@@ -776,7 +854,7 @@ static bool ggml_backend_dayan_mega_add_bf16_gated_projection(
     if (slot.kind != ggml_backend_dayan_slot_kind::gated_output_projection || gate_view == nullptr ||
         attention == nullptr || weight == nullptr || qg == nullptr || qg->src[1] == nullptr || scratch == nullptr ||
         attention->type != GGML_TYPE_F32 || qg->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_BF16 ||
-        output->type != GGML_TYPE_F32 || (scratch->type != GGML_TYPE_F16 && scratch->type != GGML_TYPE_BF16)) {
+        output->type != GGML_TYPE_F32) {
         return false;
     }
     const uint64_t tokens   = attention->ne[1];
@@ -785,7 +863,7 @@ static bool ggml_backend_dayan_mega_add_bf16_gated_projection(
     const uint64_t width    = heads * head_dim;
     if (tokens > UINT32_MAX || heads > UINT32_MAX || head_dim > UINT32_MAX ||
         width > SIZE_MAX / sizeof(uint16_t) || tokens > SIZE_MAX / (width * sizeof(uint16_t)) ||
-        ggml_nbytes(scratch) < (size_t) tokens * width * sizeof(uint16_t)) {
+        scratch_bytes < (size_t) tokens * width * sizeof(uint16_t)) {
         return false;
     }
     const DayanGatedProjectionConfig config = {
@@ -864,7 +942,7 @@ struct ggml_backend_dayan_mega_context {
     const std::vector<ggml_backend_dayan_graph_slot> & slots;
     std::vector<size_t> indices;
     npu_buffer_t * workspace = nullptr;
-    uint64_t workspace_bytes = 64;
+    uint64_t workspace_bytes = 0;
 
     bool missing(unsigned step) const { return indices[step] == SIZE_MAX; }
 };
@@ -949,8 +1027,19 @@ static bool ggml_backend_dayan_mega_match(const ggml_backend_dayan_mega_graph & 
 static bool ggml_backend_dayan_mega_workspace(const ggml_backend_dayan_mega_runtime & runtime,
                                              const ggml_backend_dayan_mega_graph & graph,
                                              ggml_backend_dayan_mega_context & ctx) {
+    ctx.workspace_bytes = graph.moe ? 64 : 0;
     for (size_t index = 0; index < graph.step_count; ++index) {
         const auto kind = graph.steps[index].kind;
+        if (kind == ggml_backend_dayan_slot_kind::gated_output_projection) {
+            const auto & slot = ctx.slots[ctx.indices[index]];
+            const auto * projection = slot.nodes[2];
+            if (projection == nullptr || projection->src[1] == nullptr) { return false; }
+            // Graph tensor storage may alias the projection output after attention.
+            const uint64_t elements = ggml_nelements(projection->src[1]);
+            if (elements > SIZE_MAX / sizeof(uint16_t)) { return false; }
+            ctx.workspace_bytes = std::max(ctx.workspace_bytes, elements * sizeof(uint16_t));
+            continue;
+        }
         const bool glu = kind == ggml_backend_dayan_slot_kind::mul_mat_id_swiglu;
         if (!glu && kind != ggml_backend_dayan_slot_kind::mul_mat_id) {
             continue;
@@ -975,8 +1064,8 @@ static bool ggml_backend_dayan_mega_workspace(const ggml_backend_dayan_mega_runt
             ctx.workspace_bytes = std::max(ctx.workspace_bytes, bytes);
         }
     }
-    return runtime.prepare_workspace != nullptr &&
-           runtime.prepare_workspace(runtime.context, ctx.workspace_bytes, &ctx.workspace) == 0;
+    return ctx.workspace_bytes == 0 || (runtime.prepare_workspace != nullptr &&
+           runtime.prepare_workspace(runtime.context, ctx.workspace_bytes, &ctx.workspace) == 0);
 }
 
 ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
@@ -990,7 +1079,7 @@ ggml_backend_dayan_mega_result ggml_backend_dayan_try_qwen35_mega(
         ggml_backend_dayan_mega_context ctx = { slots, {} };
         size_t end = begin;
         if (!ggml_backend_dayan_mega_match(graph, ctx, begin, &end) ||
-            (graph.moe && !ggml_backend_dayan_mega_workspace(runtime, graph, ctx))) {
+            !ggml_backend_dayan_mega_workspace(runtime, graph, ctx)) {
             continue;
         }
         ggml_backend_dayan_mega_parameters parameters(runtime, graph.id, graph.parameter_count);

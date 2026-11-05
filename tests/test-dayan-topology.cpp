@@ -11,6 +11,7 @@ int main() {
         uint32_t clusters;
     };
     const test_case cases[] = {
+        {{1, 1, 0x1, 0x1}, 1, 0},
         {{1, 4, 0x1, 0x1}, 1, 0},
         {{1, 4, 0x1, 0xf}, 4, 1},
         {{2, 4, 0x3, 0xf}, 8, 2},
@@ -35,6 +36,13 @@ int main() {
     for (const auto & info : {npu_runtime_topology_t{0, 4, 0, 1}, {1, 4, 2, 1}, {1, 4, 1, 16}, {1, 4, 1, 0}}) {
         DayanTopology topology;
         GGML_ASSERT(!topology.init(info));
+    }
+    for (uint32_t tokens : {2U, 5U, 1024U, 6145U}) {
+        const auto single = DayanMoeDispatchLayout::make(tokens, 256, 8, 1);
+        const auto four = DayanMoeDispatchLayout::make(tokens, 256, 8);
+        GGML_ASSERT(single.position_stride >= (uint64_t) tokens * 8 * sizeof(uint32_t));
+        GGML_ASSERT(single.offsets_offset >= single.positions_offset + single.position_stride);
+        GGML_ASSERT(single.bytes <= four.bytes);
     }
     for (uint64_t width : {1, 16, 481, 513, 1541}) {
         for (uint32_t groups : {1, 2, 8}) {

@@ -4,7 +4,7 @@
 
 `prepare` copies the selected block from a GGUF, renames it to block 0, and retains its weights, dimensions and quantization. It also keeps the tokenizer, embedding and output head needed by `llama_decode`. It supports BF16/MXFP4 dense layers and MXFP4 MoE experts with BF16 attention. Merge split GGUFs before use. The resulting one-layer model receives embeddings directly; its hidden states and generated text do not reproduce the source model's intermediate layer inputs or language quality.
 
-`run` enables mega for the layer body and checks exactly one mega launch per inference step. Embedding and the output head still launch separate kernels. In the server log, `[kernel] lp-prefill started` is the layer mega; `lp-setup` is decode's prompt setup and `lp-d...` identifies decode steps. A preceding `get-rows` and following output normalization, row selection, conversion or matrix kernels are outside the layer mega. Four `proc-create` RPCs under one launch create its four core tasks. After capture and CPU comparison finish, `run` automatically invokes the independent report script. The offline layer timing covers only the mega body. `cmp-ops` explicitly disables mega for per-slot CPU comparison.
+`run` enables mega for the layer body and checks exactly one mega launch per inference step. Embedding and the output head still launch separate kernels. In the server log, `[kernel] lp-prefill started` is the layer mega; `lp-d...` identifies decode steps. Decode loads a CPU prompt checkpoint and never launches `lp-setup`. A preceding `get-rows` and following output normalization, row selection, conversion or matrix kernels are outside the layer mega. Each launch creates one or four core tasks, matching the server topology. After capture and CPU comparison finish, `run` automatically invokes the independent report script. The offline layer timing covers only the mega body. `cmp-ops` explicitly disables mega for per-slot CPU comparison.
 
 Build the client and extract a layer once:
 
@@ -41,6 +41,20 @@ The MoE mega graph includes attention, router, softmax, TopK, routed experts, sh
 
 For a cmodel check, use `--input-len 4 --output-len 2` and omit `--pcu`. The random two-layer MoE fixture in [MoE validation](qwen35-moe.md#cmodel-and-fixture) can be used with `--layer 0 1`. It exercises both attention kinds with a 512-token vocabulary; it does not measure trained-model quality. The server remains externally managed. Do not start cmodel while another test owns its device endpoints.
 
+## Single-core inference
+
+The same prepared models and `run` arguments work on one enabled core. The backend queries `npu_runtime_get_uram_capacity()` when opening the device. Single-core kernels and mega reserve at most 768 KiB per core, using smaller BF16/FFN, MXFP4 and attention tiles. Four-core mega retains its 1536 KiB per-core budget. Capacity below the selected budget fails before launching inference.
+
+For a one-core TestCluster, start the server from the firmware directory with:
+
+```sh
+./run_server.sh --cores-per-cluster 1 --core-mask 1 --timeout-ms 4294967295
+```
+
+For one enabled core on four-core hardware, retain `--cores-per-cluster 4` and use `--core-mask 1`. Match the physical core count to the simulator. Keep TestCluster advancing until the profiler exits. The infinite Server timeout also applies to stopping and flushing the profile.
+
+`layer-perf` selects the launch mode automatically. New `run.json` files record `core_count`; reports require that many complete mega traces and retain all slot and exit checks. Old files without `core_count` still require four cores. PCU may expose additional physical-core tracks; these do not change the expected mega task count.
+
 ## Dense layers and batch modes
 
 Pass multiple indices to prepare independent single-layer models in one command, for MXFP4 or BF16:
@@ -57,7 +71,7 @@ python3 tools/dayan-trace/layer-perf.py prepare \
 
 Each output directory contains `layer-0/` and `layer-3/`, each with its own `layer.gguf` and `layer.json`. Each model still contains one block. With a single index, files stay directly under `--output`; omitting `prepare --layer` selects layer 0. Duplicate or out-of-range indices and existing prepared outputs are rejected before extraction.
 
-Start a four-core `dayan_server` connected to the desired hardware, TestCluster or cmodel instance. Set `DAYAN_SERVER_SOCKET` if its socket differs from `/tmp/dayan-server.sock`. Then run selected layers together:
+Start a one-core or four-core `dayan_server` connected to the desired hardware, TestCluster or cmodel instance. Set `DAYAN_SERVER_SOCKET` if its socket differs from `/tmp/dayan-server.sock`. Then run selected layers together:
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py run \
@@ -83,7 +97,7 @@ python3 tools/dayan-trace/layer-perf.py run \
     --cmp --pcu --output build-dayan/perf-mxfp4-both
 ```
 
-Each layer runs its selected modes in argument order, with independent client processes, traces and CPU comparisons. Decode rebuilds its prompt state; it does not reuse the measured prefill process. `--output-len` applies only to decode and defaults to one step; prefill always uses zero output steps. Omit `--pcu` for cmodel. The same command works with the BF16 prepared directory.
+Each layer runs its selected modes in argument order, with independent client processes, traces and CPU comparisons. A CPU process prepares one prompt checkpoint per layer before profiling, shared by both modes and CPU comparison. Decode restores it without executing prefill again. `--output-len` applies only to decode and defaults to one step; prefill always uses zero output steps. Omit `--pcu` for cmodel. The same command works with the BF16 prepared directory.
 
 Multiple modes use this layout, even when only one source layer is selected:
 
@@ -94,12 +108,20 @@ perf-mxfp4-both/
   report.json
   summary.csv
   layer-0/
+    prompt.json  # shared CPU state metadata
+    prompt.json.state
+    prompt.json.logits.f32
     prefill/  # perf.json, run.json, report.md, report.json, slots.csv, ...
     decode/
   layer-3/
+    prompt.json
+    prompt.json.state
+    prompt.json.logits.f32
     prefill/
     decode/
 ```
+
+`prompt.json` records the CPU checkpoint, with its state and logits files alongside it. It is created for decode or `--cmp`, once per source layer. Single-mode runs keep it next to `case.json`. Missing, incompatible or damaged checkpoint data fails the run without recomputing prefill. `run.json.initial_state` records the loaded checkpoint and host load time, separately from inference time.
 
 The top-level report has one row per layer and mode, including step count, total layer cycles, median/min/max cycles per step and CPU comparison status. Detailed reports retain slot cycles and percentages for that mode. Decode totals exclude prompt setup. Single-mode runs retain their existing directory layout, and old records remain readable.
 
@@ -119,7 +141,7 @@ python3 tools/dayan-trace/layer-perf.py run \
 python3 tools/dayan-trace/layer-perf-report.py --run build/dayan-layer/prefill-1024
 ```
 
-Or build the prefix and measure consecutive decode steps:
+Or prepare the prefix once on CPU and measure consecutive decode steps:
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py run \
@@ -131,15 +153,15 @@ python3 tools/dayan-trace/layer-perf-report.py \
     --run build/dayan-layer/decode-1024-32 --clock-hz 1000000000
 ```
 
-- `input-len` is the synthetic prompt token count. The prompt is executed normally, including KV and recurrent-state updates. It is excluded from the decode report.
-- `output-len` is the number of measured single-token decode calls after the prompt. Each consumes the previous call's greedy output token; EOS does not stop the requested run. Prefill requires zero output steps, which is its default. Decode defaults to one step.
+- `input-len` is the synthetic prompt token count. CPU executes it once and saves KV, recurrent state, convolution history, final-token logits and the greedy continuation token. Dayan decode and CPU reference restore the same checkpoint. No prompt kernels run during decode.
+- `output-len` is the number of measured single-token decode calls after the prompt. The first consumes the saved CPU prompt's greedy token; later calls consume the previous Dayan call's greedy output token. EOS does not stop the requested run. Prefill requires zero output steps, which is its default. Decode defaults to one step.
 - Each inference call uses one microbatch and must launch mega exactly once. Splitting or standalone fallback fails the run. Use an input length that fits the selected layer and available device memory.
 - `run` owns only its `dyperf --follow` process and client. It uses an existing server and waits for the profiler to close `perf.json`. It does not parse timings during inference or install per-slot host callbacks. With `--pcu`, PCU metrics are also included in `perf.json`, with no delay between sampling rounds. `--client` and `--dyperf` override executable paths.
 - Each run needs an empty output directory. `run.log`, `case.json`, `run.json`, `command.json` and `perf.json` preserve the inputs and execution record. No warmup is performed; module loading and other cold host costs remain in the separate host wall time.
 
 ## CPU comparison
 
-Add `--cmp` to `run` for an independent GGML CPU baseline. After dyperf closes the trace, a separate process keeps only the CPU backend registered and loads the same single-layer GGUF with zero GPU layers, KV offload disabled and operation offload disabled. Removing the other backends also prevents implicit ACCEL buffer selection. It replays the same prompt and the tokens selected by the Dayan run, so different greedy predictions cannot change subsequent inputs. The reference uses the original stored weights and the CPU backend's own arithmetic and activation quantization.
+Add `--cmp` to `run` for an independent GGML CPU baseline. Before profiling, CPU prepares the shared prompt checkpoint once. After dyperf closes the trace, a separate CPU process loads the saved logits for prefill comparison, or restores the saved state and replays only the tokens selected by Dayan for decode comparison. Neither comparison recomputes the prompt. Both CPU processes keep only the CPU backend registered, with zero GPU layers, KV offload disabled and operation offload disabled. Removing the other backends also prevents implicit ACCEL buffer selection. Replaying Dayan's tokens keeps subsequent inputs identical despite different greedy predictions. The reference uses the original stored weights and the CPU backend's own arithmetic and activation quantization.
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py run \
@@ -150,18 +172,18 @@ python3 tools/dayan-trace/layer-perf.py run \
 python3 tools/dayan-trace/layer-perf-report.py --run build/dayan-layer/decode-cmp
 ```
 
-Comparison covers every vocabulary logit for the prompt's final token and every decode step. Decode prompt setup is checked even though it is outside the timing summary. It does not download or compare intermediate slots. `--cmp-profile auto` selects the following defaults:
+Prefill comparison covers every vocabulary logit for the prompt's final token. Decode comparison covers every requested single-token step, starting from the shared CPU state; it does not validate Dayan prefill. Select both modes to check both paths. It does not download or compare intermediate slots. `--cmp-profile auto` selects the following defaults:
 
 | Weights | Profile | Required for each step |
 | --- | --- | --- |
 | BF16 | `strict` | Every logit satisfies `abs(Dayan - CPU) <= 0.03 + 0.03 * abs(CPU)` |
 | MXFP4 dense or MoE | `mxfp4` | Relative L2 error <= 0.35 and cosine similarity >= 0.93 |
 
-Relative L2 is `norm(Dayan - CPU) / norm(CPU)`. The MXFP4 profile allows activation quantization error while retaining every elementwise mismatch, maximum error and greedy token in the report. Its mismatch count is diagnostic; pass/fail uses both aggregate limits separately for every step, including decode setup. Nonfinite logits fail in either profile. This is an end-to-end quantization check, not a replacement for operator correctness or language-quality evaluation. Large deviations can still fail the relaxed profile.
+Relative L2 is `norm(Dayan - CPU) / norm(CPU)`. The MXFP4 profile allows activation quantization error while retaining every elementwise mismatch, maximum error and greedy token in the report. Its mismatch count is diagnostic; pass/fail uses both aggregate limits separately for every measured step. Nonfinite logits fail in either profile. This is an end-to-end quantization check, not a replacement for operator correctness or language-quality evaluation. Large deviations can still fail the relaxed profile.
 
 Override the MXFP4 limits with `--cmp-max-rel-l2` and `--cmp-min-cosine`. Use `--cmp-profile strict` to require elementwise agreement, with `--cmp-atol` and `--cmp-rtol` overriding the default 0.03 tolerances. Those two tolerances only control diagnostic mismatch counts under the `mxfp4` profile. Resolved profiles and thresholds are saved in `case.json` and the CPU report. Existing prepared MoE/MXFP4 graph metadata also selects the MXFP4 profile, without preparing again. Older run results retain their recorded criteria when reported offline. BF16 defaults and `cmp-ops` thresholds are unchanged.
 
-`cpu-reference.json` and `cpu-reference.log` store the CPU result. `run.json` and the offline report include per-step and overall maximum absolute/relative error, relative L2 error, checked logit count and mismatch count. `run.json.logits.f32` stores the Dayan outputs as native float32 rows for this local comparison. The CPU process and comparisons run after capture; output saving occurs outside each inference timer. A failed comparison returns nonzero from both `run` and the report command, while preserving the trace and slot timings for diagnosis. Without `--cmp`, the run is an execution/finite-output check only.
+`cpu-reference.json` and `cpu-reference.log` store the CPU result. `run.json` and the offline report include per-step and overall maximum absolute/relative error, relative L2 error, checked logit count and mismatch count. `run.json.logits.f32` stores the Dayan outputs as native float32 rows for this local comparison. CPU comparison runs after capture; checkpoint preparation precedes profiling. Output saving occurs outside each inference timer. A failed comparison returns nonzero from both `run` and the report command, while preserving the trace and slot timings for diagnosis. Without `--cmp`, the run is an execution/finite-output check only.
 
 ## CPU operator comparison
 
@@ -181,7 +203,7 @@ The backend's slot callbacks capture actual stored inputs before each slot runs,
 
 Mega is disabled in this pass. Necessary operator fusions are retained, so fused SwiGLU and other fused groups are checked at their materialized outputs. `fused_nodes` lists the covered graph nodes; elided intermediates are not reported as independently checked. This pass covers executable slots in a single extracted layer, embedding and output head. It does not establish full-model quality or validate every mega intermediate lifetime.
 
-`operators.json` records slot kind, output name/type/shape, mismatch count, maximum absolute/relative error, relative L2 error and first mismatch. `operators.log` prints a result for each output. Both prefill setup and requested decode steps are checked. The default per-value tolerance is `1e-4 + 1e-3 * abs(CPU)`, configurable with `--op-atol` and `--op-rtol`; integer outputs require exact equality. Matching infinities are allowed for masks, while NaNs or differing infinities fail. Comparison failures are preserved and return nonzero; missing outputs or unsupported references fail instead of being skipped.
+`operators.json` records slot kind, output name/type/shape, mismatch count, maximum absolute/relative error, relative L2 error and first mismatch. `operators.log` prints a result for each output. Prefill mode checks the prompt; decode mode loads the shared CPU checkpoint and checks only the requested decode steps. The default per-value tolerance is `1e-4 + 1e-3 * abs(CPU)`, configurable with `--op-atol` and `--op-rtol`; integer outputs require exact equality. Matching infinities are allowed for masks, while NaNs or differing infinities fail. Comparison failures are preserved and return nonzero; missing outputs or unsupported references fail instead of being skipped.
 
 Dayan's current BF16-to-MXFP4 instruction uses fixed truncation and a scale that avoids finite overflow. GGML CPU MXFP4 quantization uses nearest values and a different scale rule. The diagnostic uses the CPU rule and reports this difference as a failure; it does not silently substitute the hardware rule or increase tolerances. A successful matrix comparison after an MXFP4 cast only validates matrix arithmetic on the stored quantized inputs. MAT also discards the low three FP16 fraction bits, and the attention PV and chunked GDN products use TF32 operands. Their differences from full F32 arithmetic remain visible under the same strict thresholds.
 
@@ -208,7 +230,7 @@ When captured with `--pcu`, open `perf.json` in Perfetto to inspect each core's 
 
 Percentages use cycles, not host time: each slot's total cycles divided by the total measured layer cycles. For several decode steps this is a ratio of sums, not a mean of percentages or a ratio of medians. Embedding, output normalization and lm_head are excluded from both the default report and its layer denominator.
 
-A slot here is one named mega device step, including its following barriers. Optional no-op steps remain visible, and two device steps that reuse one host slot remain separate. Timing uses raw 48-bit counters: earliest step start to latest step end across four cores. Child-thread execution and concurrent cores are not added together. Slot spans can overlap, so their sum is not the layer duration. Root scheduling states do not measure MAT/VEC/LSU utilization.
+A slot here is one named mega device step, including its following barriers. Optional no-op steps remain visible, and two device steps that reuse one host slot remain separate. Timing uses raw 48-bit counters: earliest step start to latest step end across the participating cores. Child-thread execution and concurrent cores are not added together. Slot spans can overlap, so their sum is not the layer duration. Root scheduling states do not measure MAT/VEC/LSU utilization.
 
 The layer span covers the first named step through the final root's `WAIT_EXIT`, excluding embedding and output norm/projection. The launch span also includes root startup before its first rename. The host wall time covers the whole synchronous `llama_decode`, including those surrounding operations and profiling overhead. No full-model extrapolation is made.
 

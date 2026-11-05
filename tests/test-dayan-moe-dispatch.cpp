@@ -113,10 +113,10 @@ static void equal(const void * actual, const void * expected, size_t bytes, cons
 }
 
 static void routing_case(npu_context_t * context, npu_stream_t * stream, uint32_t tokens, uint32_t experts,
-                          uint32_t used, uint32_t slots, bool skew, uint32_t expert_shift = 0) {
+                          uint32_t used, uint32_t slots, bool skew, uint32_t cores, uint32_t expert_shift = 0) {
     constexpr uint32_t columns = 160;
     const uint32_t total = tokens * used;
-    const auto dispatch = DayanMoeDispatchLayout::make(tokens, experts, used);
+    const auto dispatch = DayanMoeDispatchLayout::make(tokens, experts, used, cores);
     const auto src_layout = DayanMxfp4Layout::make(tokens * slots, columns);
     const auto dst_layout = DayanMxfp4Layout::make(total, columns);
     DayanMxfp4MoeConfig config = {};
@@ -139,8 +139,8 @@ static void routing_case(npu_context_t * context, npu_stream_t * stream, uint32_
     }
     std::partial_sum(counts.begin(), counts.end(), offsets.begin() + 1);
     auto cursor = offsets;
-    for (uint32_t core = 0; core < 4; ++core) {
-        for (uint32_t token = core; token < tokens; token += 4) {
+    for (uint32_t core = 0; core < cores; ++core) {
+        for (uint32_t token = core; token < tokens; token += cores) {
             for (uint32_t rank = 0; rank < used; ++rank) {
                 mapping[token * used + rank] = cursor[ids[token * (used + 3) + rank]]++;
             }
@@ -156,8 +156,8 @@ static void routing_case(npu_context_t * context, npu_stream_t * stream, uint32_
     upload(stream, buffers[3], input.data(), input.size());
     npu_kernel_launch_attrs_t attrs;
     npu_kernel_launch_attrs_init(&attrs, context, stream, "moe-dispatch");
-    attrs.config.task_dim = NPUTaskDim3{4, 1, 1};
-    attrs.config.task_mode = NPUTaskMode::kFourCore;
+    attrs.config.task_dim = NPUTaskDim3{cores, 1, 1};
+    attrs.config.task_mode = cores == 4 ? NPUTaskMode::kFourCore : NPUTaskMode::kSingleCore;
     attrs.timeout_ms = 300000;
     for (unsigned repeat = 0; repeat < 2; ++repeat) {
         check(test_moe_dispatch(buffers[0], buffers[1], buffers[2], buffers[3], buffers[4], buffers[5], 0, &attrs), "dispatch");
@@ -169,8 +169,8 @@ static void routing_case(npu_context_t * context, npu_stream_t * stream, uint32_
         for (uint32_t token = 0; token < tokens; ++token) {
             for (uint32_t rank = 0; rank < used; ++rank) {
                 const uint32_t row = token * used + rank, source = token * slots + rank % slots, group = mapping[row];
-                equal(workspace.data() + dispatch.positions_offset + (token % 4) * dispatch.position_stride +
-                      ((token / 4) * used + rank) * 4, &group, 4, "mapping");
+                equal(workspace.data() + dispatch.positions_offset + (token % cores) * dispatch.position_stride +
+                      ((token / cores) * used + rank) * 4, &group, 4, "mapping");
                 equal(grouped.data() + group * dst_layout.row_stride, input.data() + source * src_layout.row_stride, dst_layout.row_stride, "gather");
                 equal(output.data() + row * dst_layout.row_stride, input.data() + source * src_layout.row_stride, dst_layout.row_stride, "scatter");
                 for (unsigned plane = 0; plane < (columns + 127) / 128; ++plane) {
@@ -207,6 +207,11 @@ int main() {
     check(npu_runtime_open(&runtime, &options), "open");
     check(npu_context_create(runtime, nullptr, &context), "context");
     check(npu_stream_create(context, nullptr, &stream), "stream");
+    npu_runtime_topology_t info;
+    check(npu_runtime_get_topology(runtime, &info), "topology");
+    DayanTopology topology;
+    if (!topology.init(info) || (topology.cores != 1 && topology.cores != 4)) { return 1; }
+    const uint32_t cores = topology.cores;
     uint32_t rows[64];
     uint64_t addresses[64], expected[64];
     for (unsigned i = 0; i < 64; ++i) { rows[i] = i * 1023; expected[i] = 0x81ffffff80ULL + (uint64_t) rows[i] * 128; }
@@ -224,13 +229,13 @@ int main() {
     check(npu_buffer_destroy(source), "free");
     check(npu_buffer_destroy(destination), "free");
     std::puts("PASS 64-bit address carry");
-    routing_case(context, stream, 2, 65, 8, 1, false);
-    routing_case(context, stream, 5, 65, 8, 1, false);
-    routing_case(context, stream, 129, 256, 8, 8, true);
-    routing_case(context, stream, 129, 1025, 8, 1, false);
-    routing_case(context, stream, 5, 1089, 8, 1, true, 1024);
-    routing_case(context, stream, 6145, 4096, 8, 1, false);
-    routing_case(context, stream, 17, 63, 3, 1, false);
+    routing_case(context, stream, 2, 65, 8, 1, false, cores);
+    routing_case(context, stream, 5, 65, 8, 1, false, cores);
+    routing_case(context, stream, 129, 256, 8, 8, true, cores);
+    routing_case(context, stream, 129, 1025, 8, 1, false, cores);
+    routing_case(context, stream, 5, 1089, 8, 1, true, cores, 1024);
+    routing_case(context, stream, 6145, 4096, 8, 1, false, cores);
+    routing_case(context, stream, 17, 63, 3, 1, false, cores);
     check(npu_stream_destroy(stream), "destroy stream");
     check(npu_context_destroy(context), "destroy context");
     check(npu_runtime_close(runtime), "close");

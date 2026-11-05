@@ -49,6 +49,7 @@ struct ggml_backend_dayan_device_state {
     npu_stream_t *  stream     = nullptr;
     size_t          references = 0;
     DayanTopology   topology;
+    uint64_t        uram_capacity = 0;
 };
 
 struct ggml_backend_dayan_slot_resources {
@@ -98,6 +99,11 @@ static std::mutex                                       ggml_backend_dayan_trace
 static ggml_backend_dayan_slot_trace_callback           ggml_backend_dayan_trace_callback;
 static void *                                           ggml_backend_dayan_trace_user_data;
 static uint64_t                                         ggml_backend_dayan_mega_launch_count;
+
+static uint64_t ggml_backend_dayan_get_core_count() {
+    std::lock_guard<std::mutex> lock(ggml_backend_dayan_device_mutex);
+    return ggml_backend_dayan_device ? ggml_backend_dayan_device->topology.cores : 0;
+}
 
 static uint64_t ggml_backend_dayan_get_mega_launch_count() {
     return ggml_backend_dayan_mega_launch_count;
@@ -919,6 +925,18 @@ static int ggml_backend_dayan_device_acquire(ggml_backend_dayan_device_state ** 
             }
         }
         if (status == 0) {
+            status = npu_runtime_get_uram_capacity(device->runtime, &device->uram_capacity);
+            const uint64_t required = device->topology.clusters ? MATMUL_DAYAN_4C_URAM_BYTES : MATMUL_DAYAN_1C_URAM_BYTES;
+            if (status == 0 && device->uram_capacity < required) { status = -ENOSPC; }
+            if (status < 0) {
+                GGML_LOG_ERROR("%s: cannot use Dayan URAM capacity %llu bytes (need %llu, status %d)\n", __func__,
+                               (unsigned long long) device->uram_capacity, (unsigned long long) required, status);
+            } else {
+                GGML_LOG_INFO("%s: %u cores, %llu KiB URAM per core\n", __func__, device->topology.cores,
+                              (unsigned long long) (device->uram_capacity / 1024));
+            }
+        }
+        if (status == 0) {
             status = npu_context_create(device->runtime, nullptr, &device->context);
         }
         if (status == 0) {
@@ -1478,7 +1496,8 @@ static int ggml_backend_dayan_mxfp4_matmul(ggml_backend_dayan_context * ctx, ggm
         npu_buffer_t * weight_buffer = ggml_backend_dayan_tensor_buffer(weight);
         if (moe) {
             ggml_backend_dayan_init_native_launch_attrs(ctx, "moe-mxfp4", node->ne[1] * node->ne[2], &attrs);
-            status = mul_mat_id_mxfp4(buffers.config, a, as ? as : a, weight_buffer, b->scales,
+            const auto launch = ctx->device->uram_capacity < MATMUL_DAYAN_4C_URAM_BYTES ? mul_mat_id_mxfp4_small : mul_mat_id_mxfp4;
+            status = launch(buffers.config, a, as ? as : a, weight_buffer, b->scales,
                                      up ? ggml_backend_dayan_tensor_buffer(up->src[0]) : weight_buffer, u->scales,
                                      ggml_backend_dayan_tensor_buffer(node->src[2]), ggml_backend_dayan_tensor_buffer(output),
                                      out ? out->scales : ggml_backend_dayan_tensor_buffer(output),
@@ -3420,8 +3439,8 @@ static int ggml_backend_dayan_mega_launch(void * context,
         const char * tag = std::getenv("GGML_DAYAN_MEGA_TAG");
         ggml_backend_dayan_init_launch_attrs(
             ctx, tag && tag[0] ? tag : kind.linear ? "q35-linear" : "q35-full-mega", &attrs);
-        attrs.config = { NPUTaskDim3{ 4, 1, 1 }, NPUTaskMode::kFourCore };
-        const auto launch = kind.moe ? qwen35_moe_mega : qwen35_dense_mega;
+        attrs.config = ctx->device->topology.launch(true);
+        const auto launch = ctx->device->topology.cores == 1 ? qwen35_mega_1c : kind.moe ? qwen35_moe_mega : qwen35_dense_mega;
         status = launch(
             buffers.config, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5],
             arguments[6], arguments[7], arguments[8], arguments[9], arguments[10], arguments[11], arguments[12],
@@ -3438,7 +3457,7 @@ static bool ggml_backend_dayan_mega_enabled(const ggml_backend_dayan_context * c
     }
 
     std::lock_guard<std::mutex> lock(ggml_backend_dayan_trace_mutex);
-    return ctx->device->topology.clusters == 1 && ctx->device->topology.cores == 4 &&
+    return (ctx->device->topology.cores == 1 || (ctx->device->topology.clusters == 1 && ctx->device->topology.cores == 4)) &&
            ggml_backend_dayan_trace_callback == nullptr && ggml_backend_dayan_filter_callback == nullptr;
 }
 
@@ -4062,6 +4081,9 @@ static void * ggml_backend_dayan_reg_get_proc_address(ggml_backend_reg_t reg, co
     }
     if (strcmp(name, "ggml_backend_dayan_get_graph_plan") == 0) {
         return (void *) ggml_backend_dayan_get_graph_plan;
+    }
+    if (strcmp(name, "ggml_backend_dayan_get_core_count") == 0) {
+        return (void *) ggml_backend_dayan_get_core_count;
     }
     if (strcmp(name, "ggml_backend_dayan_get_mega_launch_count") == 0) {
         return (void *) ggml_backend_dayan_get_mega_launch_count;

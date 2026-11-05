@@ -79,6 +79,7 @@ add_custom_command(
         ggml-dayan-conv.h
         ggml-dayan-elementwise.h
         ggml-dayan-ffn.h
+        ggml-dayan-moe-ffn.h
         ggml-dayan-flash-attention.h
         ggml-dayan-gated-delta-net.h
         ggml-dayan-layout.h
@@ -131,6 +132,7 @@ add_custom_command(
         ggml-dayan-matmul.h
         ggml-dayan-matmul-4c.h
         ggml-dayan-ffn.h
+        ggml-dayan-moe-ffn.h
         ggml-dayan-mxfp4.h
         ggml-dayan-mxfp4-layout.h
         ggml-dayan-memory.h
@@ -169,6 +171,7 @@ ggml_add_backend_library(ggml-dayan
     ggml-dayan-conv.h
     ggml-dayan-elementwise.h
     ggml-dayan-ffn.h
+    ggml-dayan-moe-ffn.h
     ggml-dayan-flash-attention.h
     ggml-dayan-gated-delta-net.h
     ggml-dayan-layout.h

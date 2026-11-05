@@ -19,6 +19,15 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+def prepare_prompt_fixture(command):
+    case, result = Path(command[1]), Path(command[2])
+    state, logits = result.with_suffix(".state"), result.with_suffix(".logits.f32")
+    state.write_bytes(b"state")
+    logits.write_bytes(b"logits")
+    runner.write_json(result, dict(status="ok", backend="CPU", case=json.loads(case.read_text()), state_file=str(state), logits_file=str(logits)))
+    return SimpleNamespace(returncode=0)
+
+
 def fixture(tags=("lp-prefill",), anchor=100, stride=100):
     events = []
     slots = [dict(name="norm0", kind="norm_pipeline"), dict(name="residual", kind="norm_pipeline")]
@@ -84,6 +93,30 @@ class LayerPerfTests(unittest.TestCase):
             path = Path(directory) / "perf.json"
             path.write_text(trace if isinstance(trace, str) else json.dumps(trace))
             return report.analyze(run, path, **kwargs)
+
+    def test_single_core_prefill_and_decode(self):
+        for tags in (("lp-prefill",), ("lp-d0000000001", "lp-d0000000002")):
+            run, trace = full_fixture(tags)
+            run["core_count"] = 1
+            trace["traceEvents"] = [event for event in trace["traceEvents"] if event["pid"] == 0]
+            result = self.analyze(run, trace, include_outer=True)
+            self.assertEqual(result["core_count"], 1)
+            self.assertEqual(result["total_layer_cycles"], 31 * len(tags))
+            self.assertTrue(all(sample["inference_cycles"] == 108 for sample in result["samples"]))
+            for cores in (4, 0, 2):
+                run["core_count"] = cores
+                with self.assertRaises(ValueError):
+                    self.analyze(run, trace)
+            del run["core_count"]
+            with self.assertRaises(ValueError):
+                self.analyze(run, trace)
+
+    def test_single_core_missing_exit_is_rejected(self):
+        run, trace = fixture()
+        run["core_count"] = 1
+        trace["traceEvents"] = [event for event in trace["traceEvents"] if event["pid"] == 0 and event.get("name") != "WAIT_EXIT"]
+        with self.assertRaisesRegex(ValueError, "missing launch, slot or final root exit"):
+            self.analyze(run, trace)
 
     def test_four_core_span_and_wait_exit_boundary(self):
         result = self.analyze(*fixture())
@@ -287,7 +320,7 @@ class LayerBatchTests(unittest.TestCase):
             path = directory / f"layer-{layer}"
             path.mkdir(parents=True)
             (path / "layer.gguf").touch()
-            metadata = dict(schema=1, source_layer=layer, model=str(path / "layer.gguf"))
+            metadata = dict(schema=1, source_layer=layer, model=str(path / "layer.gguf"), graph="Qwen35DenseBf16" + ("Linear" if layer == 0 else "Full"))
             if moe:
                 metadata.update(architecture="qwen35moe", graph="Qwen35Moe" + ("Linear" if layer == 0 else "Full"),
                                 dtype="mxfp4", expert_count=256, expert_used_count=8)
@@ -354,6 +387,9 @@ class LayerBatchTests(unittest.TestCase):
                 def execute(command, **kwargs):
                     if command[0] == runner.sys.executable:
                         return SimpleNamespace(returncode=report.main(command[2:]))
+                    if command[-1] == "--prepare-state":
+                        calls.append(("prepare", json.loads(Path(command[1]).read_text())["source_layer"]))
+                        return prepare_prompt_fixture(command)
                     profiling = command[1] == "--socket"
                     case = Path(command[-2] if profiling else command[1])
                     spec = json.loads(case.read_text())
@@ -383,7 +419,7 @@ class LayerBatchTests(unittest.TestCase):
                     env = dict(DAYAN_SERVER_SOCKET=str(path / "server.sock"), DAYAN_ROOT=str(path), DAYAN_LAYER_CLIENT="/bin/true")
                     with patch.dict(runner.os.environ, env), patch.object(runner.subprocess, "run", side_effect=execute), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                         status = runner.main(["run", "--prepared", str(prepared), "--input-len", "4", "--cmp", "--output", str(output)] + (["--pcu"] if pcu else []))
-                self.assertEqual(calls, [("perf", 0), ("cpu", 0), ("perf", 3), ("cpu", 3)])
+                self.assertEqual(calls, [("prepare", 0), ("perf", 0), ("cpu", 0), ("prepare", 3), ("perf", 3), ("cpu", 3)])
                 self.assertEqual(status, int(failed_layer is not None))
                 batch = json.loads((output / "batch.json").read_text())
                 self.assertEqual(batch["status"], "ok" if status == 0 else "failed")
@@ -401,6 +437,8 @@ class LayerBatchTests(unittest.TestCase):
                 calls = []
 
                 def execute(command, **kwargs):
+                    if command[-1] == "--prepare-state":
+                        return prepare_prompt_fixture(command)
                     self.assertEqual(command[-1], "--cmp-ops")
                     self.assertEqual(kwargs["env"]["DAYAN_SERVER_SOCKET"], str(path / "server.sock"))
                     spec = json.loads(Path(command[1]).read_text())
@@ -441,6 +479,10 @@ class LayerBatchTests(unittest.TestCase):
                     case = Path(command[-2] if profiling else command[1])
                     spec = json.loads(case.read_text())
                     layer, mode = spec["source_layer"], spec["mode"]
+                    self.assertEqual(Path(spec["prompt_state"]), output / f"layer-{layer}/prompt.json")
+                    if command[-1] == "--prepare-state":
+                        calls.append(("prepare", layer, mode))
+                        return prepare_prompt_fixture(command)
                     calls.append(("perf" if profiling else "cpu", layer, mode))
                     self.assertEqual(case.parent, output / f"layer-{layer}" / mode)
                     self.assertEqual(spec["input_len"], 4)
@@ -450,11 +492,13 @@ class LayerBatchTests(unittest.TestCase):
                     if profiling:
                         if failing and failure == "inference":
                             return SimpleNamespace(returncode=1)
-                        tags = ("lp-prefill",) if mode == "prefill" else ("lp-setup", "lp-d0000000001", "lp-d0000000002")
+                        tags = ("lp-prefill",) if mode == "prefill" else ("lp-d0000000001", "lp-d0000000002")
                         run, trace = full_fixture(tags)
                         run["case"] = spec
                         if mode == "decode":
-                            run["samples"] = run["samples"][1:]
+                            run["initial_state"] = dict(backend="CPU", checkpoint=spec["prompt_state"], tokens=4, next_token=10)
+                            for i, sample in enumerate(run["samples"], 1):
+                                sample["step"] = i
                         runner.write_json(Path(command[-1]), run)
                         if not (failing and failure == "trace"):
                             runner.write_json(Path(command[command.index("-o") + 1]), trace)
@@ -472,8 +516,8 @@ class LayerBatchTests(unittest.TestCase):
                                               "--socket", str(path / "server.sock"), "--client", "/bin/true", "--dyperf", "/bin/true",
                                               "--output", str(output)])
                 self.assertEqual(status, int(failure is not None))
-                expected = [(stage, layer, mode) for layer in (0, 3) for mode in ("prefill", "decode") for stage in ("perf", "cpu")]
-                self.assertEqual(calls, (expected[:3] if failure == "inference" else expected) + [("report",)])
+                expected = [(stage, layer, mode) for layer in (0, 3) for mode in ("prefill", "decode") for stage in (("prepare", "perf", "cpu") if mode == "prefill" else ("perf", "cpu"))]
+                self.assertEqual(calls, (expected[:4] if failure == "inference" else expected) + [("report",)])
                 batch = json.loads((output / "batch.json").read_text())
                 self.assertEqual(batch["schema"], 2)
                 summary = json.loads((output / "report.json").read_text())
@@ -483,6 +527,8 @@ class LayerBatchTests(unittest.TestCase):
                 if failure not in ("inference", "trace"):
                     self.assertEqual(summary["runs"][1]["total_layer_cycles"], 68)
                     self.assertEqual(summary["runs"][1]["median_layer_cycles"], 34)
+                    decoded = json.loads((output / "layer-0/decode/report.json").read_text())
+                    self.assertEqual(decoded["initial_state"]["checkpoint"], str(output / "layer-0/prompt.json"))
                 if failure == "inference":
                     self.assertEqual([entry["status"] for entry in batch["runs"]], ["ok", "failed", "not-run", "not-run"])
                     self.assertFalse((output / "layer-3").exists())
@@ -595,6 +641,8 @@ class LayerBatchTests(unittest.TestCase):
                 def execute(command, **kwargs):
                     if command[0] == runner.sys.executable:
                         return SimpleNamespace(returncode=report.main(command[2:]))
+                    if command[-1] == "--prepare-state":
+                        return prepare_prompt_fixture(command)
                     runner.write_json(Path(command[-1]), dict(status="failed", error="model inference failed at step 0"))
                     return SimpleNamespace(returncode=exit_code)
 
@@ -605,7 +653,7 @@ class LayerBatchTests(unittest.TestCase):
                                               "--socket", str(path / "server.sock"), "--client", "/bin/true", "--dyperf", "/bin/true",
                                               "--output", str(path / "output")])
                     self.assertEqual(status, 1)
-                    self.assertEqual(process.call_count, 2)
+                    self.assertEqual(process.call_count, 3)
                     compare.assert_not_called()
                 batch = json.loads((path / "output/batch.json").read_text())
                 self.assertEqual(batch["status"], "failed")
@@ -615,6 +663,58 @@ class LayerBatchTests(unittest.TestCase):
                     self.assertEqual(report.main(["--run", str(path / "output")]), 1)
                 summary = json.loads((path / "output/report.json").read_text())
                 self.assertEqual(summary["layers"][1], dict(source_layer=3, mode="prefill", status="not-run", report=None))
+
+
+class PromptStateTests(unittest.TestCase):
+    def test_modes_share_one_checkpoint_in_either_order(self):
+        for modes in (("prefill", "decode"), ("decode", "prefill")):
+            with self.subTest(modes=modes), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                spec = dict(model="layer.gguf", graph="Qwen35MoeLinear", source_layer=0, input_len=4, seed=1, prompt_state=str(path / "prompt.json"))
+                args = SimpleNamespace(client=Path("/bin/true"))
+                with patch.object(runner.subprocess, "run", side_effect=lambda command, **kwargs: prepare_prompt_fixture(command)) as process:
+                    for mode in modes:
+                        case = path / f"{mode}.json"
+                        current = dict(spec, mode=mode, output_len=2 if mode == "decode" else 0)
+                        runner.write_json(case, current)
+                        runner.prepare_prompt(args, case, current)
+                    self.assertEqual(process.call_count, 1)
+
+    def test_invalid_checkpoint_is_never_recomputed(self):
+        for invalid in ("missing", "json", "status", "model", "graph", "source_layer", "input_len", "seed", "state_file", "logits_file"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                case, result = path / "case.json", path / "prompt.json"
+                spec = dict(model="layer.gguf", graph="Qwen35MoeFull", source_layer=3, input_len=4, seed=1, prompt_state=str(result))
+                runner.write_json(case, spec)
+                prepare_prompt_fixture(["client", str(case), str(result), "--prepare-state"])
+                prompt = json.loads(result.read_text())
+                if invalid in ("state_file", "logits_file"):
+                    Path(prompt[invalid]).unlink()
+                elif invalid == "status":
+                    prompt[invalid] = "failed"
+                elif invalid not in ("json", "missing"):
+                    prompt["case"][invalid] = "wrong"
+                runner.write_json(result, prompt)
+                if invalid == "json":
+                    result.write_text("{")
+                if invalid == "missing":
+                    result.unlink()
+                    result.with_suffix(".command.json").write_text("[]")
+                with patch.object(runner.subprocess, "run") as process, self.assertRaisesRegex(runner.InferenceError, "will not be recomputed"):
+                    runner.prepare_prompt(SimpleNamespace(client=Path("/bin/true")), case, spec)
+                process.assert_not_called()
+
+    def test_failed_preparation_stops_before_profiling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            metadata = dict(model="layer.gguf", graph="Qwen35MoeFull", source_layer=3)
+            args = SimpleNamespace(mode="decode", input_len=4, output_len=2, seed=1, cmp=False, cmp_profile="auto", cmp_atol=0.03, cmp_rtol=0.03, cmp_max_rel_l2=0.35, cmp_min_cosine=0.93, client=Path("/bin/true"), prompt_state=path / "prompt.json")
+            with patch.object(runner.subprocess, "run", return_value=SimpleNamespace(returncode=1)) as process, self.assertRaisesRegex(runner.InferenceError, "CPU prompt preparation failed"):
+                runner.run_layer(args, metadata, path)
+            self.assertEqual(process.call_count, 1)
+            self.assertEqual(process.call_args.args[0][-1], "--prepare-state")
+            self.assertFalse((path / "command.json").exists())
 
 
 class LayerMoePrepareTests(unittest.TestCase):

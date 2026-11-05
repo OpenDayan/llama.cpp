@@ -165,6 +165,30 @@ def comparison_options(args, metadata):
                 cmp_max_rel_l2=args.cmp_max_rel_l2, cmp_min_cosine=args.cmp_min_cosine)
 
 
+def prepare_prompt(args, case, spec):
+    result = Path(spec["prompt_state"])
+    command_file = result.with_suffix(".command.json")
+    if not result.exists():
+        if command_file.exists():
+            raise InferenceError(f"missing CPU prompt checkpoint: {result}; it will not be recomputed")
+        command = [str(args.client.resolve()), str(case), str(result), "--prepare-state"]
+        write_json(command_file, command)
+        with result.with_suffix(".log").open("w") as log:
+            completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
+        if completed.returncode or not result.is_file():
+            raise InferenceError(f"CPU prompt preparation failed; see {result.with_suffix('.log')}")
+    try:
+        prompt = json.loads(result.read_text())
+    except (OSError, ValueError) as error:
+        raise InferenceError(f"cannot read CPU prompt checkpoint: {result}; it will not be recomputed") from error
+    if prompt.get("status") != "ok" or prompt.get("backend") != "CPU" or any(
+            prompt.get("case", {}).get(key) != spec[key] for key in ("model", "graph", "source_layer", "input_len", "seed")):
+        raise InferenceError(f"invalid CPU prompt checkpoint: {result}; it will not be recomputed")
+    for key in ("state_file", "logits_file"):
+        if not Path(prompt.get(key, "")).is_file():
+            raise InferenceError(f"missing {key} in CPU prompt checkpoint: {result}; it will not be recomputed")
+
+
 def run_layer(args, metadata, output):
     output.mkdir(parents=True, exist_ok=True)
     spec = dict(metadata, mode=args.mode, input_len=args.input_len, output_len=args.output_len,
@@ -172,7 +196,11 @@ def run_layer(args, metadata, output):
     case = output.resolve() / "case.json"
     result = output.resolve() / "run.json"
     trace = output.resolve() / "perf.json"
+    if args.mode == "decode" or args.cmp:
+        spec["prompt_state"] = str(args.prompt_state.resolve())
     write_json(case, spec)
+    if "prompt_state" in spec:
+        prepare_prompt(args, case, spec)
     command = [str(args.dyperf.resolve()), "--socket", args.socket, "--follow"]
     if args.pcu:
         command += ["--pcu-interval", "0"]
@@ -196,7 +224,11 @@ def compare_operators(args, metadata, output):
     spec = dict(metadata, mode=args.mode, input_len=args.input_len, output_len=args.output_len,
                 seed=args.seed, op_atol=args.op_atol, op_rtol=args.op_rtol)
     case, result = output.resolve() / "case.json", output.resolve() / "operators.json"
+    if args.mode == "decode":
+        spec["prompt_state"] = str(args.prompt_state.resolve())
     write_json(case, spec)
+    if "prompt_state" in spec:
+        prepare_prompt(args, case, spec)
     command = [str(args.client.resolve()), str(case), str(result), "--cmp-ops"]
     write_json(output / "command.json", command)
     environment = dict(os.environ, DAYAN_SERVER_SOCKET=args.socket)
@@ -223,7 +255,7 @@ def main(argv=None):
     common.add_argument("--layer", type=int, nargs="+", help="source layer indices (default: all prepared layers)")
     common.add_argument("--output", type=Path, required=True)
     common.add_argument("--mode", choices=("prefill", "decode"), nargs="+", default=["prefill"], help="inference modes in execution order (default: prefill)")
-    common.add_argument("--input-len", type=int, default=128, help="prompt length; executed before decode")
+    common.add_argument("--input-len", type=int, default=128, help="prompt length; decode loads a CPU checkpoint prepared once per layer")
     common.add_argument("--output-len", type=int, help="number of single-token decode calls (default: 1); prefill always uses 0")
     common.add_argument("--seed", type=int, default=1)
     common.add_argument("--socket", default=os.environ.get("DAYAN_SERVER_SOCKET", "/tmp/dayan-server.sock"))
@@ -283,6 +315,7 @@ def main(argv=None):
             case_args = argparse.Namespace(**vars(args))
             case_args.mode = entry["mode"]
             case_args.output_len = args.output_len if entry["mode"] == "decode" else 0
+            case_args.prompt_state = (args.output / f"layer-{entry['source_layer']}" if batch or multiple_modes else args.output) / "prompt.json"
             try:
                 execute(case_args, models[index // len(args.mode)], args.output / entry["directory"])
                 entry["status"] = "ok"

@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #ifndef MATMUL_DAYAN_1C_URAM_BYTES
-#    define MATMUL_DAYAN_1C_URAM_BYTES (1536U * 1024U)
+#    define MATMUL_DAYAN_1C_URAM_BYTES (768U * 1024U)
 #endif
 
 #ifndef MATMUL_DAYAN_4C_ATOMIC_BYTES
@@ -344,6 +344,13 @@ struct DayanMxfp4MoeConfig {
     uint64_t workspace_bytes;
 };
 
+struct DayanFfnConfig {
+    DayanMxfp4Config gate;
+    DayanMxfp4Config down;
+    uint32_t experts;
+    uint32_t experts_used;
+};
+
 struct DayanMoeDispatchLayout {
     uint64_t count_stride;
     uint64_t position_stride;
@@ -352,11 +359,11 @@ struct DayanMoeDispatchLayout {
     uint64_t offsets_offset;
     uint64_t bytes;
 
-    static DayanMoeDispatchLayout make(uint32_t tokens, uint32_t experts, uint32_t used) {
+    static DayanMoeDispatchLayout make(uint32_t tokens, uint32_t experts, uint32_t used, uint32_t cores = 4) {
         const uint64_t counts = ((uint64_t) experts * sizeof(uint32_t) + 255U) & ~255ULL;
-        const uint64_t positions = ((((uint64_t) tokens + 3U) / 4U) * used * sizeof(uint32_t) + 63U) & ~63ULL;
+        const uint64_t positions = ((((uint64_t) tokens + cores - 1U) / cores) * used * sizeof(uint32_t) + 63U) & ~63ULL;
         const uint64_t offsets = (((uint64_t) experts + 1U) * sizeof(uint32_t) + 255U) & ~255ULL;
-        return {counts, positions, 4U * counts, 4U * (counts + positions), 4U * (counts + positions) + offsets};
+        return {counts, positions, 4U * counts, 4U * counts + cores * positions, 4U * counts + cores * positions + offsets};
     }
 };
 
@@ -480,9 +487,17 @@ struct DayanGroupNormConfig {
 };
 
 #if !defined(__DAYAN_DEVICE__)
+int moe_ffn_decode(npu_buffer_t * config, npu_buffer_t * input, npu_buffer_t * input_scales,
+                   npu_buffer_t * gate, npu_buffer_t * gate_scales, npu_buffer_t * up, npu_buffer_t * up_scales,
+                   npu_buffer_t * down, npu_buffer_t * down_scales, npu_buffer_t * selected, npu_buffer_t * weights,
+                   npu_buffer_t * output, const npu_kernel_launch_attrs_t * attrs);
 int router_f32(npu_buffer_t * config, npu_buffer_t * activation, npu_buffer_t * weight, npu_buffer_t * output,
                const npu_kernel_launch_attrs_t * attrs);
 int mul_mat_id_mxfp4(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
+                     npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * ids, npu_buffer_t * output, npu_buffer_t * scales,
+                     npu_buffer_t * workspace,
+                     const npu_kernel_launch_attrs_t * attrs);
+int mul_mat_id_mxfp4_small(npu_buffer_t * config, npu_buffer_t * a, npu_buffer_t * as, npu_buffer_t * b, npu_buffer_t * bs,
                      npu_buffer_t * up, npu_buffer_t * ups, npu_buffer_t * ids, npu_buffer_t * output, npu_buffer_t * scales,
                      npu_buffer_t * workspace,
                      const npu_kernel_launch_attrs_t * attrs);

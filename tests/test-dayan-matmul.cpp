@@ -218,7 +218,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
     if (argc == 1 &&
-        (run_case(dayan.get(), GGML_TYPE_BF16, 1, 3584, 1025, 1, 1, 1, 1, false) != 0 ||
+        (run_case(dayan.get(), GGML_TYPE_BF16, 1, 513, 2049, 1, 1, 1, 1, false) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_BF16, 1, 513, 4096, 1, 1, 1, 1, false) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_F16, 1, 257, 4096, 2, 1, 2, 1, true) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_BF16, 1, 513, 4097, 1, 1, 1, 1, false) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_F16, 1, 257, 1537, 2, 1, 2, 1, false) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_BF16, 1, 257, 1025, 1, 1, 1, 1, true) != 0 ||
+         run_case(dayan.get(), GGML_TYPE_BF16, 1, 3584, 1025, 1, 1, 1, 1, false) != 0 ||
          run_case(dayan.get(), GGML_TYPE_F16, 1, 1025, 1025, 1, 1, 1, 1, false) != 0 ||
          run_case(dayan.get(), GGML_TYPE_F16, 1, 2053, 769, 2, 1, 4, 1, false) != 0 ||
          run_case(dayan.get(), GGML_TYPE_BF16, 1, 1, 2048, 1, 1, 1, 1, false) != 0 ||

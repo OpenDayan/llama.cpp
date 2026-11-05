@@ -1,5 +1,6 @@
 #include "ggml-dayan-kernels.h"
 #include "ggml-dayan-mxfp4-layout.h"
+#include "ggml-dayan-moe-ffn.h"
 #include "ggml-cpp.h"
 #include "ggml.h"
 
@@ -196,6 +197,29 @@ static void strides(uint64_t nb[4], uint32_t width, uint32_t heads, uint32_t tok
 
 static std::vector<float> cpu_reference(const json & spec, const std::vector<std::vector<float>> & inputs) {
     const std::string op = spec.at("op");
+    if (op == "moe_fused_ffn" || op == "dense_ffn") {
+        const bool moe = op == "moe_fused_ffn";
+        json gate = spec, down = spec;
+        gate["op"] = moe ? "moe_ffn" : "ffn";
+        gate["n"] = spec.at("hidden");
+        auto hidden = cpu_reference(gate, {inputs.at(0), inputs.at(1), inputs.at(2)});
+        if (spec.at("dtype") == "mxfp4") { quantize_mxfp4_reference(hidden); }
+        else { for (float & value : hidden) { value = ggml_bf16_to_fp32(ggml_fp32_to_bf16(value)); } }
+        down["op"] = moe ? "moe_down" : "matmul";
+        down["k"] = spec.at("hidden");
+        const auto values = cpu_reference(down, {hidden, inputs.at(3)});
+        const uint32_t used = moe ? spec.at("experts_used").get<uint32_t>() : 1;
+        const size_t width = spec.at("n");
+        std::vector<float> result(width);
+        for (uint32_t e = 0; e < used; ++e) {
+            const float weight = moe ? (float) (e + 1) / (used * (used + 1) / 2) : 1.0f;
+            for (size_t col = 0; col < width; ++col) {
+                const float contribution = values[e * width + col] * weight;
+                result[col] = e ? result[col] + contribution : contribution;
+            }
+        }
+        return result;
+    }
     if (op == "quantize") { return inputs.at(0); }
     const int64_t m = spec.at("m"), n = spec.value("n", 1024), k = spec.value("k", 1024);
     ggml_backend_load_all();
@@ -353,16 +377,18 @@ int main(int argc, char ** argv) {
             repeats + warmup > 100 || tag.empty() || tag.size() > 11) {
             throw std::runtime_error("invalid shape, repetition count, or tag");
         }
-        const bool moe = op == "moe_ffn" || op == "moe_down";
+        const bool fused = op == "moe_fused_ffn" || op == "dense_ffn";
+        const bool moe = op == "moe_ffn" || op == "moe_down" || op == "moe_fused_ffn";
         const uint32_t experts = spec.value("experts", 1U), used = spec.value("experts_used", 1U);
+        const uint64_t weight_elements = fused ? (uint64_t) std::max(n, k) * spec.at("hidden").get<uint32_t>() : (uint64_t) n * k;
         if (moe && (!experts || experts > 4096 || !used || used > experts || dtype != "mxfp4" || n % 16 ||
-                    (uint64_t) experts * n * k > 512ULL * 1024 * 1024)) {
+                    experts * weight_elements > 512ULL * 1024 * 1024)) {
             throw std::runtime_error("invalid MXFP4 expert shape");
         }
-        const bool matrix = op == "matmul" || op == "ffn" || moe;
+        const bool matrix = op == "matmul" || op == "ffn" || moe || fused;
         const bool mx = dtype == "mxfp4";
         if ((matrix && (dtype != "bf16" && !mx && !(dtype == "f32" && op == "matmul"))) ||
-            (matrix && !mx && output_dtype != (op == "ffn" ? "bf16" : "f32")) ||
+            (matrix && !mx && output_dtype != (op == "ffn" ? "bf16" : "f32") && !(fused && output_dtype == "bf16")) ||
             (!matrix && dtype != (op == "attention" ? "bf16" : "f32")) ||
             (output_dtype != "f32" && output_dtype != "bf16" && output_dtype != "mxfp4" && !(op == "sort" && output_dtype == "i32")) ||
             (mx && k % 32 != 0) || (output_dtype == "mxfp4" && n % 32 != 0) ||
@@ -401,11 +427,59 @@ int main(int argc, char ** argv) {
         std::vector<float> residual_reference;
         const bool lowp_output = output_dtype == "bf16";
         const bool mxfp4_output = output_dtype == "mxfp4";
-        const auto output_layout = DayanMxfp4Layout::make((uint64_t) m * (moe ? used : 1), n);
+        const auto output_layout = DayanMxfp4Layout::make((uint64_t) m * (moe && !fused ? used : 1), n);
         std::function<int()> launch;
         const float nan = std::numeric_limits<float>::quiet_NaN();
 
-        if (op == "sort") {
+        if (fused) {
+            const uint32_t hidden = spec.at("hidden");
+            if (m != 1 || !hidden || hidden > 65536 || hidden % 128 || k % 128 || n % 64 || used > 32 ||
+                (uint64_t) std::max(n, k) * hidden > 64U * 1024U * 1024U ||
+                (output_dtype != "f32" && output_dtype != "bf16") || (!moe && (experts != 1 || used != 1))) {
+                throw std::runtime_error("unsupported fused Decode FFN shape");
+            }
+            const auto a_layout = DayanMxfp4Layout::make(1, k);
+            const auto g_layout = DayanMxfp4Layout::make((uint64_t) hidden * experts, k);
+            const auto d_layout = DayanMxfp4Layout::make((uint64_t) n * experts, hidden);
+            DayanFfnConfig config{};
+            config.experts = experts; config.experts_used = used;
+            config.gate.m = config.down.m = 1;
+            config.gate.n = hidden; config.gate.k = k;
+            config.down.n = n; config.down.k = hidden;
+            config.gate.a_stride = mx ? a_layout.row_stride : k * 2ULL;
+            config.gate.a_scale_stride = a_layout.scale_stride;
+            config.gate.b_stride = mx ? g_layout.row_stride : k * 2ULL;
+            config.gate.b_scale_stride = g_layout.scale_stride;
+            config.down.b_stride = mx ? d_layout.row_stride : hidden * 2ULL;
+            config.down.b_scale_stride = d_layout.scale_stride;
+            config.gate.weight_type = config.down.weight_type = mx ? kDayanDataTypeMXFP4 : kDayanDataTypeBF16;
+            config.down.output_type = lowp_output ? kDayanDataTypeBF16 : kDayanDataTypeF32;
+            if (DayanFfnLayout::make(config).bytes > MATMUL_DAYAN_1C_URAM_BYTES) { throw std::runtime_error("fused FFN exceeds URAM budget"); }
+            auto cfg = device.upload(&config, sizeof(config));
+            auto a = mx ? mxfp4_input(device, a_layout, 1.0f / 64) : device.input(k, 1.0f / 64, true);
+            auto g = mx ? mxfp4_input(device, g_layout, 1.0f / 64) : device.input((size_t) experts * hidden * k, 1.0f / 64, true);
+            auto u = mx ? mxfp4_input(device, g_layout, 1.0f / 64) : device.input((size_t) experts * hidden * k, 1.0f / 64, true);
+            auto d = mx ? mxfp4_input(device, d_layout, 1.0f / 64) : device.input((size_t) experts * n * hidden, 1.0f / 64, true);
+            auto as = mx ? device.view(a, a_layout.scale_offset, a_layout.bytes - a_layout.scale_offset) : a;
+            auto gs = mx ? device.view(g, g_layout.scale_offset, g_layout.bytes - g_layout.scale_offset) : g;
+            auto us = mx ? device.view(u, g_layout.scale_offset, g_layout.bytes - g_layout.scale_offset) : u;
+            auto ds = mx ? device.view(d, d_layout.scale_offset, d_layout.bytes - d_layout.scale_offset) : d;
+            std::vector<int32_t> ids(used);
+            std::vector<float> weights(used);
+            for (uint32_t e = 0; e < used; ++e) {
+                ids[e] = experts - 1 - e * 13 % experts;
+                weights[e] = (float) (e + 1) / (used * (used + 1) / 2);
+            }
+            auto selected = device.upload(ids.data(), ids.size() * sizeof(ids[0]));
+            auto routing = device.upload(weights.data(), weights.size() * sizeof(weights[0]));
+            output = device.filled(n, nan, lowp_output);
+            attrs.config = topology.launch(false, 1);
+            result["kernel"] = "moe_ffn_decode";
+            launch = [&, cfg, a, as, g, gs, u, us, d, ds, selected, routing]() {
+                return moe_ffn_decode(cfg, a, as, g, gs, u, us, d, ds, selected, routing, output, &attrs);
+            };
+            if (!device.compare) { throw std::runtime_error("fused FFN probes require cmp"); }
+        } else if (op == "sort") {
             if (!used || used > n || n > kDayanSortMaxWidth || output_dtype != "i32") { throw std::runtime_error("invalid routing sort shape"); }
             const DayanSortConfig config{n, m, used, kDayanSortOrderDesc, used};
             auto cfg = device.upload(&config, sizeof(config));
@@ -475,9 +549,9 @@ int main(int argc, char ** argv) {
                     }
                     auto ids = device.upload(values.data(), values.size() * sizeof(values[0]));
                     attrs.config = topology.launch(false);
-                    result["kernel"] = "mul_mat_id_mxfp4";
+                    result["kernel"] = topology.clusters ? "mul_mat_id_mxfp4" : "mul_mat_id_mxfp4_small";
                     launch = [&, moe_cfg, a, as, b, bs, up, ups, ids, scales]() {
-                        return mul_mat_id_mxfp4(moe_cfg, a, as, b, bs, up, ups, ids, output, scales, output, &attrs);
+                        return (topology.clusters ? mul_mat_id_mxfp4 : mul_mat_id_mxfp4_small)(moe_cfg, a, as, b, bs, up, ups, ids, output, scales, output, &attrs);
                     };
                 }
                 value = k / 4096.0f;

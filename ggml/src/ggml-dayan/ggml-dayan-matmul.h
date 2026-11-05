@@ -228,9 +228,9 @@ struct MatmulBuffer {
 struct MatmulState {
     const DayanMatmulConfig * config;
     uint64_t input[3], output, physical, uram, generations;
-    uint64_t accumulator_bytes, output_bytes, output_start, scratch;
-    uint64_t a_swizzle, c_swizzle, load_phases[2], shared_phases;
-    int cores, lane, tile_m, tile_n, nt, kt, slice_m, slice_n, c_columns;
+    uint64_t accumulator_bytes, output_bytes, output_start, scratch, a_cache;
+    uint64_t a_swizzle, b_swizzle, c_swizzle, load_phases[2], shared_phases;
+    int cores, lane, tile_m, tile_n, tile_k, b_stride, nt, kt, slice_m, slice_n, c_columns;
     bool buffer_a, split_n;
     MatmulBuffer a[4], b[4], c[4];
     MatmulPhases * phases;
@@ -275,7 +275,7 @@ static inline MatmulNode matmul_node(const MatmulState & s, uint64_t generation,
         b_index = (int) (((generation * products + product) * users + slice) % kMatmulSlices);
     }
     return {row + row_offset, col + col_offset, extent(rows - row_offset, s.slice_m), extent(cols - col_offset, s.slice_n),
-            extent((int64_t) s.config->k - (int64_t) step * Constants::kTileK, Constants::kTileK), step,
+            extent((int64_t) s.config->k - (int64_t) step * s.tile_k, s.tile_k), step,
             s.buffer_a ? (int) (generation & 1) : slice,
             b_index, users};
 }
@@ -314,6 +314,7 @@ static void matmul_load(void * argument) {
                 const auto ready = DAYAN_SHARED_RESOURCE(index);
                 const auto ready_mask = DAYAN_RESOURCE_MASK(ready);
                 const int rows = b ? n.cols : n.rows;
+                const uint64_t row_stride = b ? s.b_stride : s.tile_k * 2;
                 const uint32_t users = (buffered ? n.users : 1) * (b ? 1 : Products);
                 int role = DAYAN_RESOURCE_ROLE_PRODUCER;
                 if (share && s.split_n) {
@@ -337,14 +338,14 @@ static void matmul_load(void * argument) {
                 } else if (role == DAYAN_RESOURCE_ROLE_PRODUCER) {
                     if (!b && InputLoader != nullptr) {
                         const MatmulInputArgs input = {s.input_context, s.physical + dst.uram - s.uram, s.scratch,
-                                                       (int) n.row, n.step * Constants::kTileK, n.rows, n.inner};
+                                                       (int) n.row, n.step * s.tile_k, n.rows, n.inner};
                         matmul_check(InputLoader(&input));
                     } else {
                         const uint64_t stride = b ? s.config->bt_stride : s.config->a_stride;
-                        const uint64_t src = s.input[b ? 1 + product : 0] + (b ? n.col : n.row) * stride + (uint64_t) n.step * Constants::kTileK * 2;
-                        set_lsu_matrix<0>(checksum, rows, Constants::kTileK * 2, stride, Constants::kTileK * 2);
-                        __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(b ? kMatSwizzle : s.a_swizzle);
-                        load_matrix<0>(n.inner * 2, rows, Constants::kTileK * 2, rows, dst.uram, src);
+                        const uint64_t src = s.input[b ? 1 + product : 0] + (b ? n.col : n.row) * stride + (uint64_t) n.step * s.tile_k * 2;
+                        set_lsu_matrix<0>(checksum, rows, s.tile_k * 2, stride, row_stride);
+                        __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(b ? s.b_swizzle : s.a_swizzle);
+                        load_matrix<0>(n.inner * 2, rows, s.tile_k * 2, rows, dst.uram, src);
                     }
                     if (active) {
                         matmul_check(dayan_resource_produce_lsu(dst.resource, users, 0));
@@ -355,7 +356,7 @@ static void matmul_load(void * argument) {
                 } else if (role == DAYAN_RESOURCE_ROLE_CONSUMER) {
                     const auto & cluster = dayan_cluster_state(s.config->cluster_workspace);
                     const uint64_t src = cluster.core[peer].uram + dst.uram - s.uram;
-                    set_lsu_matrix<0>(checksum, rows, Constants::kTileK * 2, Constants::kTileK * 2, Constants::kTileK * 2);
+                    set_lsu_matrix<0>(checksum, rows, s.tile_k * 2, row_stride, row_stride);
                     __tx_lsu_dma_d2u<0>((long) dst.uram, (long) src);
                     matmul_check(dayan_resource_produce_lsu(dst.resource, users, ready_mask));
                 } else {
@@ -372,11 +373,11 @@ static void matmul_load(void * argument) {
 template <typename Format, int Products>
 static void matmul_calc(MatmulState & s) {
     uint64_t & phases = s.phases->mat;
-    __tx_mat_tcsr_write<MAT_ASTRIDE>(Constants::kTileK * 2);
-    __tx_mat_tcsr_write<MAT_BSTRIDE>(Constants::kTileK * 2);
+    __tx_mat_tcsr_write<MAT_ASTRIDE>(s.tile_k * 2);
+    __tx_mat_tcsr_write<MAT_BSTRIDE>(s.b_stride);
     __tx_mat_tcsr_write<MAT_CSTRIDE>(s.c_columns * 4);
     __tx_mat_tcsr_write<MAT_ASWIZZLEMBS>(s.a_swizzle);
-    __tx_mat_tcsr_write<MAT_BSWIZZLEMBS>(kMatSwizzle);
+    __tx_mat_tcsr_write<MAT_BSWIZZLEMBS>(s.b_swizzle);
     __tx_mat_tcsr_write<MAT_CSWIZZLEMBS>(s.c_swizzle);
     __tx_mat_tcsr_write<MAT_PERSISTENTMODE>(0);
     __tx_mat_tcsr_write<MAT_DATATYPE>(Format::kMatDataType);
@@ -388,16 +389,17 @@ static void matmul_calc(MatmulState & s) {
                     continue;
                 }
                 const MatmulBuffer & a = s.a[n.a_index], & b = s.b[n.b_index], & c = s.c[slice];
-                const auto inputs = DAYAN_RESOURCE_MASK(a.resource) | DAYAN_RESOURCE_MASK(b.resource);
+                const auto inputs = (s.a_cache ? 0 : DAYAN_RESOURCE_MASK(a.resource)) | DAYAN_RESOURCE_MASK(b.resource);
                 matmul_check(dayan_resource_wait(n.step == 0 && product == 0 ? DAYAN_RESOURCE_MASK(c.resource) : 0, inputs, phases, 0));
                 __tx_mat_tcsr_write<MAT_M>(n.rows - 1);
                 __tx_mat_tcsr_write<MAT_N>(n.cols - 1);
                 __tx_mat_tcsr_write<MAT_K>(n.inner - 1);
                 const uint64_t accumulator = c.uram + product * s.accumulator_bytes;
+                const uint64_t input = s.a_cache ? s.a_cache + (uint64_t) n.step * s.tile_k * 2 : a.uram;
                 if (n.step == 0) {
-                    __tx_mat_mm<0>((long) accumulator, (long) a.uram, (long) b.uram);
+                    __tx_mat_mm<0>((long) accumulator, (long) input, (long) b.uram);
                 } else {
-                    __tx_mat_mma<0>((long) accumulator, (long) a.uram, (long) b.uram);
+                    __tx_mat_mma<0>((long) accumulator, (long) input, (long) b.uram);
                 }
                 if (n.step + 1 == s.kt && product + 1 == Products) {
                     matmul_check(dayan_resource_produce_mat(c.resource, 1, inputs));
@@ -408,7 +410,7 @@ static void matmul_calc(MatmulState & s) {
                     phases ^= DAYAN_RESOURCE_MASK(b.resource);
                 }
                 // A remains READY through all gate/up products.
-                if (product + 1 == Products && (!s.buffer_a || slice + 1 == n.users)) {
+                if (!s.a_cache && product + 1 == Products && (!s.buffer_a || slice + 1 == n.users)) {
                     phases ^= DAYAN_RESOURCE_MASK(a.resource);
                 }
             }
@@ -536,17 +538,38 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     s.lane = lane;
     s.tile_m = Products == 2 ? 96 : Cores == 4 && !HasEpilogue ? 512 : Constants::kTileM;
     s.tile_n = Constants::kTileN;
+    s.tile_k = Constants::kTileK;
     s.split_n = Inference && Cores == 4;
     s.buffer_a = Inference || InputLoader != nullptr || matrix.m < matrix.n;
     if (Inference && matrix.m < 32) {
         s.tile_m = (int) matrix.m;
         s.tile_n = Cores == 4 ? 1536 : 768;
     }
+    const bool decode = Inference && Cores == 1 && Products == 1 && InputLoader == nullptr && matrix.m == 1 && matrix.k >= 1024;
+    if (decode) {
+        s.tile_n = 512;
+        s.tile_k = 512;
+    }
+    const bool full_k = decode && matrix.k == 4096;
+    if (full_k) {
+        s.tile_n = 64;
+        s.tile_k = 4096;
+    }
+    s.b_stride = s.tile_k * 2;
+    if (full_k) {
+        s.b_stride += dayan_uram_size() < 1536U * 1024U ? 64 : 128;
+    }
+    if (dayan_uram_size() < 1536U * 1024U && matrix.m >= 32) { s.tile_m = 64; }
     s.slice_m = s.buffer_a ? s.tile_m : s.tile_m / kMatmulSlices;
     s.slice_n = s.buffer_a ? s.tile_n / kMatmulSlices : s.tile_n;
     // Pad complete VEC chunks and rotate the linear row start across Banks.
     s.c_columns = HasEpilogue || s.tile_n != Constants::kTileN ? (int) align_up(s.slice_n, Constants::kVecLanes) + 32 : s.slice_n;
     s.a_swizzle = InputLoader == nullptr ? kMatSwizzle : 0;
+    s.b_swizzle = kMatSwizzle;
+    if (decode) {
+        s.a_swizzle = 0;
+        s.b_swizzle = full_k ? 0 : dayan_uram_size() < 1536U * 1024U ? MAT_BATCH_SWIZZLE(6, 3, 4) : MAT_BATCH_SWIZZLE(7, 3, 3);
+    }
     s.c_swizzle = HasEpilogue || s.buffer_a ? 0 : kMatSwizzle;
     s.physical = (uintptr_t) dayan_uram_base();
     s.uram = s.physical & (Constants::kUramWindowStride - 1);
@@ -557,7 +580,7 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     }
     s.phases = phases ? phases : &local_phases;
     const int counts[] = {s.buffer_a ? 2 : kMatmulSlices, s.buffer_a ? kMatmulSlices : 2};
-    const uint64_t bytes[] = {(uint64_t) s.slice_m * Constants::kTileK * 2, (uint64_t) s.slice_n * Constants::kTileK * 2};
+    const uint64_t bytes[] = {(uint64_t) s.slice_m * s.tile_k * 2, (uint64_t) s.slice_n * s.b_stride};
     uint64_t address = s.uram;
     for (int operand = 0; operand < 2; ++operand) {
         MatmulBuffer * buffers = operand ? s.b : s.a;
@@ -574,6 +597,10 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     s.output_start = address - s.uram;
     s.output_bytes = OutputBytes == sizeof(uint16_t) ? (uint64_t) s.slice_m * s.c_columns * OutputBytes : 0;
     address += kMatmulSlices * s.output_bytes;
+    if (full_k) {
+        s.a_cache = address;
+        address += align_up(matrix.k * sizeof(uint16_t), 64);
+    }
     s.scratch = s.physical + address - s.uram;
     DAYAN_PARAMS_IF(!s.physical || address - s.uram + InputScratchBytes > dayan_uram_size() || address + InputScratchBytes > Constants::kUramWindowStride) {
         return -12;
@@ -589,7 +616,7 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
     const int grid = Cores == 4 && !Inference ? 2 : 1;
     const uint64_t columns = Inference ? (config->n + Cores - 1) / Cores : config->n;
     s.nt = (int) ((columns + grid * s.tile_n - 1) / (grid * s.tile_n));
-    s.kt = (int) ((config->k + Constants::kTileK - 1) / Constants::kTileK);
+    s.kt = (int) ((config->k + s.tile_k - 1) / s.tile_k);
     const uint64_t outputs = (matrix.m + grid * s.tile_m - 1) / (grid * s.tile_m) * s.nt;
     if (outputs > UINT64_MAX / s.kt) {
         return -22;
@@ -609,7 +636,17 @@ static int run_matmul(const DayanMatmulConfig * config, const uint16_t * a, cons
             resources.vec_tcsr_count = InputLoader != nullptr ? 1 : 0;
             resources.local_resource_count = 12;
             resources.shared_resource_count = Cores == 4 ? 12 : 0;
-            matmul_check(dayan_create_thread("load-a", matmul_load<Cores, Products, InputLoader>, &loads[0], &resources));
+            if (s.a_cache) {
+                // Keep A live until all N tiles in this batch finish.
+                const uint64_t bytes = matrix.k * sizeof(uint16_t);
+                long checksum = 0;
+                set_lsu_matrix<0>(checksum, 1, bytes, bytes, align_up(bytes, 64));
+                __tx_lsu_tcsr_write<LSU_URAMWRITESWIZZLEMBS>(0);
+                load_matrix<0>(bytes, 1, bytes, 1, s.a_cache, s.input[0]);
+                dayan_wait_lsu();
+            } else {
+                matmul_check(dayan_create_thread("load-a", matmul_load<Cores, Products, InputLoader>, &loads[0], &resources));
+            }
             resources.lsu_tcsr_count = 1;
             resources.vec_tcsr_count = 0;
             matmul_check(dayan_create_thread("load-b", matmul_load<Cores, Products, nullptr>, &loads[1], &resources));

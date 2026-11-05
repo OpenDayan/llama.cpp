@@ -325,9 +325,9 @@ template <unsigned Distance = 1> static inline void moe_prefix_max() {
 
 static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int32_t * selected, void * workspace) {
     if (config->sort.rows == 1) { return 0; }
-    const uint32_t task = dayan_native_task_id();
+    const uint32_t task = dayan_native_task_id(), tasks = dayan_native_task_count();
     const uint32_t tokens = config->sort.rows, experts = config->sort.width;
-    const auto layout = DayanMoeDispatchLayout::make(tokens, experts, config->experts_used);
+    const auto layout = DayanMoeDispatchLayout::make(tokens, experts, config->experts_used, tasks);
     const uint64_t uram = (uintptr_t) dayan_uram_base();
     const uint64_t plane = ((dayan_uram_size() - 256) / 3) & ~255ULL;
     const uint64_t keys = uram + 256, ids = keys + plane, positions = ids + plane;
@@ -342,7 +342,7 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
     if (status < 0) { return status; }
 
     moe_lane_ids(uram);
-    const uint32_t local_tokens = ((uint64_t) tokens + 3U - task) / 4U;
+    const uint32_t local_tokens = ((uint64_t) tokens + tasks - 1U - task) / tasks;
     const uint32_t capacity = plane / row_bytes;
     for (uint32_t expert_first = 0; expert_first < experts; expert_first += kMoeExpertWindow) {
         const uint32_t count = experts - expert_first < kMoeExpertWindow ? experts - expert_first : kMoeExpertWindow;
@@ -359,8 +359,8 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
             const uint32_t elements = rows * config->experts_used, blocks = (elements + 63) / 64;
             void * mapping = (char *) workspace + layout.positions_offset + task * layout.position_stride + (uint64_t) first * row_bytes;
             if (expert_first) { memory_load_bytes(positions, mapping, (uint64_t) rows * row_bytes); }
-            sort_transfer<true>(keys, (uintptr_t) (selected + (uint64_t) (task + 4 * first) * config->sort.output_stride),
-                                rows, row_bytes, row_bytes, 4ULL * config->sort.output_stride * sizeof(int32_t));
+            sort_transfer<true>(keys, (uintptr_t) (selected + (uint64_t) (task + tasks * first) * config->sort.output_stride),
+                                rows, row_bytes, row_bytes, (uint64_t) tasks * config->sort.output_stride * sizeof(int32_t));
             configure_vec_grid(blocks);
             configure_vec_iterator<kVecV0Base>(0, 0, 256, 0);
             configure_vec_iterator<kVecV2Base>(0, 0, 0, 0);
@@ -448,6 +448,16 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
     if (task == 0) {
         // Scan expert totals and add each core's exclusive count prefix.
         const uint64_t offsets = keys + 4 * layout.count_stride, carry = offsets + layout.count_stride;
+        if (tasks == 1) {
+            configure_vec_grid(3 * layout.count_stride / 256);
+            configure_vec_iterator<kVecV0Base>(0, 0, 256, 0);
+            begin_vec_block(2);
+            __tx_vec_lsu_g2v_broadcast32<0, 0>(0);
+            __tx_vec_lsu_v2u<0, 0>(keys);
+            start_vec_block(2);
+            dayan_wait_vec();
+            memory_store_bytes((char *) workspace + layout.count_stride, keys, 3 * layout.count_stride);
+        }
         memory_load_bytes(keys, workspace, 4 * layout.count_stride);
         configure_vec_grid(1);
         __tx_vec_tcsr_write<ggml_dayan_vec_detail::kVecDim0>(layout.count_stride / 256 - 1);
@@ -503,8 +513,8 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
             const uint32_t rows = local_tokens - first < capacity ? local_tokens - first : capacity;
             const uint32_t elements = rows * config->experts_used;
             void * mapping = (char *) workspace + layout.positions_offset + task * layout.position_stride + (uint64_t) first * row_bytes;
-            sort_transfer<true>(keys, (uintptr_t) (selected + (uint64_t) (task + 4 * first) * config->sort.output_stride),
-                                rows, row_bytes, row_bytes, 4ULL * config->sort.output_stride * sizeof(int32_t));
+            sort_transfer<true>(keys, (uintptr_t) (selected + (uint64_t) (task + tasks * first) * config->sort.output_stride),
+                                rows, row_bytes, row_bytes, (uint64_t) tasks * config->sort.output_stride * sizeof(int32_t));
             memory_load_bytes(positions, mapping, (uint64_t) elements * sizeof(uint32_t));
             configure_vec_grid((elements + 63) / 64);
             configure_vec_iterator<kVecV0Base>(0, 0, 256, 0);
@@ -542,7 +552,7 @@ static inline int run_moe_dispatch(const DayanMoeSortConfig * config, const int3
 static inline int run_moe_sort(const DayanMoeSortConfig * config, const float * probabilities, int32_t * selected, void * workspace) {
     if (!config || !probabilities || !selected || !config->sort.rows || !config->sort.width ||
         !config->experts_used || config->experts_used > config->sort.output_width ||
-        config->sort.order != kDayanSortOrderDesc || dayan_native_task_count() != 4) { return -22; }
+        config->sort.order != kDayanSortOrderDesc || (dayan_native_task_count() != 1 && dayan_native_task_count() != 4)) { return -22; }
     run_sort<false>(&config->sort, probabilities, selected);
     return run_moe_dispatch(config, selected, workspace);
 }
@@ -572,14 +582,15 @@ static void moe_permute_rows(const DayanMxfp4MoeConfig * config, void * workspac
                              void * grouped, void * grouped_scales, bool reverse) {
     const auto & r = config->routing;
     const auto & mm = config->matmul;
+    const uint32_t tasks = dayan_native_task_count();
     const uint32_t task = dayan_native_task_id(), slots = reverse ? r.experts_used : r.activation_slots;
-    const uint32_t local_tokens = ((uint64_t) r.tokens + 3U - task) / 4U;
+    const uint32_t local_tokens = ((uint64_t) r.tokens + tasks - 1U - task) / tasks;
     if (!local_tokens) { return; }
     const uint32_t total = r.tokens * r.experts_used, elements = local_tokens * r.experts_used;
     const uint32_t columns = reverse ? mm.n : mm.k;
     const bool mxfp4 = !reverse || mm.output_type == kDayanDataTypeMXFP4;
     const auto layout = DayanMxfp4Layout::make(total, columns);
-    const auto dispatch = DayanMoeDispatchLayout::make(r.tokens, r.experts, r.experts_used);
+    const auto dispatch = DayanMoeDispatchLayout::make(r.tokens, r.experts, r.experts_used, tasks);
     const auto * mapping = (const uint32_t *) ((char *) workspace + dispatch.positions_offset + task * dispatch.position_stride);
     const uint64_t linear_stride = reverse ? mm.output_stride : mm.a_stride;
     const uint64_t linear_scale_stride = reverse ? mm.output_scale_stride : mm.a_scale_stride;
@@ -592,7 +603,7 @@ static void moe_permute_rows(const DayanMxfp4MoeConfig * config, void * workspac
         // Large offsets use cached DRAM metadata; no scalar URAM access is needed.
         dayan_cache_invalidate(mapping, (uint64_t) elements * sizeof(uint32_t));
         for (uint32_t index = 0; index < elements; ++index) {
-            const uint32_t row = (task + 4 * (index / r.experts_used)) * slots + index % slots;
+            const uint32_t row = (task + tasks * (index / r.experts_used)) * slots + index % slots;
             const uint32_t group = mapping[index];
             void * natural = (char *) linear + (uint64_t) row * linear_stride;
             void * ordered = (char *) grouped + (uint64_t) group * grouped_stride;
@@ -626,7 +637,7 @@ static void moe_permute_rows(const DayanMxfp4MoeConfig * config, void * workspac
         __tx_vec_vv_int32_add<0, 0, 16>();
         __tx_vec_lsu_g2v_broadcast32<1, 2>(__builtin_ctz(r.experts_used));
         __tx_vec_vv_int32_srl<0, 0, 16>();
-        __tx_vec_lsu_g2v_broadcast32<1, 2>(4 * slots);
+        __tx_vec_lsu_g2v_broadcast32<1, 2>(tasks * slots);
         __tx_vec_vv_int32_mulu24<0, 0, 16>();
         __tx_vec_lsu_g2v_broadcast32<1, 2>(slots - 1);
         __tx_vec_vv_int32_bitwise<0, 2, 16, 0b1000>();
@@ -672,7 +683,7 @@ static int run_mul_mat_id_mxfp4_grouped(const DayanMxfp4MoeConfig * config, cons
         return -22;
     }
     const uint32_t total = r.tokens * r.experts_used;
-    const auto dispatch = DayanMoeDispatchLayout::make(r.tokens, r.experts, r.experts_used);
+    const auto dispatch = DayanMoeDispatchLayout::make(r.tokens, r.experts, r.experts_used, dayan_native_task_count());
     const DayanMxfp4Layout input_layout = DayanMxfp4Layout::make(total, mm.k);
     const DayanMxfp4Layout output_layout = DayanMxfp4Layout::make(total, mm.n);
     const uint64_t output_bytes = mm.output_type == kDayanDataTypeMXFP4 ? output_layout.bytes :
@@ -681,7 +692,7 @@ static int run_mul_mat_id_mxfp4_grouped(const DayanMxfp4MoeConfig * config, cons
     const uint64_t required = dispatch.bytes + output_offset + ((output_bytes + 63U) & ~63ULL);
     if (!config || !workspace || !a || !as || !b || !bs || !up || !ups || !ids || !output ||
         !r.tokens || !r.experts_used || !r.experts || !r.activation_slots || !config->workspace_bytes ||
-        required > config->workspace_bytes || r.experts_used % r.activation_slots || dayan_native_task_count() != 4 ||
+        required > config->workspace_bytes || r.experts_used % r.activation_slots || (dayan_native_task_count() != 1 && dayan_native_task_count() != 4) ||
         mm.m != 1 || mm.weight_type != kDayanDataTypeMXFP4 ||
         (mm.output_type == kDayanDataTypeMXFP4 && !scales)) {
         return -22;

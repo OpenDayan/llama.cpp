@@ -9,6 +9,7 @@
 #include "ggml-dayan-memory.h"
 #include "ggml-dayan-mxfp4.h"
 #include "ggml-dayan-moe.h"
+#include "ggml-dayan-moe-ffn.h"
 #include "ggml-dayan-softmax.h"
 #include "ggml-dayan-normalization.h"
 #include "ggml-dayan-rope.h"
@@ -50,7 +51,7 @@ static inline void reset_local_resources() {
 
 static int prepare_matmul_4c(uint64_t workspace) {
     reset_local_resources();
-    ggml_dayan_matmul_4c_detail::initialize_resources(workspace);
+    if (dayan_task_mode() == 4) { ggml_dayan_matmul_4c_detail::initialize_resources(workspace); }
     return 0;
 }
 
@@ -165,7 +166,7 @@ int set_rows(const DayanRowsConfig * config, const float * input, const void * i
 
 int flash_attention_fp16(const DayanFlashAttentionConfig * config, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * output) {
     reset_local_resources();
-    if (dayan_flash_attention_use_split_kv(config->q_len, config->kv_len)) {
+    if (dayan_task_mode() == 4 && dayan_flash_attention_use_split_kv(config->q_len, config->kv_len)) {
         return ggml_dayan_flash_attention_detail::run<ggml_dayan_matmul_detail::Fp16Format, 4, true>(
             config, q, k, v, output);
     }
@@ -174,6 +175,12 @@ int flash_attention_fp16(const DayanFlashAttentionConfig * config, const uint16_
 }
 
 int matmul_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, float * output) {
+    if (dayan_task_mode() == 1) {
+        reset_local_resources();
+        using namespace ggml_dayan_matmul_detail;
+        return (config->m <= 512 ? run_matmul<Bf16Format, 1, 1, sizeof(float), false, epilogue_identity, nullptr, 0, true> :
+                                  run_matmul<Bf16Format, 1, 1, sizeof(float), false, epilogue_identity>)(config, input, weight, nullptr, output, nullptr, nullptr, 64);
+    }
     const int status = prepare_matmul_4c(config->cluster_workspace);
     if (status < 0) {
         return status;
@@ -186,6 +193,10 @@ int matmul_bf16(const DayanMatmulConfig * config, const uint16_t * input, const 
 }
 
 int matmul_pair_bf16(const DayanMatmulPairConfig * config, const uint16_t * input, const uint16_t * first, const uint16_t * second, float * first_output, float * second_output) {
+    if (dayan_task_mode() == 1) {
+        const int status = matmul_bf16(&config->first, input, first, first_output);
+        return status < 0 ? status : matmul_bf16(&config->second, input, second, second_output);
+    }
     const int status = prepare_matmul_4c(config->first.cluster_workspace);
     if (status < 0) {
         return status;
@@ -194,6 +205,10 @@ int matmul_pair_bf16(const DayanMatmulPairConfig * config, const uint16_t * inpu
 }
 
 int matmul_swiglu_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * gate, const uint16_t * up, uint16_t * output) {
+    if (dayan_task_mode() == 1) {
+        reset_local_resources();
+        return ggml_dayan_ffn_detail::run<ggml_dayan_matmul_detail::Bf16Format, 1, false>(config, input, gate, up, output);
+    }
     const int status = prepare_matmul_4c(config->cluster_workspace);
     if (status < 0) {
         return status;
@@ -206,6 +221,12 @@ int matmul_swiglu_bf16(const DayanMatmulConfig * config, const uint16_t * input,
 }
 
 int matmul_quantized_bf16(const DayanMatmulConfig * config, const uint16_t * input, const uint16_t * weight, uint16_t * output) {
+    if (dayan_task_mode() == 1) {
+        reset_local_resources();
+        using namespace ggml_dayan_matmul_detail;
+        return (config->m <= 512 ? run_matmul<Bf16Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Bf16Format>, nullptr, 0, true> :
+                                  run_matmul<Bf16Format, 1, 1, sizeof(uint16_t), true, epilogue_lowp<Bf16Format>>)(config, input, weight, nullptr, output, nullptr, nullptr, 64);
+    }
     const int status = prepare_matmul_4c(config->cluster_workspace);
     if (status < 0) {
         return status;
@@ -272,6 +293,14 @@ int divide(const DayanBinaryConfig * config, const float * left, const float * r
 
 int noop() { return 0; }
 
+int ffn_decode(const DayanFfnConfig * config, const void * input, const void * input_scales,
+               const void * gate, const void * gate_scales, const void * up, const void * up_scales,
+               const void * down, const void * down_scales, const int32_t * selected, const float * weights, void * output) {
+    reset_local_resources();
+    if (dayan_task_id(DAYAN_TASK_X) || dayan_task_id(DAYAN_TASK_Y)) { return 0; }
+    return ggml_dayan_moe_ffn_detail::run(config, input, input_scales, gate, gate_scales, up, up_scales, down, down_scales, selected, weights, output);
+}
+
 #define MEGA_GRAPH_BEGIN(Name, Id, Moe, Linear) namespace Name { static const Operation operations[] = {
 #define MEGA_STEP(Name, Kind, Function, Barriers, Mode, ...) \
     { Binding<decltype(&ggml_dayan_mega_detail::Function), &ggml_dayan_mega_detail::Function>::call, Signature<decltype(&ggml_dayan_mega_detail::Function)>::count, Barriers, #Name },
@@ -293,7 +322,7 @@ static int execute(const Operation (&operations)[Count], const uintptr_t * param
             return status;
         }
         parameters += operation.argument_count;
-        for (uint16_t index = 0; index < operation.barriers; ++index) {
+        for (uint16_t index = 0; index < operation.barriers && dayan_task_mode() == 4; ++index) {
             status = dayan_cluster_barrier(4, barrier);
             if (status < 0) {
                 return status;
@@ -303,14 +332,15 @@ static int execute(const Operation (&operations)[Count], const uintptr_t * param
     return 0;
 }
 
-template <bool Moe>
+template <bool Moe, bool AnyGraph = false>
 static void run(const DayanMegaConfig * config, const void * const * sources) {
     DAYAN_PARAMS_IF(config == nullptr) {
         DAYAN_PARAMS_ERROR();
     }
     dayan_cache_invalidate(config, sizeof(*config));
     const DayanMegaParameter * encoded = (const DayanMegaParameter *) (config + 1);
-    DAYAN_PARAMS_IF(shared == nullptr || dayan_task_mode() != 4U || dayan_task_dim(DAYAN_TASK_X) != 4U ||
+    DAYAN_PARAMS_IF((dayan_task_mode() != 1U && dayan_task_mode() != 4U) ||
+                    (dayan_task_mode() == 4U && shared == nullptr) || dayan_task_dim(DAYAN_TASK_X) != dayan_task_mode() ||
                     dayan_task_dim(DAYAN_TASK_Y) != 1U || dayan_task_dim(DAYAN_TASK_Z) != 1U) {
         DAYAN_PARAMS_ERROR();
     }
@@ -341,7 +371,7 @@ static void run(const DayanMegaConfig * config, const void * const * sources) {
     switch (config->graph) {
 #define MEGA_GRAPH_BEGIN(Name, Id, IsMoe, Linear) \
         case Id: \
-            if constexpr (Moe == IsMoe) { \
+            if constexpr (AnyGraph || Moe == IsMoe) { \
                 DAYAN_PARAMS_IF(config->parameter_count != Name::parameter_count) { DAYAN_PARAMS_ERROR(); } \
                 status = execute(Name::operations, parameters, barrier, workspace); \
             } \
@@ -424,3 +454,34 @@ DAYAN_KERNEL_RESOURCE_DESC_EX(
     sizeof(dayan_cluster_barrier_t), MATMUL_DAYAN_4C_URAM_BYTES,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_TCSR_LOGICAL_GROUPS, 4,
     DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_RESOURCE_LOGICAL_COUNT, DAYAN_RESOURCE_LOGICAL_COUNT);
+
+__kernel__ void qwen35_mega_1c(
+    const DayanMegaConfig * config,
+    const void * root0,
+    const void * root1,
+    const void * root2,
+    const void * root3,
+    const void * root4,
+    const void * root5,
+    const void * root6,
+    const void * root7,
+    const void * root8,
+    const void * root9,
+    const void * root10,
+    const void * root11,
+    const void * root12,
+    const void * root13,
+    const void * root14,
+    const void * root15) {
+    const void * sources[] = {
+        config, root0, root1, root2, root3, root4, root5, root6, root7,
+        root8, root9, root10, root11, root12, root13, root14, root15,
+    };
+    ggml_dayan_mega_detail::run<false, true>(config, sources);
+}
+
+DAYAN_KERNEL_RESOURCE_DESC_EX(
+    qwen35_mega_1c, 1, DAYAN_KERNEL_MAX_CHILD_THREADS, 0,
+    0, MATMUL_DAYAN_1C_URAM_BYTES,
+    DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_TCSR_LOGICAL_GROUPS, 4,
+    DAYAN_TCSR_LOGICAL_GROUPS, DAYAN_RESOURCE_LOGICAL_COUNT, 0);

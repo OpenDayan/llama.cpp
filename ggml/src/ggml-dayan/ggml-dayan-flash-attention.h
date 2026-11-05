@@ -7,44 +7,46 @@
 
 namespace ggml_dayan_flash_attention_detail {
 
-constexpr long kSlices = 2;
-constexpr long kSlots = 2;
-constexpr long kVecLanes = 64;
-constexpr uint32_t kFlagCausal = 1;
-constexpr long kBr = 128;
-constexpr long kBc = 128;
-constexpr long kMaxHeadDim = 256;
-constexpr long kVecBytes = 256;
-constexpr long kLocalResources = kSlices + 5 * kSlices * kSlots + 4;
-constexpr long kSharedResources = 4;
-constexpr long kMatQK = 1;
-constexpr long kAtomicBytes = sizeof(DayanClusterState);
-constexpr long kUramBytes = 1536 * 1024;
-constexpr long kQBytes = kBr * kMaxHeadDim * sizeof(uint16_t);
-constexpr long kOBytes = kBr * kMaxHeadDim * sizeof(float);
-constexpr long kPVBytes = kOBytes;
-constexpr long kScoreBytes = kBr * kBc * sizeof(float);
-constexpr long kStateVectorBytes = kBr * 32;
-constexpr long kMaskBytes = (kBr / 8) * (kBc / 8) * 32;
-constexpr long kCtxQ = 0;
-constexpr long kCtxO = kQBytes;
-constexpr long kCtxTiles = kCtxO + kOBytes;
-constexpr long kTileScore = 0;
-constexpr long kTilePV = kTileScore + kScoreBytes;
-constexpr long kTileM = kTilePV + kPVBytes;
-constexpr long kTileL = kTileM + kStateVectorBytes;
-constexpr long kTileAlpha = kTileL + kStateVectorBytes;
-constexpr long kTileMask = kTileAlpha + kStateVectorBytes;
-constexpr long kTileBytes = kTileMask + kMaskBytes;
-constexpr long kContextBytes = kCtxTiles + kSlots * kTileBytes;
-constexpr long kKBytes = kBc * kMaxHeadDim * sizeof(uint16_t);
-constexpr long kVtBytes = kKBytes;
-constexpr long kUramK0 = kSlices * kContextBytes;
-constexpr long kUramVt0 = kUramK0 + 2 * kKBytes;
-constexpr long kUramZero = kUramVt0 + 2 * kVtBytes;
-constexpr long kUramMaskRows = kUramZero + kVecBytes;
-constexpr long kUramMaskCols = kUramMaskRows + kVecBytes;
-constexpr long kUramMaskDelta = kUramMaskCols + kVecBytes;
+template <long BlockRows> struct Pipeline {
+
+static constexpr long kSlices = 2;
+static constexpr long kSlots = 2;
+static constexpr long kVecLanes = 64;
+static constexpr uint32_t kFlagCausal = 1;
+static constexpr long kBr = BlockRows;
+static constexpr long kBc = 128;
+static constexpr long kMaxHeadDim = 256;
+static constexpr long kVecBytes = 256;
+static constexpr long kLocalResources = kSlices + 5 * kSlices * kSlots + 4;
+static constexpr long kSharedResources = 4;
+static constexpr long kMatQK = 1;
+static constexpr long kAtomicBytes = sizeof(DayanClusterState);
+static constexpr long kUramBytes = BlockRows == 128 ? 1536 * 1024 : 768 * 1024;
+static constexpr long kQBytes = kBr * kMaxHeadDim * sizeof(uint16_t);
+static constexpr long kOBytes = kBr * kMaxHeadDim * sizeof(float);
+static constexpr long kPVBytes = kOBytes;
+static constexpr long kScoreBytes = kBr * kBc * sizeof(float);
+static constexpr long kStateVectorBytes = kBr * 32;
+static constexpr long kMaskBytes = (kBr / 8) * (kBc / 8) * 32;
+static constexpr long kCtxQ = 0;
+static constexpr long kCtxO = kQBytes;
+static constexpr long kCtxTiles = kCtxO + kOBytes;
+static constexpr long kTileScore = 0;
+static constexpr long kTilePV = kTileScore + kScoreBytes;
+static constexpr long kTileM = kTilePV + kPVBytes;
+static constexpr long kTileL = kTileM + kStateVectorBytes;
+static constexpr long kTileAlpha = kTileL + kStateVectorBytes;
+static constexpr long kTileMask = kTileAlpha + kStateVectorBytes;
+static constexpr long kTileBytes = kTileMask + kMaskBytes;
+static constexpr long kContextBytes = kCtxTiles + kSlots * kTileBytes;
+static constexpr long kKBytes = kBc * kMaxHeadDim * sizeof(uint16_t);
+static constexpr long kVtBytes = kKBytes;
+static constexpr long kUramK0 = kSlices * kContextBytes;
+static constexpr long kUramVt0 = kUramK0 + 2 * kKBytes;
+static constexpr long kUramZero = kUramVt0 + 2 * kVtBytes;
+static constexpr long kUramMaskRows = kUramZero + kVecBytes;
+static constexpr long kUramMaskCols = kUramMaskRows + kVecBytes;
+static constexpr long kUramMaskDelta = kUramMaskCols + kVecBytes;
 static_assert(kUramMaskDelta + kVecBytes <= kUramBytes, "Attention URAM exceeds allocation");
 static_assert(kLocalResources <= 32, "Attention exceeds the Local Resource window");
 
@@ -289,7 +291,7 @@ static inline long qk_swizzle(long head_dim) {
     return head_dim == 128 ? MAT_BATCH_SWIZZLE(5, 1, 5) :
            head_dim == 256 ? MAT_BATCH_SWIZZLE(5, 2, 5) : 0;
 }
-constexpr long kVSwizzle = MAT_BATCH_SWIZZLE(5, 1, 5);
+static constexpr long kVSwizzle = MAT_BATCH_SWIZZLE(5, 1, 5);
 
 static void load_q(void * argument) {
     const State & s = *(State *) argument;
@@ -477,7 +479,8 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
         __tx_vec_lsu_u2v<0, 0>(base + kTileScore + part * 32);
         __tx_vec_vv_fp32_mul<0, 0, 23, 0>();
         __tx_vec_vv_fp32_sub<0, 0, 16, 0>();
-        __tx_vec_v_fp32_eru<0, 0, 0>();
+        // ERU Exp2 exceeds the softmax error budget.
+        __tx_vec_v_fp32_sfu<0, 0, 1>();
         if constexpr (Mask) {
             __tx_vec_lsu_u2s<0, 3>(base + kTileMask + part * 32);
             __tx_vec_vv_mux2<0, 21, 0, 0>();
@@ -492,7 +495,7 @@ template <bool Mask, bool First> static inline void online_softmax(long base, lo
         __tx_vec_vv_fp32_add<0, 0, 16, 0>();
     }
     __tx_vec_vv_fp32_sub<0, 20, 19, 0>();
-    __tx_vec_v_fp32_eru<0, 0, 0>();
+    __tx_vec_v_fp32_sfu<0, 0, 1>();
     __tx_vec_lsu_v2u<0, 2>(base + kTileAlpha);
     if constexpr (First) {
         __tx_vec_lsu_g2v_broadcast32<1, 0>(0);
@@ -696,10 +699,10 @@ static void merge_decode(const State & s, long uram, long base, long rows) {
             __tx_vec_vv_fp32_max<0, 0, 16, 0>();
             __tx_vec_lsu_v2u<0, 0>(base + kTileM);
             __tx_vec_vv_fp32_sub<0, 1, 0, 0>();
-            __tx_vec_v_fp32_eru<0, 0, 0>();
+            __tx_vec_v_fp32_sfu<0, 0, 1>();
             __tx_vec_lsu_v2u<0, 0>(alpha);
             __tx_vec_vv_fp32_sub<1, 16, 2, 0>();
-            __tx_vec_v_fp32_eru<1, 16, 0>();
+            __tx_vec_v_fp32_sfu<1, 16, 1>();
             __tx_vec_lsu_v2u<16, 0>(beta);
             __tx_vec_lsu_u2v<0, 0>(base + kTileL);
             __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
@@ -978,5 +981,13 @@ static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const 
     return 0;
 }
 
+
+};
+
+template <typename Format, int Cores, bool SplitKV = false>
+static int run(const DayanFlashAttentionConfig * cfg, const uint16_t * q, const uint16_t * k, const uint16_t * v, float * out) {
+    return dayan_uram_size() < 1536U * 1024U ? Pipeline<32>::template run<Format, Cores, SplitKV>(cfg, q, k, v, out) :
+                                             Pipeline<128>::template run<Format, Cores, SplitKV>(cfg, q, k, v, out);
+}
 
 } // namespace ggml_dayan_flash_attention_detail

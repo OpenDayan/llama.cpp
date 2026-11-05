@@ -43,6 +43,7 @@ static inline void dayan_cluster_invalidate(uint64_t workspace, uint32_t core) {
 }
 
 static inline int dayan_cluster_sync() {
+    if (dayan_task_mode() == 1 && dayan_task_dim(DAYAN_TASK_X) == 1) { return 0; }
     const auto mine = DAYAN_SHARED_RESOURCE(20 + dayan_task_id(DAYAN_TASK_X));
     const uint64_t all = 15ULL << DAYAN_SHARED_RESOURCE(20);
     // Two generations return the tokens to phase zero. Each core consumes every arrival.

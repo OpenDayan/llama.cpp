@@ -12,6 +12,7 @@
 #include "ggml-dayan-matmul-4c.h"
 #include "ggml-dayan-normalization.h"
 #include "ggml-dayan-mxfp4.h"
+#include "ggml-dayan-moe-ffn.h"
 #include "ggml-dayan-rope.h"
 #include "ggml-dayan-softmax.h"
 
@@ -57,12 +58,28 @@ static inline float u32_as_float(uint32_t value) {
 #    include "ggml-dayan-gated-delta-net.h"
 #endif
 
+__kernel__ void moe_ffn_decode(const DayanFfnConfig * config, const void * input, const void * input_scales,
+                               const void * gate, const void * gate_scales, const void * up, const void * up_scales,
+                               const void * down, const void * down_scales, const int32_t * selected, const float * weights, void * output) {
+    dayan_acquire_config(config);
+    ggml_dayan_matmul_detail::matmul_check(ggml_dayan_moe_ffn_detail::run(
+        config, input, input_scales, gate, gate_scales, up, up_scales, down, down_scales, selected, weights, output));
+}
+
 __kernel__ void router_f32(const DayanMatmulConfig * config, const float * activation, const float * weight, float * output) {
     dayan_acquire_config(config);
     ggml_dayan_matmul_detail::run_router_f32(config, activation, weight, output);
 }
 
 __kernel__ void mul_mat_id_mxfp4(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
+                                const void * b, const void * bs, const void * up, const void * ups,
+                                const int32_t * ids, void * output, void * scales, void * workspace) {
+    dayan_acquire_config(config);
+    ggml_dayan_matmul_detail::matmul_check(
+        ggml_dayan_matmul_detail::run_mul_mat_id_mxfp4(config, a, as, b, bs, up, ups, ids, output, scales, workspace));
+}
+
+__kernel__ void mul_mat_id_mxfp4_small(const DayanMxfp4MoeConfig * config, const void * a, const void * as,
                                 const void * b, const void * bs, const void * up, const void * ups,
                                 const int32_t * ids, void * output, void * scales, void * workspace) {
     dayan_acquire_config(config);
@@ -1828,7 +1845,9 @@ DAYAN_MATMUL_1C_DESC(matmul_fp16_1c);
 DAYAN_MATMUL_1C_DESC(matmul_inference_fp16_1c);
 DAYAN_MATMUL_4C_DESC(matmul_bf16_4c);
 DAYAN_MATMUL_1C_DESC(matmul_mxfp4_1c);
-DAYAN_MATMUL_1C_DESC(mul_mat_id_mxfp4);
+DAYAN_KERNEL_NAMED_RESOURCE_DESC(moe_ffn_decode, 1, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES), 2, 1, 1, 0, 2, 0);
+DAYAN_KERNEL_NAMED_RESOURCE_DESC(mul_mat_id_mxfp4, 3, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 6, 1, 2, 0, 12, 0);
+DAYAN_MATMUL_1C_DESC(mul_mat_id_mxfp4_small);
 DAYAN_KERNEL_NAMED_RESOURCE_DESC(matmul_mxfp4_4c, 3, MATMUL_DAYAN_4C_ATOMIC_BYTES, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_4C_URAM_BYTES), 7, 1, 2, 0, 12, kDayanClusterResources);
 DAYAN_KERNEL_TASK_DESC(quantize_mxfp4, 4, 2, 0, DAYAN_DESC_URAM_BYTES(640U * 1024U), 2, 0, 2, 0);
 DAYAN_KERNEL_TASK_DESC(router_f32, 4, 2, 0, DAYAN_DESC_URAM_BYTES(512U * 1024U), 2, 2, 0, 0);
@@ -1887,9 +1906,9 @@ DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_swiglu_fp16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_bf16_4c);
 DAYAN_MATMUL_4C_DESC(mul_mat_id_geglu_fp16_4c);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
                               6, 2, 2, 0, 26, 0);
-DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(1536U * 1024U),
+DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_fp16_1c, 1U, 6, DAYAN_KERNEL_RESOURCE_LOCKED_TASK, 0, DAYAN_DESC_URAM_BYTES(MATMUL_DAYAN_1C_URAM_BYTES),
                               6, 2, 2, 0, 26, 0);
 DAYAN_KERNEL_RESOURCE_DESC_EX(flash_attention_bf16_4c, 1U, 6, 0, sizeof(DayanClusterState), DAYAN_DESC_URAM_BYTES(1536U * 1024U),
                               6, 2, 2, 0, 26, kDayanClusterResources);

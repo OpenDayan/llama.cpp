@@ -245,6 +245,10 @@ static int run(const DayanMatmulConfig * config, const uint16_t * a, const uint1
     s.buffer_a = config->m <= 128;
     s.slice_m = s.buffer_a ? 128 : 256;
     s.slice_n = s.buffer_a ? 192 : 128;
+    if (dayan_uram_size() < 1536U * 1024U) {
+        s.slice_m = 64;
+        s.slice_n = 128;
+    }
     s.tile_m = s.buffer_a ? s.slice_m : kSlices * s.slice_m;
     s.tile_n = s.buffer_a ? kSlices * s.slice_n : s.slice_n;
     s.accumulator_stride = (2 * s.slice_n + 32) * sizeof(float);

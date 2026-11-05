@@ -813,19 +813,101 @@ static float compare_lowp_tensor(const char *        stage,
     return stage_max_abs;
 }
 
-static void bypass_reference_activation_casts(ggml_cgraph * graph) {
-    // The rewrite quantizes matmul activations for Dayan; the CPU reference
-    // needs the plain F32 sources instead.
+static void reference_mxfp4_activation(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void *) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && src->ne[0] % 32 == 0);
+    const float * input = (const float *) src->data;
+    float * output = (float *) dst->data;
+    constexpr float levels[] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    for (int64_t block = ith; block < ggml_nelements(src) / 32; block += nth) {
+        float values[32], largest = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            values[i] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(input[block * 32 + i]));
+            largest = std::max(largest, std::abs(values[i]));
+        }
+        int exponent = largest == 0.0f ? 0 : -127;
+        while (exponent < 127 && largest > std::ldexp(6.0f, exponent)) { ++exponent; }
+        for (int i = 0; i < 32; ++i) {
+            int code = 0;
+            while (code < 7 && std::abs(values[i]) >= std::ldexp(levels[code + 1], exponent)) { ++code; }
+            output[block * 32 + i] = std::copysign(std::ldexp(levels[code], exponent), values[i]);
+        }
+    }
+}
+
+static void reference_fp16_mat_input(ggml_tensor * dst, const ggml_tensor * src, int ith, int nth, void *) {
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous(src));
+    const float * input = (const float *) src->data;
+    float * output = (float *) dst->data;
+    for (int64_t i = ith; i < ggml_nelements(src); i += nth) {
+        // MAT drops the low three FP16 fraction bits.
+        output[i] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(input[i]) & 0xfff8U);
+    }
+}
+
+static void reference_attention(ggml_tensor * dst, int ith, int nth, void *) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const int64_t dim = q->ne[0], tokens = q->ne[1], heads = q->ne[2];
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[1] == tokens && v->ne[1] == tokens);
+    const float scale = 1.0f / std::sqrt((float) dim);
+    auto row = [](const ggml_tensor * t, int64_t token, int64_t head) {
+        return (const float *) ((const char *) t->data + token * t->nb[1] + head * t->nb[2]);
+    };
+    for (int64_t index = ith; index < tokens * heads; index += nth) {
+        const int64_t token = index / heads, head = index % heads;
+        const int64_t kv_head = head / (heads / k->ne[2]);
+        const float * query = row(q, token, head);
+        float * output = (float *) dst->data + index * dim;
+        std::fill(output, output + dim, 0.0f);
+        float maximum = -INFINITY, denominator = 0.0f;
+        for (int64_t start = 0; start <= token; start += 128) {
+            const int64_t count = std::min<int64_t>(128, token + 1 - start);
+            float scores[128], next_maximum = maximum;
+            for (int64_t j = 0; j < count; ++j) {
+                const float * key = row(k, start + j, kv_head);
+                float score = 0.0f;
+                for (int64_t d = 0; d < dim; ++d) { score += query[d] * key[d]; }
+                scores[j] = score * scale;
+                next_maximum = std::max(next_maximum, scores[j]);
+            }
+            const float alpha = std::exp(maximum - next_maximum);
+            denominator *= alpha;
+            for (int64_t d = 0; d < dim; ++d) { output[d] *= alpha; }
+            for (int64_t j = 0; j < count; ++j) {
+                const float probability = std::exp(scores[j] - next_maximum);
+                denominator += probability;
+                // PV reads softmax probabilities through MAT's TF32 input.
+                uint32_t bits;
+                std::memcpy(&bits, &probability, sizeof(bits));
+                bits &= 0xffffe000U;
+                float truncated;
+                std::memcpy(&truncated, &bits, sizeof(truncated));
+                const float * value = row(v, start + j, kv_head);
+                for (int64_t d = 0; d < dim; ++d) { output[d] += truncated * value[d]; }
+            }
+            maximum = next_maximum;
+        }
+        const float inverse = 1.0f / denominator;
+        for (int64_t d = 0; d < dim; ++d) { output[d] *= inverse; }
+    }
+}
+
+static void prepare_reference_activations(ggml_context * ctx, ggml_cgraph * graph) {
     for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
         ggml_tensor * node = ggml_graph_node(graph, i);
-        if (node->op != GGML_OP_MUL_MAT || node->src[1] == nullptr) {
+        if (node->op != GGML_OP_MUL_MAT || node->src[0]->type != GGML_TYPE_MXFP4) {
             continue;
         }
         ggml_tensor * activation = node->src[1];
-        if (activation->type == GGML_TYPE_MXFP4 && activation->src[0] != nullptr &&
-            activation->src[0]->type == GGML_TYPE_F32) {
-            node->src[1] = activation->src[0];
-        }
+        if (activation->type == GGML_TYPE_MXFP4) { activation = activation->src[0]; }
+        GGML_ASSERT(activation != nullptr && activation->type == GGML_TYPE_F32);
+        if (!ggml_is_contiguous(activation)) { activation = ggml_cont(ctx, activation); }
+        // Keep the device activation rounding while supplying F32 inputs to CPU mul_mat.
+        node->src[1] = ggml_map_custom1(ctx, activation, reference_mxfp4_activation, GGML_N_TASKS_MAX, nullptr);
+        // Avoid the quantized CPU matmul's extra Q8 activation rounding.
+        node->src[0] = ggml_cast(ctx, node->src[0], GGML_TYPE_F32);
+        ggml_mul_mat_set_prec(node, GGML_PREC_F32);
     }
 }
 
@@ -846,11 +928,27 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         !rewrite_graph(dayan, actual.ctx.get(), actual.graph)) {
         return fail("model graph rewrite failed");
     }
-    bypass_reference_activation_casts(reference.graph);
+    prepare_reference_activations(reference.ctx.get(), reference.graph);
     size_t flash_index = 0;
     for (layer_graph & layer : reference.layers) {
         if (!layer.recurrent) {
             layer.flash_attention->src[0] = reference_flash_inputs[flash_index++];
+            if (config.type == GGML_TYPE_MXFP4) {
+                for (int i = 0; i < 3; ++i) {
+                    ggml_tensor * input = ggml_cast(reference.ctx.get(), layer.flash_attention->src[i], GGML_TYPE_F32);
+                    layer.flash_attention->src[i] = ggml_map_custom1(reference.ctx.get(), input,
+                                                                    reference_fp16_mat_input, GGML_N_TASKS_MAX,
+                                                                    nullptr);
+                }
+                ggml_tensor * old = layer.flash_attention;
+                ggml_tensor * custom = ggml_custom_4d(reference.ctx.get(), GGML_TYPE_F32,
+                    old->ne[0], old->ne[1], old->ne[2], old->ne[3], old->src, 3,
+                    reference_attention, GGML_N_TASKS_MAX, nullptr);
+                // Preserve the existing output and its view allocation order.
+                old->op = custom->op;
+                std::memcpy(old->op_params, custom->op_params, sizeof(old->op_params));
+                std::copy(std::begin(custom->src), std::end(custom->src), std::begin(old->src));
+            }
         }
     }
     ggml_graph_clear(reference.graph);
@@ -1014,6 +1112,11 @@ static int run_model_case(ggml_backend_t dayan, ggml_backend_t cpu, const model_
         (*result)["relative_l2_error"] = relative_l2;
         (*result)["checked_elements"] = stats.count;
         (*result)["mega_launched"] = mega_launched;
+        (*result)["validation"] = config.type == GGML_TYPE_MXFP4 ?
+            "CPU F32 accumulation with stored weights, Dayan MXFP4 rounding and MAT attention input truncation" :
+            "CPU reference graph with MAT FP16 attention input truncation";
+        (*result)["final_hidden_max_abs_error"] = final_hidden_max_abs;
+        (*result)["logits_max_abs_error"] = logits_max_abs;
         (*result)["comparison"] = {
             {"status", stats.close ? "pass" : "fail"},
             {"max_abs_error", stats.max_abs},
@@ -1094,6 +1197,9 @@ int main(int argc, char ** argv) {
 
     const model_case cases[] = {
         { GGML_TYPE_BF16, 1, 35U, 1, model_mode::linear },
+        { GGML_TYPE_MXFP4, 1, 35U, 1, model_mode::linear },
+        { GGML_TYPE_MXFP4, 1, 35U, 1, model_mode::full },
+        { GGML_TYPE_MXFP4, 4, 35U, 1, model_mode::full },
         { GGML_TYPE_BF16, 4, 0x351004U, 4, model_mode::hybrid },
         { GGML_TYPE_F16,  4, 0x351104U, 4, model_mode::hybrid },
     };

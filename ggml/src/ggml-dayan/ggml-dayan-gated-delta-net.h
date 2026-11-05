@@ -161,7 +161,6 @@ static inline void emit_dot_half(uint64_t input, uint64_t state) {
     __tx_vec_lsu_u2v<0, 0>(input);
     __tx_vec_lsu_u2v<0, 1>(state);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-    emit_sum_64();
 }
 
 template <long Delta>
@@ -175,7 +174,6 @@ static inline void emit_update_half(uint64_t state, uint64_t key, uint64_t query
     __tx_vec_lsu_v2u<0, 1>(state);
     __tx_vec_lsu_u2v<0, 0>(query);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
-    emit_sum_64();
 }
 
 static inline void configure_vec_outer(long rows, long halves = 1) {
@@ -244,6 +242,7 @@ static inline void emit_recurrence_row(uint32_t scale_bits, const NativeContext 
     __tx_vec_shuffle_xor<1, 0>(0);
     emit_dot_half(uram_address(kUramGatedK + kVecBytes, context), uram_address(kUramState + kVecBytes, context));
     __tx_vec_vv_fp32_add<0, 0, 16, 0>();
+    emit_sum_64();
     __tx_vec_s_iter_gets<0, 0, 0, 0>();
     __tx_vec_shuffle_broadcast_dyn<0, 17, 0>();
     __tx_vec_vv_fp32_sub<0, 0, 1, 0>();
@@ -256,6 +255,7 @@ static inline void emit_recurrence_row(uint32_t scale_bits, const NativeContext 
     emit_update_half<17>(uram_address(kUramState + kVecBytes, context), uram_address(kUramK + kVecBytes, context),
                          uram_address(kUramQ + kVecBytes, context), uram_address(kUramGate + GateHalfStride, context));
     __tx_vec_vv_fp32_add<0, 16, 0, 0>();
+    emit_sum_64();
     __tx_vec_lsu_g2v_broadcast32<0, 0>(scale_bits);
     __tx_vec_vv_fp32_mul<0, 0, 1, 0>();
     __tx_vec_lsu_u2s<0, 3>(uram_address(kUramMaskTable, context));
@@ -267,7 +267,7 @@ template <long GateHalfStride>
 static inline void issue_recurrence(uint32_t scale_bits, const NativeContext & context = {}) {
     constexpr long prologue0 = 0;
     constexpr long group_prologue = 2;
-    constexpr long row_instructions = 87;
+    constexpr long row_instructions = 63;
     constexpr long group_epilogue = 2;
     const long prologue1 = prologue0 + group_prologue;
     const long loop = prologue1 + row_instructions;

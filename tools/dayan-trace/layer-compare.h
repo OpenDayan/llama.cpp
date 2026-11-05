@@ -200,6 +200,9 @@ struct layer_operator_compare {
                 computed.insert(event->nodes[i]);
             }
         }
+        if (std::strcmp(event->kind, "gated_output_projection") == 0) {
+            computed.insert(event->nodes[0]->src[0]);
+        }
         for (size_t i = 0; i < event->output_count; ++i) { computed.insert(event->outputs[i]); }
         ggml_init_params params{ggml_tensor_overhead() * 256 + ggml_graph_overhead(), nullptr, true};
         std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);

@@ -16,6 +16,28 @@ MEGA_STEP(divide_weights, elementwise_div, divide, 1, required,
           pack(binary, at(divide_weights)))
 MEGA_STEP(ffn_quant, copy, quantize_mxfp4, 1, required,
           pack(quantize, at(ffn_quant)))
+#ifdef MEGA_FFN_FUSED
+MEGA_STEP(experts, mul_mat_id_swiglu, ffn_decode, 1, required,
+          pack(ffn, at(experts), at(experts_down), &at(weighted), &at(expert_add6)))
+MEGA_STEP(experts_down, mul_mat_id, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(weighted, elementwise_mul, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add0, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add1, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add2, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add3, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add4, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add5, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+MEGA_STEP(expert_add6, elementwise_add, noop, 0, required,
+          pack(noop, 0))
+#else
 MEGA_STEP(experts, mul_mat_id_swiglu, matmul_id_mxfp4, 1, required,
           pack(matmul, at(experts).nodes[0], at(experts).nodes[1], at(experts).nodes[3], 2, ctx.workspace, ctx.workspace_bytes))
 MEGA_STEP(experts_down, mul_mat_id, matmul_id_mxfp4, 1, required,
@@ -36,12 +58,20 @@ MEGA_STEP(expert_add5, elementwise_add, add, 1, required,
           pack(binary, at(expert_add5)))
 MEGA_STEP(expert_add6, elementwise_add, add, 1, required,
           pack(binary, at(expert_add6)))
+#endif
 MEGA_STEP(shared_copy, copy, copy, 1, required,
           pack(copy, at(shared_copy)))
+#ifdef MEGA_FFN_FUSED
+MEGA_STEP(shared_ffn, mul_mat_swiglu, ffn_decode, 1, required,
+          pack(ffn, at(shared_ffn), at(shared_down), nullptr, nullptr))
+MEGA_STEP(shared_down, mul_mat, noop, 0, required,
+          pack(noop, 0))
+#else
 MEGA_STEP(shared_ffn, mul_mat_swiglu, matmul_swiglu_bf16, 1, required,
           pack(bf16_swiglu, at(shared_ffn)))
 MEGA_STEP(shared_down, mul_mat, matmul_bf16, 1, required,
           pack(bf16_matmul, at(shared_down).nodes[0], at(shared_down).nodes[0]))
+#endif
 MEGA_STEP(shared_router, mul_mat, matmul_tf32, 1, required,
           pack(tf32, at(shared_router)))
 MEGA_STEP(shared_sigmoid, sigmoid, sigmoid, 1, required,

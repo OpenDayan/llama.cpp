@@ -100,6 +100,17 @@ static void layout_test() {
             }
         }
     }
+    for (int rows : {1, 4, 31, 32, 128, 256, 1024}) {
+        for (int columns : {16, 512, 2048, 6144}) {
+            for (bool scales : {false, true}) {
+                for (int products : {1, 2}) {
+                    const auto tile = DayanMxfp4Tile::make(rows, columns, 2048, scales, products, true, 1, 768U * 1024U);
+                    require(tile.bytes() <= 768U * 1024U, "single-core tile fits 768 KiB");
+                    require(tile.m % 32 == 0 && tile.n % 256 == 0 && tile.k % 128 == 0, "small tile alignment");
+                }
+            }
+        }
+    }
     for (int rows : {1, 7, 8, 9, 65}) {
         for (int cols : {32, 128, 160, 672}) {
             const auto layout = DayanMxfp4Layout::make(rows, cols);
@@ -405,6 +416,7 @@ int main(int argc, char ** argv) {
     ggml_backend_ptr backend(ggml_backend_init_by_name("DAYAN", nullptr));
     require(backend != nullptr, "initialize backend");
     if (argc > 1 && std::strcmp(argv[1], "--decode-matmul") == 0) {
+        matmul_test(backend.get(), 1, 2048, 512, false);
         matmul_test(backend.get(), 1, 6144, 1024, false);
         matmul_test(backend.get(), 1, 4096, 1024, false);
         matmul_test(backend.get(), 1, 512, 1024, false);

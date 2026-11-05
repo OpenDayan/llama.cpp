@@ -92,6 +92,9 @@ int sum_rows(const DayanReduceConfig * config, const float * input, float * outp
 int clamp(const DayanClampConfig * config, const float * input, float * output);
 int divide(const DayanBinaryConfig * config, const float * left, const float * right, float * output);
 int noop();
+int ffn_decode(const DayanFfnConfig * config, const void * input, const void * input_scales,
+               const void * gate, const void * gate_scales, const void * up, const void * up_scales,
+               const void * down, const void * down_scales, const int32_t * selected, const float * weights, void * output);
 
 template <typename Function> struct Signature;
 
@@ -246,6 +249,26 @@ int qwen35_dense_mega(
     const npu_kernel_launch_attrs_t * attrs);
 
 int qwen35_moe_mega(
+    npu_buffer_t * config,
+    npu_buffer_t * root0,
+    npu_buffer_t * root1,
+    npu_buffer_t * root2,
+    npu_buffer_t * root3,
+    npu_buffer_t * root4,
+    npu_buffer_t * root5,
+    npu_buffer_t * root6,
+    npu_buffer_t * root7,
+    npu_buffer_t * root8,
+    npu_buffer_t * root9,
+    npu_buffer_t * root10,
+    npu_buffer_t * root11,
+    npu_buffer_t * root12,
+    npu_buffer_t * root13,
+    npu_buffer_t * root14,
+    npu_buffer_t * root15,
+    const npu_kernel_launch_attrs_t * attrs);
+
+int qwen35_mega_1c(
     npu_buffer_t * config,
     npu_buffer_t * root0,
     npu_buffer_t * root1,

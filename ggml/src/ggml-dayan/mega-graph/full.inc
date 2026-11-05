@@ -51,5 +51,5 @@ MEGA_STEP(out, mul_mat, matmul_mxfp4, 1, required,
           pack(matmul, at(out).nodes[0], nullptr, at(out).nodes[0], 0))
 #else
 MEGA_STEP(gated, gated_output_projection, gated_output_projection_bf16, 1, required,
-          pack(bf16_gated_projection, at(gated), at(q_copy).nodes[0]))
+          pack(bf16_gated_projection, at(gated), ctx.workspace, ctx.workspace_bytes))
 #endif

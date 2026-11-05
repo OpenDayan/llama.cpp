@@ -214,6 +214,12 @@ struct Tile { uint64_t row, col; int rows, cols, users; };
 template <int M, int N>
 static Tile tile_at(const State & s, uint64_t out, int slice, int lane) {
     constexpr int slice_n = N / 2;
+    if (M == 32 && s.cfg->m == 1 && s.tasks == 1) {
+        const uint64_t col = out * N;
+        const int cols = extent((int64_t) s.cfg->n - col, N);
+        return {0, col + slice * slice_n, 1, extent(cols - slice * slice_n, slice_n),
+                (cols + slice_n - 1) / slice_n};
+    }
     const uint64_t row_base = out / s.nt * s.grid_rows * M;
     const uint64_t col_base = out % s.nt * s.grid_cols * N;
     const int group_rows = extent((int64_t) s.cfg->m - row_base, s.grid_rows * M);
@@ -485,6 +491,13 @@ static int run_tiled(State & s) {
         }
         matmul_check(dayan_cluster_sync());
     }
+    if constexpr (M == 8) {
+        load<M, N, false>(&s);
+        load<M, N, true>(&s);
+        calculate<M, N>(s);
+        post<M, N>(&s);
+        return 0;
+    }
     dayan_thread_resources_t resources = {};
     resources.lsu_tcsr_count = 1;
     resources.local_resource_count = 4 + shape.c_buffers;
@@ -535,8 +548,9 @@ static int run(const DayanMxfp4Config * cfg, const void * a, const void * as, co
     const bool decode = cfg->m == 1 && cfg->weight_type == kDayanDataTypeMXFP4;
     s.share = cfg->share_inputs && !decode && s.tasks == 4 && dayan_task_mode() == 4;
     s.shape = DayanMxfp4Tile::make(cfg->m, cfg->n, cfg->k, cfg->weight_type == kDayanDataTypeMXFP4,
-                                 cfg->operation >= 2 ? 2 : 1, cfg->operation != 0 || cfg->output_type != kDayanDataTypeF32, s.tasks);
+                                 cfg->operation >= 2 ? 2 : 1, cfg->operation != 0 || cfg->output_type != kDayanDataTypeF32, s.tasks, dayan_uram_size());
     switch (s.shape.m) {
+        case 8: return run_tiled<8, 2048>(s);
         case 512: return run_tiled<512, 512>(s);
         case 256: return run_tiled<256, 512>(s);
         case 128: return run_tiled<128, 512>(s);
