@@ -1,3 +1,8 @@
+---
+name: dayan-backend
+description: Guidance for working on the Dayan backend in llama.cpp.
+---
+
 # Dayan backend agent context
 
 This directory is a progressive context package for work on the llama.cpp Dayan backend. It summarizes the framework-specific knowledge needed for graph and operator optimization without loading the full repository into an agent context.
@@ -11,29 +16,29 @@ Do not treat this directory as a replacement for reading the code being changed.
 
 ## Reading routes
 
-Always start with [quick-context.md](quick-context.md).
+Always start with [quick-context.md](references/quick-context.md).
 
 For graph rewrite or fusion work, then read:
 
-1. [framework-and-memory.md](framework-and-memory.md)
-2. [graph-optimization.md](graph-optimization.md)
-3. [qwen35-dense.md](qwen35-dense.md) when the pattern comes from Qwen3.5
-4. [validation-and-performance.md](validation-and-performance.md)
+1. [framework-and-memory.md](references/framework-and-memory.md)
+2. [graph-optimization.md](references/graph-optimization.md)
+3. [qwen35-dense.md](references/qwen35-dense.md) when the pattern comes from Qwen3.5
+4. [validation-and-performance.md](references/validation-and-performance.md)
 
 For a Device operator or kernel, then read:
 
-1. [operator-and-kernel.md](operator-and-kernel.md)
+1. [operator-and-kernel.md](references/operator-and-kernel.md)
 2. The operator-specific header under `ggml/src/ggml-dayan/`
-3. [validation-and-performance.md](validation-and-performance.md)
+3. [validation-and-performance.md](references/validation-and-performance.md)
 
 For FlashAttention, read:
 
-1. [flash-attention.md](flash-attention.md)
-2. [operator-and-kernel.md](operator-and-kernel.md)
-3. [qwen35-dense.md](qwen35-dense.md)
-4. [validation-and-performance.md](validation-and-performance.md)
+1. [flash-attention.md](references/flash-attention.md)
+2. [operator-and-kernel.md](references/operator-and-kernel.md)
+3. [qwen35-dense.md](references/qwen35-dense.md)
+4. [validation-and-performance.md](references/validation-and-performance.md)
 
-Use [source-map.md](source-map.md) to find exact source symbols and tests.
+Use [source-map.md](references/source-map.md) to find exact source symbols and tests.
 
 ## Working rule
 
