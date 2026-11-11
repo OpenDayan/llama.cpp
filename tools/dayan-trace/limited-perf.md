@@ -2,7 +2,7 @@
 
 For complete single-layer prefill/decode measurements and offline per-slot analysis, use [layer-perf.py](layer-perf.md). The operator presets below remain available for individual operator checks.
 
-`limited-perf.py` measures the key Dayan operators selected by `--model` and estimates their inference cost. Model groups, shapes, storage types, and prediction factors are recorded in [limited-perf-models.json](limited-perf-models.json). It connects to an existing `dayan_server` and reads the JSON output of an existing firmware `dyperf`. It does not start or stop TestCluster, cmodel, the server, or a profiler. No kernel contains custom performance instrumentation.
+`limited-perf.py` measures the key Dayan operators selected by `--model` and estimates their inference cost. Model groups, shapes, storage types, and prediction factors are recorded in [limited-perf-models.json](limited-perf-models.json). It connects to an existing `dayan_server` and reads the JSON output of an existing firmware `dyperf`. It does not start or stop TestCluster, Dayan-emu, the server, or a profiler. No kernel contains custom performance instrumentation.
 
 Build the host client from the repository root:
 
@@ -55,9 +55,9 @@ Add `--cmp` to check every launch against a CPU gold reference:
 python3 tools/dayan-trace/limited-perf.py run \
     --model qwen35-0.8B-mxfp4-vocab --cmp \
     --client build-dayan/bin/llama-dayan-operator-bench \
-    --simulator cmodel --socket /tmp/dayan-cmodel.sock \
-    --perf-trace /tmp/dayan-cmodel-perf.json \
-    --output build-dayan/cmodel-cmp
+    --simulator dayan_emu --socket /tmp/dayan-dayan_emu.sock \
+    --perf-trace /tmp/dayan-dayan_emu-perf.json \
+    --output build-dayan/dayan_emu-cmp
 ```
 
 The client generates deterministic varied inputs with `--cmp-seed` (default 1), including signed values, different MXFP4 block scales, independent gate/up weights, and nonzero GDN state. CPU tensors contain exactly the floating-point values represented by the uploaded BF16/MXFP4 inputs. GGML CPU F32 operators provide the reference for MatMul, fused FFN, convolution plus SiLU, GDN, causal attention, and residual/RMSNorm/scale. Standalone quantization uses the scalar reference for the device's BF16 rounding, scale selection, and E2M1 truncation. These are synthetic operator tests; `--model` does not capture tensors from a running GGUF.
@@ -167,7 +167,7 @@ Use `--warmup 1 --repeats 1` for one unmeasured warmup and one measured launch p
 
 Each case has a wall deadline of 24 hours, covering setup, uploads, execution, and teardown; change it with `--timeout SECONDS`. A failure stops further launches. After a timeout or interruption, check the device/server state before resuming: terminating a host client does not prove the Device has stopped executing it.
 
-`--sort-rows` limits only measured prefill rows for `sort` cases. It defaults to 4 because the MoE Top-8 sort has linear row cost and a full 1024-row sample can take hours on cmodel. The case records the requested row count as `target_m`, and the report scales only that sort term by `target_m / m`. Set `--sort-rows 0` to measure the full requested prefill. Matrix, attention, expert, and other cases keep the requested prefill unchanged. The scaling is a model estimate: launch overhead and task occupancy can make a small sample differ from a full batch.
+`--sort-rows` limits only measured prefill rows for `sort` cases. It defaults to 4 because the MoE Top-8 sort has linear row cost and a full 1024-row sample can take hours on Dayan-emu. The case records the requested row count as `target_m`, and the report scales only that sort term by `target_m / m`. Set `--sort-rows 0` to measure the full requested prefill. Matrix, attention, expert, and other cases keep the requested prefill unchanged. The scaling is a model estimate: launch overhead and task occupancy can make a small sample differ from a full batch.
 
 Resume with the original options plus `--resume`. It skips completed cases and rejects changed shapes, repetition counts, socket, trace path, or executable/backend hashes. Keep the same trace file: restarting dyperf with `-o` on that file truncates earlier cycle records. Use `report` rather than `run --resume` when only the report needs updating. Retries get new task names, so incomplete old launches cannot be mistaken for a new result.
 
@@ -189,18 +189,18 @@ Both supplied model configurations assume 24 inference blocks (18 linear-attenti
 
 For wall time and cycles separately, the report sums `sample * factor` and displays both that subtotal and a scenario with `--overhead-percent` added (default 20%). This is an explicit, uncalibrated allowance for omitted casts/layouts, RoPE, small gates, KV/state copies, host scheduling, and sampling; it is not a measured overhead or confidence interval. The timing of those operations can differ substantially from the allowance. Cold module-loading cost is repeated by this formula unless warmup is enabled. The preset is a coarse estimate, not a full-model benchmark or a general model profiler. Model loading, tokenization, and simulator startup are excluded.
 
-`report --overhead-percent 0` shows the sampled subtotal without allowance. `--clock-hz HZ` optionally adds ideal Device seconds in JSON from predicted cycles; it does not infer cycles from wall time. TestCluster host wall predictions estimate RTL simulation runtime on the same host and settings, not hardware inference latency. cmodel measurements validate this workflow and describe cmodel runtime only; its counters are not RTL performance evidence.
+`report --overhead-percent 0` shows the sampled subtotal without allowance. `--clock-hz HZ` optionally adds ideal Device seconds in JSON from predicted cycles; it does not infer cycles from wall time. TestCluster host wall predictions estimate RTL simulation runtime on the same host and settings, not hardware inference latency. Dayan-emu measurements validate this workflow and describe Dayan-emu runtime only; its counters are not RTL performance evidence.
 
-## Validate with cmodel
+## Validate with Dayan-emu
 
-With a four-core cmodel server and dyperf already ready, use the same command with `--simulator cmodel`, the cmodel socket, and a separate output directory. The simulator option labels the results; it does not select or start a simulator.
+With a four-core Dayan-emu server and dyperf already ready, use the same command with `--simulator dayan_emu`, the Dayan-emu socket, and a separate output directory. The simulator option labels the results; it does not select or start a simulator.
 
 ```sh
 python3 tools/dayan-trace/limited-perf.py run \
-    --simulator cmodel --socket /tmp/dayan-cmodel.sock \
-    --perf-trace /tmp/dayan-cmodel-perf.json \
-    --output build-dayan/cmodel-perf
-python3 tools/dayan-trace/limited-perf.py report --output build-dayan/cmodel-perf
+    --simulator dayan_emu --socket /tmp/dayan-dayan_emu.sock \
+    --perf-trace /tmp/dayan-dayan_emu-perf.json \
+    --output build-dayan/dayan_emu-perf
+python3 tools/dayan-trace/limited-perf.py report --output build-dayan/dayan_emu-perf
 python3 -m unittest discover -s tools/dayan-trace -p 'test_*.py'
 ```
 
@@ -208,4 +208,4 @@ The parser tests cover overlapping cores, counter wrap, partial files, missing e
 
 ## Qwen3.5/3.6 MoE
 
-Use `--model qwen36-35B-A3B-mxfp4-moe-bf16` for independent operator cases with TF32 routers and MXFP4 Top-8 expert products. Use `--model qwen36-35B-A3B-moe-mega --client build-dayan/bin/llama-dayan-moe-bench` for a two-layer hybrid fixture and consecutive decode regression. The latter compares with standalone Dayan, requires `DAYAN_MOE_MODEL`, and measures one complete `llama_decode` call rather than an isolated kernel. See [the MoE workflow](qwen35-moe.md) for the 32 GiB cmodel setup, fixture generation, CPU reference semantics, and measurement limits.
+Use `--model qwen36-35B-A3B-mxfp4-moe-bf16` for independent operator cases with TF32 routers and MXFP4 Top-8 expert products. Use `--model qwen36-35B-A3B-moe-mega --client build-dayan/bin/llama-dayan-moe-bench` for a two-layer hybrid fixture and consecutive decode regression. The latter compares with standalone Dayan, requires `DAYAN_MOE_MODEL`, and measures one complete `llama_decode` call rather than an isolated kernel. See [the MoE workflow](qwen35-moe.md) for the 32 GiB Dayan-emu setup, fixture generation, CPU reference semantics, and measurement limits.

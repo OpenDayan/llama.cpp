@@ -25,11 +25,11 @@ The HTML generator requires Python 3. The generated page loads Cytoscape.js and 
 
 The logical graph comes from the staging graph reserve API. It reflects graph rewrites and scheduler backend assignments performed during graph splitting. The Dayan backend then runs its normal graph compiler and exports the resulting physical slot plan. The plan is compile-time data, so slot timing and runtime-only staging work are not included.
 
-For a Dayan graph, start the cmodel server first and select the device explicitly:
+For a Dayan graph, start the dayan_emu server first and select the device explicitly:
 
 ```sh
 cd ${DAYAN_ROOT}
-NPU_CMODEL_HARTS=1 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./run_cmodel_server.sh
+DAYAN_EMU_HARTS=1 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./run_dayan_emu_server.sh
 
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock llama-graph-export -dev DAYAN -m model.gguf -p "Hello" -o graph.json
 ```

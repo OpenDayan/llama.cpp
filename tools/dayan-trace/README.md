@@ -31,9 +31,9 @@ python3 tools/dayan-trace/create-qwen35-moe-fixture.py \
   --output dayan-trace/qwen35-a3b-random-4l-bf16.gguf --layers 4 --seed 1234
 ```
 
-The four-layer GGUF is about 8.8 GB. Start cmodel with `NPU_CMODEL_MEMORY_MIB=16384` before loading it. The cmodel shared DRAM allocation and both scalar and tensor MMU bounds must support that size; increasing only the Runtime memory window is insufficient. Confirm that the frontend startup log reports 17179869184 shared DRAM bytes. Use `llama-graph-export` and `tools/graph-export/graph-export-html.py` for the complete compiled physical slot plan. A trace replay skips duplicate signatures and does not replace that graph or a full inference check.
+The four-layer GGUF is about 8.8 GB. Start Dayan-emu with `DAYAN_EMU_MEMORY_MIB=16384` before loading it. The Dayan-emu shared DRAM allocation and both scalar and tensor MMU bounds must support that size; increasing only the Runtime memory window is insufficient. Confirm that the frontend startup log reports 17179869184 shared DRAM bytes. Use `llama-graph-export` and `tools/graph-export/graph-export-html.py` for the complete compiled physical slot plan. A trace replay skips duplicate signatures and does not replace that graph or a full inference check.
 
-The fixture generator also accepts `--source-model`, `--expert-type mxfp4`, and `--small-vocab`. A two-layer hybrid fixture with `--full-attention-interval 2` preserves the source widths and expert count in about 953 MiB. See [Qwen3.5/3.6 MoE validation](qwen35-moe.md) for the 32 GiB cmodel workflow, standalone CPU comparisons, mega decode regression, and limited-perf presets.
+The fixture generator also accepts `--source-model`, `--expert-type mxfp4`, and `--small-vocab`. A two-layer hybrid fixture with `--full-attention-interval 2` preserves the source widths and expert count in about 953 MiB. See [Qwen3.5/3.6 MoE validation](qwen35-moe.md) for the 32 GiB Dayan-emu workflow, standalone CPU comparisons, mega decode regression, and limited-perf presets.
 
 ## Top-8 benchmark
 
@@ -45,4 +45,4 @@ The fixture generator also accepts `--source-model`, `--expert-type mxfp4`, and 
 
 ## Limited RTL operator measurements
 
-[limited-perf.py](limited-perf.md) runs 16 selected MatMul, FFN, attention, and vector cases against an existing server and dyperf, then reports wall time, cycle spans, and a Qwen3.5-0.8B prefill/decode estimate. It does not load a full model and supports cmodel validation, case selection, and offline reporting.
+[limited-perf.py](limited-perf.md) runs 16 selected MatMul, FFN, attention, and vector cases against an existing server and dyperf, then reports wall time, cycle spans, and a Qwen3.5-0.8B prefill/decode estimate. It does not load a full model and supports Dayan-emu validation, case selection, and offline reporting.

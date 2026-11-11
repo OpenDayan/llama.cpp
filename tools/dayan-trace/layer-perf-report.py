@@ -247,7 +247,7 @@ def analyze(run, trace, clock_hz=None, include_outer=False):
     frequency = clock_hz if clock_hz is not None else metadata.get("clock_hz") if timed else None
     if frequency is not None and (not math.isfinite(frequency) or frequency <= 0):
         raise ValueError("clock frequency must be positive and finite")
-    functional = spec.get("simulator") == "cmodel"
+    functional = spec.get("simulator") == "dayan_emu"
 
     def microseconds(cycles):
         return cycles * 1e6 / frequency if frequency and not functional else None
@@ -314,7 +314,7 @@ def analyze(run, trace, clock_hz=None, include_outer=False):
                     ] if include_outer else []),
                     "Decode loads the shared CPU prompt checkpoint without executing prefill. Every decode step has its own context length and slot timings." if run.get("initial_state") else
                     "Legacy decode prompt setup, when present, is excluded. Every decode step has its own context length and slot timings.",
-                    "cmodel counters validate trace analysis only; device microseconds are suppressed." if functional else
+                    "Dayan-emu counters validate trace analysis only; device microseconds are suppressed." if functional else
                     "Device microseconds use the selected clock frequency and require hardware or a cycle-accurate simulator. Host wall time is not hardware latency." if timed else
                     "Counter source is controlled externally. Raw counter ticks are reported; use --clock-hz for time conversion only with hardware or a cycle-accurate simulator.",
                 ])

@@ -207,9 +207,9 @@ class LayerPerfTests(unittest.TestCase):
         self.assertEqual([sample["layer_cycles"] for sample in result["samples"]], [34, 74])
         self.assertAlmostEqual(result["slots"][0]["percent_of_layer"], 100 * 26 / 108)
 
-    def test_cmodel_has_no_device_latency(self):
+    def test_dayan_emu_has_no_device_latency(self):
         run, trace = fixture()
-        run["case"]["simulator"] = "cmodel"
+        run["case"]["simulator"] = "dayan_emu"
         result = self.analyze(run, trace)
         self.assertFalse(result["performance_valid"])
         self.assertIsNone(result["total_layer_device_us"])

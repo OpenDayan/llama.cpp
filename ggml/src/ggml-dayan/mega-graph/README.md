@@ -24,4 +24,4 @@ Keep synchronization explicit. A zero barrier count is valid only when the follo
 
 Each device step calls `dayan_set_proc_name` with its declared name before execution. The following barriers stay in that trace segment. Names must fit in `DAYAN_THREAD_NAME_SIZE` including NUL; the operation table's fixed name array enforces this at compile time.
 
-To add or remove an existing operation, edit its fragment. No parameter offsets, graph counts, decode indices, or dense-prefix lengths need editing. A new operation also needs a typed device function and a host packer that validates its tensors. Cmodel tests should assert that mega launched, so a packing failure cannot pass through standalone fallback.
+To add or remove an existing operation, edit its fragment. No parameter offsets, graph counts, decode indices, or dense-prefix lengths need editing. A new operation also needs a typed device function and a host packer that validates its tensors. Dayan-emu tests should assert that mega launched, so a packing failure cannot pass through standalone fallback.

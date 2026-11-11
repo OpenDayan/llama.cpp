@@ -2,7 +2,7 @@
   "schema": 1,
   "models": {
     "qwen36-35B-A3B-mxfp4-moe-bf16": {
-      "description": "Qwen3.6-35B-A3B qwen35moe: 40 blocks (30 linear, 10 full), hidden=2048, 256 MXFP4 experts, top-8, expert/shared FFN=512, BF16 attention/shared experts, F32 router on TF32 MAT. Batch=1, one final-token logit row. Excludes routing postprocessing, small gates/layouts, and MTP; cmodel is functional validation only.",
+      "description": "Qwen3.6-35B-A3B qwen35moe: 40 blocks (30 linear, 10 full), hidden=2048, 256 MXFP4 experts, top-8, expert/shared FFN=512, BF16 attention/shared experts, F32 router on TF32 MAT. Batch=1, one final-token logit row. Excludes routing postprocessing, small gates/layouts, and MTP; dayan_emu is functional validation only.",
       "cases": [
         {"name": "router", "op": "matmul", "n": 256, "k": 2048, "dtype": "f32"},
         {"name": "top8", "op": "sort", "n": 256, "experts_used": 8, "dtype": "f32", "output_dtype": "i32"},
@@ -106,7 +106,7 @@
       ]
     },
     "qwen35-mega-bf16": {
-      "description": "Single Qwen3.5 Dense BF16 transformer blocks for Dayan mega validation: one linear-attention block and one full-attention block. Each case uses a deterministic CPU graph and requires one cmodel mega launch.",
+      "description": "Single Qwen3.5 Dense BF16 transformer blocks for Dayan mega validation: one linear-attention block and one full-attention block. Each case uses a deterministic CPU graph and requires one dayan_emu mega launch.",
       "cases": [
         {"name": "mega-linear", "op": "mega", "dtype": "bf16", "mode": "linear", "layers": 1},
         {"name": "mega-full", "op": "mega", "dtype": "bf16", "mode": "full", "layers": 1}

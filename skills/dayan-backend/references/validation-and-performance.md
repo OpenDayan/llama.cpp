@@ -30,9 +30,9 @@ Do not add a test when an existing case exercises the changed contract. Add one 
 
 The graph suite's fan-out case intentionally produces an unsupported GLU message and then finishes with PASS. This proves a fusion did not eliminate an intermediate that has another consumer.
 
-## CModel lifecycle
+## Dayan-emu lifecycle
 
-Use the existing `npu-firmware/run_cmodel_server.sh` lifecycle for functional work. Confirm no unrelated process owns the fixed simulator, FUSE, shared-memory, or socket resources before starting it. Use four Harts for the full Qwen3.5 path unless a focused operator explicitly uses another configuration.
+Use the existing `npu-firmware/run_dayan_emu_server.sh` lifecycle for functional work. Confirm no unrelated process owns the fixed simulator, FUSE, shared-memory, or socket resources before starting it. Use four Harts for the full Qwen3.5 path unless a focused operator explicitly uses another configuration.
 
 Typical client commands are:
 
@@ -96,15 +96,15 @@ Compare performance only when all of these remain fixed:
 
 - llama.cpp commit and build type except for the change under test.
 - Kernel object and firmware build.
-- CModel and QEMU versions.
+- Dayan-emu and QEMU versions.
 - Hart count and memory size.
 - Model file and saved trace.
 - `--check` setting.
 - Cold/warm interpretation.
 
-CModel has run-to-run variation. Prefer repeated samples and a median for a focused operator. Use per-signature deltas to isolate a kernel change; the full estimated total includes variation from every operator.
+Dayan-emu has run-to-run variation. Prefer repeated samples and a median for a focused operator. Use per-signature deltas to isolate a kernel change; the full estimated total includes variation from every operator.
 
-Never present CModel wall time or `mcycle` as RTL or hardware performance. Use RTL simulation or hardware measurements for cycle-accurate claims, contention behavior, and final throughput.
+Never present Dayan-emu wall time or `mcycle` as RTL or hardware performance. Use RTL simulation or hardware measurements for cycle-accurate claims, contention behavior, and final throughput.
 
 ## Numerical reporting
 

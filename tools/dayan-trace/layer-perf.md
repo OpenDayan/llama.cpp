@@ -39,7 +39,7 @@ python3 tools/dayan-trace/layer-perf-report.py \
 
 The MoE mega graph includes attention, router, softmax, TopK, routed experts, shared experts and the final residual. Each slot has its own cycles and layer percentage in the report. The report also identifies the graph, weight precision, expert count and experts selected per token. Weights and expert metadata are retained during extraction, including the F32 routers, BF16 attention/shared experts and MXFP4 routed experts. This path requires MXFP4 expert weights; it does not select the dense FFN graph. `run --cmp` uses the CPU baseline, not standalone Dayan.
 
-For a cmodel check, use `--input-len 4 --output-len 2` and omit `--pcu`. The random two-layer MoE fixture in [MoE validation](qwen35-moe.md#cmodel-and-fixture) can be used with `--layer 0 1`. It exercises both attention kinds with a 512-token vocabulary; it does not measure trained-model quality. The server remains externally managed. Do not start cmodel while another test owns its device endpoints.
+For a Dayan-emu check, use `--input-len 4 --output-len 2` and omit `--pcu`. The random two-layer MoE fixture in [MoE validation](qwen35-moe.md#dayan-emu-and-fixture) can be used with `--layer 0 1`. It exercises both attention kinds with a 512-token vocabulary; it does not measure trained-model quality. The server remains externally managed. Do not start Dayan-emu while another test owns its device endpoints.
 
 ## Single-core inference
 
@@ -71,7 +71,7 @@ python3 tools/dayan-trace/layer-perf.py prepare \
 
 Each output directory contains `layer-0/` and `layer-3/`, each with its own `layer.gguf` and `layer.json`. Each model still contains one block. With a single index, files stay directly under `--output`; omitting `prepare --layer` selects layer 0. Duplicate or out-of-range indices and existing prepared outputs are rejected before extraction.
 
-Start a one-core or four-core `dayan_server` connected to the desired hardware, TestCluster or cmodel instance. Set `DAYAN_SERVER_SOCKET` if its socket differs from `/tmp/dayan-server.sock`. Then run selected layers together:
+Start a one-core or four-core `dayan_server` connected to the desired hardware, TestCluster or Dayan-emu instance. Set `DAYAN_SERVER_SOCKET` if its socket differs from `/tmp/dayan-server.sock`. Then run selected layers together:
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py run \
@@ -97,7 +97,7 @@ python3 tools/dayan-trace/layer-perf.py run \
     --cmp --pcu --output build-dayan/perf-mxfp4-both
 ```
 
-Each layer runs its selected modes in argument order, with independent client processes, traces and CPU comparisons. A CPU process prepares one prompt checkpoint per layer before profiling, shared by both modes and CPU comparison. Decode restores it without executing prefill again. `--output-len` applies only to decode and defaults to one step; prefill always uses zero output steps. Omit `--pcu` for cmodel. The same command works with the BF16 prepared directory.
+Each layer runs its selected modes in argument order, with independent client processes, traces and CPU comparisons. A CPU process prepares one prompt checkpoint per layer before profiling, shared by both modes and CPU comparison. Decode restores it without executing prefill again. `--output-len` applies only to decode and defaults to one step; prefill always uses zero output steps. Omit `--pcu` for Dayan-emu. The same command works with the BF16 prepared directory.
 
 Multiple modes use this layout, even when only one source layer is selected:
 
@@ -127,7 +127,7 @@ The top-level report has one row per layer and mode, including step count, total
 
 `run` connects to the external server without a `--simulator` argument. The client defaults to `DAYAN_LAYER_CLIENT` or `build-dayan-public/bin/llama-dayan-layer-bench`; override it with `--client`. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf` (`DAYAN_ROOT` defaults to `~/npu-firmware`). Pass `--dyperf /path/to/dyperf` to choose another profiler; it is launched and stopped automatically. `--socket` overrides `DAYAN_SERVER_SOCKET`.
 
-PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; this passes `--pcu-interval 0` to dyperf for continuous sampling. cmodel does not support PCU, so omit `--pcu` there. Proc-state tracing and offline slot timing work without PCU.
+PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; this passes `--pcu-interval 0` to dyperf for continuous sampling. Dayan-emu does not support PCU, so omit `--pcu` there. Proc-state tracing and offline slot timing work without PCU.
 
 The backend waits indefinitely by default. This applies to kernel and backend transfer waits and is logged as `4294967295 ms (infinite)` when the backend opens. Set `GGML_DAYAN_TIMEOUT_MS` to a positive number of milliseconds before launching the client to request a finite timeout; unset it or use `4294967295` for unlimited waits. After status `-110`, check the external server: the timed-out task may still be running and holding resources, so finish or reset it before retrying. The runner does not reset the simulator or server.
 
@@ -246,7 +246,7 @@ python3 tools/dayan-trace/layer-perf-report.py \
 
 The original command without `--output` still writes reports into the run directory. Traces must be complete before analysis; no new inference or performance capture is needed.
 
-For a cmodel smoke test, use its socket, for example with input length 4 and output length 2. New runs do not record a simulator label, and dyperf currently does not identify the counter source. Reports therefore show raw counter ticks by default and leave `performance_valid` false. For hardware or cycle-accurate RTL, pass the actual frequency to the report with `--clock-hz`, for example `--clock-hz 1000000000` for 1 GHz, to enable time conversion. Do not use this conversion for cmodel: its counters and wall times are not hardware performance measurements. Older records that explicitly identify cmodel still suppress time conversion.
+For a Dayan-emu smoke test, use its socket, for example with input length 4 and output length 2. New runs do not record a simulator label, and dyperf currently does not identify the counter source. Reports therefore show raw counter ticks by default and leave `performance_valid` false. For hardware or cycle-accurate RTL, pass the actual frequency to the report with `--clock-hz`, for example `--clock-hz 1000000000` for 1 GHz, to enable time conversion. Do not use this conversion for Dayan-emu: its counters and wall times are not hardware performance measurements. Older records that explicitly identify Dayan-emu still suppress time conversion.
 
 ```sh
 python3 -m unittest discover -s tools/dayan-trace -p 'test_layer_perf.py'

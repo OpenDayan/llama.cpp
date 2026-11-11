@@ -54,12 +54,12 @@ cmake --build build-dayan -j6 --target \
     test-dayan-attention-projection test-dayan-flash-attention
 ```
 
-### Start cmodel and the Runtime server
+### Start Dayan-emu and the Runtime server
 
-Rebuild cmodel after changing its source or instruction implementations. The firmware launcher builds firmware and the Runtime server, but does not rebuild cmodel:
+Rebuild Dayan-emu after changing its source or instruction implementations. The firmware launcher builds firmware and the Runtime server, but does not rebuild Dayan-emu:
 
 ```sh
-make -C "$HOME/rvtng-cmodel" -j6
+make -C "$HOME/dayan-emu" -j6
 ```
 
 | Model group | Example memory capacity |
@@ -71,11 +71,11 @@ make -C "$HOME/rvtng-cmodel" -j6
 In a separate terminal with `DAYAN_ROOT` and `DAYAN_SERVER_SOCKET` set, start one four-core server. This 32 GiB configuration can be reused for all three groups:
 
 ```sh
-NPU_CMODEL_HARTS=4 NPU_CMODEL_MEMORY_MIB=32768 \
-    bash "$DAYAN_ROOT/run_cmodel_server.sh"
+DAYAN_EMU_HARTS=4 DAYAN_EMU_MEMORY_MIB=32768 \
+    bash "$DAYAN_ROOT/run_dayan_emu_server.sh"
 ```
 
-Wait for `Dayan cmodel server is ready`. Run one inference or operator client at a time, and stop the launcher with Ctrl-C after testing. A single-core operator run uses `NPU_CMODEL_HARTS=1`; mega requires one complete four-core Cluster. If using an existing server, select its socket instead of starting another simulator.
+Wait for `Dayan-emu server is ready`. Run one inference or operator client at a time, and stop the launcher with Ctrl-C after testing. A single-core operator run uses `DAYAN_EMU_HARTS=1`; mega requires one complete four-core Cluster. If using an existing server, select its socket instead of starting another simulator.
 
 ### Run model inference
 
@@ -261,7 +261,7 @@ python3 tools/dayan-trace/layer-perf.py prepare \
 
 Each output directory contains `layer-0/` and `layer-3/`, each with its own `layer.gguf` and `layer.json`. A single index keeps the original layout with files directly under `--output`; the default index is 0.
 
-With an external four-core server ready, run both selected layers in one command. The same commands connect to TestCluster, hardware or cmodel through `DAYAN_SERVER_SOCKET`; simulator startup is managed externally. Prefill is the default mode:
+With an external four-core server ready, run both selected layers in one command. The same commands connect to TestCluster, hardware or Dayan-emu through `DAYAN_SERVER_SOCKET`; simulator startup is managed externally. Prefill is the default mode:
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py run \
@@ -297,9 +297,9 @@ python3 tools/dayan-trace/layer-perf.py run \
     --cmp --pcu --output build-dayan/perf-moe-both
 ```
 
-Omit `--pcu` for cmodel. Each layer runs the requested modes in argument order. `--output-len` sets the measured decode steps, defaulting to one; prefill always uses zero output steps. Each mode has its own client process, trace and CPU comparison. A CPU process prepares the prompt once per layer before profiling. Both modes and CPU comparison share that checkpoint; decode restores it without executing prefill again.
+Omit `--pcu` for Dayan-emu. Each layer runs the requested modes in argument order. `--output-len` sets the measured decode steps, defaulting to one; prefill always uses zero output steps. Each mode has its own client process, trace and CPU comparison. A CPU process prepares the prompt once per layer before profiling. Both modes and CPU comparison share that checkpoint; decode restores it without executing prefill again.
 
-MoE runs use the `Qwen35MoeLinear` and `Qwen35MoeFull` mega graphs. Reports include routing, TopK, routed experts, shared experts and the final residual, with cycles and percentages for each slot. `layer.json` records MXFP4 precision and expert counts. The prepared model retains the original expert weights, F32 routers and BF16 attention/shared experts. For a small cmodel check, use `--input-len 4 --output-len 2`; the random MoE fixture uses source layers `0 1`. See [MoE layer tests](../../../tools/dayan-trace/layer-perf.md#moe-layers).
+MoE runs use the `Qwen35MoeLinear` and `Qwen35MoeFull` mega graphs. Reports include routing, TopK, routed experts, shared experts and the final residual, with cycles and percentages for each slot. `layer.json` records MXFP4 precision and expert counts. The prepared model retains the original expert weights, F32 routers and BF16 attention/shared experts. For a small Dayan-emu check, use `--input-len 4 --output-len 2`; the random MoE fixture uses source layers `0 1`. See [MoE layer tests](../../../tools/dayan-trace/layer-perf.md#moe-layers).
 
 With multiple modes, results are stored in `layer-N/prefill/` and `layer-N/decode/`, even for a single selected layer. The top-level `report.md`, `report.json` and `summary.csv` contain one row per layer and mode: step count, total layer cycles, median/min/max cycles per step and CPU comparison status. Each mode's detailed report includes slot cycles and percentages. Decode statistics exclude prompt setup. Single-mode directory layouts and old report inputs remain supported.
 
@@ -318,7 +318,7 @@ python3 tools/dayan-trace/layer-perf-report.py \
 
 For sorting, `cmp-ops` checks only the ARGSORT prefix consumed by the graph. It checks score order and unique, valid indices, allowing equal-score ties to use different index orders. Native `TOP_K` is unordered, so its comparison checks the selected score multiset and index uniqueness. Unwritten ARGSORT suffixes are reported as `ignored_elements`.
 
-The client defaults to `DAYAN_LAYER_CLIENT`, or `build-dayan-public/bin/llama-dayan-layer-bench` when unset. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf`, with `DAYAN_ROOT` falling back to `~/npu-firmware`. Override it with `--dyperf /path/to/dyperf`; the script automatically launches `dyperf --follow`, runs the client, and waits for the trace to close. PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; it adds `--pcu-interval 0` to dyperf for continuous sampling. cmodel does not support PCU, so omit `--pcu` there. `--client` and `--socket` override their environment defaults. No `--simulator` argument is needed.
+The client defaults to `DAYAN_LAYER_CLIENT`, or `build-dayan-public/bin/llama-dayan-layer-bench` when unset. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf`, with `DAYAN_ROOT` falling back to `~/npu-firmware`. Override it with `--dyperf /path/to/dyperf`; the script automatically launches `dyperf --follow`, runs the client, and waits for the trace to close. PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; it adds `--pcu-interval 0` to dyperf for continuous sampling. Dayan-emu does not support PCU, so omit `--pcu` there. `--client` and `--socket` override their environment defaults. No `--simulator` argument is needed.
 
 With `--pcu`, open each `perf.json` in Perfetto to inspect per-core MAT utilization, VEC/Scalar IPC, LSU bandwidth and URAM read/write statistics. `PCU snapshot` events retain the 112 raw counters; metadata records `pcu_enabled: true` and `pcu_interval_ms: 0`. Offline slot timing uses proc-state events and works without PCU.
 
@@ -332,7 +332,7 @@ Status `-110` is a timeout, not a CPU comparison failure. Returning from a timed
 
 For an intermittent inference stall, first run without dyperf, set `GGML_DAYAN_TIMEOUT_MS=60000 GGML_DAYAN_MEGA_DEBUG=1`, and retain both client stderr and server logs. The mega debug output identifies submitted graphs and completed launches; it does not identify the last active device slot. Start the server with `DAYAN_RPC_DEBUG=1` to record RPC begin/end and core IDs. A timeout bounds a host wait and does not prove a Resource deadlock. After the outstanding task finishes or is reset, repeat with `GGML_DAYAN_MEGA=0` to compare standalone scheduling. Completion in that mode alone is not a synchronization fix. With `--single-turn -n 16`, reaching the 16-token budget normally exits even if the answer is unfinished.
 
-With the four-core cmodel server ready, run prefill and compare against CPU:
+With the four-core Dayan-emu server ready, run prefill and compare against CPU:
 
 ```sh
 python3 tools/dayan-trace/layer-perf.py run \
@@ -361,7 +361,7 @@ The run directory contains `perf.json`, `run.json`, the command and log, and, wi
 
 Report option `--include-outer` adds a separate kernel table and `kernels.csv` for embedding, the mega launch and output kernels. It shows the full inference span including gaps, with percentages relative to that separate span; layer statistics stay unchanged. Use `--output /path/to/reports` to leave the source run directory untouched. These are offline operations and never connect to the device; analyze a completed `layer-N` directory for single-mode runs, or `layer-N/prefill` or `layer-N/decode` for multiple modes, while other cases are still running. See [offline report](../../../tools/dayan-trace/layer-perf.md#offline-report) for timing boundaries.
 
-For actual performance measurement, use an existing hardware or TestCluster server and choose the intended lengths, such as `--mode decode --input-len 1024 --output-len 32`. The runner starts and stops its profiler/client only. CPU comparison runs after the trace is closed. Slot time is the earliest start to latest finish across the participating cores, including following barriers; concurrent cores are not summed. The layer span excludes embedding and output norm/projection, while host inference wall time includes them. Reports show raw counter ticks by default because the trace does not identify its simulator. For hardware/RTL, pass the actual frequency to the report, for example `--clock-hz 1000000000` for 1 GHz, to enable microsecond conversion. Cmodel counters validate execution and trace analysis only; do not convert them to hardware latency. See [single-layer profiling](../../../tools/dayan-trace/layer-perf.md) for detailed timing boundaries and formats.
+For actual performance measurement, use an existing hardware or TestCluster server and choose the intended lengths, such as `--mode decode --input-len 1024 --output-len 32`. The runner starts and stops its profiler/client only. CPU comparison runs after the trace is closed. Slot time is the earliest start to latest finish across the participating cores, including following barriers; concurrent cores are not summed. The layer span excludes embedding and output norm/projection, while host inference wall time includes them. Reports show raw counter ticks by default because the trace does not identify its simulator. For hardware/RTL, pass the actual frequency to the report, for example `--clock-hz 1000000000` for 1 GHz, to enable microsecond conversion. Dayan-emu counters validate execution and trace analysis only; do not convert them to hardware latency. See [single-layer profiling](../../../tools/dayan-trace/layer-perf.md) for detailed timing boundaries and formats.
 
 ### Operator benchmarks with limited-perf.py
 
@@ -378,7 +378,7 @@ for preset in qwen35-0.8B-mxfp4-vocab qwen35-0.8B-bf16 qwen36-35B-A3B-mxfp4-moe-
 done
 ```
 
-With cmodel ready, run the desired presets sequentially. Remove names from the loop to test only one model group. Each run has its own trace and output directory:
+With Dayan-emu ready, run the desired presets sequentially. Remove names from the loop to test only one model group. Each run has its own trace and output directory:
 
 ```sh
 for preset in qwen35-0.8B-mxfp4-vocab qwen35-0.8B-bf16 qwen36-35B-A3B-mxfp4-moe-bf16; do
@@ -386,7 +386,7 @@ for preset in qwen35-0.8B-mxfp4-vocab qwen35-0.8B-bf16 qwen36-35B-A3B-mxfp4-moe-
         --socket "$DAYAN_SERVER_SOCKET" --follow -o "/tmp/dayan-$preset.json" -- \
         python3 tools/dayan-trace/limited-perf.py run \
             --model "$preset" --client build-dayan/bin/llama-dayan-operator-bench \
-            --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+            --simulator dayan_emu --socket "$DAYAN_SERVER_SOCKET" \
             --perf-trace "/tmp/dayan-$preset.json" --output "build-dayan/perf-$preset" \
             --prefill 4 --context 16 --cmp --cmp-seed 35
     python3 tools/dayan-trace/limited-perf.py report --output "build-dayan/perf-$preset"
@@ -405,7 +405,7 @@ For a short run, add one of these filters to `plan` and `run`, using a separate 
 
 `--cmp` covers the selected cases, not every model operator. Row reads/writes, RoPE, layouts, and small gates need the separate tests above. Hardware MXFP4 conversion differs from GGML's nearest-value quantizer. For larger samples, adjust `--prefill` and `--context`; use `--warmup 1 --repeats 3` for repeated operator measurements. `--resume` requires the original trace, output directory, binaries, and parameters. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for prediction formulas and exit statuses.
 
-Top-8 routing uses four measured prefill rows by default and scales only that sort term to the requested `--prefill` in the report. Use `--sort-rows 0` when a full-size sorting measurement is required; this can be very slow on cmodel. Other MoE operator cases still use the requested prefill size.
+Top-8 routing uses four measured prefill rows by default and scales only that sort term to the requested `--prefill` in the report. Use `--sort-rows 0` when a full-size sorting measurement is required; this can be very slow on Dayan-emu. Other MoE operator cases still use the requested prefill size.
 
 ### Mega benchmarks
 
@@ -422,7 +422,7 @@ For BF16 dense, benchmark both attention modes in prefill and decode:
     --socket "$DAYAN_SERVER_SOCKET" --follow -o /tmp/dayan-mega-bf16.json -- \
     python3 tools/dayan-trace/limited-perf.py run \
         --model qwen35-mega-bf16 --client build-dayan/bin/test-dayan-qwen35-dense \
-        --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+        --simulator dayan_emu --socket "$DAYAN_SERVER_SOCKET" \
         --perf-trace /tmp/dayan-mega-bf16.json --output build-dayan/perf-mega-bf16 \
         --prefill 4 --context 16 --cmp --cmp-seed 35
 python3 tools/dayan-trace/limited-perf.py report --output build-dayan/perf-mega-bf16
@@ -435,13 +435,13 @@ For MXFP4 MoE, use `DAYAN_MOE_MODEL` from the fixture step:
     --socket "$DAYAN_SERVER_SOCKET" --follow -o /tmp/dayan-mega-moe.json -- \
     python3 tools/dayan-trace/limited-perf.py run \
         --model qwen36-35B-A3B-moe-mega --client build-dayan/bin/llama-dayan-moe-bench \
-        --simulator cmodel --socket "$DAYAN_SERVER_SOCKET" \
+        --simulator dayan_emu --socket "$DAYAN_SERVER_SOCKET" \
         --perf-trace /tmp/dayan-mega-moe.json --output build-dayan/perf-mega-moe \
         --prefill 4 --context 2 --cmp --cmp-seed 35
 python3 tools/dayan-trace/limited-perf.py report --output build-dayan/perf-mega-moe
 ```
 
-Mega presets require cmodel, `--repeats 1`, and `--warmup 0` (the defaults). The MoE sample measures one `llama_decode` call on the two-layer fixture; it is not a 40-layer model estimate. cmodel wall times and counters do not establish hardware or RTL performance.
+Mega presets require Dayan-emu, `--repeats 1`, and `--warmup 0` (the defaults). The MoE sample measures one `llama_decode` call on the two-layer fixture; it is not a 40-layer model estimate. Dayan-emu wall times and counters do not establish hardware or RTL performance.
 
 ### Benchmark full-model inference
 
@@ -461,7 +461,7 @@ GGML_DAYAN_MEGA=1 ./build-dayan/bin/llama-bench -m "$DAYAN_MODEL_MOE" \
     --device DAYAN -ngl 99 -fa on -p 128 -n 16 -b 128 -ub 128 -r 1 --no-warmup
 ```
 
-Use `GGML_DAYAN_MEGA=0` for standalone comparisons. `--no-warmup` keeps smoke runs short; omit it and increase repetitions for warm measurements. On cmodel, wall time and tokens/s describe simulator execution.
+Use `GGML_DAYAN_MEGA=0` for standalone comparisons. `--no-warmup` keeps smoke runs short; omit it and increase repetitions for warm measurements. On Dayan-emu, wall time and tokens/s describe simulator execution.
 
 ## Runtime topology and task dimensions
 
@@ -501,7 +501,7 @@ Workers cache up to 64 I32/I64 indices per load, including strided index views. 
 
 MXFP4 `GET_ROWS` writes F32, BF16, or FP16 embeddings. It uses the same packed payload and Z-scale allocation as MatMul, so a tied embedding/LM head can remain one MXFP4 tensor. Each tile loads up to 32768 selected-row elements plus aligned 32-byte scale packs and uses the same index cache. One VEC block expands FP4 nibbles and applies E8M0 scales; BF16/FP16 conversion and packing remain in registers. Dim2 covers 64-element groups, and LSU stores the complete output tile. Repeated selections, batched indices, and K32 tails are supported. Eligible residual/norm consumers retain the existing BF16/FP16 storage rewrite.
 
-`ggml-dayan-workers.h` also dispatches independent regions of non-buffered norm, residual add, scale/clamp, division, broadcast fallback, reductions, format conversion, SET_ROWS, diagonal mask, Softmax, RoPE, ADD_ID, sorting, router and SSM convolution paths. Recurrent GDN partitions heads and sequences; token recurrence stays ordered. Most workers use 256 KiB each; standalone MXFP4 quantization needs 320 KiB each. Dispatch requires at least 32768 elements and one independent work unit per child, otherwise the root calls the same function directly. Generic tiles hold 8192 elements, and Softmax reductions use VEC DIM0 loops with constant instruction counts. Existing unary/binary/L2 ping-pong paths, matrix/attention/GDN chunk pipelines, and whole-tensor D2D copies retain their existing scheduling. Correctness and scheduling are checked with cmodel; hardware speedup still requires hardware or RTL measurements.
+`ggml-dayan-workers.h` also dispatches independent regions of non-buffered norm, residual add, scale/clamp, division, broadcast fallback, reductions, format conversion, SET_ROWS, diagonal mask, Softmax, RoPE, ADD_ID, sorting, router and SSM convolution paths. Recurrent GDN partitions heads and sequences; token recurrence stays ordered. Most workers use 256 KiB each; standalone MXFP4 quantization needs 320 KiB each. Dispatch requires at least 32768 elements and one independent work unit per child, otherwise the root calls the same function directly. Generic tiles hold 8192 elements, and Softmax reductions use VEC DIM0 loops with constant instruction counts. Existing unary/binary/L2 ping-pong paths, matrix/attention/GDN chunk pipelines, and whole-tensor D2D copies retain their existing scheduling. Correctness and scheduling are checked with Dayan-emu; hardware speedup still requires hardware or RTL measurements.
 
 For either operand, let `r` be the A row or B column and `g` the K32 group. The scale offset is `(g / 4) * scale_stride + r * 4 + g % 4`, with `scale_stride = align_up(rows_or_columns, 8) * 4`. Eight lanes occupy 32 bytes in each K128 plane. Scales are unswizzled; only matrix payload follows the selected MAT input swizzle. The load-a and load-b threads load both payload and scales before publishing their Resource. The paired gate/up products share A and release its Resource after both MAT reads.
 
@@ -534,7 +534,7 @@ GGML_DAYAN_MXFP4_SHARE_INPUTS=1 ./build-dayan/bin/test-dayan-mxfp4 --matmul-tile
 GGML_DAYAN_MXFP4_SHARE_INPUTS=0 ./build-dayan/bin/test-dayan-mxfp4 --matmul-tiles
 ```
 
-These checks compare QG, K/V, output, FFN, down, decode, and tail shapes against CPU references using the device's activation quantization rules. Use hardware or TestCluster traces to evaluate the sharing tradeoff; cmodel validates correctness only.
+These checks compare QG, K/V, output, FFN, down, decode, and tail shapes against CPU references using the device's activation quantization rules. Use hardware or TestCluster traces to evaluate the sharing tradeoff; Dayan-emu validates correctness only.
 
 The post thread submits one VEC block for the entire MAT slice. For MXFP4 output, Dim2 spans physical 128-element blocks and Dim3 spans rows: 1024 independent iterations for a 512 x 256 MatMul slice and 512 for a 256 x 256 FFN slice. Each iteration reads its whole C block and any gate/up inputs before overwriting that C block. Activation, BF16 rounding, and MXFP4 conversion stay in VEC registers. The C swizzle only permutes 128-byte groups within rows, so each K32 scale group remains intact. A 64-byte VEC channel stride leaves each group's 16-byte payload and scale at offsets 0 and 64 in its original 128-byte C region. BF16/FP16 output uses 64-element iterations and leaves 64 packed bytes in each original 128-byte group.
 
@@ -550,7 +550,7 @@ The rewrite shares activation casts and fuses eligible MatMul or SwiGLU/GeGLU pr
 
 The SDK must include the MXFP4 correction in `dayan_intrinsics.h`: `__tx_vec_cvt_mxfp4_bf16<0, 0, 0>()` must encode `0x8027800b`. The older Clang builtin emits `0x8023800b`, which does not select the conversion instruction class. This uses the same SDK correction mechanism as the BF16/FP16 conversion wrappers.
 
-Build `test-dayan-mxfp4` and run it against an isolated cmodel server. It checks scale Z layout, partial transfers, VEC conversion, matrix tails, repeated resource reuse, shared casts, fused FFN, and floating-point output boundaries. `test-dayan-mxfp4 --matmul-tiles` checks prefill shapes, tile dispatch, three-buffer reuse, K tails, and paired FFN. `test-dayan-mxfp4 --host-only` checks packing and the tile memory budget without a device. `test-dayan-mxfp4 --get-rows` checks quantized embeddings and the low-precision storage rewrite. The limited operator profiler also accepts `--cmp` for CPU gold comparisons; see [limited-perf.md](../../../tools/dayan-trace/limited-perf.md).
+Build `test-dayan-mxfp4` and run it against an isolated Dayan-emu server. It checks scale Z layout, partial transfers, VEC conversion, matrix tails, repeated resource reuse, shared casts, fused FFN, and floating-point output boundaries. `test-dayan-mxfp4 --matmul-tiles` checks prefill shapes, tile dispatch, three-buffer reuse, K tails, and paired FFN. `test-dayan-mxfp4 --host-only` checks packing and the tile memory budget without a device. `test-dayan-mxfp4 --get-rows` checks quantized embeddings and the low-precision storage rewrite. The limited operator profiler also accepts `--cmp` for CPU gold comparisons; see [limited-perf.md](../../../tools/dayan-trace/limited-perf.md).
 
 Before scheduling a llama graph, the backend rewrite inserts one matching BF16 or FP16 `CPY` for each unique F32 activation used by an eligible matrix multiplication. Matrix multiplications that share an activation and storage type also share the cast tensor. Direct ggml users that do not run the rewrite can still provide F32 activations; the Dayan graph executor converts each unique activation once.
 
@@ -626,7 +626,7 @@ When convolution consumes `concat(history, transpose(qkv))` with a final history
 
 Gated Delta Net assigns heads and sequences to independent single-core tasks, limited by the enabled core count. Scalar-gate prefill with at least 16 tokens and one final state snapshot uses 64-token chunks. Each task has a loader Thread, a precompute Thread, and the root state-update loop. Two input slots and two prepared slots use four Local Resources for backpressure. Precompute builds the gate coefficients and jointly solves U and W with 256 independent RHS rows. The root computes the corrected values as U - W S, then produces outputs and updates the FP32 state. MAT, VEC, and LSU work from different chunks can overlap. Resource phases continue across heads and sequences; there is no separate limit on how far a producer can advance.
 
-Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and cmodel with the TF32 operand encoding enabled. The pipeline uses 758.5 KiB within a 768 KiB task reservation, with up to two resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation. Prepared Q becomes output storage after its last MAT read, and the prepared Resource stays held until the output DMA completes.
+Chunk MAT uses `MAT_DATATYPE_PAIR(DT_MATIN_TF32, DT_MATIN_TF32)`. The inputs have FP32 storage and TF32 precision; accumulation and VEC arithmetic remain FP32. This requires firmware headers and Dayan-emu with the TF32 operand encoding enabled. The pipeline uses 758.5 KiB within a 768 KiB task reservation, with up to two resident tasks per core. Head and chunk row strides are 576 and 320 bytes, so LSU transposes remain 64-byte aligned. All units use identity swizzling; VisualSwizzle reports peak Bank pressure 1 and no extra requests for these layouts. Padding and the triangular mask handle chunk tails, and unused gate differences are masked before exponentiation. Prepared Q becomes output storage after its last MAT read, and the prepared Resource stays held until the output DMA completes.
 
 Decode, short prefill, vector gates (KDA), and multiple state snapshots use the FP32 recurrent VEC path with a 512 KiB reservation and up to two independent 128 KiB workers per Proc. It forms the gated key once per token and folds state decay into the state update, avoiding a separate full-state read/write pass. Both entries distribute independent heads and sequences across available cores. Recurrent state rows use a 576-byte internal stride; LSU loads and stores retain the external 512-byte row stride.
 
@@ -638,11 +638,11 @@ Other recurrent cases keep the row-wise path. Each dot adds its two 64-lane part
 
 Device operators contain no custom cycle counters or performance buffers. The [operator benchmark commands](#operator-benchmarks-with-limited-perfpy) collect firmware scheduling traces for MXFP4 dense, BF16 dense, and MXFP4 MoE. The [full-model commands](#benchmark-full-model-inference) measure GGUF inference with the profiler stopped. Record the model, prompt/generation lengths, batch sizes, repetitions, and simulator configuration.
 
-For an existing RTL server, operator presets also accept `--simulator testcluster` with that server's socket. This labels the report; it does not start TestCluster. Mega presets currently require cmodel. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for measurement boundaries and extrapolation factors.
+For an existing RTL server, operator presets also accept `--simulator testcluster` with that server's socket. This labels the report; it does not start TestCluster. Mega presets currently require Dayan-emu. See [limited-perf.md](../../../tools/dayan-trace/limited-perf.md) for measurement boundaries and extrapolation factors.
 
 ## Test a specific operator
 
-Run commands from the repository root. Start `dayan_server` connected to the device, cmodel, or TestCluster, then select its socket:
+Run commands from the repository root. Start `dayan_server` connected to the device, Dayan-emu, or TestCluster, then select its socket:
 
 ```sh
 export DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock
@@ -676,7 +676,7 @@ DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-backend-ops -b
 
 The backend selects kernels from the cores enabled in `dayan_server`; core mask `0xf` permits four-core cooperation, and a partial mask selects non-cooperative kernels. The same client commands work with a TestCluster-backed server.
 
-To run cmodel alongside TestCluster, isolate its FUSE mount, Runtime socket, emulator IPC sockets, and DRAM/URAM shared-memory names. Separate mount and Runtime socket paths alone are insufficient. The stock `run_cmodel_server.sh` cleans the default IPC and shared-memory files, so do not use it while TestCluster owns those resources. Use an isolated emulator/QEMU pair and a launcher whose cleanup touches only that instance's paths. Clients select the instance through `DAYAN_SERVER_SOCKET`.
+To run Dayan-emu alongside TestCluster, isolate its FUSE mount, Runtime socket, emulator IPC sockets, and DRAM/URAM shared-memory names. Separate mount and Runtime socket paths alone are insufficient. The stock `run_dayan_emu_server.sh` cleans the default IPC and shared-memory files, so do not use it while TestCluster owns those resources. Use an isolated emulator/QEMU pair and a launcher whose cleanup touches only that instance's paths. Clients select the instance through `DAYAN_SERVER_SOCKET`.
 
 Replace `test` with `support` to check whether Dayan supports the selected cases without running their numerical comparison. `perf` runs the performance case set, which has different shapes and may require a different `-p` filter; host timings under simulation are not hardware throughput measurements.
 
@@ -766,7 +766,7 @@ The Qwen3.5 dense test includes the BF16 single-token linear regression with see
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock ./build-dayan/bin/test-dayan-qwen35-dense
 ```
 
-The grouped routing regression checks exact CPU row maps, repeated experts, tails, repeated launches, 1024-expert window boundaries, empty windows, cross-batch counters, MXFP4 payload/scale permutations, F32 output restoration, and 64-bit address carry. Its 128 KiB scratch forces multiple batches in the large case. cmodel validation must enforce the 8 KiB local SparseMem capacity; an unbounded address map can hide invalid addresses and aliasing:
+The grouped routing regression checks exact CPU row maps, repeated experts, tails, repeated launches, 1024-expert window boundaries, empty windows, cross-batch counters, MXFP4 payload/scale permutations, F32 output restoration, and 64-bit address carry. Its 128 KiB scratch forces multiple batches in the large case. Dayan-emu validation must enforce the 8 KiB local SparseMem capacity; an unbounded address map can hide invalid addresses and aliasing:
 
 ```sh
 cmake --build build-dayan --target test-dayan-moe-dispatch

@@ -68,7 +68,7 @@ class PerfReportTests(unittest.TestCase):
                 perf.write_json(root / (tag + ".result.json"), dict(status="ok", samples=[
                     dict(tag=tag, warmup=False, wall_s=2, tasks=4, status=0)]))
             perf.write_json(trace, dict(traceEvents=records))
-            manifest = dict(model_config=model, cases=cases, simulator="cmodel", run_id="sort", prefill=1024, context=16)
+            manifest = dict(model_config=model, cases=cases, simulator="dayan_emu", run_id="sort", prefill=1024, context=16)
             for legacy in (False, True):
                 if legacy:
                     cases[0]["m"] = cases[0].pop("target_m")
@@ -110,7 +110,7 @@ class PerfReportTests(unittest.TestCase):
             root = Path(directory)
             case = perf.make_cases(8, 8)[0]
             case.update(cmp=True, seed=1)
-            manifest = dict(cases=[case], simulator="cmodel", run_id="cmp", prefill=8, context=8)
+            manifest = dict(cases=[case], simulator="dayan_emu", run_id="cmp", prefill=8, context=8)
             result = dict(status="ok", samples=[dict(tag="cmp", warmup=False, wall_s=1, tasks=4, status=0)])
             trace = root / "trace.json"
             perf.write_json(trace, dict(traceEvents=events("cmp", [(100, 200)] * 4)))
@@ -176,7 +176,7 @@ class PerfReportTests(unittest.TestCase):
             model = perf.load_model("qwen35-0.8B-mxfp4")
             cases = perf.make_cases(8, 8, model=model)
             model["prediction_terms"] = [{"case": "decode-vocab", "factor": 7, "reason": "saved factor"}]
-            manifest = dict(model="qwen35-0.8B-mxfp4", model_config=model, cases=cases, simulator="cmodel", run_id="unit", prefill=8, context=8, perf_trace=str(root / "trace.json"))
+            manifest = dict(model="qwen35-0.8B-mxfp4", model_config=model, cases=cases, simulator="dayan_emu", run_id="unit", prefill=8, context=8, perf_trace=str(root / "trace.json"))
             perf.write_json(root / "manifest.json", manifest)
             perf.write_json(root / "decode-vocab.result.json", dict(status="ok", samples=[
                 dict(tag="vocab", warmup=False, wall_s=2, tasks=4, status=0)]))
@@ -251,7 +251,7 @@ class PerfReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cases = perf.make_cases(1024, 1024)
-            manifest = dict(cases=cases, simulator="cmodel", run_id="unit", prefill=1024, context=1024, perf_trace=str(root / "trace.json"))
+            manifest = dict(cases=cases, simulator="dayan_emu", run_id="unit", prefill=1024, context=1024, perf_trace=str(root / "trace.json"))
             perf.write_json(root / "manifest.json", manifest)
             perf.write_json(root / "decode-conv.result.json", dict(status="ok", samples=[
                 dict(tag="conv", warmup=False, wall_s=1, tasks=4, status=0)]))
@@ -312,7 +312,7 @@ class PerfReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cases = perf.make_cases(1024, 1024)
-            manifest = dict(cases=cases, simulator="cmodel", run_id="unit", prefill=1024, context=1024)
+            manifest = dict(cases=cases, simulator="dayan_emu", run_id="unit", prefill=1024, context=1024)
             trace_events = []
             for index, case in enumerate(cases):
                 tag = f"case{index}"

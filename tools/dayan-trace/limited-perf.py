@@ -248,14 +248,14 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         "Unmeasured work includes RoPE and projection epilogues, extra layouts/casts, small gates/elementwise ops, KV/state copies, host graph scheduling, and sampling. Weights are assumed resident. Model loading, tokenization, and simulator/server startup are excluded.",
         f"The end-to-end scenario adds {overhead_percent:g}% to BOTH sampled subtotals as an explicit uncalibrated allowance, not a measured overhead or a confidence interval. Inspect and adjust the factors before using a different model.",
         "With no warmup, the wall prediction repeats each sample's cold module-loading cost; this can overestimate a resident model. Use --warmup 1 for steady-state measurements at the cost of an extra launch per case.",
-        "TestCluster wall predictions apply only to the same simulator/host/profiler setup and are not hardware latency. cmodel wall times and counters do not establish RTL performance.",
+        "TestCluster wall predictions apply only to the same simulator/host/profiler setup and are not hardware latency. Dayan-emu wall times and counters do not establish RTL performance.",
         "With --cmp, deterministic varied inputs are shared with a GGML CPU F32 reference. Stored BF16/MXFP4 inputs and output conversion are included in the reference. Every launch is checked outside its timing interval. These are synthetic operator inputs, not tensors captured from model inference.",
     ]
     if model.get("comparison_reference") == "dayan-standalone":
         notes = [
             "Wall time measures one complete llama_decode call on the two-layer hybrid fixture, including host graph work, embedding, and final projection. Setup, reference runs, and extra decode validation steps are excluded.",
             "Every initial and subsequent decode step compares logits with standalone Dayan and requires one mega launch per layer. This checks fusion; independent operator cases provide the CPU reference checks.",
-            "The cycle span covers both four-core mega launches and their intervening host gap. It excludes embedding and final projection. cmodel counters do not establish hardware or RTL performance.",
+            "The cycle span covers both four-core mega launches and their intervening host gap. It excludes embedding and final projection. Dayan-emu counters do not establish hardware or RTL performance.",
             "The reported subtotal covers this fixture only. It is not a 40-layer model estimate. Decode uses two cached tokens. Repeats=1 and warmup=0 are required.",
             f"The additional {overhead_percent:g}% is an uncalibrated allowance. Use --overhead-percent 0 for the measured subtotal.",
         ]
@@ -277,7 +277,7 @@ def make_report(directory, manifest, trace_path, overhead_percent, clock_hz):
         return "N/A" if value is None else f"{value:.{digits}f}"
 
     lines = [f"Dayan limited operator measurements ({model_name}, {manifest['simulator']}, run {manifest['run_id']})", "",
-             f"Measured repeats per case: {manifest['cases'][0]['repeats']}; warmups per case: {manifest['cases'][0]['warmup']}. Cycles on cmodel are not RTL cycles.", "",
+             f"Measured repeats per case: {manifest['cases'][0]['repeats']}; warmups per case: {manifest['cases'][0]['warmup']}. Cycles on Dayan-emu are not RTL cycles.", "",
              "| Case | Shape | Status | Launch wall (s) | Cycles | Process wall (s) | CPU cmp | Max abs error | Relative L2 |",
              "| --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: |"]
     for row in rows:
@@ -316,7 +316,7 @@ def main():
     parser.add_argument("--client", type=Path, default=ROOT / "build-dayan/bin/llama-dayan-operator-bench")
     parser.add_argument("--perf-trace", type=Path, help="JSON output of the already-running dyperf (required for run)")
     parser.add_argument("--socket", default=os.environ.get("DAYAN_SERVER_SOCKET", "/tmp/dayan-server.sock"))
-    parser.add_argument("--simulator", choices=("testcluster", "cmodel"), default="testcluster")
+    parser.add_argument("--simulator", choices=("testcluster", "dayan_emu"), default="testcluster")
     parser.add_argument("--prefill", type=int, default=1024, help="prefill tokens (default: 1024)")
     parser.add_argument("--sort-rows", type=int, default=4, help="maximum measured prefill rows for sorting; estimate the requested prefill by row scaling (default: 4; 0: full size)")
     parser.add_argument("--context", type=int, default=1024, help="decode prefix tokens, excluding the new token (default: 1024)")
@@ -361,8 +361,8 @@ def main():
         if args.cmp:
             for case in cases:
                 case.update(cmp=True, seed=args.cmp_seed)
-    if any(case["op"] == "mega" for case in cases) and args.command == "run" and args.simulator != "cmodel":
-        parser.error("mega cases are restricted to --simulator cmodel")
+    if any(case["op"] == "mega" for case in cases) and args.command == "run" and args.simulator != "dayan_emu":
+        parser.error("mega cases are restricted to --simulator Dayan-emu")
     if any(case["op"] == "mega" for case in cases) and args.command == "run" and (args.repeats != 1 or args.warmup != 0):
         parser.error("mega cases currently require --repeats 1 --warmup 0")
     if args.cases:

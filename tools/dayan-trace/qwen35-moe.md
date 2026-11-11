@@ -4,14 +4,14 @@ The tested source is `Qwen3.6-35B-A3B-MXFP4_MOE_BF16.gguf`, architecture `qwen35
 
 The backend supports these operators. F32 matrix products use MAT TF32 with F32 accumulation. Routed products use the existing W4A4 pipeline and actual expert-ID row strides. Standalone and mega sorting share VEC compare/shuffle networks with stable index tie-breaking. Small K prunes candidates after each 64-lane local sort; full ARGSORT uses bitonic merges. Prefill batches rows across cores, with two workers per core for large inputs and 256 KiB of scratch per worker. Single-row decode sorts on one core. Standalone sorting reserves no Atomic Cache. MoE mega selects experts from softmax probabilities in its `sort` slot. VEC sorts 64 assignments by expert, computes run ranks, and updates per-core SparseMem histograms with one writer per expert run. Sequential VEC loops preserve histogram updates between blocks. VEC also computes prefix sums and final grouped row maps; cores exchange bases through the DRAM workspace. Dispatch uses 4 KiB of local SparseMem for 1024 expert counters and 256 bytes for reordering; larger expert sets use multiple windows. This SRAM is separate from Runtime `shared` memory. The MoE entry reserves 272 bytes of Atomic Cache for CPU synchronization only, aligned to 320 bytes by the Runtime. All Proc slots are reserved during mega execution, and sorting workers finish before dispatch uses local SparseMem. Grouped expert products build 64-bit address tables with VEC and batch payload/scale movement with LSU gather/scatter. Decode reads cached DRAM IDs directly. None of these routing stages use scalar URAM data loads or stores. Its separate `qwen35_moe_mega` entry combines a BF16 attention segment with routing, experts, shared experts, and the F32 residual. It accepts initial and later decode graphs, including omitted state SCALE slots and contiguous ADD slots lowered as residual adds.
 
-## cmodel and fixture
+## Dayan-emu and fixture
 
-Use cmodel for functional checks. TestCluster and RTL performance measurements are separate.
+Use Dayan-emu for functional checks. TestCluster and RTL performance measurements are separate.
 
 ```sh
-NPU_CMODEL_HARTS=4 NPU_CMODEL_MEMORY_MIB=32768 \
+DAYAN_EMU_HARTS=4 DAYAN_EMU_MEMORY_MIB=32768 \
 DAYAN_SERVER_SOCKET=/tmp/dayan-moe.sock \
-bash ~/npu-firmware/run_cmodel_server.sh
+bash ~/npu-firmware/run_dayan_emu_server.sh
 ```
 
 Confirm 34359738368 shared DRAM bytes in the startup log. Runtime offsets and mega parameters use 64-bit addresses. Create a smaller random fixture without reading the source weight payloads:
@@ -33,7 +33,7 @@ Run the operator preset under firmware `dyperf`:
 ```sh
 ~/npu-firmware/build/host/dyperf/dyperf --socket /tmp/dayan-moe.sock --follow -o /tmp/dayan-moe-operators-perf.json -- \
 python3 tools/dayan-trace/limited-perf.py run \
-  --model qwen36-35B-A3B-mxfp4-moe-bf16 --simulator cmodel \
+  --model qwen36-35B-A3B-mxfp4-moe-bf16 --simulator dayan_emu \
   --socket /tmp/dayan-moe.sock --perf-trace /tmp/dayan-moe-operators-perf.json \
   --prefill 4 --context 16 --cmp --cmp-seed 35 \
   --output build-dayan/moe-operators
@@ -57,7 +57,7 @@ DAYAN_MOE_MODEL=$PWD/build-dayan/moe-validation/hybrid.gguf \
 ~/npu-firmware/build/host/dyperf/dyperf --socket /tmp/dayan-moe.sock --follow -o /tmp/dayan-moe-mega-perf.json -- \
 python3 tools/dayan-trace/limited-perf.py run \
   --model qwen36-35B-A3B-moe-mega \
-  --client build-dayan/bin/llama-dayan-moe-bench --simulator cmodel \
+  --client build-dayan/bin/llama-dayan-moe-bench --simulator dayan_emu \
   --socket /tmp/dayan-moe.sock --perf-trace /tmp/dayan-moe-mega-perf.json \
   --prefill 4 --context 2 --cmp --cmp-seed 35 \
   --output build-dayan/moe-mega
@@ -66,11 +66,11 @@ python3 tools/dayan-trace/limited-perf.py report --output build-dayan/moe-mega
 
 Each case runs standalone Dayan and mega from fresh contexts. The prefill case checks the prompt and two later single-token steps. The decode case starts with one token and checks two consecutive decode steps. Every step must launch one mega block per layer. A silent fallback fails the test. Logits are compared at every step. This is a fusion regression against standalone Dayan; CPU operator checks remain separate.
 
-The sample measures one `llama_decode` call, including embedding, final norm/head, host graph work, and two mega launches. Validation and extra decode steps are excluded from that sample. The preset reports this two-layer fixture only; it does not extrapolate a 40-layer model. Its decode sample has two cached tokens. cmodel wall times describe simulator runtime, and its cycle counters are not hardware performance evidence. An exit code of 2 can mean numerical checks passed but usable cycle records are unavailable; inspect the result JSON.
+The sample measures one `llama_decode` call, including embedding, final norm/head, host graph work, and two mega launches. Validation and extra decode steps are excluded from that sample. The preset reports this two-layer fixture only; it does not extrapolate a 40-layer model. Its decode sample has two cached tokens. Dayan-emu wall times describe simulator runtime, and its cycle counters are not hardware performance evidence. An exit code of 2 can mean numerical checks passed but usable cycle records are unavailable; inspect the result JSON.
 
 ## Validation record (2026-09-19)
 
-On four-core cmodel with 32 GiB DRAM:
+On four-core Dayan-emu with 32 GiB DRAM:
 
 | Check | Result |
 | --- | --- |

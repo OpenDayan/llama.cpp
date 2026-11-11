@@ -261,7 +261,7 @@ def main(argv=None):
     common.add_argument("--socket", default=os.environ.get("DAYAN_SERVER_SOCKET", "/tmp/dayan-server.sock"))
     common.add_argument("--client", type=Path, default=Path(os.environ.get("DAYAN_LAYER_CLIENT", ROOT / "build-dayan-public/bin/llama-dayan-layer-bench")), help="client executable (default: DAYAN_LAYER_CLIENT or build-dayan-public/bin/llama-dayan-layer-bench)")
     run_parser = commands.add_parser("run", parents=[common], help="run inference, record dyperf and generate reports")
-    run_parser.add_argument("--pcu", action="store_true", help="include continuous PCU sampling (off by default; unsupported by cmodel)")
+    run_parser.add_argument("--pcu", action="store_true", help="include continuous PCU sampling (off by default; unsupported by dayan_emu)")
     run_parser.add_argument("--cmp", action="store_true", help="compare every step's final-token logits with a CPU replay after profiling")
     run_parser.add_argument("--cmp-profile", choices=("auto", "strict", "mxfp4"), default="auto", help="auto selects aggregate MXFP4 checks for dense/MoE MXFP4 and strict elementwise checks for BF16")
     run_parser.add_argument("--cmp-atol", type=float, default=0.03, help="absolute logit tolerance; diagnostic only with the mxfp4 profile (default: 0.03)")
