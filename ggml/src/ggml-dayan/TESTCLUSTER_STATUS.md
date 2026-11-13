@@ -5,7 +5,7 @@ This file records the Dayan decode validation and performance results available 
 ## Test scope
 
 - llama.cpp revision: `8507e57904baf8a78e8832f04111fe827b07056a`
-- npu-firmware revision: `004cd8c80d16695fbf01081a2adc5470952c8650`
+- dayan-base revision: `004cd8c80d16695fbf01081a2adc5470952c8650`
 - Model: Qwen3.5 0.8B BF16
 - Phase: one-token decode after a 128-token prefill
 - Trace: `/tmp/dayan-decode-current.json`

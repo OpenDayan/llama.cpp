@@ -268,7 +268,7 @@ def main(argv=None):
     run_parser.add_argument("--cmp-rtol", type=float, default=0.03, help="relative logit tolerance; diagnostic only with the mxfp4 profile (default: 0.03)")
     run_parser.add_argument("--cmp-max-rel-l2", type=float, default=0.35, help="maximum relative L2 error per step with the mxfp4 profile (default: 0.35)")
     run_parser.add_argument("--cmp-min-cosine", type=float, default=0.93, help="minimum cosine similarity per step with the mxfp4 profile (default: 0.93)")
-    run_parser.add_argument("--dyperf", type=Path, default=Path(os.environ.get("DAYAN_ROOT", Path.home() / "npu-firmware")) / "build/host/dyperf/dyperf", help="profiler executable; launched automatically (default: $DAYAN_ROOT/build/host/dyperf/dyperf)")
+    run_parser.add_argument("--dyperf", type=Path, default=Path(os.environ.get("DAYAN_ROOT", Path.home() / "dayan-base")) / "build/host/dyperf/dyperf", help="profiler executable; launched automatically (default: $DAYAN_ROOT/build/host/dyperf/dyperf)")
     compare_parser = commands.add_parser("cmp-ops", parents=[common], help="compare each inference operator against CPU using its actual inputs")
     compare_parser.add_argument("--op-atol", type=float, default=1e-4)
     compare_parser.add_argument("--op-rtol", type=float, default=1e-3)

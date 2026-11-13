@@ -9,7 +9,7 @@
 Build the client and extract a layer once:
 
 ```sh
-cmake -S . -B build-dayan-public -DGGML_DAYAN=ON -DDAYAN_ROOT="$HOME/npu-firmware"
+cmake -S . -B build-dayan-public -DGGML_DAYAN=ON -DDAYAN_ROOT="$HOME/dayan-base"
 cmake --build build-dayan-public --target llama-dayan-layer-bench -j8
 
 python3 tools/dayan-trace/layer-perf.py prepare \
@@ -125,7 +125,7 @@ perf-mxfp4-both/
 
 The top-level report has one row per layer and mode, including step count, total layer cycles, median/min/max cycles per step and CPU comparison status. Detailed reports retain slot cycles and percentages for that mode. Decode totals exclude prompt setup. Single-mode runs retain their existing directory layout, and old records remain readable.
 
-`run` connects to the external server without a `--simulator` argument. The client defaults to `DAYAN_LAYER_CLIENT` or `build-dayan-public/bin/llama-dayan-layer-bench`; override it with `--client`. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf` (`DAYAN_ROOT` defaults to `~/npu-firmware`). Pass `--dyperf /path/to/dyperf` to choose another profiler; it is launched and stopped automatically. `--socket` overrides `DAYAN_SERVER_SOCKET`.
+`run` connects to the external server without a `--simulator` argument. The client defaults to `DAYAN_LAYER_CLIENT` or `build-dayan-public/bin/llama-dayan-layer-bench`; override it with `--client`. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf` (`DAYAN_ROOT` defaults to `~/dayan-base`). Pass `--dyperf /path/to/dyperf` to choose another profiler; it is launched and stopped automatically. `--socket` overrides `DAYAN_SERVER_SOCKET`.
 
 PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; this passes `--pcu-interval 0` to dyperf for continuous sampling. Dayan-emu does not support PCU, so omit `--pcu` there. Proc-state tracing and offline slot timing work without PCU.
 

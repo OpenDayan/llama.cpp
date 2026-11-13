@@ -10,7 +10,7 @@ Run from the llama.cpp repository root:
 cmake -S . -B build-dayan \
   -DCMAKE_BUILD_TYPE=Release \
   -DGGML_DAYAN=ON \
-  -DDAYAN_ROOT="$HOME/npu-firmware" \
+  -DDAYAN_ROOT="$HOME/dayan-base" \
   -DLLAMA_BUILD_TOOLS=ON \
   -DLLAMA_BUILD_SERVER=OFF
 
@@ -30,7 +30,7 @@ cmake --build build-dayan -j4 --target \
 Keep this command running in terminal 1:
 
 ```sh
-cd "$HOME/npu-firmware"
+cd "$HOME/dayan-base"
 DAYAN_EMU_HARTS=4 \
 DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock \
 ./run_dayan_emu_server.sh

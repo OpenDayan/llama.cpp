@@ -15,7 +15,7 @@ Run commands from the llama.cpp repository root. The examples cover these three 
 Set the SDK, Runtime socket, and model paths in each client terminal:
 
 ```sh
-export DAYAN_ROOT="$HOME/npu-firmware"
+export DAYAN_ROOT="$HOME/dayan-base"
 export DAYAN_SERVER_SOCKET=/tmp/dayan-server.sock
 export DAYAN_LAYER_CLIENT="$PWD/build-dayan/bin/llama-dayan-layer-bench"
 export DAYAN_MODEL_MXFP4=/share/models/Qwen3.5-0.8B-MXFP4/Qwen3.5-0.8B-MXFP4-Vocab-MXFP4.gguf
@@ -318,7 +318,7 @@ python3 tools/dayan-trace/layer-perf-report.py \
 
 For sorting, `cmp-ops` checks only the ARGSORT prefix consumed by the graph. It checks score order and unique, valid indices, allowing equal-score ties to use different index orders. Native `TOP_K` is unordered, so its comparison checks the selected score multiset and index uniqueness. Unwritten ARGSORT suffixes are reported as `ignored_elements`.
 
-The client defaults to `DAYAN_LAYER_CLIENT`, or `build-dayan-public/bin/llama-dayan-layer-bench` when unset. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf`, with `DAYAN_ROOT` falling back to `~/npu-firmware`. Override it with `--dyperf /path/to/dyperf`; the script automatically launches `dyperf --follow`, runs the client, and waits for the trace to close. PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; it adds `--pcu-interval 0` to dyperf for continuous sampling. Dayan-emu does not support PCU, so omit `--pcu` there. `--client` and `--socket` override their environment defaults. No `--simulator` argument is needed.
+The client defaults to `DAYAN_LAYER_CLIENT`, or `build-dayan-public/bin/llama-dayan-layer-bench` when unset. The profiler defaults to `$DAYAN_ROOT/build/host/dyperf/dyperf`, with `DAYAN_ROOT` falling back to `~/dayan-base`. Override it with `--dyperf /path/to/dyperf`; the script automatically launches `dyperf --follow`, runs the client, and waits for the trace to close. PCU sampling is off by default. Add `--pcu` to `run` on a backend that supports PCU; it adds `--pcu-interval 0` to dyperf for continuous sampling. Dayan-emu does not support PCU, so omit `--pcu` there. `--client` and `--socket` override their environment defaults. No `--simulator` argument is needed.
 
 With `--pcu`, open each `perf.json` in Perfetto to inspect per-core MAT utilization, VEC/Scalar IPC, LSU bandwidth and URAM read/write statistics. `PCU snapshot` events retain the 112 raw counters; metadata records `pcu_enabled: true` and `pcu_interval_ms: 0`. Offline slot timing uses proc-state events and works without PCU.
 

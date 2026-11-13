@@ -60,7 +60,7 @@ If any item is unknown, read the relevant source before editing. A successful De
 - Keep code and comments ASCII-only.
 - Prefer existing backend infrastructure and existing tests.
 - Keep comments short and explain only non-obvious invariants.
-- Do not add a new dependency for Device instruction encodings. The public headers in `npu-firmware/device/include/api` are the source of truth.
+- Do not add a new dependency for Device instruction encodings. The public headers in `dayan-base/device/include/api` are the source of truth.
 - Dayan-emu is for functional and relative before/after comparison. It is not RTL or hardware timing.
 
 ## Keeping this package current

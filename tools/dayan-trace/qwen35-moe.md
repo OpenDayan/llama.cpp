@@ -11,7 +11,7 @@ Use Dayan-emu for functional checks. TestCluster and RTL performance measurement
 ```sh
 DAYAN_EMU_HARTS=4 DAYAN_EMU_MEMORY_MIB=32768 \
 DAYAN_SERVER_SOCKET=/tmp/dayan-moe.sock \
-bash ~/npu-firmware/run_dayan_emu_server.sh
+bash ~/dayan-base/run_dayan_emu_server.sh
 ```
 
 Confirm 34359738368 shared DRAM bytes in the startup log. Runtime offsets and mega parameters use 64-bit addresses. Create a smaller random fixture without reading the source weight payloads:
@@ -31,7 +31,7 @@ This fixture keeps the real layer dimensions and 256 experts. It has one linear 
 Run the operator preset under firmware `dyperf`:
 
 ```sh
-~/npu-firmware/build/host/dyperf/dyperf --socket /tmp/dayan-moe.sock --follow -o /tmp/dayan-moe-operators-perf.json -- \
+~/dayan-base/build/host/dyperf/dyperf --socket /tmp/dayan-moe.sock --follow -o /tmp/dayan-moe-operators-perf.json -- \
 python3 tools/dayan-trace/limited-perf.py run \
   --model qwen36-35B-A3B-mxfp4-moe-bf16 --simulator dayan_emu \
   --socket /tmp/dayan-moe.sock --perf-trace /tmp/dayan-moe-operators-perf.json \
@@ -54,7 +54,7 @@ After standalone checks pass, use the separate mega client:
 
 ```sh
 DAYAN_MOE_MODEL=$PWD/build-dayan/moe-validation/hybrid.gguf \
-~/npu-firmware/build/host/dyperf/dyperf --socket /tmp/dayan-moe.sock --follow -o /tmp/dayan-moe-mega-perf.json -- \
+~/dayan-base/build/host/dyperf/dyperf --socket /tmp/dayan-moe.sock --follow -o /tmp/dayan-moe-mega-perf.json -- \
 python3 tools/dayan-trace/limited-perf.py run \
   --model qwen36-35B-A3B-moe-mega \
   --client build-dayan/bin/llama-dayan-moe-bench --simulator dayan_emu \

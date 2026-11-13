@@ -7,7 +7,7 @@ For complete single-layer prefill/decode measurements and offline per-slot analy
 Build the host client from the repository root:
 
 ```sh
-cmake -S . -B build-dayan -DGGML_DAYAN=ON -DDAYAN_ROOT="$HOME/npu-firmware"
+cmake -S . -B build-dayan -DGGML_DAYAN=ON -DDAYAN_ROOT="$HOME/dayan-base"
 cmake --build build-dayan --target llama-dayan-operator-bench -j4
 python3 tools/dayan-trace/limited-perf.py plan
 ```
@@ -94,10 +94,10 @@ Configure the server with `--normal-memory-size-mib 256` or more for the default
 When restarting the server after a firmware update, rebuild the Device firmware, API ELF, host driver, and profiler together, then relink the benchmark:
 
 ```sh
-make -C "$HOME/npu-firmware" -j4 device host-driver dycc dyperf
+make -C "$HOME/dayan-base" -j4 device host-driver dycc dyperf
 cmake --build build-dayan --target llama-dayan-operator-bench -j4
 # After the simulator is ready, use these arguments when starting the server.
-"$HOME/npu-firmware/run_server.sh" --normal-memory-size-mib 256
+"$HOME/dayan-base/run_server.sh" --normal-memory-size-mib 256
 ```
 
 The run script connects to the existing socket and does not change the server's memory budget or the active profiler. Errors include the failing API and transfer/allocation size in the case log and reports. An empty `samples` array means setup failed before calling the kernel; a failed launch has a sample with its returned status.

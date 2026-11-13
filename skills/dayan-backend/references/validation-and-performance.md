@@ -32,7 +32,7 @@ The graph suite's fan-out case intentionally produces an unsupported GLU message
 
 ## Dayan-emu lifecycle
 
-Use the existing `npu-firmware/run_dayan_emu_server.sh` lifecycle for functional work. Confirm no unrelated process owns the fixed simulator, FUSE, shared-memory, or socket resources before starting it. Use four Harts for the full Qwen3.5 path unless a focused operator explicitly uses another configuration.
+Use the existing `dayan-base/run_dayan_emu_server.sh` lifecycle for functional work. Confirm no unrelated process owns the fixed simulator, FUSE, shared-memory, or socket resources before starting it. Use four Harts for the full Qwen3.5 path unless a focused operator explicitly uses another configuration.
 
 Typical client commands are:
 
