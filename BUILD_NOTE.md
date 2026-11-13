@@ -40,7 +40,7 @@ The launcher configures 4096 MiB for both QEMU DRAM and the HAL Normal-memory re
 
 Wait for `Dayan-emu server is ready` before starting llama.cpp. Press Ctrl-C in terminal 1 after the client exits.
 
-Do not start another Dayan-emu instance while `/tmp/virtual_npu`, `/tmp/dayan-server.sock`, `rvt_emulator`, `dl-riscv64`, or `dayan_server` belongs to a live run. The Dayan-emu frontend uses the fixed `/tmp/virtual_npu` path.
+Do not start another Dayan-emu instance while `/tmp/virtual_npu`, `/tmp/dayan-server.sock`, `dayan-emu`, `dl-riscv64`, or `dayan_server` belongs to a live run. The Dayan-emu frontend uses the fixed `/tmp/virtual_npu` path.
 
 ## Device-resident tensor storage
 
@@ -329,14 +329,14 @@ A valid run must assign all 26 model layer slots to DAYAN, print the Dayan-only 
 
 ## Expected Host usage
 
-This is not a CPU-free Host process. Model files and explicit inputs originate on the Host, CPU sampling reads the requested logits output, and the Host submits Device commands and small configs. The Dayan-emu also executes `rvt_emulator` and RISC-V QEMU on the Host CPU, so high CPU usage from `rvt_emulator` or `dl-riscv64` represents simulated Dayan execution.
+This is not a CPU-free Host process. Model files and explicit inputs originate on the Host, CPU sampling reads the requested logits output, and the Host submits Device commands and small configs. The Dayan-emu also executes `dayan-emu` and RISC-V QEMU on the Host CPU, so high CPU usage from `dayan-emu` or `dl-riscv64` represents simulated Dayan execution.
 
 Pure Dayan graph execution does not pack or download intermediate tensors. Every non-metadata model graph node must be assigned to Dayan; context creation or graph execution fails before compute if the scheduler assigns one to another backend. Sampling remains on CPU and is not inserted into the Dayan model graph.
 
 Use `GGML_SCHED_DEBUG=2` for scheduler diagnostics. Use this command during a run to separate simulator and Host usage:
 
 ```sh
-pidstat -u -p "$(pgrep -d, -f 'llama-completion|rvt_emulator|dl-riscv64|dayan_server')" 1
+pidstat -u -p "$(pgrep -d, -f 'llama-completion|dayan-emu|dl-riscv64|dayan_server')" 1
 ```
 
 ## Current limitations
