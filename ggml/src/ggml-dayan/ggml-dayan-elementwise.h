@@ -111,12 +111,16 @@ static inline void binary_preload_right(const DayanBinaryConfig * config, const 
             load_matrix<0>(bytes, 1, NormalizationLayout::kFloatBytes, 1, right_uram,
                            (uint64_t) (uintptr_t) right);
             for (uint32_t filled = 1; filled < copies; filled *= 2) {
+                // Each copy reads URAM written by the previous DMA; LSU issue order alone does
+                // not make that write visible to the next DMA's read.
+                dayan_wait_lsu();
                 configure_memory_lsu<0>(filled, bytes, bytes, bytes, bytes);
                 __tx_lsu_dma_u2u<0>((long) (right_uram + filled * bytes), (long) right_uram);
             }
         } else {
             load_matrix<0>(bytes, 1, NormalizationLayout::kFloatBytes, 1, right_uram,
                            (uint64_t) (uintptr_t) right);
+            dayan_wait_lsu();
             configure_memory_lsu<0>(2, 64, 64, 64, 64);
             __tx_lsu_dma_u2u<0>((long) (right_uram + bytes), (long) right_uram);
         }
